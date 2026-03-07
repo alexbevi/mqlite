@@ -75,7 +75,7 @@ Recommended Node changes for the first adapter:
 - Add a local stream factory for Unix sockets or named pipes.
 - Skip incompatible SDAM features by forcing single-topology semantics.
 - Reuse existing command monitoring and pooling behavior after the local stream is established.
-- Add a dedicated mqlite runner instead of editing existing integration suites in place. The current Node workspace uses `test/mocha_mqlite.js` plus `test/tools/runner/run_mqlite.cjs` so the same tests can be pointed at `file:///...` with profile-based selection.
+- Add a dedicated mqlite runner instead of editing existing integration suites in place. The current Node workspace uses `test/mocha_mqlite.js` plus `test/tools/runner/run_mqlite.cjs` so the same tests can be pointed at `file:///...` with profile-based selection, and `test/tools/runner/mqlite_suite_registry.ts` is the checked-in allowlist you comment out to remove suites from the default run.
 
 ## Reference Anchors
 
@@ -115,5 +115,5 @@ MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite
 MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite:crud
 ```
 
-- `check:mqlite` points the integration harness at a `file://` database and runs the normal integration tree under the dedicated mqlite hook.
-- `check:mqlite:crud` uses the same harness but restricts execution to the current curated CRUD bring-up profile, which starts with `test/integration/crud/abstract_operation.test.ts` and can grow without modifying the underlying tests.
+- `check:mqlite` points the integration harness at a `file://` database and runs the explicit suite list from `test/tools/runner/mqlite_suite_registry.ts`.
+- `check:mqlite:crud` uses the same harness but restricts execution to the current curated CRUD bring-up profile in that same registry, which starts with `test/integration/crud/abstract_operation.test.ts` and can grow without modifying the underlying tests.

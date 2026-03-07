@@ -2685,7 +2685,7 @@ fn internal_error(error: anyhow::Error) -> CommandError {
     CommandError::new(8, "UnknownError", error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{
         path::Path,
