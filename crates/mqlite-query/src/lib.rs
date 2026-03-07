@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size",
+    "$size", "$mod",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -35,16 +35,51 @@ pub enum MatchExpr {
     And(Vec<MatchExpr>),
     Or(Vec<MatchExpr>),
     Nor(Vec<MatchExpr>),
-    Eq { path: String, value: Bson },
-    Ne { path: String, value: Bson },
-    Gt { path: String, value: Bson },
-    Gte { path: String, value: Bson },
-    Lt { path: String, value: Bson },
-    Lte { path: String, value: Bson },
-    In { path: String, values: Vec<Bson> },
-    Nin { path: String, values: Vec<Bson> },
-    Exists { path: String, exists: bool },
-    Size { path: String, size: usize },
+    Eq {
+        path: String,
+        value: Bson,
+    },
+    Ne {
+        path: String,
+        value: Bson,
+    },
+    Gt {
+        path: String,
+        value: Bson,
+    },
+    Gte {
+        path: String,
+        value: Bson,
+    },
+    Lt {
+        path: String,
+        value: Bson,
+    },
+    Lte {
+        path: String,
+        value: Bson,
+    },
+    In {
+        path: String,
+        values: Vec<Bson>,
+    },
+    Nin {
+        path: String,
+        values: Vec<Bson>,
+    },
+    Exists {
+        path: String,
+        exists: bool,
+    },
+    Size {
+        path: String,
+        size: usize,
+    },
+    Mod {
+        path: String,
+        divisor: i64,
+        remainder: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,6 +461,12 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::Size { path, size } => lookup_path(document, path)
             .and_then(Bson::as_array)
             .is_some_and(|values| values.len() == *size),
+        MatchExpr::Mod {
+            path,
+            divisor,
+            remainder,
+        } => lookup_path(document, path)
+            .is_some_and(|value| matches_mod(value, *divisor, *remainder)),
     }
 }
 
@@ -488,6 +529,26 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                         )
                         .map_err(|_| QueryError::InvalidStructure)?,
                     },
+                    "$mod" => {
+                        let values = operator_value
+                            .as_array()
+                            .ok_or(QueryError::InvalidStructure)?;
+                        if values.len() != 2 {
+                            return Err(QueryError::InvalidStructure);
+                        }
+                        let divisor =
+                            coerce_to_i64(&values[0]).ok_or(QueryError::InvalidStructure)?;
+                        let remainder =
+                            coerce_to_i64(&values[1]).ok_or(QueryError::InvalidStructure)?;
+                        if divisor == 0 {
+                            return Err(QueryError::InvalidStructure);
+                        }
+                        MatchExpr::Mod {
+                            path: path.to_string(),
+                            divisor,
+                            remainder,
+                        }
+                    }
                     other => return Err(QueryError::UnsupportedOperator(other.to_string())),
                 });
             }
@@ -536,6 +597,32 @@ fn integer_value(value: &Bson) -> Option<i64> {
         Bson::Int64(value) => Some(*value),
         Bson::Double(value) if value.fract() == 0.0 => Some(*value as i64),
         _ => None,
+    }
+}
+
+fn coerce_to_i64(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(value) => Some(*value as i64),
+        Bson::Int64(value) => Some(*value),
+        Bson::Double(value) if value.is_finite() => truncate_f64_to_i64(*value),
+        Bson::Decimal128(value) => truncate_f64_to_i64(value.to_string().parse::<f64>().ok()?),
+        _ => None,
+    }
+}
+
+fn truncate_f64_to_i64(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    ((i64::MIN as f64)..=(i64::MAX as f64))
+        .contains(&truncated)
+        .then_some(truncated as i64)
+}
+
+fn matches_mod(value: &Bson, divisor: i64, remainder: i64) -> bool {
+    match value {
+        Bson::Array(items) => items
+            .iter()
+            .any(|item| matches_mod(item, divisor, remainder)),
+        _ => coerce_to_i64(value).is_some_and(|coerced| coerced % divisor == remainder),
     }
 }
 
@@ -910,6 +997,33 @@ mod tests {
         assert_filter(&document, doc! { "tags": { "$size": 1 } }, false);
         assert_filter(&document, doc! { "meta.values": { "$size": 1 } }, true);
         assert_filter(&document, doc! { "missing": { "$size": 0 } }, false);
+    }
+
+    #[test]
+    fn supports_mod_filters() {
+        let document = doc! { "qty": 12, "score": 4.7, "values": [1, 8] };
+
+        assert_filter(&document, doc! { "qty": { "$mod": [5, 2] } }, true);
+        assert_filter(&document, doc! { "qty": { "$mod": [5, 1] } }, false);
+        assert_filter(&document, doc! { "score": { "$mod": [4, 0] } }, true);
+        assert_filter(&document, doc! { "values": { "$mod": [4, 0] } }, true);
+        assert_filter(&document, doc! { "missing": { "$mod": [4, 0] } }, false);
+    }
+
+    #[test]
+    fn rejects_malformed_mod_filters() {
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$mod": [5] } }),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$mod": [0, 0] } }),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$mod": ["x", 0] } }),
+            Err(QueryError::InvalidStructure)
+        ));
     }
 
     #[test]

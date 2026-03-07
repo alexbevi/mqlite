@@ -1857,6 +1857,7 @@ fn collect_field_bounds(
         }
         MatchExpr::Nin { .. } => None,
         MatchExpr::Size { .. } => None,
+        MatchExpr::Mod { .. } => None,
         MatchExpr::Gt { path, value } => {
             tighten_lower(
                 field_bounds.entry(path.clone()).or_default(),
@@ -2026,7 +2027,8 @@ fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>
         | MatchExpr::In { path, .. }
         | MatchExpr::Nin { path, .. }
         | MatchExpr::Exists { path, .. }
-        | MatchExpr::Size { path, .. } => {
+        | MatchExpr::Size { path, .. }
+        | MatchExpr::Mod { path, .. } => {
             paths.insert(path.clone());
         }
     }
@@ -2203,6 +2205,11 @@ fn filter_shape(expression: &MatchExpr) -> String {
         MatchExpr::Nin { path, values } => format!("{path}:nin{}", values.len()),
         MatchExpr::Exists { path, exists } => format!("{path}:exists{exists}"),
         MatchExpr::Size { path, size } => format!("{path}:size{size}"),
+        MatchExpr::Mod {
+            path,
+            divisor,
+            remainder,
+        } => format!("{path}:mod{divisor}:{remainder}"),
     }
 }
 

@@ -147,6 +147,54 @@ fn command_find_supports_size_filter() {
 }
 
 #[test]
+fn command_find_supports_mod_filter() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-mod.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"qty":5},{"qty":12},{"qty":4.7}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"qty":{"$mod":[5,2]}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["qty"], 12);
+}
+
+#[test]
 fn command_preserves_unique_indexes_across_restart() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-index.mongodb");

@@ -28,7 +28,7 @@ cargo run -p mqlite-capabilities -- sync --check
 
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
-| Query operators | 41 | 13 | 28 |
+| Query operators | 41 | 14 | 27 |
 | Aggregation stages | 57 | 12 | 45 |
 | Aggregation expression operators | 176 | 1 | 175 |
 | Aggregation accumulators | 25 | 4 | 21 |
@@ -36,7 +36,7 @@ cargo run -p mqlite-capabilities -- sync --check
 
 ## Query Operators
 
-Public upstream: 41. Supported: 13. Unsupported: 28.
+Public upstream: 41. Supported: 14. Unsupported: 27.
 
 ### Supported Public
 
@@ -48,6 +48,7 @@ Public upstream: 41. Supported: 13. Unsupported: 28.
 - `$in`
 - `$lt`
 - `$lte`
+- `$mod`
 - `$ne`
 - `$nin`
 - `$nor`
@@ -72,7 +73,6 @@ Public upstream: 41. Supported: 13. Unsupported: 28.
 - `$geoWithin`
 - `$id`
 - `$jsonSchema`
-- `$mod`
 - `$near`
 - `$nearSphere`
 - `$not`
