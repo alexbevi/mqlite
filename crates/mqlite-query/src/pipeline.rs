@@ -83,6 +83,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 list_cached_and_active_users_documents(stage_index, stage_spec)?
             }
             "$listLocalSessions" => list_local_sessions_documents(stage_index, stage_spec)?,
+            "$listSampledQueries" => list_sampled_queries_documents(stage_index, stage_spec)?,
             "$listSessions" => list_sessions_documents(stage_index, stage_spec)?,
             "$listMqlEntities" => list_mql_entities_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
@@ -1204,6 +1205,18 @@ fn list_sessions_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Docume
     Ok(Vec::new())
 }
 
+fn list_sampled_queries_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    parse_list_sampled_queries_spec(spec)?;
+    Ok(Vec::new())
+}
+
 fn list_mql_entities_documents(
     stage_index: usize,
     spec: &Bson,
@@ -1256,6 +1269,35 @@ fn parse_list_sessions_spec(spec: &Bson) -> Result<(), QueryError> {
         return Err(QueryError::InvalidStage);
     }
 
+    Ok(())
+}
+
+fn parse_list_sampled_queries_spec(spec: &Bson) -> Result<(), QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "namespace" => {
+                let namespace = value.as_str().ok_or(QueryError::InvalidStage)?;
+                validate_namespace_string(namespace)?;
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_namespace_string(namespace: &str) -> Result<(), QueryError> {
+    if namespace.contains('\0') {
+        return Err(QueryError::InvalidStage);
+    }
+    let Some((database, collection)) = namespace.split_once('.') else {
+        return Err(QueryError::InvalidStage);
+    };
+    if database.is_empty() || collection.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
     Ok(())
 }
 

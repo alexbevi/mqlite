@@ -46,6 +46,7 @@
     "$listCatalog",
     "$listLocalSessions",
     "$listMqlEntities",
+    "$listSampledQueries",
     "$listSessions",
     "$lookup",
     "$match",

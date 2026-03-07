@@ -187,6 +187,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$listCatalog`
   - `$listCachedAndActiveUsers`
   - `$listLocalSessions`
+  - `$listSampledQueries`
   - `$listSessions`
   - `$listMqlEntities`
   - `$planCacheStats`
@@ -218,6 +219,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$listCatalog` aggregation on `admin` and collection-scoped `$listCatalog` aggregation on existing namespaces, returning the local file-backed namespace catalog.
 - `$listCachedAndActiveUsers` as an empty diagnostic source because authentication and user caching are out of scope for `mqlite`.
 - Collectionless `$listLocalSessions` aggregation with the public `allUsers` and `users` filters, returning an empty result because `mqlite` does not implement logical sessions or a local session cache.
+- Collectionless `$listSampledQueries` aggregation on `admin`, accepting the public optional `namespace` filter and returning an empty result because `mqlite` does not implement query sampling.
 - `$listSessions` aggregation on `config.system.sessions`, accepting the public `allUsers` and `users` filters and returning an empty result because `mqlite` does not implement persisted logical sessions.
 - Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.

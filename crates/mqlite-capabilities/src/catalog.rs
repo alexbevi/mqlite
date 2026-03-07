@@ -1136,6 +1136,10 @@ mod tests {
                 Vec::new(),
                 vec![doc! { "$listLocalSessions": { "allUsers": true } }],
             ),
+            "$listSampledQueries" => (
+                Vec::new(),
+                vec![doc! { "$listSampledQueries": { "namespace": "app.widgets" } }],
+            ),
             "$listSessions" => (
                 Vec::new(),
                 vec![doc! { "$listSessions": { "allUsers": true } }],

@@ -2160,6 +2160,42 @@ fn list_sessions_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn list_sampled_queries_stage_accepts_public_specs() {
+    for stage in [
+        doc! { "$listSampledQueries": {} },
+        doc! { "$listSampledQueries": { "namespace": "app.widgets" } },
+    ] {
+        let results = run_pipeline_ok(Vec::new(), &[stage]);
+        assert!(results.is_empty());
+    }
+}
+
+#[test]
+fn list_sampled_queries_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listSampledQueries": 1 },
+        doc! { "$listSampledQueries": { "namespace": 1 } },
+        doc! { "$listSampledQueries": { "namespace": "invalid" } },
+        doc! { "$listSampledQueries": { "namespace": "app." } },
+        doc! { "$listSampledQueries": { "namespace": "app\0.widgets" } },
+        doc! { "$listSampledQueries": { "all": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$documents": [{ "_id": 1 }] },
+            doc! { "$listSampledQueries": {} },
+        ],
+    )
+    .expect_err("$listSampledQueries should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn list_mql_entities_stage_reports_supported_aggregation_stages() {
     let results = run_pipeline_ok(
         Vec::new(),

@@ -1397,6 +1397,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$listLocalSessions");
+        let starts_with_list_sampled_queries = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$listSampledQueries");
         let starts_with_list_sessions = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1436,6 +1440,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$listLocalSessions must be run against the database with {aggregate: 1}, not a collection",
+            ));
+        }
+        if starts_with_list_sampled_queries && (!is_collectionless || database != "admin") {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$listSampledQueries must be run against the 'admin' database with {aggregate: 1}",
             ));
         }
         if starts_with_list_sessions
@@ -1531,6 +1542,15 @@ impl Broker {
         }
         if starts_with_list_local_sessions {
             return self.handle_list_local_sessions_aggregate(
+                &database,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_list_sampled_queries {
+            return self.handle_list_sampled_queries_aggregate(
                 &database,
                 batch_size,
                 execution_pipeline,
@@ -1877,6 +1897,48 @@ impl Broker {
     }
 
     fn handle_list_local_sessions_aggregate(
+        &self,
+        database: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.$cmd.aggregate");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_list_sampled_queries_aggregate(
         &self,
         database: &str,
         batch_size: Option<i64>,

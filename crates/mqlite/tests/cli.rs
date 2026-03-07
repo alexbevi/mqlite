@@ -776,6 +776,68 @@ fn command_aggregate_rejects_list_sessions_stage_on_wrong_namespace() {
 }
 
 #[test]
+fn command_collectionless_aggregate_supports_list_sampled_queries_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-sampled-queries.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listSampledQueries":{"namespace":"app.widgets"}},{"$count":"count"}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch, &vec![json!({ "count": 0 })]);
+}
+
+#[test]
+fn command_collectionless_aggregate_rejects_list_sampled_queries_stage_outside_admin() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-sampled-queries-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listSampledQueries":{}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_list_mql_entities_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-list-mql-entities.mongodb");
