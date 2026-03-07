@@ -8,6 +8,9 @@ use mqlite_bson::{compare_documents, lookup_path_owned};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const INDEX_TREE_LEAF_CAPACITY: usize = 64;
+const INDEX_TREE_BRANCH_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Catalog {
     pub databases: BTreeMap<String, DatabaseCatalog>,
@@ -29,6 +32,42 @@ pub struct CollectionCatalog {
 pub struct CollectionRecord {
     pub record_id: u64,
     pub document: Document,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexTree {
+    pub root: Option<Box<IndexNode>>,
+    pub height: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexNode {
+    Leaf {
+        entries: Vec<IndexEntry>,
+    },
+    Internal {
+        separators: Vec<Document>,
+        children: Vec<IndexNode>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexBounds {
+    pub lower: Option<IndexBound>,
+    pub upper: Option<IndexBound>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexBound {
+    pub key: Document,
+    pub inclusive: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NodeSummary {
+    node: IndexNode,
+    min_key: Document,
+    max_key: Document,
 }
 
 impl CollectionCatalog {
@@ -59,6 +98,12 @@ impl CollectionCatalog {
             .collect()
     }
 
+    pub fn hydrate_indexes(&mut self) {
+        for index in self.indexes.values_mut() {
+            index.rebuild_tree();
+        }
+    }
+
     pub fn insert_record(&mut self, record: CollectionRecord) -> Result<(), CatalogError> {
         if self
             .records
@@ -75,6 +120,7 @@ impl CollectionCatalog {
         for index in self.indexes.values_mut() {
             let entry = index_entry_for_document(record.record_id, &record.document, &index.key);
             insert_index_entry(&mut index.entries, entry);
+            index.rebuild_tree();
         }
         self.records.push(record);
         Ok(())
@@ -101,6 +147,7 @@ impl CollectionCatalog {
             index.entries.retain(|entry| entry.record_id != record_id);
             let entry = index_entry_for_document(record_id, &document, &index.key);
             insert_index_entry(&mut index.entries, entry);
+            index.rebuild_tree();
         }
         self.records[position].document = document;
         Ok(true)
@@ -118,6 +165,7 @@ impl CollectionCatalog {
             index
                 .entries
                 .retain(|entry| !record_ids.contains(&entry.record_id));
+            index.rebuild_tree();
         }
         before - self.records.len()
     }
@@ -133,6 +181,8 @@ pub struct IndexCatalog {
     pub key: Document,
     pub unique: bool,
     pub entries: Vec<IndexEntry>,
+    #[serde(skip, default)]
+    pub tree: IndexTree,
 }
 
 impl IndexCatalog {
@@ -142,7 +192,57 @@ impl IndexCatalog {
             key,
             unique,
             entries: Vec::new(),
+            tree: IndexTree::default(),
         }
+    }
+
+    pub fn rebuild_tree(&mut self) {
+        self.tree = IndexTree::build(&self.entries);
+    }
+
+    pub fn scan_bounds(&self, bounds: &IndexBounds) -> Vec<u64> {
+        self.tree.scan(bounds)
+    }
+}
+
+impl IndexTree {
+    pub fn build(entries: &[IndexEntry]) -> Self {
+        if entries.is_empty() {
+            return Self::default();
+        }
+
+        let mut level = entries
+            .chunks(INDEX_TREE_LEAF_CAPACITY)
+            .map(|chunk| NodeSummary {
+                node: IndexNode::Leaf {
+                    entries: chunk.to_vec(),
+                },
+                min_key: chunk.first().expect("leaf entry").key.clone(),
+                max_key: chunk.last().expect("leaf entry").key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut height = 1;
+
+        while level.len() > 1 {
+            height += 1;
+            level = level
+                .chunks(INDEX_TREE_BRANCH_CAPACITY)
+                .map(build_internal_summary)
+                .collect();
+        }
+
+        Self {
+            root: Some(Box::new(level.remove(0).node)),
+            height,
+        }
+    }
+
+    pub fn scan(&self, bounds: &IndexBounds) -> Vec<u64> {
+        let mut record_ids = Vec::new();
+        if let Some(root) = self.root.as_deref() {
+            scan_node(root, bounds, &mut record_ids);
+        }
+        record_ids
     }
 }
 
@@ -362,6 +462,7 @@ pub fn apply_index_specs(
                 index_entry_for_document(record.record_id, &record.document, &index.key),
             );
         }
+        index.rebuild_tree();
         collection.indexes.insert(name, index.clone());
         created.push(index);
     }
@@ -543,6 +644,89 @@ fn compare_index_entries(left: &IndexEntry, right: &IndexEntry) -> Ordering {
     compare_documents(&left.key, &right.key).then_with(|| left.record_id.cmp(&right.record_id))
 }
 
+fn build_internal_summary(children: &[NodeSummary]) -> NodeSummary {
+    let min_key = children.first().expect("children").min_key.clone();
+    let max_key = children.last().expect("children").max_key.clone();
+    let separators = children
+        .iter()
+        .skip(1)
+        .map(|child| child.min_key.clone())
+        .collect();
+    let node = IndexNode::Internal {
+        separators,
+        children: children.iter().map(|child| child.node.clone()).collect(),
+    };
+    NodeSummary {
+        node,
+        min_key,
+        max_key,
+    }
+}
+
+fn scan_node(node: &IndexNode, bounds: &IndexBounds, record_ids: &mut Vec<u64>) {
+    match node {
+        IndexNode::Leaf { entries } => {
+            for entry in entries {
+                if key_within_bounds(&entry.key, bounds) {
+                    record_ids.push(entry.record_id);
+                }
+            }
+        }
+        IndexNode::Internal {
+            separators,
+            children,
+        } => {
+            let start = bounds
+                .lower
+                .as_ref()
+                .map_or(0, |bound| child_start_index(separators, bound));
+            let end = bounds
+                .upper
+                .as_ref()
+                .map_or(children.len().saturating_sub(1), |bound| {
+                    child_end_index(separators, bound)
+                });
+            if start > end {
+                return;
+            }
+
+            for child in &children[start..=end] {
+                scan_node(child, bounds, record_ids);
+            }
+        }
+    }
+}
+
+fn child_start_index(separators: &[Document], bound: &IndexBound) -> usize {
+    separators.partition_point(|separator| {
+        let ordering = compare_documents(separator, &bound.key);
+        ordering.is_lt() || (bound.inclusive && ordering.is_eq())
+    })
+}
+
+fn child_end_index(separators: &[Document], bound: &IndexBound) -> usize {
+    separators.partition_point(|separator| {
+        let ordering = compare_documents(separator, &bound.key);
+        ordering.is_lt() || (bound.inclusive && ordering.is_eq())
+    })
+}
+
+fn key_within_bounds(key: &Document, bounds: &IndexBounds) -> bool {
+    if let Some(lower) = bounds.lower.as_ref() {
+        let ordering = compare_documents(key, &lower.key);
+        if ordering.is_lt() || (!lower.inclusive && ordering.is_eq()) {
+            return false;
+        }
+    }
+    if let Some(upper) = bounds.upper.as_ref() {
+        let ordering = compare_documents(key, &upper.key);
+        if ordering.is_gt() || (!upper.inclusive && ordering.is_eq()) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -550,7 +734,10 @@ mod tests {
     use bson::doc;
     use pretty_assertions::assert_eq;
 
-    use super::{Catalog, CatalogError, CollectionCatalog, CollectionRecord, default_index_name};
+    use super::{
+        Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
+        default_index_name,
+    };
 
     #[test]
     fn creates_collection_with_default_id_index() {
@@ -678,6 +865,43 @@ mod tests {
         let entries = &collection.indexes.get("sku_1").expect("index").entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].record_id, 2);
+    }
+
+    #[test]
+    fn scans_runtime_btree_bounds_across_multiple_leaf_groups() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        for record_id in 1..=200_u64 {
+            collection
+                .insert_record(CollectionRecord {
+                    record_id,
+                    document: doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                })
+                .expect("insert");
+        }
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let index = collection.indexes.get("sku_1").expect("index");
+        assert!(index.tree.height > 1);
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "sku": "sku-050" },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "sku": "sku-099" },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids.first().copied(), Some(50));
+        assert_eq!(record_ids.last().copied(), Some(99));
+        assert_eq!(record_ids.len(), 50);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -29,6 +29,9 @@ const WAL_HEADER_LEN: usize = 40;
 const PAGE_MAGIC: &[u8; 8] = b"MQLTPG04";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
+const PAGE_KIND_RECORD: u16 = 1;
+const PAGE_KIND_INDEX_LEAF: u16 = 2;
+const PAGE_KIND_INDEX_INTERNAL: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedState {
@@ -205,6 +208,7 @@ struct SnapshotCollectionCatalog {
 struct SnapshotIndexCatalog {
     key: bson::Document,
     unique: bool,
+    root_page_id: Option<u64>,
     pages: Vec<PageRef>,
     entry_count: usize,
 }
@@ -218,7 +222,7 @@ struct PageRef {
     entry_count: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EncodedPage {
     page_id: u64,
     bytes: Vec<u8>,
@@ -239,10 +243,32 @@ struct EncodedSnapshotCatalog {
 #[derive(Debug, Default)]
 struct SlottedPageBuilder {
     page_id: u64,
+    page_kind: u16,
+    page_extra: u64,
     bytes: Vec<u8>,
     slot_count: u16,
     free_start: usize,
     free_end: usize,
+}
+
+#[derive(Debug)]
+struct EncodedIndexTree {
+    root_page_id: Option<u64>,
+    pages: Vec<EncodedPage>,
+}
+
+#[derive(Debug)]
+struct EncodedTreePageSummary {
+    page: EncodedPage,
+    min_key: bson::Document,
+    max_key: bson::Document,
+}
+
+#[derive(Debug)]
+struct DecodedPage {
+    page_kind: u16,
+    page_extra: u64,
+    entries: Vec<(u64, bson::Document)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -491,9 +517,11 @@ impl DatabaseFile {
 }
 
 impl SlottedPageBuilder {
-    fn new(page_id: u64) -> Self {
+    fn new(page_id: u64, page_kind: u16, page_extra: u64) -> Self {
         Self {
             page_id,
+            page_kind,
+            page_extra,
             bytes: vec![0_u8; PAGE_SIZE],
             slot_count: 0,
             free_start: PAGE_HEADER_LEN,
@@ -538,10 +566,10 @@ impl SlottedPageBuilder {
         self.bytes[..8].copy_from_slice(PAGE_MAGIC);
         self.bytes[8..16].copy_from_slice(&self.page_id.to_le_bytes());
         self.bytes[16..18].copy_from_slice(&self.slot_count.to_le_bytes());
-        self.bytes[18..20].copy_from_slice(&0_u16.to_le_bytes());
+        self.bytes[18..20].copy_from_slice(&self.page_kind.to_le_bytes());
         self.bytes[20..22].copy_from_slice(&(self.free_start as u16).to_le_bytes());
         self.bytes[22..24].copy_from_slice(&(self.free_end as u16).to_le_bytes());
-        self.bytes[24..32].copy_from_slice(&0_u64.to_le_bytes());
+        self.bytes[24..32].copy_from_slice(&self.page_extra.to_le_bytes());
 
         EncodedPage {
             page_id: self.page_id,
@@ -819,8 +847,10 @@ fn apply_mutation(catalog: &mut Catalog, mutation: &WalMutation) -> Result<()> {
             collection,
             collection_state,
         } => {
-            validate_collection_indexes(collection_state).map_err(map_catalog_error)?;
-            catalog.replace_collection(database, collection, collection_state.clone());
+            let mut hydrated = collection_state.clone();
+            hydrated.hydrate_indexes();
+            validate_collection_indexes(&hydrated).map_err(map_catalog_error)?;
+            catalog.replace_collection(database, collection, hydrated);
         }
         WalMutation::DropCollection {
             database,
@@ -854,11 +884,11 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
 
             let mut snapshot_indexes = BTreeMap::new();
             for (index_name, index) in &collection.indexes {
-                let index_pages = encode_index_pages(&index.entries, &mut next_page_id)?;
+                let encoded_index_tree = encode_index_tree_pages(&index.entries, &mut next_page_id)?;
                 let index_page_count_before = encoded_catalog.pages.len();
-                encoded_catalog.index_page_count += index_pages.len();
+                encoded_catalog.index_page_count += encoded_index_tree.pages.len();
                 encoded_catalog.index_entry_count += index.entries.len();
-                encoded_catalog.pages.extend(index_pages);
+                encoded_catalog.pages.extend(encoded_index_tree.pages);
                 let index_page_ids = (index_page_count_before..encoded_catalog.pages.len())
                     .map(|position| encoded_catalog.pages[position].page_id)
                     .collect::<Vec<_>>();
@@ -868,6 +898,7 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
                     SnapshotIndexCatalog {
                         key: index.key.clone(),
                         unique: index.unique,
+                        root_page_id: encoded_index_tree.root_page_id,
                         pages: placeholder_page_refs(index_page_ids),
                         entry_count: index.entries.len(),
                     },
@@ -942,23 +973,23 @@ fn encode_collection_pages(
         records
             .iter()
             .map(|record| (record.record_id, &record.document)),
+        PAGE_KIND_RECORD,
+        0,
         next_page_id,
     )
 }
 
-fn encode_index_pages(entries: &[IndexEntry], next_page_id: &mut u64) -> Result<Vec<EncodedPage>> {
-    encode_document_pages(
-        entries.iter().map(|entry| (entry.record_id, &entry.key)),
-        next_page_id,
-    )
-}
-
-fn encode_document_pages<'a, I>(entries: I, next_page_id: &mut u64) -> Result<Vec<EncodedPage>>
+fn encode_document_pages<'a, I>(
+    entries: I,
+    page_kind: u16,
+    page_extra: u64,
+    next_page_id: &mut u64,
+) -> Result<Vec<EncodedPage>>
 where
     I: IntoIterator<Item = (u64, &'a bson::Document)>,
 {
     let mut pages = Vec::new();
-    let mut builder = SlottedPageBuilder::new(*next_page_id);
+    let mut builder = SlottedPageBuilder::new(*next_page_id, page_kind, page_extra);
 
     for (entry_id, document) in entries {
         let payload = bson::to_vec(document)?;
@@ -968,7 +999,7 @@ where
         if !builder.can_fit(payload.len()) {
             pages.push(builder.finish());
             *next_page_id += 1;
-            builder = SlottedPageBuilder::new(*next_page_id);
+            builder = SlottedPageBuilder::new(*next_page_id, page_kind, page_extra);
         }
         builder.insert(entry_id, document)?;
     }
@@ -979,6 +1010,120 @@ where
     }
 
     Ok(pages)
+}
+
+fn encode_index_tree_pages(
+    entries: &[IndexEntry],
+    next_page_id: &mut u64,
+) -> Result<EncodedIndexTree> {
+    if entries.is_empty() {
+        return Ok(EncodedIndexTree {
+            root_page_id: None,
+            pages: Vec::new(),
+        });
+    }
+
+    let mut pages = Vec::new();
+    let mut level = build_leaf_index_pages(entries, next_page_id)?;
+    pages.extend(level.iter().map(|summary| summary.page.clone()));
+
+    while level.len() > 1 {
+        level = build_internal_index_pages(&level, next_page_id)?;
+        pages.extend(level.iter().map(|summary| summary.page.clone()));
+    }
+
+    Ok(EncodedIndexTree {
+        root_page_id: Some(level[0].page.page_id),
+        pages,
+    })
+}
+
+fn build_leaf_index_pages(
+    entries: &[IndexEntry],
+    next_page_id: &mut u64,
+) -> Result<Vec<EncodedTreePageSummary>> {
+    let mut pages = Vec::new();
+    let mut builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_INDEX_LEAF, 0);
+    let mut page_entries = Vec::<IndexEntry>::new();
+
+    for entry in entries {
+        let payload = bson::to_vec(&entry.key)?;
+        if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
+            return Err(StorageError::RecordTooLarge.into());
+        }
+        if !builder.can_fit(payload.len()) && !page_entries.is_empty() {
+            pages.push(finish_leaf_page(builder, &page_entries));
+            *next_page_id += 1;
+            builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_INDEX_LEAF, 0);
+            page_entries.clear();
+        }
+        builder.insert(entry.record_id, &entry.key)?;
+        page_entries.push(entry.clone());
+    }
+
+    if !page_entries.is_empty() {
+        pages.push(finish_leaf_page(builder, &page_entries));
+        *next_page_id += 1;
+    }
+
+    Ok(pages)
+}
+
+fn build_internal_index_pages(
+    children: &[EncodedTreePageSummary],
+    next_page_id: &mut u64,
+) -> Result<Vec<EncodedTreePageSummary>> {
+    let mut pages = Vec::new();
+    let mut position = 0;
+
+    while position < children.len() {
+        let left_child = &children[position];
+        let mut builder = SlottedPageBuilder::new(
+            *next_page_id,
+            PAGE_KIND_INDEX_INTERNAL,
+            left_child.page.page_id,
+        );
+        let min_key = left_child.min_key.clone();
+        let mut max_key = left_child.max_key.clone();
+        let mut child_count = 1;
+        position += 1;
+
+        while position < children.len() {
+            let child = &children[position];
+            let payload = bson::to_vec(&child.min_key)?;
+            if !builder.can_fit(payload.len()) {
+                break;
+            }
+            builder.insert(child.page.page_id, &child.min_key)?;
+            max_key = child.max_key.clone();
+            child_count += 1;
+            position += 1;
+        }
+
+        if child_count < 2 {
+            return Err(StorageError::InvalidPage.into());
+        }
+
+        pages.push(EncodedTreePageSummary {
+            page: builder.finish(),
+            min_key,
+            max_key,
+        });
+        *next_page_id += 1;
+    }
+
+    Ok(pages)
+}
+
+fn finish_leaf_page(
+    builder: SlottedPageBuilder,
+    entries: &[IndexEntry],
+) -> EncodedTreePageSummary {
+    EncodedTreePageSummary {
+        page: builder.finish(),
+        min_key: entries.first().expect("leaf entry").key.clone(),
+        max_key: entries.last().expect("leaf entry").key.clone(),
+    }
 }
 
 fn restore_catalog(
@@ -1008,34 +1153,18 @@ fn restore_catalog(
 
             let mut indexes = BTreeMap::new();
             for (index_name, index) in &collection.indexes {
-                let mut entries = Vec::with_capacity(index.entry_count);
-                for page_ref in &index.pages {
-                    let page_entries = decode_index_page(file, page_ref)?;
-                    counts.page_count += 1;
-                    counts.index_page_count += 1;
-                    entries.extend(page_entries);
-                }
-
-                if entries.len() != index.entry_count {
-                    return Err(StorageError::InvalidPage.into());
-                }
-
-                indexes.insert(
-                    index_name.clone(),
-                    IndexCatalog {
-                        name: index_name.clone(),
-                        key: index.key.clone(),
-                        unique: index.unique,
-                        entries,
-                    },
-                );
+                let restored_index = restore_index(file, index_name, index)?;
+                counts.page_count += index.pages.len();
+                counts.index_page_count += index.pages.len();
+                indexes.insert(index_name.clone(), restored_index);
             }
 
-            let collection_state = CollectionCatalog {
+            let mut collection_state = CollectionCatalog {
                 options: collection.options.clone(),
                 indexes,
                 records,
             };
+            collection_state.hydrate_indexes();
             validate_collection_indexes(&collection_state).map_err(map_catalog_error)?;
             counts.record_count += collection_state.records.len();
             counts.index_entry_count += collection_state
@@ -1056,8 +1185,43 @@ fn restore_catalog(
     Ok((catalog, counts))
 }
 
+fn restore_index(
+    file: &mut File,
+    index_name: &str,
+    snapshot_index: &SnapshotIndexCatalog,
+) -> Result<IndexCatalog> {
+    let mut index = IndexCatalog::new(
+        index_name.to_string(),
+        snapshot_index.key.clone(),
+        snapshot_index.unique,
+    );
+
+    if let Some(root_page_id) = snapshot_index.root_page_id {
+        let page_ref_by_id = snapshot_index
+            .pages
+            .iter()
+            .map(|page_ref| (page_ref.page_id, page_ref))
+            .collect::<BTreeMap<_, _>>();
+        let mut visited = BTreeSet::new();
+        index.entries = read_index_tree(file, root_page_id, &page_ref_by_id, &mut visited)?;
+        if visited.len() != snapshot_index.pages.len() || index.entries.len() != snapshot_index.entry_count {
+            return Err(StorageError::InvalidPage.into());
+        }
+    } else if !snapshot_index.pages.is_empty() || snapshot_index.entry_count != 0 {
+        return Err(StorageError::InvalidPage.into());
+    }
+
+    index.rebuild_tree();
+    Ok(index)
+}
+
 fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<CollectionRecord>> {
-    decode_page(file, page_ref)?
+    let page = decode_page(file, page_ref)?;
+    if page.page_kind != PAGE_KIND_RECORD {
+        return Err(StorageError::InvalidPage.into());
+    }
+
+    page.entries
         .into_iter()
         .map(|(record_id, document)| {
             Ok(CollectionRecord {
@@ -1068,14 +1232,50 @@ fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<Collect
         .collect()
 }
 
-fn decode_index_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<IndexEntry>> {
-    decode_page(file, page_ref)?
-        .into_iter()
-        .map(|(record_id, key)| Ok(IndexEntry { record_id, key }))
-        .collect()
+fn read_index_tree(
+    file: &mut File,
+    page_id: u64,
+    page_ref_by_id: &BTreeMap<u64, &PageRef>,
+    visited: &mut BTreeSet<u64>,
+) -> Result<Vec<IndexEntry>> {
+    if !visited.insert(page_id) {
+        return Err(StorageError::InvalidPage.into());
+    }
+
+    let page_ref = page_ref_by_id
+        .get(&page_id)
+        .copied()
+        .ok_or(StorageError::InvalidPageReference)?;
+    let page = decode_page(file, page_ref)?;
+    match page.page_kind {
+        PAGE_KIND_INDEX_LEAF => page
+            .entries
+            .into_iter()
+            .map(|(record_id, key)| Ok(IndexEntry { record_id, key }))
+            .collect(),
+        PAGE_KIND_INDEX_INTERNAL => {
+            if page.page_extra == 0 {
+                return Err(StorageError::InvalidPage.into());
+            }
+
+            let mut entries = read_index_tree(file, page.page_extra, page_ref_by_id, visited)?;
+            for (child_page_id, separator_key) in page.entries {
+                let child_entries = read_index_tree(file, child_page_id, page_ref_by_id, visited)?;
+                let Some(first_entry) = child_entries.first() else {
+                    return Err(StorageError::InvalidPage.into());
+                };
+                if first_entry.key != separator_key {
+                    return Err(StorageError::InvalidPage.into());
+                }
+                entries.extend(child_entries);
+            }
+            Ok(entries)
+        }
+        _ => Err(StorageError::InvalidPage.into()),
+    }
 }
 
-fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<(u64, bson::Document)>> {
+fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<DecodedPage> {
     if page_ref.page_len as usize != PAGE_SIZE || page_ref.offset < DATA_START_OFFSET {
         return Err(StorageError::InvalidPageReference.into());
     }
@@ -1098,8 +1298,10 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<(u64, bson::Do
     }
 
     let slot_count = u16::from_le_bytes(page[16..18].try_into().expect("slot count"));
+    let page_kind = u16::from_le_bytes(page[18..20].try_into().expect("page kind"));
     let free_start = u16::from_le_bytes(page[20..22].try_into().expect("free start")) as usize;
     let free_end = u16::from_le_bytes(page[22..24].try_into().expect("free end")) as usize;
+    let page_extra = u64::from_le_bytes(page[24..32].try_into().expect("page extra"));
 
     if free_start > PAGE_SIZE
         || free_end > PAGE_SIZE
@@ -1142,7 +1344,11 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<(u64, bson::Do
         return Err(StorageError::InvalidPage.into());
     }
 
-    Ok(entries)
+    Ok(DecodedPage {
+        page_kind,
+        page_extra,
+        entries,
+    })
 }
 
 fn is_skippable_checkpoint_error(error: &anyhow::Error) -> bool {
@@ -1230,8 +1436,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_SIZE, SnapshotState,
-        VerifyReport, WalMutation, read_superblock,
+        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL,
+        PAGE_SIZE, SnapshotState, VerifyReport, WalMutation, decode_page, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -1399,6 +1605,27 @@ mod tests {
         let inspect = DatabaseFile::inspect(&path).expect("inspect");
         assert!(inspect.checkpoint_index_page_count >= 2);
         assert_eq!(inspect.checkpoint_index_entry_count, 600);
+
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let index = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection")
+            .indexes
+            .get("sku_1")
+            .expect("index");
+        let root_page_ref = index
+            .pages
+            .iter()
+            .find(|page_ref| Some(page_ref.page_id) == index.root_page_id)
+            .expect("root page ref");
+        let mut file = OpenOptions::new().read(true).open(&path).expect("open file");
+        let root_page = decode_page(&mut file, root_page_ref).expect("decode page");
+        assert_eq!(root_page.page_kind, PAGE_KIND_INDEX_INTERNAL);
     }
 
     #[test]

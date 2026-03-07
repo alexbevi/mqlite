@@ -8,11 +8,12 @@
 ## Architecture Decisions
 - `mqlite` is a broker-per-file MongoDB-compatible local engine that communicates via `OP_MSG` over local IPC only.
 - One `.mongodb` file is the durable store of record. Sidecars such as manifests are ephemeral and may be recreated.
-- The durable file uses a fixed header, two rotating superblocks, checkpoint snapshots, fixed-size slotted record pages with stable `RecordId`s, persisted slotted index pages keyed by BSON plus `RecordId`, and an append-only WAL for typed collection mutations.
+- The durable file uses a fixed header, two rotating superblocks, checkpoint snapshots, fixed-size slotted record pages with stable `RecordId`s, persisted B-tree index pages with internal and leaf nodes keyed by BSON plus `RecordId`, and an append-only WAL for typed collection mutations.
 - The compatibility target is a MongoDB Stable API v1 subset plus the minimum bootstrap/admin commands needed by drivers.
 - Unsupported distributed/server features must fail explicitly and must have regression coverage.
 - `mqlite command` is the default direct validation path before any driver patching work.
 - Reopen must validate persisted index pages against collection pages; do not silently rebuild index state from collection snapshots during load.
+- Indexed `find` planning should be directly observable through `explain`, not just inferred from behavior.
 
 ## Upstream Reference Anchors
 - Server generic command fields and unsupported envelope behavior are keyed off `../mongo/src/mongo/idl/generic_argument.idl`.
@@ -39,5 +40,6 @@
 - Add unit tests for pure logic and encoding.
 - Add integration tests for broker behavior over real IPC and `OP_MSG`.
 - Add storage recovery and page-format tests whenever the file format or mutation log changes, including persisted index-page checks.
+- Add planner tests and `explain` coverage whenever index scan selection changes.
 - Add regression tests for every bug fix.
 - Preserve cross-platform behavior by keeping CI green on macOS, Linux, and Windows.

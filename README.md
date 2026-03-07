@@ -6,7 +6,7 @@
 
 The repository now contains a working Rust workspace baseline with:
 - A cross-crate architecture aligned to the long-term plan.
-- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots backed by slotted record pages plus persisted slotted index pages.
+- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots backed by slotted record pages plus persisted B-tree index pages.
 - Local IPC manifest and endpoint generation.
 - `OP_MSG` encoding and decoding.
 - A broker with core command handling and cursor support.
@@ -62,7 +62,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Fixed file header and rotating superblocks.
 - Append-only WAL for typed collection mutations.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
-- Secondary and unique index entries are stored in dedicated index pages keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
+- Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
 - Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and persistent index state.
@@ -71,6 +71,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `listDatabases`
 - `listCollections`
 - `listIndexes`
+- `explain` for `find`
 - `create`
 - `drop`
 - `createIndexes`
@@ -85,6 +86,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `distinct`
 - `aggregate`
 - Persistent `_id_` and secondary index durability across broker restarts.
+- Planner-backed single-field index scans for `find`, with `explain` reporting `IXSCAN` vs `COLLSCAN`.
 
 ### Query semantics currently implemented
 - Equality and comparison matching on dotted field paths.
@@ -157,34 +159,148 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and indexes, truncated-tail handling, and fallback to older checkpoints when newer record or index pages are corrupted.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, and fallback to older checkpoints when newer record or index pages are corrupted.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, and broker restart tests that prove unique indexes survive checkpoint and reopen.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify indexed `find` plans return `IXSCAN`.
 
 ## CLI
 
 ```text
-mqlite serve --file /path/to/data.mongodb
-mqlite command --file /path/to/data.mongodb --db app --eval '{"ping":1}'
-mqlite checkpoint --file /path/to/data.mongodb
-mqlite verify --file /path/to/data.mongodb
-mqlite inspect --file /path/to/data.mongodb
+mqlite <subcommand> [options]
+mqlite --help
+mqlite <subcommand> --help
 ```
 
-## Direct Validation
+`mqlite` is currently a subcommand-oriented CLI. Every command takes an explicit `--file` path instead of the SQLite-style positional database argument, and clap provides `-h, --help` on the root command and on each subcommand.
 
-The broker can now be exercised directly from the CLI without adapting a driver first. `mqlite command` auto-spawns or reuses the broker for the target file, sends a real `OP_MSG` request over local IPC, and prints the BSON reply as JSON.
+Top-level option:
 
-Example:
+| Option | Summary | Example |
+| --- | --- | --- |
+| `-h, --help` | Show the top-level command summary and list of subcommands. | `mqlite --help` |
+
+### `serve`
+
+Starts a broker for one `.mongodb` file, publishes a local IPC manifest, serves `OP_MSG` traffic, and exits after the broker has been idle for the configured timeout. If the target file does not exist yet, it is created.
+
+Usage:
+
+```text
+mqlite serve --file <path> [--idle-shutdown-secs <seconds>]
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Target `.mongodb` file for the broker; required. | `mqlite serve --file /tmp/app.mongodb` |
+| `--idle-shutdown-secs <seconds>` | Idle timeout before the broker shuts down and checkpoints any pending WAL; defaults to `60`. | `mqlite serve --file /tmp/app.mongodb --idle-shutdown-secs 300` |
+| `-h, --help` | Show command help. | `mqlite serve --help` |
+
+### `command`
+
+Auto-spawns or reuses the broker for the target file, sends one MongoDB command over a real `OP_MSG` request, prints the BSON reply as pretty JSON, and returns a non-zero exit status when the reply has `ok: 0`. If the target file does not exist yet, it is created through the spawned broker.
+
+Usage:
+
+```text
+mqlite command --file <path> [--db <name>] [--eval <json>] [--idle-shutdown-secs <seconds>]
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Target `.mongodb` file for broker discovery or auto-spawn; required. | `mqlite command --file /tmp/app.mongodb --eval '{"ping":1}'` |
+| `--db <name>` | Default database to inject as `$db` when the payload does not already contain `$db`; defaults to `admin` when omitted. | `mqlite command --file /tmp/app.mongodb --db app --eval '{"ping":1}'` |
+| `--eval <json>` | Inline JSON object to convert to BSON and send as the command body. When omitted, `mqlite command` reads the full JSON object from stdin instead. | `mqlite command --file /tmp/app.mongodb --db app --eval '{"create":"widgets"}'` |
+| `--idle-shutdown-secs <seconds>` | Idle timeout to pass to an auto-spawned broker; defaults to `60`. This does not affect an already-running broker for the same file. | `mqlite command --file /tmp/app.mongodb --db app --idle-shutdown-secs 5 --eval '{"ping":1}'` |
+| `-h, --help` | Show command help. | `mqlite command --help` |
+
+Examples:
 
 ```text
 mqlite command --file /tmp/example.mongodb --db app --eval '{"create":"widgets"}'
 mqlite command --file /tmp/example.mongodb --db app --eval '{"insert":"widgets","documents":[{"sku":"alpha","qty":2}]}'
 mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","filter":{"sku":"alpha"}}'
+printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongodb --db app
 ```
+
+### `checkpoint`
+
+Opens or creates the target file, writes a new checkpoint, and then prints the resulting storage inspection report as pretty JSON.
+
+Usage:
+
+```text
+mqlite checkpoint --file <path>
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Target `.mongodb` file to checkpoint; required. | `mqlite checkpoint --file /tmp/app.mongodb` |
+| `-h, --help` | Show command help. | `mqlite checkpoint --help` |
+
+### `verify`
+
+Loads an existing `.mongodb` file, validates the durable structure that can be checked on open, and prints a JSON verification report.
+
+Usage:
+
+```text
+mqlite verify --file <path>
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Existing `.mongodb` file to verify; required. | `mqlite verify --file /tmp/app.mongodb` |
+| `-h, --help` | Show command help. | `mqlite verify --help` |
+
+### `inspect`
+
+Loads an existing `.mongodb` file and prints a JSON report with checkpoint metadata, WAL counters, file size, page counts, and discovered database names.
+
+Usage:
+
+```text
+mqlite inspect --file <path>
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Existing `.mongodb` file to inspect; required. | `mqlite inspect --file /tmp/app.mongodb` |
+| `-h, --help` | Show command help. | `mqlite inspect --help` |
+
+## Direct Validation
+
+The broker can be exercised directly from the CLI without adapting a driver first. `mqlite command` is the main direct validation path: it auto-spawns or reuses the broker for the target file, sends a real `OP_MSG` request over local IPC, and prints the BSON reply as JSON.
+
+## Compared with `sqlite3`
+
+The current CLI is intentionally explicit, but it does not yet feel as lightweight as the standard `sqlite3` shell.
+
+| Area | `mqlite` today | `sqlite3`-style expectation | Possible improvement |
+| --- | --- | --- | --- |
+| Entry point | Requires a subcommand such as `command` or `serve`. | Common usage starts with the database path itself. | Accept `mqlite <path>` as a shorthand for opening the file in a default shell or one-shot mode. |
+| File selection | Uses `--file <path>` everywhere. | Uses a positional database argument. | Add a positional file argument while keeping `--file` as an explicit alias. |
+| Query input | Uses JSON command documents and MongoDB command names. | Uses SQL statements and shell dot-commands. | Add an interactive shell with history, multi-line input, and helper meta-commands for common admin tasks. |
+| Database selection | One file may contain multiple MongoDB databases, so commands may need `--db` or `$db`. | One file normally feels like one database namespace. | Make one user database the default shell context and let `use <db>` or a shell flag switch context explicitly. |
+| Process model | `command` may auto-spawn a background broker and wait for an idle shutdown. | The CLI usually opens the file directly and exits when the command finishes. | Hide broker lifecycle behind a shell/one-shot UX so local use feels direct even though the broker remains the implementation detail. |
+| Maintenance commands | `inspect`, `verify`, and `checkpoint` are separate top-level verbs. | Many maintenance tasks are discoverable inside the shell. | Add shell commands analogous to `.tables`, `.schema`, or integrity-check helpers, with the current top-level verbs kept for scripting. |
+
+If the goal is to make `mqlite` feel closer to `sqlite3` without losing the MongoDB-compatible transport model, the most impactful changes would be:
+- Add a positional file argument and a top-level one-shot execution mode such as `mqlite /tmp/app.mongodb --db app --eval '{"ping":1}'`.
+- Add an interactive shell that keeps a current file and current database context so repeated `--file` and `--db` flags are unnecessary.
+- Introduce short, discoverable shell helpers for inspection and verification so local workflows do not have to remember multiple top-level maintenance verbs.
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted slotted index pages, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, richer on-disk index layouts beyond the current sorted leaf-page model, and planner execution beyond the current in-memory catalog model.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, compound-prefix and sort-aware planning, and eventually page-splitting and reuse policies that operate incrementally instead of rebuilding runtime tree state from the persisted entry set.

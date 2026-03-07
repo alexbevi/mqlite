@@ -160,3 +160,48 @@ fn command_preserves_unique_indexes_across_restart() {
     assert_eq!(response["ok"], 0.0);
     assert_eq!(response["code"], 11000);
 }
+
+#[test]
+fn command_explain_reports_ixscan_for_indexed_find() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-explain.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"explain":{"find":"widgets","filter":{"sku":"alpha"}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["queryPlanner"]["winningPlan"]["stage"], "IXSCAN");
+    assert_eq!(response["queryPlanner"]["winningPlan"]["indexName"], "sku_1");
+}

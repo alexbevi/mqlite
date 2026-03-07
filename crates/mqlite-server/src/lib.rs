@@ -11,9 +11,10 @@ use std::{
 
 use anyhow::Result;
 use bson::{Bson, Document, doc};
-use mqlite_bson::{ensure_object_id, lookup_path_owned};
+use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned};
 use mqlite_catalog::{
-    CatalogError, CollectionCatalog, CollectionRecord, IndexCatalog, apply_index_specs,
+    CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
+    apply_index_specs,
     drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
@@ -22,8 +23,8 @@ use mqlite_ipc::{
     remove_manifest, write_manifest,
 };
 use mqlite_query::{
-    QueryError, apply_projection, apply_update, document_matches, parse_update, run_pipeline,
-    upsert_seed_from_query,
+    MatchExpr, QueryError, apply_projection, apply_update, document_matches, parse_filter,
+    parse_update, run_pipeline, upsert_seed_from_query,
 };
 use mqlite_storage::{DatabaseFile, WalMutation};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
@@ -252,6 +253,7 @@ impl Broker {
             "listDatabases" => self.handle_list_databases(body),
             "listCollections" => self.handle_list_collections(body),
             "listIndexes" => self.handle_list_indexes(body),
+            "explain" => self.handle_explain(body),
             "create" => self.handle_create(body),
             "drop" => self.handle_drop(body),
             "createIndexes" => self.handle_create_indexes(body),
@@ -371,6 +373,44 @@ impl Broker {
             true,
         );
         Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_explain(&self, body: &Document) -> Result<Document, CommandError> {
+        let database = database_name(body)?;
+        let command = body
+            .get_document("explain")
+            .map_err(|_| CommandError::new(9, "FailedToParse", "explain requires a document"))?;
+        let command_name = command_name(command)
+            .ok_or_else(|| CommandError::new(9, "FailedToParse", "explain command is empty"))?;
+        if command_name != "find" {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                format!("explain for `{command_name}` is not supported"),
+            ));
+        }
+
+        let collection_name = command.get_str("find").map_err(|_| {
+            CommandError::new(9, "FailedToParse", "find requires a collection name")
+        })?;
+        let filter = command
+            .get_document("filter")
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        let storage = self.storage.read();
+        let winning_plan = match storage.catalog().get_collection(&database, collection_name) {
+            Ok(collection) => plan_find(collection, &filter)?,
+            Err(CatalogError::NamespaceNotFound(_, _)) => PlannedFind::CollectionScan,
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(doc! {
+            "queryPlanner": {
+                "namespace": format!("{database}.{collection_name}"),
+                "winningPlan": winning_plan.to_document(),
+            }
+        })
     }
 
     fn handle_create(&self, body: &Document) -> Result<Document, CommandError> {
@@ -561,14 +601,11 @@ impl Broker {
         let single_batch = body.get_bool("singleBatch").unwrap_or(false);
 
         let storage = self.storage.read();
-        let mut documents = storage
-            .catalog()
-            .get_collection(&database, collection)
-            .map(|collection| collection.documents())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|document| document_matches(document, &filter).unwrap_or(false))
-            .collect::<Vec<_>>();
+        let mut documents = match storage.catalog().get_collection(&database, collection) {
+            Ok(collection) => execute_find(collection, &filter)?,
+            Err(CatalogError::NamespaceNotFound(_, _)) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
 
         if let Some(sort) = sort.as_ref() {
             sort_documents(&mut documents, sort);
@@ -889,6 +926,209 @@ impl Broker {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct FieldBounds {
+    eq: Option<Bson>,
+    lower: Option<(Bson, bool)>,
+    upper: Option<(Bson, bool)>,
+}
+
+#[derive(Debug, Clone)]
+enum PlannedFind {
+    CollectionScan,
+    IndexScan {
+        index_name: String,
+        bounds: IndexBounds,
+        record_ids: Vec<u64>,
+    },
+}
+
+impl PlannedFind {
+    fn to_document(&self) -> Document {
+        match self {
+            PlannedFind::CollectionScan => doc! { "stage": "COLLSCAN" },
+            PlannedFind::IndexScan {
+                index_name, bounds, ..
+            } => {
+                let mut document = doc! {
+                    "stage": "IXSCAN",
+                    "indexName": index_name.clone(),
+                };
+                if let Some(lower) = bounds.lower.as_ref() {
+                    document.insert("lowerBound", Bson::Document(lower.key.clone()));
+                    document.insert("lowerInclusive", lower.inclusive);
+                }
+                if let Some(upper) = bounds.upper.as_ref() {
+                    document.insert("upperBound", Bson::Document(upper.key.clone()));
+                    document.insert("upperInclusive", upper.inclusive);
+                }
+                document
+            }
+        }
+    }
+}
+
+fn execute_find(collection: &CollectionCatalog, filter: &Document) -> Result<Vec<Document>, CommandError> {
+    let record_by_id = collection
+        .records
+        .iter()
+        .map(|record| (record.record_id, &record.document))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let planned = plan_find(collection, filter)?;
+    let documents = match planned {
+        PlannedFind::CollectionScan => collection.documents(),
+        PlannedFind::IndexScan { record_ids, .. } => record_ids
+            .into_iter()
+            .filter_map(|record_id| record_by_id.get(&record_id).cloned().cloned())
+            .collect(),
+    };
+
+    documents
+        .into_iter()
+        .filter(|document| document_matches(document, filter).unwrap_or(false))
+        .map(Ok)
+        .collect()
+}
+
+fn plan_find(collection: &CollectionCatalog, filter: &Document) -> Result<PlannedFind, CommandError> {
+    let expression = parse_filter(filter)?;
+    let Some(field_bounds) = extract_field_bounds(&expression) else {
+        return Ok(PlannedFind::CollectionScan);
+    };
+
+    let mut best_plan: Option<(usize, String, IndexBounds, Vec<u64>)> = None;
+    for index in collection.indexes.values() {
+        let Some(bounds) = build_index_bounds(index, &field_bounds) else {
+            continue;
+        };
+        let record_ids = index.scan_bounds(&bounds);
+        let score = if bounds.lower.is_some() && bounds.upper.is_some() {
+            3
+        } else {
+            2
+        };
+
+        let replace = match &best_plan {
+            Some((best_score, _, _, best_ids)) => {
+                score > *best_score || (score == *best_score && record_ids.len() < best_ids.len())
+            }
+            None => true,
+        };
+        if replace {
+            best_plan = Some((score, index.name.clone(), bounds, record_ids));
+        }
+    }
+
+    Ok(match best_plan {
+        Some((_, index_name, bounds, record_ids)) => PlannedFind::IndexScan {
+            index_name,
+            bounds,
+            record_ids,
+        },
+        None => PlannedFind::CollectionScan,
+    })
+}
+
+fn extract_field_bounds(expression: &MatchExpr) -> Option<std::collections::BTreeMap<String, FieldBounds>> {
+    let mut field_bounds = std::collections::BTreeMap::new();
+    collect_field_bounds(expression, &mut field_bounds)?;
+    (!field_bounds.is_empty()).then_some(field_bounds)
+}
+
+fn collect_field_bounds(
+    expression: &MatchExpr,
+    field_bounds: &mut std::collections::BTreeMap<String, FieldBounds>,
+) -> Option<()> {
+    match expression {
+        MatchExpr::And(items) => {
+            for item in items {
+                collect_field_bounds(item, field_bounds)?;
+            }
+            Some(())
+        }
+        MatchExpr::Eq { path, value } => {
+            field_bounds.entry(path.clone()).or_default().eq = Some(value.clone());
+            Some(())
+        }
+        MatchExpr::Gt { path, value } => {
+            tighten_lower(field_bounds.entry(path.clone()).or_default(), value.clone(), false);
+            Some(())
+        }
+        MatchExpr::Gte { path, value } => {
+            tighten_lower(field_bounds.entry(path.clone()).or_default(), value.clone(), true);
+            Some(())
+        }
+        MatchExpr::Lt { path, value } => {
+            tighten_upper(field_bounds.entry(path.clone()).or_default(), value.clone(), false);
+            Some(())
+        }
+        MatchExpr::Lte { path, value } => {
+            tighten_upper(field_bounds.entry(path.clone()).or_default(), value.clone(), true);
+            Some(())
+        }
+        MatchExpr::Ne { .. } | MatchExpr::In { .. } | MatchExpr::Exists { .. } | MatchExpr::Or(_) => None,
+    }
+}
+
+fn build_index_bounds(
+    index: &IndexCatalog,
+    field_bounds: &std::collections::BTreeMap<String, FieldBounds>,
+) -> Option<IndexBounds> {
+    if index.key.len() != 1 {
+        return None;
+    }
+    let field = index.key.keys().next()?.clone();
+    let bounds = field_bounds.get(&field)?;
+    if let Some(value) = bounds.eq.as_ref() {
+        let key = doc! { &field: value.clone() };
+        return Some(IndexBounds {
+            lower: Some(IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key,
+                inclusive: true,
+            }),
+        });
+    }
+
+    let lower = bounds.lower.as_ref().map(|(value, inclusive)| IndexBound {
+        key: doc! { &field: value.clone() },
+        inclusive: *inclusive,
+    });
+    let upper = bounds.upper.as_ref().map(|(value, inclusive)| IndexBound {
+        key: doc! { &field: value.clone() },
+        inclusive: *inclusive,
+    });
+    (lower.is_some() || upper.is_some()).then_some(IndexBounds { lower, upper })
+}
+
+fn tighten_lower(bounds: &mut FieldBounds, candidate: Bson, inclusive: bool) {
+    match bounds.lower.as_ref() {
+        Some((current, current_inclusive)) => {
+            let ordering = compare_bson(&candidate, current);
+            if ordering.is_gt() || (ordering.is_eq() && !inclusive && *current_inclusive) {
+                bounds.lower = Some((candidate, inclusive));
+            }
+        }
+        None => bounds.lower = Some((candidate, inclusive)),
+    }
+}
+
+fn tighten_upper(bounds: &mut FieldBounds, candidate: Bson, inclusive: bool) {
+    match bounds.upper.as_ref() {
+        Some((current, current_inclusive)) => {
+            let ordering = compare_bson(&candidate, current);
+            if ordering.is_lt() || (ordering.is_eq() && !inclusive && *current_inclusive) {
+                bounds.upper = Some((candidate, inclusive));
+            }
+        }
+        None => bounds.upper = Some((candidate, inclusive)),
+    }
+}
+
 fn command_name(body: &Document) -> Option<String> {
     body.keys().find(|key| !key.starts_with('$')).cloned()
 }
@@ -1128,6 +1368,52 @@ mod tests {
                 .get("total"),
             Some(&Bson::Int64(4))
         );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_reports_ixscan_for_indexed_find() {
+        let (serve_task, _temp_dir, manifest) = start_broker("explain.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert_eq!(winning_plan.get_str("indexName").expect("index"), "sku_1");
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
