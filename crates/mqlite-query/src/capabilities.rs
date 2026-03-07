@@ -43,6 +43,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$unwind",
     "$group",
     "$replaceRoot",
+    "$replaceWith",
 ];
 
 pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[

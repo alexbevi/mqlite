@@ -1138,6 +1138,10 @@ mod tests {
                 vec![doc! { "payload": { "qty": 1 } }],
                 vec![doc! { "$replaceRoot": { "newRoot": "$payload" } }],
             ),
+            "$replaceWith" => (
+                vec![doc! { "payload": { "qty": 1 } }],
+                vec![doc! { "$replaceWith": "$payload" }],
+            ),
             other => panic!("missing supported stage fixture for {other}"),
         }
     }

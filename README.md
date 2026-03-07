@@ -178,8 +178,9 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$sort`
   - `$count`
   - `$unwind`
-  - `$group`
-  - `$replaceRoot`
+- `$group`
+- `$replaceRoot`
+- `$replaceWith`
 
 ## Unsupported Features
 

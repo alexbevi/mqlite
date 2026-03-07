@@ -38,6 +38,7 @@
     "$match",
     "$project",
     "$replaceRoot",
+    "$replaceWith",
     "$set",
     "$skip",
     "$sort",

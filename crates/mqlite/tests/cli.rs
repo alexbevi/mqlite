@@ -572,6 +572,57 @@ fn command_find_rejects_function_projection() {
 }
 
 #[test]
+fn command_aggregate_supports_replace_with_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-replace-with.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"comments":[{"user_id":"x","comment":"foo"},{"user_id":"y","comment":"bar"}]},{"comments":[{"user_id":"y","comment":"baz"}]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$unwind":"$comments"},{"$replaceWith":"$comments"},{"$group":{"_id":"$user_id","count":{"$sum":1}}},{"$sort":{"count":-1,"_id":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 2);
+    assert_eq!(first_batch[0]["_id"], "y");
+    assert_eq!(first_batch[0]["count"], 2);
+    assert_eq!(first_batch[1]["_id"], "x");
+    assert_eq!(first_batch[1]["count"], 1);
+}
+
+#[test]
 fn command_find_supports_not_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-not.mongodb");

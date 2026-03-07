@@ -97,6 +97,7 @@ pub fn run_pipeline(
                 current,
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
             )?,
+            "$replaceWith" => replace_with(current, stage_spec)?,
             other => return Err(QueryError::UnsupportedStage(other.to_string())),
         };
     }
@@ -222,6 +223,16 @@ fn replace_root(documents: Vec<Document>, spec: &Document) -> Result<Vec<Documen
     documents
         .into_iter()
         .map(|document| match eval_expression(&document, new_root)? {
+            Bson::Document(document) => Ok(document),
+            _ => Err(QueryError::ExpectedDocument),
+        })
+        .collect()
+}
+
+fn replace_with(documents: Vec<Document>, expression: &Bson) -> Result<Vec<Document>, QueryError> {
+    documents
+        .into_iter()
+        .map(|document| match eval_expression(&document, expression)? {
             Bson::Document(document) => Ok(document),
             _ => Err(QueryError::ExpectedDocument),
         })

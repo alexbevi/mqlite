@@ -1029,12 +1029,41 @@ fn replace_root_promotes_subdocuments_and_expression_objects() {
 }
 
 #[test]
+fn replace_with_alias_matches_replace_root_behavior() {
+    let promoted = run_pipeline_ok(
+        vec![doc! { "wrapper": { "name": "alpha", "qty": 1 } }],
+        &[doc! { "$replaceWith": "$wrapper" }],
+    );
+    assert_eq!(promoted, vec![doc! { "name": "alpha", "qty": 1 }]);
+
+    let expression_object = run_pipeline_ok(
+        vec![doc! { "name": "alpha" }],
+        &[doc! { "$replaceWith": { "name": "$name", "wrapped": { "$literal": true } } }],
+    );
+    assert_eq!(
+        expression_object,
+        vec![doc! { "name": "alpha", "wrapped": true }]
+    );
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],
         &[doc! { "$replaceRoot": { "newRoot": "$value" } }],
     )
     .expect_err("replaceRoot should reject scalars");
+
+    assert!(matches!(error, QueryError::ExpectedDocument));
+}
+
+#[test]
+fn replace_with_errors_when_expression_is_not_a_document() {
+    let error = run_pipeline(
+        vec![doc! { "value": 5 }],
+        &[doc! { "$replaceWith": "$value" }],
+    )
+    .expect_err("replaceWith should reject scalars");
 
     assert!(matches!(error, QueryError::ExpectedDocument));
 }
