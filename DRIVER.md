@@ -27,11 +27,15 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
   - `replicaSet`
   - `loadBalanced`
   - `readConcern`
-  - `writeConcern`
   - read preference other than primary/direct single
   - `retryReads`
   - `retryWrites`
   - session and transaction enabling knobs when exposed directly
+- Treat the default acknowledged write concern as a no-op compatibility case:
+  - allow `w=1`
+  - allow `journal=false` / `j=false`
+  - allow `wtimeout=0` / `wtimeoutMS=0`
+  - reject any non-default `writeConcern`
 - Preserve local client-side options such as:
   - `appName`
   - pool sizing
@@ -98,6 +102,7 @@ The current supported and unsupported query and aggregation surface is tracked i
 
 Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
 `mqlite` also supports collectionless `aggregate: 1` commands when the pipeline begins with `$documents`, which is the direct validation path for collectionless aggregation before any driver-specific adapter work.
+Cross-namespace aggregation stages operate only within the same local `.mongodb` file; there is no network federation, so stages such as `$unionWith` resolve foreign namespaces from the same broker-owned file.
 Server-side JavaScript is permanently out of scope for `mqlite`, so `$where` and `$function` should remain explicit unsupported-operator failures rather than compatibility gaps to close later.
 
 ## Driver Test Checklist

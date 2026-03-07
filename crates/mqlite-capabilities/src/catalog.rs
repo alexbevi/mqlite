@@ -1110,6 +1110,12 @@ mod tests {
                 vec![doc! { "team": "red" }],
                 vec![doc! { "$sortByCount": "$team" }],
             ),
+            "$unionWith" => (
+                vec![doc! { "_id": "base" }],
+                vec![
+                    doc! { "$unionWith": { "pipeline": [{ "$documents": [{ "_id": "other" }] }] } },
+                ],
+            ),
             "$match" => (
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$match": { "qty": { "$gte": 1 } } }],

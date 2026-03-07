@@ -205,6 +205,76 @@ fn command_collection_aggregate_rejects_documents_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_union_with_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-union-with.mongodb");
+
+    let mut insert_base = Command::cargo_bin("mqlite").expect("binary");
+    insert_base
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"label":"base"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert_union = Command::cargo_bin("mqlite").expect("binary");
+    insert_union
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"archive","documents":[{"label":"u1"},{"label":"u2"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$unionWith":{"coll":"archive","pipeline":[{"$set":{"source":{"$literal":"archive"}}}]}},{"$sort":{"label":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "label": "base", "_id": first_batch[0]["_id"].clone() }),
+            json!({ "label": "u1", "source": "archive", "_id": first_batch[1]["_id"].clone() }),
+            json!({ "label": "u2", "source": "archive", "_id": first_batch[2]["_id"].clone() }),
+        ]
+    );
+}
+
+#[test]
 fn command_aggregate_supports_sample_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-sample.mongodb");

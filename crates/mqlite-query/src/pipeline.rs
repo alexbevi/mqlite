@@ -14,22 +14,52 @@ use crate::{
     projection::apply_projection,
 };
 
+pub trait CollectionResolver {
+    fn resolve_collection(&self, database: &str, collection: &str) -> Vec<Document>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct NoopResolver;
+
+impl CollectionResolver for NoopResolver {
+    fn resolve_collection(&self, _database: &str, _collection: &str) -> Vec<Document> {
+        Vec::new()
+    }
+}
+
 pub fn run_pipeline(
     documents: Vec<Document>,
     pipeline: &[Document],
 ) -> Result<Vec<Document>, QueryError> {
-    run_pipeline_with_context(documents, pipeline, PipelineContext::default())
+    let resolver = NoopResolver;
+    run_pipeline_with_resolver(documents, pipeline, "", &resolver)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct PipelineContext {
-    inside_facet: bool,
-}
-
-fn run_pipeline_with_context(
+pub fn run_pipeline_with_resolver<R: CollectionResolver>(
     documents: Vec<Document>,
     pipeline: &[Document],
-    context: PipelineContext,
+    database: &str,
+    resolver: &R,
+) -> Result<Vec<Document>, QueryError> {
+    let context = PipelineContext {
+        inside_facet: false,
+        database,
+        resolver,
+    };
+    run_pipeline_with_context(documents, pipeline, &context)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PipelineContext<'a, R> {
+    inside_facet: bool,
+    database: &'a str,
+    resolver: &'a R,
+}
+
+fn run_pipeline_with_context<R: CollectionResolver>(
+    documents: Vec<Document>,
+    pipeline: &[Document],
+    context: &PipelineContext<'_, R>,
 ) -> Result<Vec<Document>, QueryError> {
     let mut current = documents;
 
@@ -44,7 +74,7 @@ fn run_pipeline_with_context(
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
-            "$facet" => facet_documents(current, stage_spec)?,
+            "$facet" => facet_documents(current, stage_spec, context)?,
             "$match" => {
                 let filter = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -122,6 +152,7 @@ fn run_pipeline_with_context(
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
             )?,
             "$replaceWith" => replace_with(current, stage_spec)?,
+            "$unionWith" => union_with_documents(current, stage_spec, context)?,
             other => return Err(QueryError::UnsupportedStage(other.to_string())),
         };
     }
@@ -129,7 +160,11 @@ fn run_pipeline_with_context(
     Ok(current)
 }
 
-fn facet_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+fn facet_documents<R: CollectionResolver>(
+    documents: Vec<Document>,
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<Vec<Document>, QueryError> {
     let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
     if spec.is_empty() {
         return Err(QueryError::InvalidStage);
@@ -143,11 +178,12 @@ fn facet_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document
             .iter()
             .map(|value| value.as_document().cloned().ok_or(QueryError::InvalidStage))
             .collect::<Result<Vec<_>, _>>()?;
-        let results = run_pipeline_with_context(
-            documents.clone(),
-            &stages,
-            PipelineContext { inside_facet: true },
-        )?;
+        let facet_context = PipelineContext {
+            inside_facet: true,
+            database: context.database,
+            resolver: context.resolver,
+        };
+        let results = run_pipeline_with_context(documents.clone(), &stages, &facet_context)?;
         output.insert(
             facet_name.clone(),
             Bson::Array(results.into_iter().map(Bson::Document).collect()),
@@ -155,6 +191,97 @@ fn facet_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document
     }
 
     Ok(vec![output])
+}
+
+fn union_with_documents<R: CollectionResolver>(
+    mut documents: Vec<Document>,
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<Vec<Document>, QueryError> {
+    let union_spec = parse_union_with_spec(spec, context.database)?;
+    let union_database = union_spec.database.as_deref().unwrap_or(context.database);
+    let input = match union_spec.collection.as_deref() {
+        Some(collection) => context
+            .resolver
+            .resolve_collection(union_database, collection),
+        None => Vec::new(),
+    };
+    let union_context = PipelineContext {
+        inside_facet: false,
+        database: union_database,
+        resolver: context.resolver,
+    };
+    let results = run_pipeline_with_context(input, &union_spec.pipeline, &union_context)?;
+    documents.extend(results);
+    Ok(documents)
+}
+
+struct UnionWithStage {
+    database: Option<String>,
+    collection: Option<String>,
+    pipeline: Vec<Document>,
+}
+
+fn parse_union_with_spec(
+    spec: &Bson,
+    default_database: &str,
+) -> Result<UnionWithStage, QueryError> {
+    match spec {
+        Bson::String(collection) => Ok(UnionWithStage {
+            database: Some(default_database.to_string()),
+            collection: Some(collection.clone()),
+            pipeline: Vec::new(),
+        }),
+        Bson::Document(document) => {
+            let mut database = None;
+            let mut collection = None;
+            let mut pipeline = None;
+
+            for (field, value) in document {
+                match field.as_str() {
+                    "db" => {
+                        database =
+                            Some(value.as_str().ok_or(QueryError::InvalidStage)?.to_string());
+                    }
+                    "coll" => {
+                        collection =
+                            Some(value.as_str().ok_or(QueryError::InvalidStage)?.to_string());
+                    }
+                    "pipeline" => {
+                        pipeline = Some(
+                            value
+                                .as_array()
+                                .ok_or(QueryError::InvalidStage)?
+                                .iter()
+                                .map(|value| {
+                                    value.as_document().cloned().ok_or(QueryError::InvalidStage)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                    _ => return Err(QueryError::InvalidStage),
+                }
+            }
+
+            let pipeline = pipeline.unwrap_or_default();
+            if collection.is_none() {
+                let starts_with_documents = pipeline
+                    .first()
+                    .and_then(|stage| stage.keys().next())
+                    .is_some_and(|stage_name| stage_name == "$documents");
+                if !starts_with_documents {
+                    return Err(QueryError::InvalidStage);
+                }
+            }
+
+            Ok(UnionWithStage {
+                database,
+                collection,
+                pipeline,
+            })
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
 }
 
 fn bucket_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
@@ -556,6 +683,7 @@ fn parse_accumulator(value: &Bson) -> Result<GroupAccumulatorSpec, QueryError> {
         "$sum" => Ok(GroupAccumulatorSpec::Sum(expression.clone())),
         "$first" => Ok(GroupAccumulatorSpec::First(expression.clone())),
         "$push" => Ok(GroupAccumulatorSpec::Push(expression.clone())),
+        "$addToSet" => Ok(GroupAccumulatorSpec::AddToSet(expression.clone())),
         "$avg" => Ok(GroupAccumulatorSpec::Avg(expression.clone())),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
@@ -565,6 +693,7 @@ enum GroupAccumulatorSpec {
     Sum(Bson),
     First(Bson),
     Push(Bson),
+    AddToSet(Bson),
     Avg(Bson),
 }
 
@@ -572,6 +701,7 @@ enum GroupAccumulatorState {
     Sum(f64),
     First(Option<Bson>),
     Push(Vec<Bson>),
+    AddToSet(Vec<Bson>),
     Avg { sum: f64, count: u64 },
 }
 
@@ -581,6 +711,7 @@ impl GroupAccumulatorState {
             GroupAccumulatorSpec::Sum(_) => Self::Sum(0.0),
             GroupAccumulatorSpec::First(_) => Self::First(None),
             GroupAccumulatorSpec::Push(_) => Self::Push(Vec::new()),
+            GroupAccumulatorSpec::AddToSet(_) => Self::AddToSet(Vec::new()),
             GroupAccumulatorSpec::Avg(_) => Self::Avg { sum: 0.0, count: 0 },
         }
     }
@@ -605,6 +736,16 @@ impl GroupAccumulatorState {
                 values.push(eval_expression(document, expression)?);
                 Ok(())
             }
+            (Self::AddToSet(values), GroupAccumulatorSpec::AddToSet(expression)) => {
+                let value = eval_expression(document, expression)?;
+                if !values
+                    .iter()
+                    .any(|existing| compare_bson(existing, &value).is_eq())
+                {
+                    values.push(value);
+                }
+                Ok(())
+            }
             (Self::Avg { sum, count }, GroupAccumulatorSpec::Avg(expression)) => {
                 *sum += numeric_value(&eval_expression(document, expression)?)?;
                 *count += 1;
@@ -619,6 +760,7 @@ impl GroupAccumulatorState {
             Self::Sum(total) => number_bson(total),
             Self::First(value) => value.unwrap_or(Bson::Null),
             Self::Push(values) => Bson::Array(values),
+            Self::AddToSet(values) => Bson::Array(values),
             Self::Avg { sum, count } => {
                 if count == 0 {
                     Bson::Null

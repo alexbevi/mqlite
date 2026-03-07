@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use bson::{
     Binary, Bson, DateTime, Decimal128, Document, Timestamp, doc, oid::ObjectId,
@@ -7,8 +10,9 @@ use bson::{
 use pretty_assertions::assert_eq;
 
 use crate::{
-    QueryError, apply_projection, apply_update, document_matches, document_matches_expression,
-    parse_filter, parse_update, run_pipeline,
+    CollectionResolver, QueryError, apply_projection, apply_update, document_matches,
+    document_matches_expression, parse_filter, parse_update, run_pipeline,
+    run_pipeline_with_resolver,
 };
 
 // These cases are grounded in MongoDB matcher and pipeline tests such as
@@ -19,6 +23,41 @@ use crate::{
 
 fn run_pipeline_ok(documents: Vec<Document>, pipeline: &[Document]) -> Vec<Document> {
     run_pipeline(documents, pipeline).expect("pipeline")
+}
+
+#[derive(Default)]
+struct StaticResolver {
+    collections: BTreeMap<(String, String), Vec<Document>>,
+}
+
+impl StaticResolver {
+    fn with_collection(
+        mut self,
+        database: &str,
+        collection: &str,
+        documents: Vec<Document>,
+    ) -> Self {
+        self.collections
+            .insert((database.to_string(), collection.to_string()), documents);
+        self
+    }
+}
+
+impl CollectionResolver for StaticResolver {
+    fn resolve_collection(&self, database: &str, collection: &str) -> Vec<Document> {
+        self.collections
+            .get(&(database.to_string(), collection.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn run_pipeline_with_static_resolver(
+    documents: Vec<Document>,
+    pipeline: &[Document],
+    resolver: &StaticResolver,
+) -> Vec<Document> {
+    run_pipeline_with_resolver(documents, pipeline, "app", resolver).expect("pipeline")
 }
 
 fn assert_filter(document: &Document, filter: Document, expected: bool) {
@@ -1059,12 +1098,13 @@ fn unwind_stage_preserves_null_missing_and_empty_arrays_when_requested() {
 }
 
 #[test]
-fn group_stage_supports_sum_first_push_and_avg_accumulators() {
+fn group_stage_supports_sum_first_push_add_to_set_and_avg_accumulators() {
     let results = run_pipeline_ok(
         vec![
             doc! { "team": "blue", "sku": "b1", "qty": 2 },
             doc! { "team": "red", "sku": "r1", "qty": 1 },
             doc! { "team": "red", "sku": "r2", "qty": 3 },
+            doc! { "team": "red", "sku": "r1", "qty": 4 },
         ],
         &[
             doc! {
@@ -1073,6 +1113,7 @@ fn group_stage_supports_sum_first_push_and_avg_accumulators() {
                     "total": { "$sum": "$qty" },
                     "firstSku": { "$first": "$sku" },
                     "skus": { "$push": "$sku" },
+                    "uniqueSkus": { "$addToSet": "$sku" },
                     "avgQty": { "$avg": "$qty" }
                 }
             },
@@ -1088,14 +1129,16 @@ fn group_stage_supports_sum_first_push_and_avg_accumulators() {
                 "total": 2_i64,
                 "firstSku": "b1",
                 "skus": ["b1"],
+                "uniqueSkus": ["b1"],
                 "avgQty": 2.0
             },
             doc! {
                 "_id": "red",
-                "total": 4_i64,
+                "total": 8_i64,
                 "firstSku": "r1",
-                "skus": ["r1", "r2"],
-                "avgQty": 2.0
+                "skus": ["r1", "r2", "r1"],
+                "uniqueSkus": ["r1", "r2"],
+                "avgQty": 8.0 / 3.0
             }
         ]
     );
@@ -1175,6 +1218,74 @@ fn bucket_stage_groups_documents_by_boundaries() {
             doc! { "_id": 20, "totalQty": 5_i64 },
         ]
     );
+}
+
+#[test]
+fn union_with_stage_appends_documents_from_another_collection() {
+    let resolver = StaticResolver::default().with_collection(
+        "app",
+        "union",
+        vec![doc! { "_id": "u1" }, doc! { "_id": "u2" }],
+    );
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "_id": "base" }],
+        &[doc! { "$unionWith": "union" }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": "base" },
+            doc! { "_id": "u1" },
+            doc! { "_id": "u2" }
+        ]
+    );
+}
+
+#[test]
+fn union_with_stage_supports_nested_subpipelines_and_collectionless_documents() {
+    let resolver =
+        StaticResolver::default().with_collection("app", "union", vec![doc! { "_id": "u1" }]);
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "_id": "base" }],
+        &[doc! {
+            "$unionWith": {
+                "coll": "union",
+                "pipeline": [
+                    { "$set": { "source": { "$literal": "union" } } },
+                    { "$unionWith": { "pipeline": [{ "$documents": [{ "_id": "inline", "source": "inline" }] }] } }
+                ]
+            }
+        }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": "base" },
+            doc! { "_id": "u1", "source": "union" },
+            doc! { "_id": "inline", "source": "inline" }
+        ]
+    );
+}
+
+#[test]
+fn union_with_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$unionWith": 1 },
+        doc! { "$unionWith": {} },
+        doc! { "$unionWith": { "db": "app" } },
+        doc! { "$unionWith": { "coll": 1 } },
+        doc! { "$unionWith": { "pipeline": 1 } },
+        doc! { "$unionWith": { "pipeline": [{ "$match": {} }] } },
+        doc! { "$unionWith": { "coll": "union", "unknown": true } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "_id": "base" }], &[stage]).expect_err("invalid unionWith");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
 }
 
 #[test]

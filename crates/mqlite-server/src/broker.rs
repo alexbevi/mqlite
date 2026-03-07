@@ -22,8 +22,9 @@ use mqlite_ipc::{
     remove_manifest, write_manifest,
 };
 use mqlite_query::{
-    MatchExpr, QueryError, apply_projection, apply_update, document_matches,
-    document_matches_expression, parse_filter, parse_update, run_pipeline, upsert_seed_from_query,
+    CollectionResolver, MatchExpr, QueryError, apply_projection, apply_update, document_matches,
+    document_matches_expression, parse_filter, parse_update, run_pipeline_with_resolver,
+    upsert_seed_from_query,
 };
 use mqlite_storage::{
     DatabaseFile, PersistedPlanCacheChoice, PersistedPlanCacheEntry, WalMutation,
@@ -1066,6 +1067,9 @@ impl Broker {
             .is_some_and(|stage_name| stage_name == "$documents");
 
         let storage = self.storage.read();
+        let resolver = BrokerCollectionResolver {
+            catalog: storage.catalog(),
+        };
         let (namespace, input) = match body.get("aggregate") {
             Some(Bson::String(collection_name)) => {
                 if starts_with_documents {
@@ -1100,12 +1104,25 @@ impl Broker {
                 ));
             }
         };
-        let results = run_pipeline(input, &pipeline)?;
+        let results = run_pipeline_with_resolver(input, &pipeline, &database, &resolver)?;
         let cursor = self
             .cursors
             .lock()
             .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
+    }
+}
+
+struct BrokerCollectionResolver<'a> {
+    catalog: &'a mqlite_catalog::Catalog,
+}
+
+impl CollectionResolver for BrokerCollectionResolver<'_> {
+    fn resolve_collection(&self, database: &str, collection: &str) -> Vec<Document> {
+        self.catalog
+            .get_collection(database, collection)
+            .map(|collection| collection.documents())
+            .unwrap_or_default()
     }
 }
 
@@ -2774,13 +2791,12 @@ fn index_to_document(index: IndexCatalog) -> Document {
 }
 
 fn reject_unsupported_envelope(body: &Document) -> Result<(), CommandError> {
-    const UNSUPPORTED_KEYS: [(&str, &str); 7] = [
+    const UNSUPPORTED_KEYS: [(&str, &str); 6] = [
         ("lsid", "logical sessions are not supported"),
         ("txnNumber", "transactions are not supported"),
         ("startTransaction", "transactions are not supported"),
         ("autocommit", "transactions are not supported"),
         ("readConcern", "read concern is not supported"),
-        ("writeConcern", "write concern is not supported"),
         ("$readPreference", "read preference is not supported"),
     ];
 
@@ -2790,7 +2806,60 @@ fn reject_unsupported_envelope(body: &Document) -> Result<(), CommandError> {
         }
     }
 
+    if let Ok(write_concern) = body.get_document("writeConcern") {
+        reject_unsupported_write_concern(write_concern)?;
+    }
+
     Ok(())
+}
+
+fn reject_unsupported_write_concern(write_concern: &Document) -> Result<(), CommandError> {
+    for (key, value) in write_concern {
+        let supported = match key.as_str() {
+            "w" => default_write_concern_w(value),
+            "j" | "journal" | "fsync" => falseish_write_concern_flag(value),
+            "wtimeout" | "wtimeoutMS" => zero_write_concern_timeout(value),
+            _ => false,
+        };
+
+        if !supported {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                "non-default write concern is not supported",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn default_write_concern_w(value: &Bson) -> bool {
+    match value {
+        Bson::Int32(value) => *value == 1,
+        Bson::Int64(value) => *value == 1,
+        Bson::Double(value) => *value == 1.0,
+        _ => false,
+    }
+}
+
+fn falseish_write_concern_flag(value: &Bson) -> bool {
+    match value {
+        Bson::Boolean(value) => !value,
+        Bson::Int32(value) => *value == 0,
+        Bson::Int64(value) => *value == 0,
+        Bson::Double(value) => *value == 0.0,
+        _ => false,
+    }
+}
+
+fn zero_write_concern_timeout(value: &Bson) -> bool {
+    match value {
+        Bson::Int32(value) => *value == 0,
+        Bson::Int64(value) => *value == 0,
+        Bson::Double(value) => *value == 0.0,
+        _ => false,
+    }
 }
 
 fn sort_documents(documents: &mut [Document], sort: &Document) {
@@ -4196,7 +4265,33 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_read_and_write_concern_envelopes() {
+    async fn accepts_default_write_concern_as_a_noop() {
+        let (serve_task, _temp_dir, manifest) = start_broker("default-write-concern.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1, "sku": "alpha" }],
+                "writeConcern": { "w": 1, "j": false, "wtimeout": 0 },
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_read_concern_and_nondefault_write_concern_envelopes() {
         assert_rejected(
             doc! { "ping": 1, "readConcern": { "level": "majority" }, "$db": "admin" },
             115,
@@ -4204,6 +4299,11 @@ mod tests {
         .await;
         assert_rejected(
             doc! { "ping": 1, "writeConcern": { "w": "majority" }, "$db": "admin" },
+            115,
+        )
+        .await;
+        assert_rejected(
+            doc! { "ping": 1, "writeConcern": { "w": 1, "journal": true }, "$db": "admin" },
             115,
         )
         .await;

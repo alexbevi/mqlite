@@ -47,6 +47,7 @@
     "$skip",
     "$sort",
     "$sortByCount",
+    "$unionWith",
     "$unset",
     "$unwind"
   ],
@@ -64,6 +65,7 @@
     "$or"
   ],
   "aggregation_accumulator_operators": [
+    "$addToSet",
     "$avg",
     "$first",
     "$push",

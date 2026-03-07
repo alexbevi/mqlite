@@ -29,9 +29,9 @@ cargo run -p mqlite-capabilities -- sync --check
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 |
-| Aggregation stages | 57 | 18 | 39 |
+| Aggregation stages | 57 | 19 | 38 |
 | Aggregation expression operators | 176 | 11 | 165 |
-| Aggregation accumulators | 25 | 4 | 21 |
+| Aggregation accumulators | 25 | 5 | 20 |
 | Aggregation window functions | 36 | 0 | 36 |
 
 ## Query Operators
@@ -114,7 +114,7 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 
 ## Aggregation Stages
 
-Public upstream: 57. Supported: 18. Unsupported: 39.
+Public upstream: 57. Supported: 19. Unsupported: 38.
 
 ### Supported Public
 
@@ -134,6 +134,7 @@ Public upstream: 57. Supported: 18. Unsupported: 39.
 - `$skip`
 - `$sort`
 - `$sortByCount`
+- `$unionWith`
 - `$unset`
 - `$unwind`
 
@@ -176,7 +177,6 @@ Public upstream: 57. Supported: 18. Unsupported: 39.
 - `$setVariableFromSubPipeline`
 - `$setWindowFields`
 - `$shardedDataDistribution`
-- `$unionWith`
 - `$vectorSearch`
 
 ### Internal Or Server-Only Upstream
@@ -408,10 +408,11 @@ Public upstream: 176. Supported: 11. Unsupported: 165.
 
 ## Aggregation Accumulators
 
-Public upstream: 25. Supported: 4. Unsupported: 21.
+Public upstream: 25. Supported: 5. Unsupported: 20.
 
 ### Supported Public
 
+- `$addToSet`
 - `$avg`
 - `$first`
 - `$push`
@@ -420,7 +421,6 @@ Public upstream: 25. Supported: 4. Unsupported: 21.
 ### Unsupported Public
 
 - `$accumulator`
-- `$addToSet`
 - `$bottom`
 - `$bottomN`
 - `$concatArrays` (feature-flagged)

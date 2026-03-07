@@ -106,7 +106,7 @@ file:///absolute/path/to/database.mongodb?db=app
 
 - The URI path is always the filesystem path to the database file.
 - The optional `db` query parameter selects the default database.
-- Drivers must reject incompatible network-style options for `file://`, including auth, TLS, proxying, network compression, non-primary read preference, read concern, write concern, replica-set/load-balanced options, and retryable reads or writes.
+- Drivers must reject incompatible network-style options for `file://`, including auth, TLS, proxying, network compression, non-primary read preference, read concern, non-default write concern, replica-set/load-balanced options, and retryable reads or writes. The default acknowledged write concern remains a compatibility no-op, so `w=1`, `journal=false`, and zero write-concern timeouts may be accepted.
 
 ## Supported Features
 
@@ -173,6 +173,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$bucket`
   - `$sample`
   - `$sortByCount`
+  - `$unionWith`
   - `$match`
   - `$project`
   - `$set`
@@ -186,6 +187,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `$group`
 - `$replaceRoot`
 - `$replaceWith`
+- Same-file cross-namespace aggregation via `$unionWith`, including collection-backed unions and collectionless `$documents` union subpipelines.
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
 
 ## Unsupported Features
@@ -200,6 +202,7 @@ These are already part of the tested failure surface:
 - `writeConcern`
 - `$readPreference`
 - Session and transaction envelopes remain rejected even though `killAllSessions` exists as a no-op admin compatibility command.
+- Non-default `writeConcern` values remain rejected; only the default acknowledged write concern is accepted as a no-op compatibility case.
 - Unsupported commands
 - Unsupported query operators
 - Unsupported aggregation stages

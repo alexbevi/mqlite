@@ -36,6 +36,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$facet",
     "$sample",
     "$sortByCount",
+    "$unionWith",
     "$match",
     "$project",
     "$set",
@@ -55,6 +56,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$literal", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$and", "$or", "$not", "$in",
 ];
 
-pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] = &["$sum", "$first", "$push", "$avg"];
+pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =
+    &["$sum", "$first", "$push", "$addToSet", "$avg"];
 
 pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[];
