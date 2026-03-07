@@ -29,8 +29,8 @@ cargo run -p mqlite-capabilities -- sync --check
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 |
-| Aggregation stages | 54 | 36 | 18 |
-| Aggregation expression operators | 176 | 11 | 165 |
+| Aggregation stages | 54 | 37 | 17 |
+| Aggregation expression operators | 176 | 12 | 164 |
 | Aggregation accumulators | 25 | 5 | 20 |
 | Aggregation window functions | 36 | 0 | 36 |
 
@@ -114,7 +114,7 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 
 ## Aggregation Stages
 
-Public upstream: 54. Supported: 36. Unsupported: 18.
+Public upstream: 54. Supported: 37. Unsupported: 17.
 
 ### Supported Public
 
@@ -144,6 +144,7 @@ Public upstream: 54. Supported: 36. Unsupported: 18.
 - `$planCacheStats`
 - `$project`
 - `$querySettings`
+- `$redact`
 - `$replaceRoot`
 - `$replaceWith`
 - `$sample`
@@ -166,7 +167,6 @@ Public upstream: 54. Supported: 36. Unsupported: 18.
 - `$listExtensions` (feature-flagged)
 - `$queryStats` (feature-flagged)
 - `$rankFusion`
-- `$redact`
 - `$score`
 - `$scoreFusion` (feature-flagged)
 - `$search`
@@ -211,11 +211,12 @@ Public upstream: 54. Supported: 36. Unsupported: 18.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 11. Unsupported: 165.
+Public upstream: 176. Supported: 12. Unsupported: 164.
 
 ### Supported Public
 
 - `$and`
+- `$cond`
 - `$eq`
 - `$gt`
 - `$gte`
@@ -255,7 +256,6 @@ Public upstream: 176. Supported: 11. Unsupported: 165.
 - `$cmp`
 - `$concat`
 - `$concatArrays`
-- `$cond`
 - `$const`
 - `$convert`
 - `$cos`

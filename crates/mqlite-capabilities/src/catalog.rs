@@ -1224,6 +1224,10 @@ mod tests {
                 Vec::new(),
                 vec![doc! { "$querySettings": { "showDebugQueryShape": true } }],
             ),
+            "$redact" => (
+                vec![doc! { "_id": 1, "qty": 1 }],
+                vec![doc! { "$redact": "$$KEEP" }],
+            ),
             "$set" => (
                 vec![doc! { "_id": 1, "qty": 1 }],
                 vec![doc! { "$set": { "copied": "$qty" } }],
@@ -1275,6 +1279,7 @@ mod tests {
     fn supported_expression_projection(name: &str) -> Document {
         match name {
             "$literal" => doc! { "value": { "$literal": 5 } },
+            "$cond" => doc! { "value": { "$cond": [{ "$eq": ["$left", "$left"] }, "yes", "no"] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
             "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },

@@ -65,12 +65,13 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$count",
     "$unwind",
     "$group",
+    "$redact",
     "$replaceRoot",
     "$replaceWith",
 ];
 
 pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
-    "$literal", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$and", "$or", "$not", "$in",
+    "$literal", "$cond", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$and", "$or", "$not", "$in",
 ];
 
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =

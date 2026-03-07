@@ -193,6 +193,12 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
                 &context.variables,
             )?,
+            "$redact" => current
+                .into_iter()
+                .filter_map(|document| {
+                    redact_document(&document, stage_spec, &context.variables).transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             "$replaceRoot" => replace_root(
                 current,
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
@@ -1705,6 +1711,87 @@ fn group_documents(
             Ok(output)
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedactDecision {
+    Descend,
+    Keep,
+    Prune,
+}
+
+fn redact_document(
+    document: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<Document>, QueryError> {
+    redact_document_with_root(document, document, expression, variables)
+}
+
+fn redact_document_with_root(
+    root: &Document,
+    current: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<Document>, QueryError> {
+    match redact_decision(root, current, expression, variables)? {
+        RedactDecision::Keep => Ok(Some(current.clone())),
+        RedactDecision::Prune => Ok(None),
+        RedactDecision::Descend => {
+            let mut redacted = Document::new();
+            for (field, value) in current {
+                if let Some(value) = redact_value(root, value, expression, variables)? {
+                    redacted.insert(field.clone(), value);
+                }
+            }
+            Ok(Some(redacted))
+        }
+    }
+}
+
+fn redact_value(
+    root: &Document,
+    value: &Bson,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<Bson>, QueryError> {
+    match value {
+        Bson::Document(document) => Ok(redact_document_with_root(
+            root, document, expression, variables,
+        )?
+        .map(Bson::Document)),
+        Bson::Array(items) => {
+            let mut redacted = Vec::new();
+            for item in items {
+                if let Some(item) = redact_value(root, item, expression, variables)? {
+                    redacted.push(item);
+                }
+            }
+            Ok(Some(Bson::Array(redacted)))
+        }
+        _ => Ok(Some(value.clone())),
+    }
+}
+
+fn redact_decision(
+    root: &Document,
+    current: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<RedactDecision, QueryError> {
+    let mut variables = variables.clone();
+    variables.insert("ROOT".to_string(), Bson::Document(root.clone()));
+    variables.insert("CURRENT".to_string(), Bson::Document(current.clone()));
+    variables.insert("DESCEND".to_string(), Bson::String("descend".to_string()));
+    variables.insert("KEEP".to_string(), Bson::String("keep".to_string()));
+    variables.insert("PRUNE".to_string(), Bson::String("prune".to_string()));
+
+    match eval_expression_with_variables(current, expression, &variables)? {
+        Bson::String(value) if value == "descend" => Ok(RedactDecision::Descend),
+        Bson::String(value) if value == "keep" => Ok(RedactDecision::Keep),
+        Bson::String(value) if value == "prune" => Ok(RedactDecision::Prune),
+        _ => Err(QueryError::InvalidStage),
+    }
 }
 
 fn replace_root(

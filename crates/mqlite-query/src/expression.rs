@@ -68,6 +68,7 @@ fn eval_expression_operator(
 ) -> Result<Bson, QueryError> {
     match operator {
         "$literal" => Ok(value.clone()),
+        "$cond" => eval_cond_expression(document, value, variables),
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
             let [left, right] = expression_arguments::<2>(value)?;
             let left = eval_expression_with_variables(document, left, variables)?;
@@ -144,7 +145,14 @@ fn variable_value(document: &Document, path: &str, variables: &BTreeMap<String, 
     let remainder = segments.next();
 
     let source = match name {
-        "ROOT" | "CURRENT" => Bson::Document(document.clone()),
+        "ROOT" => variables
+            .get("ROOT")
+            .cloned()
+            .unwrap_or_else(|| Bson::Document(document.clone())),
+        "CURRENT" => variables
+            .get("CURRENT")
+            .cloned()
+            .unwrap_or_else(|| Bson::Document(document.clone())),
         _ => variables.get(name).cloned().unwrap_or(Bson::Null),
     };
 
@@ -170,6 +178,36 @@ fn expression_arguments<const N: usize>(value: &Bson) -> Result<[&Bson; N], Quer
         return Err(QueryError::InvalidStructure);
     }
     Ok(std::array::from_fn(|index| &arguments[index]))
+}
+
+fn eval_cond_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Bson, QueryError> {
+    let (condition, on_true, on_false) = match value {
+        Bson::Array(_) => {
+            let [condition, on_true, on_false] = expression_arguments::<3>(value)?;
+            (condition, on_true, on_false)
+        }
+        Bson::Document(spec) => {
+            if spec.len() != 3 {
+                return Err(QueryError::InvalidStructure);
+            }
+            let condition = spec.get("if").ok_or(QueryError::InvalidStructure)?;
+            let on_true = spec.get("then").ok_or(QueryError::InvalidStructure)?;
+            let on_false = spec.get("else").ok_or(QueryError::InvalidStructure)?;
+            (condition, on_true, on_false)
+        }
+        _ => return Err(QueryError::InvalidStructure),
+    };
+
+    let condition = eval_expression_with_variables(document, condition, variables)?;
+    if expression_truthy(&condition) {
+        eval_expression_with_variables(document, on_true, variables)
+    } else {
+        eval_expression_with_variables(document, on_false, variables)
+    }
 }
 
 pub(crate) fn expression_truthy(value: &Bson) -> bool {

@@ -175,7 +175,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Pipeline-style updates using aggregation document transformation stages such as `$set`, `$addFields`, `$unset`, `$project`, `$replaceRoot`, and `$replaceWith` on the matched document stream.
-- Aggregation expression operators `$literal`, comparison operators `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, and membership via `$in`.
+- Aggregation expression operators `$literal`, `$cond`, comparison operators `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, and membership via `$in`.
 - Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.
 - Aggregation stages:
@@ -213,6 +213,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$count`
   - `$unwind`
   - `$group`
+  - `$redact`
   - `$replaceRoot`
   - `$replaceWith`
 - Same-file cross-namespace aggregation via `$unionWith` and `$lookup`, including collection-backed namespace resolution and collectionless `$documents` subpipelines for both stages.
@@ -232,6 +233,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$querySettings` aggregation on `admin`, accepting the public `showDebugQueryShape` option and returning an empty result until `mqlite` grows a query-settings store.
 - Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
+- `$redact` aggregation with recursive `$$KEEP`, `$$PRUNE`, and `$$DESCEND` semantics over nested documents and arrays.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
 ## Unsupported Features

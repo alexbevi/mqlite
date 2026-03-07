@@ -1196,6 +1196,98 @@ fn replace_with_alias_matches_replace_root_behavior() {
 }
 
 #[test]
+fn cond_expression_supports_array_and_object_forms() {
+    let results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "qty": 2 }],
+        &[doc! {
+            "$project": {
+                "_id": 0,
+                "arrayForm": { "$cond": [{ "$lte": ["$qty", 2] }, "low", "high"] },
+                "objectForm": {
+                    "$cond": {
+                        "if": { "$gt": ["$qty", 2] },
+                        "then": "high",
+                        "else": "low"
+                    }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! { "arrayForm": "low", "objectForm": "low" }]
+    );
+}
+
+#[test]
+fn redact_stage_descends_and_prunes_nested_documents() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! {
+                "_id": 1,
+                "level": 1,
+                "nested": {
+                    "level": 2,
+                    "keep": true,
+                    "deeper": { "level": 3, "secret": true }
+                },
+                "items": [
+                    { "level": 2, "visible": true },
+                    { "level": 4, "hidden": true },
+                    "plain"
+                ]
+            },
+            doc! { "_id": 2, "level": 3, "drop": true },
+        ],
+        &[doc! {
+            "$redact": {
+                "$cond": [
+                    { "$lte": ["$level", 2] },
+                    "$$DESCEND",
+                    "$$PRUNE"
+                ]
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "_id": 1,
+            "level": 1,
+            "nested": { "level": 2, "keep": true },
+            "items": [
+                { "level": 2, "visible": true },
+                "plain"
+            ]
+        }]
+    );
+}
+
+#[test]
+fn redact_stage_supports_keep_prune_and_descend_variables() {
+    let input = vec![doc! { "_id": 1, "nested": { "value": 1 } }];
+
+    assert_eq!(
+        run_pipeline_ok(input.clone(), &[doc! { "$redact": "$$KEEP" }]),
+        input
+    );
+    assert!(run_pipeline_ok(input.clone(), &[doc! { "$redact": "$$PRUNE" }]).is_empty());
+    assert_eq!(
+        run_pipeline_ok(input.clone(), &[doc! { "$redact": "$$DESCEND" }]),
+        input
+    );
+}
+
+#[test]
+fn redact_stage_rejects_invalid_decisions() {
+    let error = run_pipeline(vec![doc! { "_id": 1 }], &[doc! { "$redact": "KEEP" }])
+        .expect_err("invalid redact decision");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn documents_stage_replaces_input_when_first() {
     let results = run_pipeline_ok(
         vec![doc! { "_id": 0, "ignored": true }],

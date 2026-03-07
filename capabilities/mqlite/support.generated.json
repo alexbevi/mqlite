@@ -57,6 +57,7 @@
     "$planCacheStats",
     "$project",
     "$querySettings",
+    "$redact",
     "$replaceRoot",
     "$replaceWith",
     "$sample",
@@ -70,6 +71,7 @@
   ],
   "aggregation_expression_operators": [
     "$and",
+    "$cond",
     "$eq",
     "$gt",
     "$gte",
