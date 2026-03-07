@@ -884,7 +884,8 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
 
             let mut snapshot_indexes = BTreeMap::new();
             for (index_name, index) in &collection.indexes {
-                let encoded_index_tree = encode_index_tree_pages(&index.entries, &mut next_page_id)?;
+                let encoded_index_tree =
+                    encode_index_tree_pages(&index.entries, &mut next_page_id)?;
                 let index_page_count_before = encoded_catalog.pages.len();
                 encoded_catalog.index_page_count += encoded_index_tree.pages.len();
                 encoded_catalog.index_entry_count += index.entries.len();
@@ -1115,10 +1116,7 @@ fn build_internal_index_pages(
     Ok(pages)
 }
 
-fn finish_leaf_page(
-    builder: SlottedPageBuilder,
-    entries: &[IndexEntry],
-) -> EncodedTreePageSummary {
+fn finish_leaf_page(builder: SlottedPageBuilder, entries: &[IndexEntry]) -> EncodedTreePageSummary {
     EncodedTreePageSummary {
         page: builder.finish(),
         min_key: entries.first().expect("leaf entry").key.clone(),
@@ -1204,7 +1202,9 @@ fn restore_index(
             .collect::<BTreeMap<_, _>>();
         let mut visited = BTreeSet::new();
         index.entries = read_index_tree(file, root_page_id, &page_ref_by_id, &mut visited)?;
-        if visited.len() != snapshot_index.pages.len() || index.entries.len() != snapshot_index.entry_count {
+        if visited.len() != snapshot_index.pages.len()
+            || index.entries.len() != snapshot_index.entry_count
+        {
             return Err(StorageError::InvalidPage.into());
         }
     } else if !snapshot_index.pages.is_empty() || snapshot_index.entry_count != 0 {
@@ -1436,8 +1436,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL,
-        PAGE_SIZE, SnapshotState, VerifyReport, WalMutation, decode_page, read_superblock,
+        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE,
+        SnapshotState, VerifyReport, WalMutation, decode_page, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -1623,7 +1623,10 @@ mod tests {
             .iter()
             .find(|page_ref| Some(page_ref.page_id) == index.root_page_id)
             .expect("root page ref");
-        let mut file = OpenOptions::new().read(true).open(&path).expect("open file");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open file");
         let root_page = decode_page(&mut file, root_page_ref).expect("decode page");
         assert_eq!(root_page.page_kind, PAGE_KIND_INDEX_INTERNAL);
     }

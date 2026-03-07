@@ -14,8 +14,7 @@ use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned};
 use mqlite_catalog::{
     CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
-    apply_index_specs,
-    drop_indexes_from_collection,
+    apply_index_specs, drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
@@ -938,7 +937,7 @@ enum PlannedFind {
     CollectionScan,
     IndexScan {
         index_name: String,
-        bounds: IndexBounds,
+        bounds: Box<IndexBounds>,
         record_ids: Vec<u64>,
     },
 }
@@ -968,7 +967,10 @@ impl PlannedFind {
     }
 }
 
-fn execute_find(collection: &CollectionCatalog, filter: &Document) -> Result<Vec<Document>, CommandError> {
+fn execute_find(
+    collection: &CollectionCatalog,
+    filter: &Document,
+) -> Result<Vec<Document>, CommandError> {
     let record_by_id = collection
         .records
         .iter()
@@ -991,13 +993,16 @@ fn execute_find(collection: &CollectionCatalog, filter: &Document) -> Result<Vec
         .collect()
 }
 
-fn plan_find(collection: &CollectionCatalog, filter: &Document) -> Result<PlannedFind, CommandError> {
+fn plan_find(
+    collection: &CollectionCatalog,
+    filter: &Document,
+) -> Result<PlannedFind, CommandError> {
     let expression = parse_filter(filter)?;
     let Some(field_bounds) = extract_field_bounds(&expression) else {
         return Ok(PlannedFind::CollectionScan);
     };
 
-    let mut best_plan: Option<(usize, String, IndexBounds, Vec<u64>)> = None;
+    let mut best_plan: Option<(usize, String, Box<IndexBounds>, Vec<u64>)> = None;
     for index in collection.indexes.values() {
         let Some(bounds) = build_index_bounds(index, &field_bounds) else {
             continue;
@@ -1016,7 +1021,7 @@ fn plan_find(collection: &CollectionCatalog, filter: &Document) -> Result<Planne
             None => true,
         };
         if replace {
-            best_plan = Some((score, index.name.clone(), bounds, record_ids));
+            best_plan = Some((score, index.name.clone(), Box::new(bounds), record_ids));
         }
     }
 
@@ -1030,7 +1035,9 @@ fn plan_find(collection: &CollectionCatalog, filter: &Document) -> Result<Planne
     })
 }
 
-fn extract_field_bounds(expression: &MatchExpr) -> Option<std::collections::BTreeMap<String, FieldBounds>> {
+fn extract_field_bounds(
+    expression: &MatchExpr,
+) -> Option<std::collections::BTreeMap<String, FieldBounds>> {
     let mut field_bounds = std::collections::BTreeMap::new();
     collect_field_bounds(expression, &mut field_bounds)?;
     (!field_bounds.is_empty()).then_some(field_bounds)
@@ -1052,22 +1059,41 @@ fn collect_field_bounds(
             Some(())
         }
         MatchExpr::Gt { path, value } => {
-            tighten_lower(field_bounds.entry(path.clone()).or_default(), value.clone(), false);
+            tighten_lower(
+                field_bounds.entry(path.clone()).or_default(),
+                value.clone(),
+                false,
+            );
             Some(())
         }
         MatchExpr::Gte { path, value } => {
-            tighten_lower(field_bounds.entry(path.clone()).or_default(), value.clone(), true);
+            tighten_lower(
+                field_bounds.entry(path.clone()).or_default(),
+                value.clone(),
+                true,
+            );
             Some(())
         }
         MatchExpr::Lt { path, value } => {
-            tighten_upper(field_bounds.entry(path.clone()).or_default(), value.clone(), false);
+            tighten_upper(
+                field_bounds.entry(path.clone()).or_default(),
+                value.clone(),
+                false,
+            );
             Some(())
         }
         MatchExpr::Lte { path, value } => {
-            tighten_upper(field_bounds.entry(path.clone()).or_default(), value.clone(), true);
+            tighten_upper(
+                field_bounds.entry(path.clone()).or_default(),
+                value.clone(),
+                true,
+            );
             Some(())
         }
-        MatchExpr::Ne { .. } | MatchExpr::In { .. } | MatchExpr::Exists { .. } | MatchExpr::Or(_) => None,
+        MatchExpr::Ne { .. }
+        | MatchExpr::In { .. }
+        | MatchExpr::Exists { .. }
+        | MatchExpr::Or(_) => None,
     }
 }
 

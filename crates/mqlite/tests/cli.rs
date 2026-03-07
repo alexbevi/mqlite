@@ -203,5 +203,8 @@ fn command_explain_reports_ixscan_for_indexed_find() {
 
     let response: Value = serde_json::from_slice(&output).expect("json response");
     assert_eq!(response["queryPlanner"]["winningPlan"]["stage"], "IXSCAN");
-    assert_eq!(response["queryPlanner"]["winningPlan"]["indexName"], "sku_1");
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["indexName"],
+        "sku_1"
+    );
 }
