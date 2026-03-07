@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +13,7 @@ use crate::{
     capabilities::SUPPORTED_AGGREGATION_STAGES,
     expression::{eval_expression_with_variables, integer_value, number_bson, numeric_value},
     filter::document_matches_with_variables,
+    parse_filter,
     projection::apply_projection_with_variables,
 };
 
@@ -96,6 +97,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$facet" => facet_documents(current, stage_spec, context)?,
+            "$graphLookup" => graph_lookup_documents(current, stage_spec, context)?,
             "$lookup" => lookup_documents(current, stage_spec, context)?,
             "$match" => {
                 let filter = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
@@ -355,6 +357,172 @@ fn lookup_documents<R: CollectionResolver>(
             Ok(local_document)
         })
         .collect()
+}
+
+fn graph_lookup_documents<R: CollectionResolver>(
+    documents: Vec<Document>,
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<Vec<Document>, QueryError> {
+    let spec = parse_graph_lookup_spec(spec)?;
+    let foreign_documents = context
+        .resolver
+        .resolve_collection(context.database, &spec.from_collection);
+
+    documents
+        .into_iter()
+        .map(|mut local_document| {
+            let start_with = eval_expression_with_variables(
+                &local_document,
+                &spec.start_with,
+                &context.variables,
+            )?;
+            let mut frontier = graph_lookup_start_values(start_with);
+            let mut results = Vec::new();
+            let mut visited = BTreeSet::new();
+
+            while let Some((value, depth)) = frontier.pop_front() {
+                if spec.max_depth.is_some_and(|max_depth| depth > max_depth) {
+                    continue;
+                }
+
+                for foreign in &foreign_documents {
+                    if let Some(filter) = &spec.restrict_search_with_match {
+                        if !document_matches_with_variables(foreign, filter, &context.variables)? {
+                            continue;
+                        }
+                    }
+
+                    if !join_values_match(
+                        std::slice::from_ref(&value),
+                        foreign,
+                        &spec.connect_to_field,
+                    ) {
+                        continue;
+                    }
+
+                    let identity = bson::to_vec(foreign).map_err(|_| QueryError::InvalidStage)?;
+                    if !visited.insert(identity) {
+                        continue;
+                    }
+
+                    let mut result = foreign.clone();
+                    if let Some(depth_field) = &spec.depth_field {
+                        set_path(&mut result, depth_field, Bson::Int64(depth))
+                            .map_err(|_| QueryError::InvalidStructure)?;
+                    }
+
+                    if spec.max_depth.is_none_or(|max_depth| depth < max_depth) {
+                        for next in
+                            graph_lookup_connect_from_values(foreign, &spec.connect_from_field)
+                        {
+                            frontier.push_back((next, depth + 1));
+                        }
+                    }
+
+                    results.push(result);
+                }
+            }
+
+            set_path(
+                &mut local_document,
+                &spec.as_field,
+                Bson::Array(results.into_iter().map(Bson::Document).collect()),
+            )
+            .map_err(|_| QueryError::InvalidStructure)?;
+            Ok(local_document)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct GraphLookupStage {
+    from_collection: String,
+    start_with: Bson,
+    connect_from_field: String,
+    connect_to_field: String,
+    as_field: String,
+    max_depth: Option<i64>,
+    depth_field: Option<String>,
+    restrict_search_with_match: Option<Document>,
+}
+
+fn parse_graph_lookup_spec(spec: &Bson) -> Result<GraphLookupStage, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut from_collection = None;
+    let mut start_with = None;
+    let mut connect_from_field = None;
+    let mut connect_to_field = None;
+    let mut as_field = None;
+    let mut max_depth = None;
+    let mut depth_field = None;
+    let mut restrict_search_with_match = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "from" => {
+                let collection = value.as_str().ok_or(QueryError::InvalidStage)?;
+                if collection.is_empty() {
+                    return Err(QueryError::InvalidStage);
+                }
+                from_collection = Some(collection.to_string());
+            }
+            "startWith" => start_with = Some(value.clone()),
+            "connectFromField" => connect_from_field = Some(parse_field_name(value)?),
+            "connectToField" => connect_to_field = Some(parse_field_name(value)?),
+            "as" => as_field = Some(parse_field_name(value)?),
+            "maxDepth" => {
+                let depth = integer_value(value).ok_or(QueryError::InvalidStage)?;
+                if depth < 0 {
+                    return Err(QueryError::InvalidStage);
+                }
+                max_depth = Some(depth);
+            }
+            "depthField" => depth_field = Some(parse_field_name(value)?),
+            "restrictSearchWithMatch" => {
+                let filter = value.as_document().ok_or(QueryError::InvalidStage)?.clone();
+                parse_filter(&filter)?;
+                restrict_search_with_match = Some(filter);
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(GraphLookupStage {
+        from_collection: from_collection.ok_or(QueryError::InvalidStage)?,
+        start_with: start_with.ok_or(QueryError::InvalidStage)?,
+        connect_from_field: connect_from_field.ok_or(QueryError::InvalidStage)?,
+        connect_to_field: connect_to_field.ok_or(QueryError::InvalidStage)?,
+        as_field: as_field.ok_or(QueryError::InvalidStage)?,
+        max_depth,
+        depth_field,
+        restrict_search_with_match,
+    })
+}
+
+fn graph_lookup_start_values(value: Bson) -> std::collections::VecDeque<(Bson, i64)> {
+    let mut queue = std::collections::VecDeque::new();
+    match value {
+        Bson::Array(values) => {
+            for value in values {
+                queue.push_back((value, 0));
+            }
+        }
+        value => queue.push_back((value, 0)),
+    }
+    queue
+}
+
+fn graph_lookup_connect_from_values(document: &Document, field: &str) -> Vec<Bson> {
+    match mqlite_bson::lookup_path_owned(document, field) {
+        Some(Bson::Array(values)) => values
+            .into_iter()
+            .filter(|value| !matches!(value, Bson::Null))
+            .collect(),
+        Some(Bson::Null) | None => Vec::new(),
+        Some(value) => vec![value],
+    }
 }
 
 #[derive(Debug, Clone)]

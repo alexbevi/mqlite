@@ -1238,6 +1238,18 @@ mod tests {
                     doc! { "$fill": { "sortBy": { "_id": 1 }, "output": { "qty": { "method": "linear" } } } },
                 ],
             ),
+            "$graphLookup" => (
+                vec![doc! { "start": 1 }],
+                vec![doc! {
+                    "$graphLookup": {
+                        "from": "foreign",
+                        "startWith": "$start",
+                        "connectFromField": "neighbors",
+                        "connectToField": "_id",
+                        "as": "matches"
+                    }
+                }],
+            ),
             "$lookup" => (
                 vec![doc! { "wanted": 2 }],
                 vec![doc! {

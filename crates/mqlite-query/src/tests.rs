@@ -1478,6 +1478,108 @@ fn fill_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn graph_lookup_stage_traverses_foreign_documents_with_depth_and_filters() {
+    let resolver = StaticResolver::default().with_collection(
+        "app",
+        "foreign",
+        vec![
+            doc! { "name": "a", "neighbors": ["b", "c"], "kind": "keep" },
+            doc! { "name": "b", "neighbors": ["d"], "kind": "skip" },
+            doc! { "name": "c", "neighbors": ["d"], "kind": "keep" },
+            doc! { "name": "d", "neighbors": [], "kind": "keep" },
+        ],
+    );
+
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "start": "a" }],
+        &[doc! {
+            "$graphLookup": {
+                "from": "foreign",
+                "startWith": "$start",
+                "connectFromField": "neighbors",
+                "connectToField": "name",
+                "depthField": "depth",
+                "maxDepth": 2,
+                "restrictSearchWithMatch": { "kind": "keep" },
+                "as": "results"
+            }
+        }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "start": "a",
+            "results": [
+                { "name": "a", "neighbors": ["b", "c"], "kind": "keep", "depth": 0_i64 },
+                { "name": "c", "neighbors": ["d"], "kind": "keep", "depth": 1_i64 },
+                { "name": "d", "neighbors": [], "kind": "keep", "depth": 2_i64 },
+            ]
+        }]
+    );
+}
+
+#[test]
+fn graph_lookup_stage_supports_outer_lookup_variables() {
+    let resolver = StaticResolver::default()
+        .with_collection("app", "local", vec![doc! {}])
+        .with_collection(
+            "app",
+            "foreign",
+            vec![doc! { "_id": 0, "from": "b", "to": "a" }],
+        );
+
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "seed": "a" }],
+        &[doc! {
+            "$lookup": {
+                "from": "local",
+                "let": { "start": "$seed" },
+                "pipeline": [{
+                    "$graphLookup": {
+                        "from": "foreign",
+                        "startWith": "$$start",
+                        "connectFromField": "from",
+                        "connectToField": "to",
+                        "as": "matches"
+                    }
+                }],
+                "as": "lookup"
+            }
+        }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "seed": "a",
+            "lookup": [{
+                "matches": [{ "_id": 0, "from": "b", "to": "a" }]
+            }]
+        }]
+    );
+}
+
+#[test]
+fn graph_lookup_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$graphLookup": 1 },
+        doc! { "$graphLookup": { "from": "foreign", "connectFromField": "neighbors", "connectToField": "name", "as": "results" } },
+        doc! { "$graphLookup": { "from": 1, "startWith": "$seed", "connectFromField": "neighbors", "connectToField": "name", "as": "results" } },
+        doc! { "$graphLookup": { "from": "foreign", "startWith": "$seed", "connectFromField": "$neighbors", "connectToField": "name", "as": "results" } },
+        doc! { "$graphLookup": { "from": "foreign", "startWith": "$seed", "connectFromField": "neighbors", "connectToField": "name", "as": "$results" } },
+        doc! { "$graphLookup": { "from": "foreign", "startWith": "$seed", "connectFromField": "neighbors", "connectToField": "name", "as": "results", "maxDepth": -1 } },
+        doc! { "$graphLookup": { "from": "foreign", "startWith": "$seed", "connectFromField": "neighbors", "connectToField": "name", "as": "results", "restrictSearchWithMatch": 1 } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "seed": "a" }], &[stage]).expect_err("invalid graphLookup");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn documents_stage_replaces_input_when_first() {
     let results = run_pipeline_ok(
         vec![doc! { "_id": 0, "ignored": true }],

@@ -1451,6 +1451,119 @@ fn command_aggregate_rejects_invalid_fill_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_graph_lookup_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-graph-lookup.mongodb");
+
+    let mut insert_local = Command::cargo_bin("mqlite").expect("binary");
+    insert_local
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"start":"a"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert_foreign = Command::cargo_bin("mqlite").expect("binary");
+    insert_foreign
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"foreign","documents":[{"name":"a","neighbors":["b","c"],"kind":"keep"},{"name":"b","neighbors":["d"],"kind":"skip"},{"name":"c","neighbors":["d"],"kind":"keep"},{"name":"d","neighbors":[],"kind":"keep"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"start":1}},{"$graphLookup":{"from":"foreign","startWith":"$start","connectFromField":"neighbors","connectToField":"name","depthField":"depth","maxDepth":2,"restrictSearchWithMatch":{"kind":"keep"},"as":"results"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let mut first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch")
+        .clone();
+    for document in &mut first_batch {
+        if let Some(results) = document.get_mut("results").and_then(Value::as_array_mut) {
+            for foreign in results {
+                foreign
+                    .as_object_mut()
+                    .expect("foreign document")
+                    .remove("_id");
+            }
+        }
+    }
+    assert_eq!(
+        &first_batch,
+        &vec![json!({
+            "start": "a",
+            "results": [
+                { "name": "a", "neighbors": ["b", "c"], "kind": "keep", "depth": 0 },
+                { "name": "c", "neighbors": ["d"], "kind": "keep", "depth": 1 },
+                { "name": "d", "neighbors": [], "kind": "keep", "depth": 2 },
+            ]
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_rejects_invalid_graph_lookup_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-graph-lookup-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$graphLookup":{"from":"foreign","connectFromField":"neighbors","connectToField":"name","as":"results"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_query_settings_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-query-settings.mongodb");
