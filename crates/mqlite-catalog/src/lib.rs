@@ -21,6 +21,23 @@ pub struct CollectionCatalog {
     pub documents: Vec<Document>,
 }
 
+impl CollectionCatalog {
+    pub fn new(options: Document) -> Self {
+        Self {
+            options,
+            indexes: BTreeMap::from([(
+                "_id_".to_string(),
+                IndexCatalog {
+                    name: "_id_".to_string(),
+                    key: doc! { "_id": 1 },
+                    unique: true,
+                },
+            )]),
+            documents: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCatalog {
     pub name: String,
@@ -89,21 +106,9 @@ impl Catalog {
             ));
         }
 
-        database_entry.collections.insert(
-            collection.to_string(),
-            CollectionCatalog {
-                options,
-                indexes: BTreeMap::from([(
-                    "_id_".to_string(),
-                    IndexCatalog {
-                        name: "_id_".to_string(),
-                        key: doc! { "_id": 1 },
-                        unique: true,
-                    },
-                )]),
-                documents: Vec::new(),
-            },
-        );
+        database_entry
+            .collections
+            .insert(collection.to_string(), CollectionCatalog::new(options));
         Ok(())
     }
 
@@ -145,6 +150,23 @@ impl Catalog {
             ));
         }
         Ok(())
+    }
+
+    pub fn replace_collection(
+        &mut self,
+        database: &str,
+        collection: &str,
+        collection_state: CollectionCatalog,
+    ) {
+        let database_entry = self
+            .databases
+            .entry(database.to_string())
+            .or_insert_with(|| DatabaseCatalog {
+                collections: BTreeMap::new(),
+            });
+        database_entry
+            .collections
+            .insert(collection.to_string(), collection_state);
     }
 
     pub fn get_collection(
@@ -189,30 +211,7 @@ impl Catalog {
         specs: &[Document],
     ) -> Result<Vec<IndexCatalog>, CatalogError> {
         let collection = self.ensure_collection(database, collection);
-        let mut created = Vec::new();
-
-        for spec in specs {
-            let key = spec
-                .get_document("key")
-                .map_err(|_| CatalogError::InvalidIndexSpec)?;
-            let name = spec
-                .get_str("name")
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| default_index_name(key));
-            if collection.indexes.contains_key(&name) {
-                return Err(CatalogError::IndexExists(name));
-            }
-            let unique = spec.get_bool("unique").unwrap_or(false);
-            let index = IndexCatalog {
-                name: name.clone(),
-                key: key.clone(),
-                unique,
-            };
-            collection.indexes.insert(name, index.clone());
-            created.push(index);
-        }
-
-        Ok(created)
+        apply_index_specs(collection, specs)
     }
 
     pub fn drop_indexes(
@@ -222,24 +221,61 @@ impl Catalog {
         target: &str,
     ) -> Result<usize, CatalogError> {
         let collection = self.get_collection_mut(database, collection)?;
-        if target == "*" {
-            let retained = collection.indexes.remove("_id_");
-            let removed = collection.indexes.len();
-            collection.indexes.clear();
-            if let Some(id_index) = retained {
-                collection.indexes.insert(id_index.name.clone(), id_index);
-            }
-            return Ok(removed);
-        }
+        drop_indexes_from_collection(collection, target)
+    }
+}
 
-        if target == "_id_" {
-            return Ok(0);
-        }
+pub fn apply_index_specs(
+    collection: &mut CollectionCatalog,
+    specs: &[Document],
+) -> Result<Vec<IndexCatalog>, CatalogError> {
+    let mut created = Vec::new();
 
-        match collection.indexes.remove(target) {
-            Some(_) => Ok(1),
-            None => Err(CatalogError::IndexNotFound(target.to_string())),
+    for spec in specs {
+        let key = spec
+            .get_document("key")
+            .map_err(|_| CatalogError::InvalidIndexSpec)?;
+        let name = spec
+            .get_str("name")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| default_index_name(key));
+        if collection.indexes.contains_key(&name) {
+            return Err(CatalogError::IndexExists(name));
         }
+        let unique = spec.get_bool("unique").unwrap_or(false);
+        let index = IndexCatalog {
+            name: name.clone(),
+            key: key.clone(),
+            unique,
+        };
+        collection.indexes.insert(name, index.clone());
+        created.push(index);
+    }
+
+    Ok(created)
+}
+
+pub fn drop_indexes_from_collection(
+    collection: &mut CollectionCatalog,
+    target: &str,
+) -> Result<usize, CatalogError> {
+    if target == "*" {
+        let retained = collection.indexes.remove("_id_");
+        let removed = collection.indexes.len();
+        collection.indexes.clear();
+        if let Some(id_index) = retained {
+            collection.indexes.insert(id_index.name.clone(), id_index);
+        }
+        return Ok(removed);
+    }
+
+    if target == "_id_" {
+        return Ok(0);
+    }
+
+    match collection.indexes.remove(target) {
+        Some(_) => Ok(1),
+        None => Err(CatalogError::IndexNotFound(target.to_string())),
     }
 }
 

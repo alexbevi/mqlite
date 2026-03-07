@@ -6,10 +6,11 @@
 
 The repository now contains a working Rust workspace baseline with:
 - A cross-crate architecture aligned to the long-term plan.
-- A single-file durable store with fixed header and checkpoint metadata.
+- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots.
 - Local IPC manifest and endpoint generation.
 - `OP_MSG` encoding and decoding.
 - A broker with core command handling and cursor support.
+- A direct CLI command path for broker validation without any patched driver.
 - Progressive tests, CI scaffolding, and living specs.
 
 ## Upstream Reference Anchors
@@ -58,7 +59,9 @@ file:///absolute/path/to/database.mongodb?db=app
 
 ### Storage and catalog
 - One durable `.mongodb` file per broker.
-- File header validation and checkpoint metadata.
+- Fixed file header and rotating superblocks.
+- Append-only WAL for typed collection mutations.
+- Recovery by replaying WAL on top of the latest valid checkpoint snapshot.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and index metadata.
 
@@ -151,20 +154,34 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
+- Storage tests cover WAL recovery, superblock rotation, and truncated-tail handling.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, plus regression tests for unsupported query operators and aggregation stages.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, and CLI tests that validate broker auto-spawn and restart recovery without any patched driver.
 
 ## CLI
 
 ```text
 mqlite serve --file /path/to/data.mongodb
+mqlite command --file /path/to/data.mongodb --db app --eval '{"ping":1}'
 mqlite checkpoint --file /path/to/data.mongodb
 mqlite verify --file /path/to/data.mongodb
 mqlite inspect --file /path/to/data.mongodb
 ```
 
+## Direct Validation
+
+The broker can now be exercised directly from the CLI without adapting a driver first. `mqlite command` auto-spawns or reuses the broker for the target file, sends a real `OP_MSG` request over local IPC, and prints the BSON reply as JSON.
+
+Example:
+
+```text
+mqlite command --file /tmp/example.mongodb --db app --eval '{"create":"widgets"}'
+mqlite command --file /tmp/example.mongodb --db app --eval '{"insert":"widgets","documents":[{"sku":"alpha","qty":2}]}'
+mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","filter":{"sku":"alpha"}}'
+```
+
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The file format and crate boundaries reserve space for WAL, dual superblocks, and richer query planning, but the current implementation already runs as a local broker with durable storage and tested command execution.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, checkpoint snapshots, and replay on open. The next storage steps are compaction, finer-grained record/index structures, and planner execution beyond the current in-memory catalog model.

@@ -520,9 +520,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "bson",
  "clap",
+ "mqlite-ipc",
  "mqlite-server",
  "mqlite-storage",
+ "mqlite-wire",
  "serde_json",
  "tempfile",
  "tokio",
@@ -608,6 +611,7 @@ name = "mqlite-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bson",
  "fs4",
  "mqlite-catalog",

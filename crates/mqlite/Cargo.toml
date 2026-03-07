@@ -7,9 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bson.workspace = true
 clap.workspace = true
+mqlite-ipc = { path = "../mqlite-ipc" }
 mqlite-server = { path = "../mqlite-server" }
 mqlite-storage = { path = "../mqlite-storage" }
+mqlite-wire = { path = "../mqlite-wire" }
 serde_json.workspace = true
 tokio.workspace = true
 

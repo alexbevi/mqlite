@@ -11,7 +11,9 @@ use std::{
 use anyhow::Result;
 use bson::{Bson, Document, doc};
 use mqlite_bson::{ensure_object_id, lookup_path_owned};
-use mqlite_catalog::{CatalogError, IndexCatalog};
+use mqlite_catalog::{
+    CatalogError, CollectionCatalog, IndexCatalog, apply_index_specs, drop_indexes_from_collection,
+};
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
     BoxedStream, BrokerManifest, BrokerPaths, IpcListener, broker_paths, cleanup_endpoint,
@@ -21,7 +23,7 @@ use mqlite_query::{
     QueryError, apply_projection, apply_update, document_matches, parse_update, run_pipeline,
     upsert_seed_from_query,
 };
-use mqlite_storage::DatabaseFile;
+use mqlite_storage::{DatabaseFile, WalMutation};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
@@ -187,6 +189,9 @@ impl Broker {
             }
         }
 
+        if self.storage.read().has_pending_wal() {
+            self.storage.write().checkpoint()?;
+        }
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
         Ok(())
@@ -375,10 +380,20 @@ impl Broker {
         options.remove("$db");
 
         let mut storage = self.storage.write();
+        if storage
+            .catalog()
+            .get_collection(&database, collection)
+            .is_ok()
+        {
+            return Err(CatalogError::NamespaceExists(database, collection.to_string()).into());
+        }
         storage
-            .catalog_mut()
-            .create_collection(&database, collection, options)?;
-        storage.checkpoint().map_err(internal_error)?;
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection.to_string(),
+                collection_state: CollectionCatalog::new(options),
+            })
+            .map_err(internal_error)?;
         Ok(Document::new())
     }
 
@@ -394,9 +409,11 @@ impl Broker {
             .indexes
             .len() as i32;
         storage
-            .catalog_mut()
-            .drop_collection(&database, collection)?;
-        storage.checkpoint().map_err(internal_error)?;
+            .commit_mutation(WalMutation::DropCollection {
+                database: database.clone(),
+                collection: collection.to_string(),
+            })
+            .map_err(internal_error)?;
         Ok(doc! {
             "ns": format!("{database}.{collection}"),
             "nIndexesWas": index_count,
@@ -434,15 +451,20 @@ impl Broker {
             .catalog()
             .get_collection(&database, collection)
             .is_ok();
-        let before = storage
+        let mut collection_state = storage
             .catalog()
             .get_collection(&database, collection)
-            .map(|collection| collection.indexes.len())
-            .unwrap_or(0) as i32;
-        let created = storage
-            .catalog_mut()
-            .create_indexes(&database, collection, &specs)?;
-        storage.checkpoint().map_err(internal_error)?;
+            .cloned()
+            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+        let before = collection_state.indexes.len() as i32;
+        let created = apply_index_specs(&mut collection_state, &specs)?;
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection.to_string(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
         Ok(doc! {
             "numIndexesBefore": before,
             "numIndexesAfter": before + created.len() as i32,
@@ -460,10 +482,18 @@ impl Broker {
         })?;
 
         let mut storage = self.storage.write();
-        let removed = storage
-            .catalog_mut()
-            .drop_indexes(&database, collection, target)?;
-        storage.checkpoint().map_err(internal_error)?;
+        let mut collection_state = storage
+            .catalog()
+            .get_collection(&database, collection)?
+            .clone();
+        let removed = drop_indexes_from_collection(&mut collection_state, target)?;
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection.to_string(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
         Ok(doc! { "nIndexesWas": removed as i32 })
     }
 
@@ -484,23 +514,30 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
-        storage
-            .catalog_mut()
-            .ensure_collection(&database, collection_name);
-        let indexes = storage.catalog().list_indexes(&database, collection_name)?;
+        let mut collection_state = storage
+            .catalog()
+            .get_collection(&database, collection_name)
+            .cloned()
+            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+        let indexes = collection_state
+            .indexes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
 
-        let inserted_total = {
-            let collection = storage
-                .catalog_mut()
-                .get_collection_mut(&database, collection_name)?;
-            for mut document in documents {
-                ensure_object_id(&mut document);
-                enforce_unique_indexes(&indexes, &collection.documents, &document, None)?;
-                collection.documents.push(document);
-            }
-            collection.documents.len() as i32
-        };
-        storage.checkpoint().map_err(internal_error)?;
+        for mut document in documents {
+            ensure_object_id(&mut document);
+            enforce_unique_indexes(&indexes, &collection_state.documents, &document, None)?;
+            collection_state.documents.push(document);
+        }
+        let inserted_total = collection_state.documents.len() as i32;
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection_name.to_string(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
         Ok(doc! { "n": inserted_total })
     }
 
@@ -624,80 +661,85 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
-        storage
-            .catalog_mut()
-            .ensure_collection(&database, collection_name);
-        let indexes = storage.catalog().list_indexes(&database, collection_name)?;
-        let (matched, modified, upserted) = {
-            let collection = storage
-                .catalog_mut()
-                .get_collection_mut(&database, collection_name)?;
+        let mut collection_state = storage
+            .catalog()
+            .get_collection(&database, collection_name)
+            .cloned()
+            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+        let indexes = collection_state
+            .indexes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
 
-            let mut matched = 0_i32;
-            let mut modified = 0_i32;
-            let mut upserted = Vec::new();
+        let mut matched = 0_i32;
+        let mut modified = 0_i32;
+        let mut upserted = Vec::new();
 
-            for (operation_index, operation) in operations.iter().enumerate() {
-                let query = operation.get_document("q").map_err(|_| {
-                    CommandError::new(9, "FailedToParse", "update operations require `q`")
-                })?;
-                let update = operation.get_document("u").map_err(|_| {
-                    CommandError::new(9, "FailedToParse", "update operations require `u`")
-                })?;
-                let update_spec = parse_update(update)?;
-                let multi = operation.get_bool("multi").unwrap_or(false);
-                let upsert = operation.get_bool("upsert").unwrap_or(false);
+        for (operation_index, operation) in operations.iter().enumerate() {
+            let query = operation.get_document("q").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "update operations require `q`")
+            })?;
+            let update = operation.get_document("u").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "update operations require `u`")
+            })?;
+            let update_spec = parse_update(update)?;
+            let multi = operation.get_bool("multi").unwrap_or(false);
+            let upsert = operation.get_bool("upsert").unwrap_or(false);
 
-                let matching_indexes = collection
-                    .documents
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, document)| {
-                        document_matches(document, query)
-                            .ok()
-                            .and_then(|matches| matches.then_some(index))
-                    })
-                    .collect::<Vec<_>>();
+            let matching_indexes = collection_state
+                .documents
+                .iter()
+                .enumerate()
+                .filter_map(|(index, document)| {
+                    document_matches(document, query)
+                        .ok()
+                        .and_then(|matches| matches.then_some(index))
+                })
+                .collect::<Vec<_>>();
 
-                if matching_indexes.is_empty() {
-                    if upsert {
-                        let mut document = upsert_seed_from_query(query);
-                        apply_update(&mut document, &update_spec)?;
-                        let upserted_id = ensure_object_id(&mut document);
-                        enforce_unique_indexes(&indexes, &collection.documents, &document, None)?;
-                        collection.documents.push(document);
-                        upserted.push(doc! { "index": operation_index as i32, "_id": upserted_id });
-                    }
-                    continue;
+            if matching_indexes.is_empty() {
+                if upsert {
+                    let mut document = upsert_seed_from_query(query);
+                    apply_update(&mut document, &update_spec)?;
+                    let upserted_id = ensure_object_id(&mut document);
+                    enforce_unique_indexes(&indexes, &collection_state.documents, &document, None)?;
+                    collection_state.documents.push(document);
+                    upserted.push(doc! { "index": operation_index as i32, "_id": upserted_id });
                 }
-
-                let mut touched = 0;
-                for document_index in matching_indexes {
-                    let original = collection.documents[document_index].clone();
-                    let mut updated = original.clone();
-                    apply_update(&mut updated, &update_spec)?;
-                    enforce_unique_indexes(
-                        &indexes,
-                        &collection.documents,
-                        &updated,
-                        Some(document_index),
-                    )?;
-                    matched += 1;
-                    if updated != original {
-                        collection.documents[document_index] = updated;
-                        modified += 1;
-                    }
-                    touched += 1;
-                    if !multi && touched >= 1 {
-                        break;
-                    }
-                }
+                continue;
             }
 
-            (matched, modified, upserted)
-        };
+            let mut touched = 0;
+            for document_index in matching_indexes {
+                let original = collection_state.documents[document_index].clone();
+                let mut updated = original.clone();
+                apply_update(&mut updated, &update_spec)?;
+                enforce_unique_indexes(
+                    &indexes,
+                    &collection_state.documents,
+                    &updated,
+                    Some(document_index),
+                )?;
+                matched += 1;
+                if updated != original {
+                    collection_state.documents[document_index] = updated;
+                    modified += 1;
+                }
+                touched += 1;
+                if !multi && touched >= 1 {
+                    break;
+                }
+            }
+        }
 
-        storage.checkpoint().map_err(internal_error)?;
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection_name.to_string(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
         Ok(doc! {
             "n": matched + upserted.len() as i32,
             "nModified": modified,
@@ -723,34 +765,37 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
-        let deleted = {
-            let collection = storage
-                .catalog_mut()
-                .get_collection_mut(&database, collection_name)?;
-            let mut deleted = 0_i32;
+        let mut collection_state = storage
+            .catalog()
+            .get_collection(&database, collection_name)?
+            .clone();
+        let mut deleted = 0_i32;
 
-            for operation in operations {
-                let query = operation.get_document("q").map_err(|_| {
-                    CommandError::new(9, "FailedToParse", "delete operations require `q`")
-                })?;
-                let limit = operation.get_i32("limit").unwrap_or(0);
-                let mut removed = 0_i32;
-                collection.documents.retain(|document| {
-                    let matches = document_matches(document, query).unwrap_or(false);
-                    if matches && (limit == 0 || removed == 0) {
-                        removed += 1;
-                        deleted += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
+        for operation in operations {
+            let query = operation.get_document("q").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "delete operations require `q`")
+            })?;
+            let limit = operation.get_i32("limit").unwrap_or(0);
+            let mut removed = 0_i32;
+            collection_state.documents.retain(|document| {
+                let matches = document_matches(document, query).unwrap_or(false);
+                if matches && (limit == 0 || removed == 0) {
+                    removed += 1;
+                    deleted += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
-            deleted
-        };
-
-        storage.checkpoint().map_err(internal_error)?;
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database,
+                collection: collection_name.to_string(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
         Ok(doc! { "n": deleted })
     }
 

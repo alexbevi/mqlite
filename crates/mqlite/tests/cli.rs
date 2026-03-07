@@ -1,4 +1,7 @@
+use std::{thread, time::Duration};
+
 use assert_cmd::Command;
+use serde_json::Value;
 use tempfile::tempdir;
 
 #[test]
@@ -26,4 +29,71 @@ fn inspect_and_verify_commands_work() {
         .arg(&database_path)
         .assert()
         .success();
+}
+
+#[test]
+fn command_auto_spawns_and_recovers_after_broker_restart() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command.mongodb");
+
+    let mut create = Command::cargo_bin("mqlite").expect("binary");
+    create
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"sku":"alpha","qty":2}]}"#,
+        ])
+        .assert()
+        .success();
+
+    thread::sleep(Duration::from_secs(2));
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"sku":"alpha"}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["sku"], "alpha");
+    assert_eq!(first_batch[0]["qty"], 2);
 }
