@@ -1,0 +1,17 @@
+[package]
+name = "mqlite-capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mqlite-query = { path = "../mqlite-query" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+bson.workspace = true
+pretty_assertions.workspace = true

@@ -1,0 +1,38 @@
+{
+  "query_operators": [
+    "$and",
+    "$eq",
+    "$exists",
+    "$gt",
+    "$gte",
+    "$in",
+    "$lt",
+    "$lte",
+    "$ne",
+    "$or"
+  ],
+  "aggregation_stages": [
+    "$addFields",
+    "$count",
+    "$group",
+    "$limit",
+    "$match",
+    "$project",
+    "$replaceRoot",
+    "$set",
+    "$skip",
+    "$sort",
+    "$unset",
+    "$unwind"
+  ],
+  "aggregation_expression_operators": [
+    "$literal"
+  ],
+  "aggregation_accumulator_operators": [
+    "$avg",
+    "$first",
+    "$push",
+    "$sum"
+  ],
+  "aggregation_window_operators": []
+}

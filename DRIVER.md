@@ -75,6 +75,7 @@ Recommended Node changes for the first adapter:
 - Add a local stream factory for Unix sockets or named pipes.
 - Skip incompatible SDAM features by forcing single-topology semantics.
 - Reuse existing command monitoring and pooling behavior after the local stream is established.
+- Add a dedicated mqlite runner instead of editing existing integration suites in place. The current Node workspace uses `test/mocha_mqlite.js` plus `test/tools/runner/run_mqlite.cjs` so the same tests can be pointed at `file:///...` with profile-based selection.
 
 ## Reference Anchors
 
@@ -85,6 +86,13 @@ The current adapter design was checked against:
 - `../specifications/source/mongodb-handshake/handshake.md`
 - `../specifications/source/connection-string/connection-string-spec.md`
 - `../specifications/source/compression/OP_COMPRESSED.md`
+
+The current supported and unsupported query and aggregation surface is tracked in:
+- `capabilities/mongodb/upstream-capabilities.generated.json`
+- `capabilities/mqlite/gap-analysis.generated.json`
+- `capabilities/mqlite/gap-analysis.generated.md`
+
+Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
 
 ## Driver Test Checklist
 
@@ -99,3 +107,13 @@ Any driver integration should include:
 - `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.
+
+For `node-mongodb-native`, the current direct driver-validation commands are:
+
+```text
+MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite
+MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite:crud
+```
+
+- `check:mqlite` points the integration harness at a `file://` database and runs the normal integration tree under the dedicated mqlite hook.
+- `check:mqlite:crud` uses the same harness but restricts execution to the current curated CRUD bring-up profile, which starts with `test/integration/crud/abstract_operation.test.ts` and can grow without modifying the underlying tests.

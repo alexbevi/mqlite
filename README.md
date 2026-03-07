@@ -10,6 +10,7 @@ The repository now contains a working Rust workspace baseline with:
 - Local IPC manifest and endpoint generation.
 - `OP_MSG` encoding and decoding.
 - A broker with core command handling and cursor support.
+- A source-driven capability sync tool and checked-in MongoDB gap analysis for query and aggregation support.
 - A direct CLI command path for broker validation without any patched driver.
 - Progressive tests, CI scaffolding, and living specs.
 
@@ -72,6 +73,28 @@ This baseline was shaped against the checked-out MongoDB references in the paren
   - `../specifications/source/mongodb-handshake/handshake.md`
   - `../specifications/source/connection-string/connection-string-spec.md`
   - `../specifications/source/compression/OP_COMPRESSED.md`
+
+## Capability Gap Analysis
+
+The repo now keeps a checked-in capability snapshot and gap report generated from the sibling MongoDB source checkout:
+- `capabilities/mongodb/upstream-capabilities.generated.json`
+- `capabilities/mqlite/support.generated.json`
+- `capabilities/mqlite/gap-analysis.generated.json`
+- `capabilities/mqlite/gap-analysis.generated.md`
+
+These files are generated from the MongoDB query parser and aggregation registration sources, with command IDL files kept as reference anchors for command shape context. They are intended to drive gap analysis and direct validation planning for `mqlite`.
+
+Resync the checked-in reports from the local sibling `mongo` checkout with:
+
+```text
+cargo run -p mqlite-capabilities -- sync
+```
+
+Check that the generated files are current without rewriting them with:
+
+```text
+cargo run -p mqlite-capabilities -- sync --check
+```
 
 ## URI Model
 
@@ -138,6 +161,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available, including persisted cache reuse after broker restart.
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
+- Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Aggregation stages:
   - `$match`
   - `$project`
@@ -208,7 +232,9 @@ Test coverage is a release gate:
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
+- Capability snapshot tests keep the checked-in MongoDB operator and stage catalog in sync with the current `mqlite` support surface, and direct parser/executor contract tests validate that supported query operators, aggregation stages, expression operators, and accumulators are accepted while unsupported ones are rejected predictably.
 - The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
+- The Node driver workspace now also carries a dedicated `file://` harness (`test/mocha_mqlite.js` and `test/tools/runner/run_mqlite.cjs`) so existing `node-mongodb-native` integration suites can be replayed against mqlite without editing the suites themselves. `npm run check:mqlite` runs the broad harness, while `npm run check:mqlite:crud` selects the current curated CRUD bring-up profile, which starts with `test/integration/crud/abstract_operation.test.ts`.
 
 ## CLI
 

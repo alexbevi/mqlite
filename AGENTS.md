@@ -3,6 +3,7 @@
 ## Repo Rules
 - Keep `README.md` and `DRIVER.md` in sync with code. Any supported or unsupported behavior change must update the docs in the same patch.
 - Keep `ARCHITECTURE.md` in sync with storage, indexing, planner, and command-execution changes in the same patch.
+- Keep the generated capability snapshots under `capabilities/` in sync with query and aggregation support changes. Run `cargo run -p mqlite-capabilities -- sync` whenever the supported or unsupported operator and stage surface changes.
 - Keep tests in the same patch as code. A feature is not complete until parser, execution, recovery, and rejection behavior are covered where applicable.
 - Treat `mongo`, `node-mongodb-native`, and `specifications` in the workspace as reference material only. `mqlite` remains an independent Rust implementation.
 
@@ -46,6 +47,7 @@
 ## Test Discipline
 - Add unit tests for pure logic and encoding.
 - Add integration tests for broker behavior over real IPC and `OP_MSG`.
+- Add capability snapshot and gap-analysis tests whenever query or aggregation support changes, and ensure the checked-in capability report still matches the live support surface.
 - Add storage recovery and page-format tests whenever the file format or mutation log changes, including persisted index-page checks.
 - Add planner tests and `explain` coverage whenever index scan selection changes.
 - Add storage-level regression tests whenever index ordering semantics change so descending or compound key behavior is validated after reopen, not only in memory.

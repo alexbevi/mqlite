@@ -4,6 +4,31 @@ use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set_path};
 use thiserror::Error;
 
+pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
+    "$and", "$or", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$exists",
+];
+
+pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
+    "$match",
+    "$project",
+    "$set",
+    "$addFields",
+    "$unset",
+    "$limit",
+    "$skip",
+    "$sort",
+    "$count",
+    "$unwind",
+    "$group",
+    "$replaceRoot",
+];
+
+pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &["$literal"];
+
+pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] = &["$sum", "$first", "$push", "$avg"];
+
+pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchExpr {
     And(Vec<MatchExpr>),
@@ -492,6 +517,18 @@ fn eval_expression(document: &Document, expression: &Bson) -> Result<Bson, Query
         Bson::Document(spec) if spec.len() == 1 && spec.contains_key("$literal") => {
             Ok(spec.get("$literal").cloned().unwrap_or(Bson::Null))
         }
+        Bson::Document(spec) if spec.len() == 1 => {
+            let (field, _) = spec.iter().next().expect("single field");
+            if field.starts_with('$') {
+                return Err(QueryError::UnsupportedOperator(field.to_string()));
+            }
+
+            let mut evaluated = Document::new();
+            for (field, value) in spec {
+                evaluated.insert(field, eval_expression(document, value)?);
+            }
+            Ok(Bson::Document(evaluated))
+        }
         Bson::Document(spec) => {
             let mut evaluated = Document::new();
             for (field, value) in spec {
@@ -833,6 +870,20 @@ mod tests {
         assert!(matches!(
             error,
             super::QueryError::UnsupportedStage(stage) if stage == "$lookup"
+        ));
+    }
+
+    #[test]
+    fn projection_rejects_unsupported_expression_operator() {
+        let error = apply_projection(
+            &doc! { "_id": 1, "value": 2 },
+            Some(&doc! { "out": { "$add": [1, 2] } }),
+        )
+        .expect_err("unsupported expression");
+
+        assert!(matches!(
+            error,
+            super::QueryError::UnsupportedOperator(operator) if operator == "$add"
         ));
     }
 }
