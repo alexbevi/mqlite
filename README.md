@@ -6,7 +6,7 @@
 
 The repository now contains a working Rust workspace baseline with:
 - A cross-crate architecture aligned to the long-term plan.
-- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots.
+- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots backed by slotted record pages.
 - Local IPC manifest and endpoint generation.
 - `OP_MSG` encoding and decoding.
 - A broker with core command handling and cursor support.
@@ -61,7 +61,8 @@ file:///absolute/path/to/database.mongodb?db=app
 - One durable `.mongodb` file per broker.
 - Fixed file header and rotating superblocks.
 - Append-only WAL for typed collection mutations.
-- Recovery by replaying WAL on top of the latest valid checkpoint snapshot.
+- Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
+- Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and index metadata.
 
@@ -154,7 +155,7 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, and truncated-tail handling.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill, truncated-tail handling, and fallback to older checkpoints when newer pages are corrupted.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
@@ -184,4 +185,4 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, checkpoint snapshots, and replay on open. The next storage steps are compaction, finer-grained record/index structures, and planner execution beyond the current in-memory catalog model.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages at checkpoint time, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, persistent index structures, and planner execution beyond the current in-memory catalog model.

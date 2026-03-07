@@ -18,7 +18,13 @@ pub struct DatabaseCatalog {
 pub struct CollectionCatalog {
     pub options: Document,
     pub indexes: BTreeMap<String, IndexCatalog>,
-    pub documents: Vec<Document>,
+    pub records: Vec<CollectionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollectionRecord {
+    pub record_id: u64,
+    pub document: Document,
 }
 
 impl CollectionCatalog {
@@ -33,8 +39,24 @@ impl CollectionCatalog {
                     unique: true,
                 },
             )]),
-            documents: Vec::new(),
+            records: Vec::new(),
         }
+    }
+
+    pub fn next_record_id(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|record| record.record_id)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    pub fn documents(&self) -> Vec<Document> {
+        self.records
+            .iter()
+            .map(|record| record.document.clone())
+            .collect()
     }
 }
 

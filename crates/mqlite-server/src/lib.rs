@@ -12,7 +12,8 @@ use anyhow::Result;
 use bson::{Bson, Document, doc};
 use mqlite_bson::{ensure_object_id, lookup_path_owned};
 use mqlite_catalog::{
-    CatalogError, CollectionCatalog, IndexCatalog, apply_index_specs, drop_indexes_from_collection,
+    CatalogError, CollectionCatalog, CollectionRecord, IndexCatalog, apply_index_specs,
+    drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
@@ -527,10 +528,14 @@ impl Broker {
 
         for mut document in documents {
             ensure_object_id(&mut document);
-            enforce_unique_indexes(&indexes, &collection_state.documents, &document, None)?;
-            collection_state.documents.push(document);
+            enforce_unique_indexes(&indexes, &collection_state.records, &document, None)?;
+            let record_id = collection_state.next_record_id();
+            collection_state.records.push(CollectionRecord {
+                record_id,
+                document,
+            });
         }
-        let inserted_total = collection_state.documents.len() as i32;
+        let inserted_total = collection_state.records.len() as i32;
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
                 database,
@@ -562,7 +567,7 @@ impl Broker {
         let mut documents = storage
             .catalog()
             .get_collection(&database, collection)
-            .map(|collection| collection.documents.clone())
+            .map(|collection| collection.documents())
             .unwrap_or_default()
             .into_iter()
             .filter(|document| document_matches(document, &filter).unwrap_or(false))
@@ -688,11 +693,11 @@ impl Broker {
             let upsert = operation.get_bool("upsert").unwrap_or(false);
 
             let matching_indexes = collection_state
-                .documents
+                .records
                 .iter()
                 .enumerate()
-                .filter_map(|(index, document)| {
-                    document_matches(document, query)
+                .filter_map(|(index, record)| {
+                    document_matches(&record.document, query)
                         .ok()
                         .and_then(|matches| matches.then_some(index))
                 })
@@ -703,8 +708,12 @@ impl Broker {
                     let mut document = upsert_seed_from_query(query);
                     apply_update(&mut document, &update_spec)?;
                     let upserted_id = ensure_object_id(&mut document);
-                    enforce_unique_indexes(&indexes, &collection_state.documents, &document, None)?;
-                    collection_state.documents.push(document);
+                    enforce_unique_indexes(&indexes, &collection_state.records, &document, None)?;
+                    let record_id = collection_state.next_record_id();
+                    collection_state.records.push(CollectionRecord {
+                        record_id,
+                        document,
+                    });
                     upserted.push(doc! { "index": operation_index as i32, "_id": upserted_id });
                 }
                 continue;
@@ -712,18 +721,18 @@ impl Broker {
 
             let mut touched = 0;
             for document_index in matching_indexes {
-                let original = collection_state.documents[document_index].clone();
+                let original = collection_state.records[document_index].document.clone();
                 let mut updated = original.clone();
                 apply_update(&mut updated, &update_spec)?;
                 enforce_unique_indexes(
                     &indexes,
-                    &collection_state.documents,
+                    &collection_state.records,
                     &updated,
                     Some(document_index),
                 )?;
                 matched += 1;
                 if updated != original {
-                    collection_state.documents[document_index] = updated;
+                    collection_state.records[document_index].document = updated;
                     modified += 1;
                 }
                 touched += 1;
@@ -777,8 +786,8 @@ impl Broker {
             })?;
             let limit = operation.get_i32("limit").unwrap_or(0);
             let mut removed = 0_i32;
-            collection_state.documents.retain(|document| {
-                let matches = document_matches(document, query).unwrap_or(false);
+            collection_state.records.retain(|record| {
+                let matches = document_matches(&record.document, query).unwrap_or(false);
                 if matches && (limit == 0 || removed == 0) {
                     removed += 1;
                     deleted += 1;
@@ -814,9 +823,9 @@ impl Broker {
             .get_collection(&database, collection_name)
             .map(|collection| {
                 collection
-                    .documents
+                    .records
                     .iter()
-                    .filter(|document| document_matches(document, &query).unwrap_or(false))
+                    .filter(|record| document_matches(&record.document, &query).unwrap_or(false))
                     .count()
             })
             .unwrap_or(0);
@@ -841,11 +850,11 @@ impl Broker {
         let storage = self.storage.read();
         let mut seen = Vec::<Bson>::new();
         if let Ok(collection) = storage.catalog().get_collection(&database, collection_name) {
-            for document in &collection.documents {
-                if !document_matches(document, &query).unwrap_or(false) {
+            for record in &collection.records {
+                if !document_matches(&record.document, &query).unwrap_or(false) {
                     continue;
                 }
-                let value = lookup_path_owned(document, key).unwrap_or(Bson::Null);
+                let value = lookup_path_owned(&record.document, key).unwrap_or(Bson::Null);
                 if !seen.iter().any(|existing| existing == &value) {
                     seen.push(value);
                 }
@@ -881,7 +890,7 @@ impl Broker {
         let input = storage
             .catalog()
             .get_collection(&database, collection_name)
-            .map(|collection| collection.documents.clone())
+            .map(|collection| collection.documents())
             .unwrap_or_default();
         let results = run_pipeline(input, &pipeline)?;
         let cursor = self.cursors.lock().open(
@@ -982,20 +991,20 @@ fn internal_error(error: anyhow::Error) -> CommandError {
 
 fn enforce_unique_indexes(
     indexes: &[IndexCatalog],
-    existing_documents: &[Document],
+    existing_records: &[CollectionRecord],
     candidate: &Document,
     skip_index: Option<usize>,
 ) -> Result<(), CommandError> {
     for index in indexes.iter().filter(|index| index.unique) {
         let candidate_key = unique_index_key(candidate, index);
-        let conflict = existing_documents
+        let conflict = existing_records
             .iter()
             .enumerate()
-            .any(|(position, document)| {
+            .any(|(position, record)| {
                 if skip_index == Some(position) {
                     return false;
                 }
-                unique_index_key(document, index) == candidate_key
+                unique_index_key(&record.document, index) == candidate_key
             });
         if conflict {
             return Err(CommandError::new(
