@@ -502,6 +502,10 @@ impl Broker {
             .ok_or_else(|| CommandError::new(9, "FailedToParse", "explain command is empty"))?;
         match command_name.as_str() {
             "find" => self.handle_find_explain(&database, command),
+            "delete" => self.handle_delete_explain(&database, command),
+            "update" => self.handle_update_explain(&database, command),
+            "distinct" => self.handle_distinct_explain(&database, command),
+            "findAndModify" => self.handle_find_and_modify_explain(&database, command),
             "aggregate" => self.handle_aggregate_explain(&database, command),
             _ => Err(CommandError::new(
                 115,
@@ -526,38 +530,13 @@ impl Broker {
             .unwrap_or_default();
         let sort = command.get_document("sort").ok().cloned();
         let projection = command.get_document("projection").ok().cloned();
-        let storage = self.storage.read();
-        let sequence = storage.last_applied_sequence();
-        let namespace = format!("{database}.{collection_name}");
-        let cached_plan = match storage.catalog().get_collection(database, collection_name) {
-            Ok(collection) => self.cached_find_plan(
-                namespace.clone(),
-                sequence,
-                collection,
-                &filter,
-                sort.as_ref(),
-                projection.as_ref(),
-            )?,
-            Err(CatalogError::NamespaceNotFound(_, _)) => CachedFindPlan {
-                plan: PlannedFind::Collection {
-                    documents: Vec::new(),
-                    record_ids: Vec::new(),
-                    docs_examined: 0,
-                    sort_required: sort.is_some(),
-                },
-                cache_used: false,
-            },
-            Err(error) => return Err(error.into()),
-        };
-        let winning_plan = cached_plan.plan;
-
-        Ok(doc! {
-            "queryPlanner": {
-                "namespace": namespace,
-                "planCacheUsed": cached_plan.cache_used,
-                "winningPlan": winning_plan.to_document(),
-            }
-        })
+        self.query_planner_response(
+            database,
+            collection_name,
+            &filter,
+            sort.as_ref(),
+            projection.as_ref(),
+        )
     }
 
     fn handle_aggregate_explain(
@@ -619,6 +598,99 @@ impl Broker {
         }));
         stages.extend(pipeline.into_iter().map(Bson::Document));
         Ok(doc! { "stages": stages })
+    }
+
+    fn handle_delete_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
+        let collection_name = command.get_str("delete").map_err(|_| {
+            CommandError::new(9, "FailedToParse", "delete requires a collection name")
+        })?;
+        let operation = command
+            .get_array("deletes")
+            .map_err(|_| CommandError::new(9, "FailedToParse", "delete requires a deletes array"))?
+            .first()
+            .and_then(Bson::as_document)
+            .ok_or_else(|| CommandError::new(9, "FailedToParse", "delete requires an operation"))?;
+        let filter = operation
+            .get_document("q")
+            .map_err(|_| CommandError::new(9, "FailedToParse", "delete operations require `q`"))?;
+        self.query_planner_response(database, collection_name, filter, None, None)
+    }
+
+    fn handle_update_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
+        let collection_name = command.get_str("update").map_err(|_| {
+            CommandError::new(9, "FailedToParse", "update requires a collection name")
+        })?;
+        let operation = command
+            .get_array("updates")
+            .map_err(|_| CommandError::new(9, "FailedToParse", "update requires an updates array"))?
+            .first()
+            .and_then(Bson::as_document)
+            .ok_or_else(|| CommandError::new(9, "FailedToParse", "update requires an operation"))?;
+        let filter = operation
+            .get_document("q")
+            .map_err(|_| CommandError::new(9, "FailedToParse", "update operations require `q`"))?;
+        self.query_planner_response(database, collection_name, filter, None, None)
+    }
+
+    fn handle_distinct_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
+        let collection_name = command.get_str("distinct").map_err(|_| {
+            CommandError::new(9, "FailedToParse", "distinct requires a collection name")
+        })?;
+        let filter = command
+            .get_document("query")
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        self.query_planner_response(database, collection_name, &filter, None, None)
+    }
+
+    fn handle_find_and_modify_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
+        let collection_name = command.get_str("findAndModify").map_err(|_| {
+            CommandError::new(9, "FailedToParse", "findAndModify requires a collection name")
+        })?;
+        let filter = command
+            .get_document("query")
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        let sort = command.get_document("sort").ok().cloned();
+        self.query_planner_response(database, collection_name, &filter, sort.as_ref(), None)
+    }
+
+    fn query_planner_response(
+        &self,
+        database: &str,
+        collection_name: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        projection: Option<&Document>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.{collection_name}");
+        let cached_plan =
+            self.explain_find_plan(database, collection_name, filter, sort, projection)?;
+        Ok(doc! {
+            "queryPlanner": {
+                "namespace": namespace,
+                "planCacheUsed": cached_plan.cache_used,
+                "winningPlan": cached_plan.plan.to_document(),
+            }
+        })
     }
 
     fn explain_find_plan(
@@ -3899,6 +3971,73 @@ mod tests {
             "app.widgets"
         );
         assert!(planner.get_document("winningPlan").is_ok());
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_reports_query_planner_for_delete_update_distinct_and_find_and_modify() {
+        let (serve_task, _temp_dir, manifest) = start_broker("crud-explain.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1, "sku": "a", "qty": 2 }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        for command in [
+            doc! {
+                "explain": {
+                    "delete": "widgets",
+                    "deletes": [{ "q": { "sku": "a" }, "limit": 1 }]
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+            doc! {
+                "explain": {
+                    "update": "widgets",
+                    "updates": [{ "q": { "sku": "a" }, "u": { "$set": { "qty": 3 } } }]
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+            doc! {
+                "explain": {
+                    "distinct": "widgets",
+                    "key": "sku",
+                    "query": { "sku": "a" }
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+            doc! {
+                "explain": {
+                    "findAndModify": "widgets",
+                    "query": { "sku": "a" },
+                    "remove": true
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+        ] {
+            let explain = send_command(&mut stream, command).await;
+            let planner = explain.get_document("queryPlanner").expect("queryPlanner");
+            assert_eq!(planner.get_str("namespace").expect("namespace"), "app.widgets");
+            assert!(planner.get_document("winningPlan").is_ok());
+        }
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

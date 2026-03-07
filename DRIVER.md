@@ -69,6 +69,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
   - `killAllSessions` succeeds as a no-op cleanup command
   - `getParameter` returns at least `authenticationMechanisms` and `requireApiVersion`
   - `db.aggregate([{ $currentOp: { localOps: true } }])` on `admin` returns the in-flight aggregate command
+  - wrapped CRUD `explain(...)` calls for `delete`, `update`, `distinct`, and `findAndModify` return a `queryPlanner` response
   - collection-backed `aggregate(...).explain()` returns a `$cursor.queryPlanner` stage for non-`$out` pipelines
   - collection-backed aggregation accepts a trailing `$out` stage and returns an empty cursor
   - session and transaction envelopes are still rejected explicitly
