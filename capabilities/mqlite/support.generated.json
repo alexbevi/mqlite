@@ -40,6 +40,7 @@
     "$densify",
     "$documents",
     "$facet",
+    "$fill",
     "$group",
     "$indexStats",
     "$limit",

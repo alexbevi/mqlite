@@ -82,6 +82,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.admin.aggregate([{ $listMqlEntities: { entityType: "aggregationStages" } }])` returns the sorted list of currently supported aggregation stages
 - `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
 - `db.collection.aggregate([{ $densify: { field: "ts", range: { step: 1, bounds: "full", unit: "day" } } }])` densifies numeric and date fields over `full`, `partition`, or explicit bounds on the local document stream
+- `db.collection.aggregate([{ $fill: { sortBy: { _id: 1 }, partitionBy: "$part", output: { score: { method: "linear" }, lastSeen: { method: "locf" } } } }])` fills missing and `null` values with constant, `locf`, or `linear` semantics over the local document stream
 - `db.collection.aggregate([{ $redact: { $cond: [{ $lte: ["$level", 2] }, "$$DESCEND", "$$PRUNE"] } }])` applies recursive redaction with `$$KEEP`, `$$PRUNE`, and `$$DESCEND`
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
 - Null-byte database or collection names are rejected with `InvalidNamespace`

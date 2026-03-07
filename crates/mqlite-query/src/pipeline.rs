@@ -79,6 +79,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$densify" => densify_documents(current, stage_spec)?,
+            "$fill" => fill_documents(current, stage_spec, &context.variables)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
             "$listCatalog" => list_catalog_documents(stage_index, stage_spec)?,
             "$listClusterCatalog" => list_cluster_catalog_documents(stage_index, stage_spec)?,
@@ -1219,6 +1220,409 @@ fn densify_value_to_bson(value: DensifyValue, numeric_kind: Option<DensifyNumeri
         },
         DensifyValue::DateTime(value) => Bson::DateTime(value),
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FillPartitionBy {
+    Fields(Vec<String>),
+    Expression(Bson),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillMethod {
+    Locf,
+    Linear,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FillOutput {
+    Value(Bson),
+    Method(FillMethod),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FillSpec {
+    sort_by: Option<Document>,
+    partition_by: Option<FillPartitionBy>,
+    outputs: Vec<(String, FillOutput)>,
+}
+
+fn fill_documents(
+    mut documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
+    let spec = parse_fill_spec(spec)?;
+    let has_methods = spec
+        .outputs
+        .iter()
+        .any(|(_, output)| matches!(output, FillOutput::Method(_)));
+
+    if has_methods {
+        if spec.sort_by.is_some() {
+            documents.sort_by(|left, right| compare_fill_documents(left, right, &spec, variables));
+            apply_sorted_fill_methods(&mut documents, &spec, variables)?;
+        } else {
+            apply_streaming_fill_methods(&mut documents, &spec, variables)?;
+        }
+    }
+
+    for (field, output) in &spec.outputs {
+        let FillOutput::Value(expression) = output else {
+            continue;
+        };
+
+        for document in &mut documents {
+            if !fill_needs_value(document, field) {
+                continue;
+            }
+            let value = eval_expression_with_variables(document, expression, variables)?;
+            set_path(document, field, value).map_err(|_| QueryError::InvalidStructure)?;
+        }
+    }
+
+    Ok(documents)
+}
+
+fn parse_fill_spec(spec: &Bson) -> Result<FillSpec, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut sort_by = None;
+    let mut partition_by_fields = None;
+    let mut partition_by = None;
+    let mut outputs = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "sortBy" => {
+                let sort = value.as_document().ok_or(QueryError::InvalidStage)?.clone();
+                validate_sort_spec(&sort)?;
+                sort_by = Some(sort);
+            }
+            "partitionByFields" => {
+                partition_by_fields = Some(
+                    value
+                        .as_array()
+                        .ok_or(QueryError::InvalidStage)?
+                        .iter()
+                        .map(parse_field_name)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            "partitionBy" => {
+                partition_by = Some(match value {
+                    Bson::String(path) => {
+                        if !path.starts_with('$') {
+                            return Err(QueryError::InvalidStage);
+                        }
+                        FillPartitionBy::Expression(Bson::String(path.clone()))
+                    }
+                    Bson::Document(_) => FillPartitionBy::Expression(value.clone()),
+                    _ => return Err(QueryError::InvalidStage),
+                });
+            }
+            "output" => outputs = Some(parse_fill_outputs(value)?),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let outputs = outputs.ok_or(QueryError::InvalidStage)?;
+    if outputs.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    if partition_by_fields.is_some() && partition_by.is_some() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let partition_by = match (partition_by_fields, partition_by) {
+        (Some(fields), None) => Some(FillPartitionBy::Fields(fields)),
+        (None, Some(expr)) => Some(expr),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(QueryError::InvalidStage),
+    };
+
+    if outputs
+        .iter()
+        .any(|(_, output)| matches!(output, FillOutput::Method(FillMethod::Linear)))
+        && sort_by.is_none()
+    {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(FillSpec {
+        sort_by,
+        partition_by,
+        outputs,
+    })
+}
+
+fn parse_fill_outputs(value: &Bson) -> Result<Vec<(String, FillOutput)>, QueryError> {
+    let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut outputs = Vec::new();
+
+    for (field, spec) in document {
+        if field.is_empty() || field.starts_with('$') {
+            return Err(QueryError::InvalidStage);
+        }
+        let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+        if spec.len() != 1 {
+            return Err(QueryError::InvalidStage);
+        }
+
+        let (kind, value) = spec.iter().next().expect("single fill output spec");
+        let output = match kind.as_str() {
+            "value" => FillOutput::Value(value.clone()),
+            "method" => match value.as_str().ok_or(QueryError::InvalidStage)? {
+                "locf" => FillOutput::Method(FillMethod::Locf),
+                "linear" => FillOutput::Method(FillMethod::Linear),
+                _ => return Err(QueryError::InvalidStage),
+            },
+            _ => return Err(QueryError::InvalidStage),
+        };
+        outputs.push((field.clone(), output));
+    }
+
+    Ok(outputs)
+}
+
+fn compare_fill_documents(
+    left: &Document,
+    right: &Document,
+    spec: &FillSpec,
+    variables: &BTreeMap<String, Bson>,
+) -> std::cmp::Ordering {
+    if let Some(partition_by) = &spec.partition_by {
+        let left_key = fill_partition_key(left, partition_by, variables);
+        let right_key = fill_partition_key(right, partition_by, variables);
+        let ordering = match (left_key, right_key) {
+            (Ok(left_key), Ok(right_key)) => compare_bson(&left_key, &right_key),
+            _ => std::cmp::Ordering::Equal,
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    let sort_by = spec.sort_by.as_ref().expect("sorted fill requires sortBy");
+    compare_documents_by_sort(left, right, sort_by)
+}
+
+fn apply_streaming_fill_methods(
+    documents: &mut [Document],
+    spec: &FillSpec,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<(), QueryError> {
+    let method_fields = spec
+        .outputs
+        .iter()
+        .filter_map(|(field, output)| match output {
+            FillOutput::Method(method) => Some((field.as_str(), *method)),
+            FillOutput::Value(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut states: Vec<(Bson, BTreeMap<String, Bson>)> = Vec::new();
+
+    for document in documents {
+        let partition_key = match &spec.partition_by {
+            Some(partition_by) => fill_partition_key(document, partition_by, variables)?,
+            None => Bson::Null,
+        };
+
+        let state_index = states
+            .iter()
+            .position(|(key, _)| compare_bson(key, &partition_key).is_eq())
+            .unwrap_or_else(|| {
+                states.push((partition_key.clone(), BTreeMap::new()));
+                states.len() - 1
+            });
+        let (_, last_seen) = &mut states[state_index];
+
+        for (field, method) in &method_fields {
+            match method {
+                FillMethod::Locf => {
+                    if let Some(value) = lookup_path(document, field) {
+                        if !matches!(value, Bson::Null) {
+                            last_seen.insert((*field).to_string(), value.clone());
+                            continue;
+                        }
+                    }
+                    if let Some(previous) = last_seen.get(*field) {
+                        set_path(document, field, previous.clone())
+                            .map_err(|_| QueryError::InvalidStructure)?;
+                    }
+                }
+                FillMethod::Linear => return Err(QueryError::InvalidStage),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_sorted_fill_methods(
+    documents: &mut [Document],
+    spec: &FillSpec,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<(), QueryError> {
+    let mut start = 0;
+    while start < documents.len() {
+        let end = fill_partition_end(documents, spec, variables, start)?;
+        for (field, output) in &spec.outputs {
+            match output {
+                FillOutput::Method(FillMethod::Locf) => {
+                    fill_locf_partition(&mut documents[start..end], field)?
+                }
+                FillOutput::Method(FillMethod::Linear) => {
+                    let sort_by = spec.sort_by.as_ref().expect("validated");
+                    fill_linear_partition(&mut documents[start..end], field, sort_by)?;
+                }
+                FillOutput::Value(_) => {}
+            }
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+fn fill_partition_end(
+    documents: &[Document],
+    spec: &FillSpec,
+    variables: &BTreeMap<String, Bson>,
+    start: usize,
+) -> Result<usize, QueryError> {
+    let Some(partition_by) = &spec.partition_by else {
+        return Ok(documents.len());
+    };
+
+    let first_key = fill_partition_key(&documents[start], partition_by, variables)?;
+    let mut end = start + 1;
+    while end < documents.len() {
+        let key = fill_partition_key(&documents[end], partition_by, variables)?;
+        if !compare_bson(&first_key, &key).is_eq() {
+            break;
+        }
+        end += 1;
+    }
+    Ok(end)
+}
+
+fn fill_locf_partition(documents: &mut [Document], field: &str) -> Result<(), QueryError> {
+    let mut last_seen = None;
+    for document in documents {
+        if let Some(value) = lookup_path(document, field) {
+            if !matches!(value, Bson::Null) {
+                last_seen = Some(value.clone());
+                continue;
+            }
+        }
+        if let Some(previous) = &last_seen {
+            set_path(document, field, previous.clone())
+                .map_err(|_| QueryError::InvalidStructure)?;
+        }
+    }
+    Ok(())
+}
+
+fn fill_linear_partition(
+    documents: &mut [Document],
+    field: &str,
+    sort_by: &Document,
+) -> Result<(), QueryError> {
+    let mut previous_anchor: Option<(usize, f64, f64)> = None;
+
+    for index in 0..documents.len() {
+        let sort_value = fill_sort_scalar(&documents[index], sort_by)?;
+        let current = lookup_path(&documents[index], field);
+
+        let Some(current) = current else {
+            continue;
+        };
+        if matches!(current, Bson::Null) {
+            continue;
+        }
+
+        let current_value = numeric_value(current)?;
+        if let Some((anchor_index, anchor_sort, anchor_value)) = previous_anchor {
+            if index > anchor_index + 1 {
+                let span = sort_value - anchor_sort;
+                if span == 0.0 {
+                    return Err(QueryError::InvalidStage);
+                }
+
+                for document in documents
+                    .iter_mut()
+                    .enumerate()
+                    .skip(anchor_index + 1)
+                    .take(index - anchor_index - 1)
+                {
+                    let (_, document) = document;
+                    if !fill_needs_value(document, field) {
+                        continue;
+                    }
+                    let missing_sort = fill_sort_scalar(document, sort_by)?;
+                    let ratio = (missing_sort - anchor_sort) / span;
+                    let filled_value = anchor_value + ((current_value - anchor_value) * ratio);
+                    set_path(document, field, number_bson(filled_value))
+                        .map_err(|_| QueryError::InvalidStructure)?;
+                }
+            }
+        }
+        previous_anchor = Some((index, sort_value, current_value));
+    }
+
+    Ok(())
+}
+
+fn fill_sort_scalar(document: &Document, sort_by: &Document) -> Result<f64, QueryError> {
+    let (field, _) = sort_by.iter().next().ok_or(QueryError::InvalidStage)?;
+    let value = lookup_path(document, field).ok_or(QueryError::InvalidStage)?;
+    match value {
+        Bson::DateTime(value) => Ok(value.timestamp_millis() as f64),
+        _ => numeric_value(value),
+    }
+}
+
+fn fill_partition_key(
+    document: &Document,
+    partition_by: &FillPartitionBy,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Bson, QueryError> {
+    match partition_by {
+        FillPartitionBy::Fields(fields) => Ok(Bson::Array(
+            fields
+                .iter()
+                .map(|field| lookup_path(document, field).cloned().unwrap_or(Bson::Null))
+                .collect(),
+        )),
+        FillPartitionBy::Expression(expression) => {
+            eval_expression_with_variables(document, expression, variables)
+        }
+    }
+}
+
+fn fill_needs_value(document: &Document, field: &str) -> bool {
+    matches!(lookup_path(document, field), None | Some(Bson::Null))
+}
+
+fn validate_sort_spec(sort: &Document) -> Result<(), QueryError> {
+    if sort.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    for (field, direction) in sort {
+        if field.is_empty() || field.starts_with('$') {
+            return Err(QueryError::InvalidStage);
+        }
+
+        match integer_value(direction) {
+            Some(1 | -1) => {}
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(())
 }
 
 fn bucket_documents(

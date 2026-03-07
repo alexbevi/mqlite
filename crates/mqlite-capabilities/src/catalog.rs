@@ -1228,6 +1228,16 @@ mod tests {
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$facet": { "all": [{ "$project": { "qty": 1 } }] } }],
             ),
+            "$fill" => (
+                vec![
+                    doc! { "_id": 1, "qty": 1 },
+                    doc! { "_id": 2, "qty": Bson::Null },
+                    doc! { "_id": 3, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$fill": { "sortBy": { "_id": 1 }, "output": { "qty": { "method": "linear" } } } },
+                ],
+            ),
             "$lookup" => (
                 vec![doc! { "wanted": 2 }],
                 vec![doc! {

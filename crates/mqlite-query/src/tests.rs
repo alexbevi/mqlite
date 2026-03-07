@@ -1391,6 +1391,93 @@ fn densify_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn fill_stage_supports_partitioned_locf_and_linear_methods() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 1, "part": 1, "linear": 1, "other": 1 },
+            doc! { "_id": 2, "part": 2, "linear": 1, "other": 1 },
+            doc! { "_id": 3, "part": 1, "linear": Bson::Null, "other": Bson::Null },
+            doc! { "_id": 4, "part": 2, "linear": Bson::Null, "other": Bson::Null },
+            doc! { "_id": 5, "part": 1, "linear": 5, "other": 10 },
+            doc! { "_id": 6, "part": 2, "linear": 6, "other": 2 },
+            doc! { "_id": 7, "part": 1, "linear": Bson::Null, "other": Bson::Null },
+            doc! { "_id": 8, "part": 2, "linear": 3, "other": 5 },
+            doc! { "_id": 9, "part": 1, "linear": 7, "other": 15 },
+            doc! { "_id": 10, "part": 2, "linear": Bson::Null, "other": Bson::Null },
+        ],
+        &[doc! {
+            "$fill": {
+                "sortBy": { "_id": 1 },
+                "partitionBy": "$part",
+                "output": {
+                    "linear": { "method": "linear" },
+                    "other": { "method": "locf" }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 1, "part": 1, "linear": 1, "other": 1 },
+            doc! { "_id": 3, "part": 1, "linear": 3_i64, "other": 1 },
+            doc! { "_id": 5, "part": 1, "linear": 5, "other": 10 },
+            doc! { "_id": 7, "part": 1, "linear": 6_i64, "other": 10 },
+            doc! { "_id": 9, "part": 1, "linear": 7, "other": 15 },
+            doc! { "_id": 2, "part": 2, "linear": 1, "other": 1 },
+            doc! { "_id": 4, "part": 2, "linear": 3.5, "other": 1 },
+            doc! { "_id": 6, "part": 2, "linear": 6, "other": 2 },
+            doc! { "_id": 8, "part": 2, "linear": 3, "other": 5 },
+            doc! { "_id": 10, "part": 2, "linear": Bson::Null, "other": 5 },
+        ]
+    );
+}
+
+#[test]
+fn fill_stage_supports_value_outputs_after_methods() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 1, "part": 1, "other": Bson::Null, "linear": 1 },
+            doc! { "_id": 2, "part": 1, "other": 10, "linear": Bson::Null },
+        ],
+        &[doc! {
+            "$fill": {
+                "sortBy": { "_id": 1 },
+                "output": {
+                    "linear": { "method": "locf" },
+                    "other": { "value": "$_id" }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 1, "part": 1, "other": 1, "linear": 1 },
+            doc! { "_id": 2, "part": 1, "other": 10, "linear": 1 },
+        ]
+    );
+}
+
+#[test]
+fn fill_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$fill": {} },
+        doc! { "$fill": { "output": {} } },
+        doc! { "$fill": { "output": { "qty": "bad" } } },
+        doc! { "$fill": { "sortBy": { "$bad": 1 }, "output": { "qty": { "value": 1 } } } },
+        doc! { "$fill": { "partitionBy": "$part", "partitionByFields": ["part"], "output": { "qty": { "method": "locf" } } } },
+        doc! { "$fill": { "output": { "qty": { "method": "linear" } } } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "_id": 1, "qty": 1 }], &[stage]).expect_err("invalid fill");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn documents_stage_replaces_input_when_first() {
     let results = run_pipeline_ok(
         vec![doc! { "_id": 0, "ignored": true }],

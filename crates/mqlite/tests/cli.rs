@@ -1365,6 +1365,92 @@ fn command_aggregate_rejects_invalid_densify_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_fill_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-fill.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"seq":1,"part":1,"linear":1,"other":1},{"seq":2,"part":2,"linear":1,"other":1},{"seq":3,"part":1,"linear":null,"other":null},{"seq":4,"part":2,"linear":null,"other":null},{"seq":5,"part":1,"linear":5,"other":10},{"seq":6,"part":2,"linear":6,"other":2}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"seq":1,"part":1,"linear":1,"other":1}},{"$fill":{"sortBy":{"seq":1},"partitionBy":"$part","output":{"linear":{"method":"linear"},"other":{"method":"locf"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "seq": 1, "part": 1, "linear": 1, "other": 1 }),
+            json!({ "seq": 3, "part": 1, "linear": 3, "other": 1 }),
+            json!({ "seq": 5, "part": 1, "linear": 5, "other": 10 }),
+            json!({ "seq": 2, "part": 2, "linear": 1, "other": 1 }),
+            json!({ "seq": 4, "part": 2, "linear": 3.5, "other": 1 }),
+            json!({ "seq": 6, "part": 2, "linear": 6, "other": 2 }),
+        ]
+    );
+}
+
+#[test]
+fn command_aggregate_rejects_invalid_fill_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-fill-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$fill":{"output":{"qty":{"method":"linear"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_query_settings_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-query-settings.mongodb");

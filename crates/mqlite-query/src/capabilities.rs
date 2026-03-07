@@ -38,6 +38,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$densify",
     "$documents",
     "$facet",
+    "$fill",
     "$indexStats",
     "$lookup",
     "$listCatalog",
