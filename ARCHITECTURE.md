@@ -153,6 +153,9 @@ Current cross-namespace aggregation behavior:
   continue to work in nested stages.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
+- `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file
+  target namespace using supported `whenMatched` and `whenNotMatched` string modes plus optional
+  `on` fields.
 - The current implementation does not federate across files or processes.
 
 ## WAL And Recovery

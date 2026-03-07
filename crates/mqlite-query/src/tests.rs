@@ -1356,6 +1356,55 @@ fn out_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn merge_stage_must_be_last_and_accepts_supported_mode_combinations() {
+    let string_results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! { "$merge": "archive" }],
+    );
+    assert!(string_results.is_empty());
+
+    let object_results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! {
+            "$merge": {
+                "into": { "db": "analytics", "coll": "archive" },
+                "on": "_id",
+                "whenMatched": "replace",
+                "whenNotMatched": "insert"
+            }
+        }],
+    );
+    assert!(object_results.is_empty());
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! { "$merge": "archive" }, doc! { "$match": { "value": 1 } }],
+    )
+    .expect_err("$merge must be last");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
+fn merge_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$merge": 1 },
+        doc! { "$merge": {} },
+        doc! { "$merge": { "into": { "db": "analytics" } } },
+        doc! { "$merge": { "into": { "coll": 1 } } },
+        doc! { "$merge": { "into": "archive", "on": [] } },
+        doc! { "$merge": { "into": "archive", "on": [1] } },
+        doc! { "$merge": { "into": "archive", "whenMatched": "keepExisting", "whenNotMatched": "discard" } },
+        doc! { "$merge": { "into": "archive", "whenMatched": [] } },
+        doc! { "$merge": { "into": "archive", "let": { "x": 1 } } },
+        doc! { "$merge": { "into": "archive", "unknown": true } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid $merge");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn union_with_stage_appends_documents_from_another_collection() {
     let resolver = StaticResolver::default().with_collection(
         "app",

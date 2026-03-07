@@ -180,6 +180,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$sortByCount`
   - `$unionWith`
   - `$match`
+  - `$merge`
   - `$out`
   - `$project`
   - `$set`
@@ -195,6 +196,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$replaceWith`
 - Same-file cross-namespace aggregation via `$unionWith` and `$lookup`, including collection-backed namespace resolution and collectionless `$documents` subpipelines for both stages.
 - Same-file aggregation write stages via `$out`, including string targets and `{ db, coll }` targets within the same `.mongodb` file.
+- Same-file aggregation write stages via `$merge`, including string targets or `{ db, coll }` targets, `on` fields, and the currently supported string mode combinations for `whenMatched` and `whenNotMatched`.
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
 - Collectionless `$currentOp` aggregation with `localOps: true` as a driver-compatibility helper.
 

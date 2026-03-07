@@ -478,6 +478,104 @@ fn command_aggregate_supports_out_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_merge_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-merge.mongodb");
+
+    let mut insert_source = Command::cargo_bin("mqlite").expect("binary");
+    insert_source
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"source","documents":[{"key":1,"a":1,"b":"a"},{"key":2,"a":2,"b":"b"},{"key":3,"a":3,"b":"c"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert_target = Command::cargo_bin("mqlite").expect("binary");
+    insert_target
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"archive","documents":[{"key":1,"a":10,"c":"z"},{"key":3,"a":30},{"key":4,"a":40}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"source","pipeline":[{"$merge":{"into":{"db":"analytics","coll":"archive"},"on":"key","whenMatched":"merge","whenNotMatched":"insert"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert!(
+        response["cursor"]["firstBatch"]
+            .as_array()
+            .expect("firstBatch")
+            .is_empty()
+    );
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let find_output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"archive","filter":{},"sort":{"key":1},"projection":{"_id":0,"key":1,"a":1,"b":1,"c":1}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let find_response: Value = serde_json::from_slice(&find_output).expect("json response");
+    let first_batch = find_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "key": 1, "a": 1, "b": "a", "c": "z" }),
+            json!({ "key": 2, "a": 2, "b": "b" }),
+            json!({ "key": 3, "a": 3, "b": "c" }),
+            json!({ "key": 4, "a": 40 }),
+        ]
+    );
+}
+
+#[test]
 fn command_aggregate_supports_sample_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-sample.mongodb");

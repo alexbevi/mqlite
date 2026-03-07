@@ -1119,6 +1119,10 @@ mod tests {
                     }
                 }],
             ),
+            "$merge" => (
+                vec![doc! { "_id": 1 }],
+                vec![doc! { "$merge": "archive" }],
+            ),
             "$out" => (
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$out": "archive" }],

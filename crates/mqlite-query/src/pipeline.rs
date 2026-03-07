@@ -99,6 +99,13 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 parse_out_stage(stage_spec)?;
                 Vec::new()
             }
+            "$merge" => {
+                if stage_index + 1 != pipeline.len() {
+                    return Err(QueryError::InvalidStage);
+                }
+                parse_merge_stage(stage_spec)?;
+                Vec::new()
+            }
             "$project" => {
                 let projection = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -486,6 +493,21 @@ struct UnionWithStage {
     pipeline: Vec<Document>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeWhenMatched {
+    Replace,
+    Merge,
+    KeepExisting,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeWhenNotMatched {
+    Insert,
+    Discard,
+    Fail,
+}
+
 fn parse_union_with_spec(
     spec: &Bson,
     default_database: &str,
@@ -573,6 +595,121 @@ fn parse_out_stage(spec: &Bson) -> Result<(), QueryError> {
         }
         _ => Err(QueryError::InvalidStage),
     }
+}
+
+fn parse_merge_stage(spec: &Bson) -> Result<(), QueryError> {
+    let mut target_database = None;
+    let mut target_collection = None;
+    let mut on_fields = vec!["_id".to_string()];
+    let mut when_matched = MergeWhenMatched::Merge;
+    let mut when_not_matched = MergeWhenNotMatched::Insert;
+
+    match spec {
+        Bson::String(collection) => {
+            target_collection = Some(collection.clone());
+        }
+        Bson::Document(document) => {
+            for (field, value) in document {
+                match field.as_str() {
+                    "into" => match value {
+                        Bson::String(collection) => target_collection = Some(collection.clone()),
+                        Bson::Document(namespace) => {
+                            for (field, value) in namespace {
+                                match field.as_str() {
+                                    "db" => {
+                                        target_database = Some(
+                                            value
+                                                .as_str()
+                                                .ok_or(QueryError::InvalidStage)?
+                                                .to_string(),
+                                        );
+                                    }
+                                    "coll" => {
+                                        target_collection = Some(
+                                            value
+                                                .as_str()
+                                                .ok_or(QueryError::InvalidStage)?
+                                                .to_string(),
+                                        );
+                                    }
+                                    _ => return Err(QueryError::InvalidStage),
+                                }
+                            }
+                        }
+                        _ => return Err(QueryError::InvalidStage),
+                    },
+                    "on" => {
+                        on_fields = match value {
+                            Bson::String(field) => vec![field.clone()],
+                            Bson::Array(fields) => fields
+                                .iter()
+                                .map(|field| {
+                                    field
+                                        .as_str()
+                                        .map(str::to_string)
+                                        .ok_or(QueryError::InvalidStage)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                            _ => return Err(QueryError::InvalidStage),
+                        };
+                        if on_fields.is_empty() {
+                            return Err(QueryError::InvalidStage);
+                        }
+                    }
+                    "whenMatched" => {
+                        when_matched = match value {
+                            Bson::String(mode) => match mode.as_str() {
+                                "replace" => MergeWhenMatched::Replace,
+                                "merge" => MergeWhenMatched::Merge,
+                                "keepExisting" => MergeWhenMatched::KeepExisting,
+                                "fail" => MergeWhenMatched::Fail,
+                                _ => return Err(QueryError::InvalidStage),
+                            },
+                            Bson::Array(_) => return Err(QueryError::InvalidStage),
+                            _ => return Err(QueryError::InvalidStage),
+                        };
+                    }
+                    "whenNotMatched" => {
+                        when_not_matched = match value.as_str().ok_or(QueryError::InvalidStage)? {
+                            "insert" => MergeWhenNotMatched::Insert,
+                            "discard" => MergeWhenNotMatched::Discard,
+                            "fail" => MergeWhenNotMatched::Fail,
+                            _ => return Err(QueryError::InvalidStage),
+                        };
+                    }
+                    "let" | "targetCollectionVersion" | "allowMergeOnNullishValues" => {
+                        return Err(QueryError::InvalidStage)
+                    }
+                    _ => return Err(QueryError::InvalidStage),
+                }
+            }
+        }
+        _ => return Err(QueryError::InvalidStage),
+    }
+
+    let target_collection = target_collection.ok_or(QueryError::InvalidStage)?;
+    if !matches!(
+        (when_matched, when_not_matched),
+        (MergeWhenMatched::Replace, MergeWhenNotMatched::Insert)
+            | (MergeWhenMatched::Replace, MergeWhenNotMatched::Discard)
+            | (MergeWhenMatched::Replace, MergeWhenNotMatched::Fail)
+            | (MergeWhenMatched::Merge, MergeWhenNotMatched::Insert)
+            | (MergeWhenMatched::Merge, MergeWhenNotMatched::Discard)
+            | (MergeWhenMatched::Merge, MergeWhenNotMatched::Fail)
+            | (MergeWhenMatched::KeepExisting, MergeWhenNotMatched::Insert)
+            | (MergeWhenMatched::Fail, MergeWhenNotMatched::Insert)
+    ) {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let _ = (
+        target_database,
+        target_collection,
+        on_fields,
+        when_matched,
+        when_not_matched,
+    );
+    Ok(())
 }
 
 fn bucket_documents(

@@ -1188,7 +1188,16 @@ impl Broker {
             .and_then(|stage| stage.get("$out"))
             .map(parse_out_target)
             .transpose()?;
-        let execution_pipeline = if out_target.is_some() {
+        let merge_target = if out_target.is_none() {
+            pipeline
+                .last()
+                .and_then(|stage| stage.get("$merge"))
+                .map(parse_merge_target)
+                .transpose()?
+        } else {
+            None
+        };
+        let execution_pipeline = if out_target.is_some() || merge_target.is_some() {
             &pipeline[..pipeline.len().saturating_sub(1)]
         } else {
             &pipeline[..]
@@ -1255,6 +1264,14 @@ impl Broker {
         if let Some(target) = out_target {
             let target_database = target.database.as_deref().unwrap_or(&database);
             self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(&database, &target, results)?;
             let cursor = self
                 .cursors
                 .lock()
@@ -1351,11 +1368,141 @@ impl Broker {
             .map(|_| ())
             .map_err(internal_error)
     }
+
+    fn merge_into_collection(
+        &self,
+        default_database: &str,
+        target: &MergeTarget,
+        results: Vec<Document>,
+    ) -> Result<(), CommandError> {
+        let database = target.database.as_deref().unwrap_or(default_database);
+        let mut storage = self.storage.write();
+        let mut collection_state = storage
+            .catalog()
+            .get_collection(database, &target.collection)
+            .cloned()
+            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+        let mut deferred_error = None;
+
+        for mut document in results {
+            if target.on_fields.iter().any(|field| field == "_id") {
+                ensure_object_id(&mut document);
+            }
+
+            let matches = collection_state
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| merge_fields_match(&record.document, &document, &target.on_fields))
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>();
+
+            if matches.len() > 1 {
+                deferred_error.get_or_insert_with(|| {
+                    CommandError::new(
+                        11000,
+                        "DuplicateKey",
+                        "merge target contains duplicate `on` field values",
+                    )
+                });
+                continue;
+            }
+
+            if let Some(position) = matches.first().copied() {
+                let existing = collection_state.records[position].document.clone();
+                let outcome = match target.when_matched {
+                    MergeWhenMatched::Replace => collection_state
+                        .update_record_at(position, document)
+                        .map(|_| ()),
+                    MergeWhenMatched::Merge => {
+                        let mut merged = existing;
+                        for (field, value) in document {
+                            merged.insert(field, value);
+                        }
+                        collection_state.update_record_at(position, merged).map(|_| ())
+                    }
+                    MergeWhenMatched::KeepExisting => Ok(()),
+                    MergeWhenMatched::Fail => Err(CatalogError::DuplicateKey(
+                        "merge encountered a matching target document".to_string(),
+                    )),
+                };
+
+                if let Err(error) = outcome {
+                    deferred_error.get_or_insert_with(|| match error {
+                        CatalogError::DuplicateKey(message) => {
+                            CommandError::new(11000, "DuplicateKey", message)
+                        }
+                        other => other.into(),
+                    });
+                }
+                continue;
+            }
+
+            let outcome = match target.when_not_matched {
+                MergeWhenNotMatched::Insert => collection_state.insert_record(CollectionRecord {
+                    record_id: collection_state.next_record_id(),
+                    document,
+                }),
+                MergeWhenNotMatched::Discard => Ok(()),
+                MergeWhenNotMatched::Fail => Err(CatalogError::InvalidIndexState(
+                    "merge did not find a matching target document".to_string(),
+                )),
+            };
+
+            if let Err(error) = outcome {
+                deferred_error.get_or_insert_with(|| match target.when_not_matched {
+                    MergeWhenNotMatched::Fail => CommandError::new(
+                        13113,
+                        "MergeStageNoMatchingDocument",
+                        "merge did not find a matching target document",
+                    ),
+                    _ => error.into(),
+                });
+            }
+        }
+
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: database.to_string(),
+                collection: target.collection.clone(),
+                collection_state,
+            })
+            .map_err(internal_error)?;
+
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
 }
 
 struct OutTarget {
     database: Option<String>,
     collection: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeWhenMatched {
+    Replace,
+    Merge,
+    KeepExisting,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeWhenNotMatched {
+    Insert,
+    Discard,
+    Fail,
+}
+
+struct MergeTarget {
+    database: Option<String>,
+    collection: String,
+    on_fields: Vec<String>,
+    when_matched: MergeWhenMatched,
+    when_not_matched: MergeWhenNotMatched,
 }
 
 fn parse_out_target(value: &Bson) -> Result<OutTarget, CommandError> {
@@ -1430,6 +1577,155 @@ fn parse_out_target(value: &Bson) -> Result<OutTarget, CommandError> {
             "aggregation stage `$out` only supports string targets or `{ db, coll }` objects",
         )),
     }
+}
+
+fn parse_merge_target(value: &Bson) -> Result<MergeTarget, CommandError> {
+    let invalid = || {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            "aggregation stage `$merge` only supports a string target or an object with `into`, optional `on`, `whenMatched`, and `whenNotMatched`",
+        )
+    };
+
+    match value {
+        Bson::String(collection) => Ok(MergeTarget {
+            database: None,
+            collection: collection.clone(),
+            on_fields: vec!["_id".to_string()],
+            when_matched: MergeWhenMatched::Merge,
+            when_not_matched: MergeWhenNotMatched::Insert,
+        }),
+        Bson::Document(document) => {
+            let mut database = None;
+            let mut collection = None;
+            let mut on_fields = vec!["_id".to_string()];
+            let mut when_matched = MergeWhenMatched::Merge;
+            let mut when_not_matched = MergeWhenNotMatched::Insert;
+
+            for (field, value) in document {
+                match field.as_str() {
+                    "into" => match value {
+                        Bson::String(collection_name) => collection = Some(collection_name.clone()),
+                        Bson::Document(namespace) => {
+                            for (field, value) in namespace {
+                                match field.as_str() {
+                                    "db" => {
+                                        database = Some(
+                                            value
+                                                .as_str()
+                                                .ok_or_else(invalid)?
+                                                .to_string(),
+                                        );
+                                    }
+                                    "coll" => {
+                                        collection = Some(
+                                            value
+                                                .as_str()
+                                                .ok_or_else(invalid)?
+                                                .to_string(),
+                                        );
+                                    }
+                                    _ => return Err(invalid()),
+                                }
+                            }
+                        }
+                        _ => return Err(invalid()),
+                    },
+                    "on" => {
+                        on_fields = match value {
+                            Bson::String(field) => vec![field.clone()],
+                            Bson::Array(fields) => fields
+                                .iter()
+                                .map(|field| field.as_str().map(str::to_string).ok_or_else(invalid))
+                                .collect::<Result<Vec<_>, _>>()?,
+                            _ => return Err(invalid()),
+                        };
+                        if on_fields.is_empty() {
+                            return Err(invalid());
+                        }
+                    }
+                    "whenMatched" => {
+                        when_matched = match value {
+                            Bson::String(mode) => match mode.as_str() {
+                                "replace" => MergeWhenMatched::Replace,
+                                "merge" => MergeWhenMatched::Merge,
+                                "keepExisting" => MergeWhenMatched::KeepExisting,
+                                "fail" => MergeWhenMatched::Fail,
+                                _ => return Err(invalid()),
+                            },
+                            Bson::Array(_) => {
+                                return Err(CommandError::new(
+                                    115,
+                                    "CommandNotSupported",
+                                    "aggregation stage `$merge` does not yet support pipeline-style `whenMatched`",
+                                ))
+                            }
+                            _ => return Err(invalid()),
+                        };
+                    }
+                    "whenNotMatched" => {
+                        when_not_matched = match value.as_str().ok_or_else(invalid)? {
+                            "insert" => MergeWhenNotMatched::Insert,
+                            "discard" => MergeWhenNotMatched::Discard,
+                            "fail" => MergeWhenNotMatched::Fail,
+                            _ => return Err(invalid()),
+                        };
+                    }
+                    "let" => {
+                        return Err(CommandError::new(
+                            115,
+                            "CommandNotSupported",
+                            "aggregation stage `$merge` does not yet support `let` variables",
+                        ))
+                    }
+                    "targetCollectionVersion" | "allowMergeOnNullishValues" => {
+                        return Err(CommandError::new(
+                            115,
+                            "CommandNotSupported",
+                            "aggregation stage `$merge` does not support router-only merge options",
+                        ))
+                    }
+                    _ => return Err(invalid()),
+                }
+            }
+
+            if !matches!(
+                (when_matched, when_not_matched),
+                (MergeWhenMatched::Replace, MergeWhenNotMatched::Insert)
+                    | (MergeWhenMatched::Replace, MergeWhenNotMatched::Discard)
+                    | (MergeWhenMatched::Replace, MergeWhenNotMatched::Fail)
+                    | (MergeWhenMatched::Merge, MergeWhenNotMatched::Insert)
+                    | (MergeWhenMatched::Merge, MergeWhenNotMatched::Discard)
+                    | (MergeWhenMatched::Merge, MergeWhenNotMatched::Fail)
+                    | (MergeWhenMatched::KeepExisting, MergeWhenNotMatched::Insert)
+                    | (MergeWhenMatched::Fail, MergeWhenNotMatched::Insert)
+            ) {
+                return Err(CommandError::new(
+                    51181,
+                    "Location51181",
+                    "the selected `whenMatched` and `whenNotMatched` mode combination is not supported",
+                ));
+            }
+
+            Ok(MergeTarget {
+                database,
+                collection: collection.ok_or_else(invalid)?,
+                on_fields,
+                when_matched,
+                when_not_matched,
+            })
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn merge_fields_match(left: &Document, right: &Document, on_fields: &[String]) -> bool {
+    on_fields.iter().all(|field| {
+        let left_value = lookup_path_owned(left, field).unwrap_or(Bson::Null);
+        let right_value = lookup_path_owned(right, field).unwrap_or(Bson::Null);
+        compare_bson(&left_value, &right_value).is_eq()
+    })
 }
 
 struct BrokerCollectionResolver<'a> {
