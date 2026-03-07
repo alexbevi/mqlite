@@ -336,6 +336,7 @@ impl Broker {
             "create" => self.handle_create(body),
             "dropDatabase" => self.handle_drop_database(body),
             "drop" => self.handle_drop(body),
+            "renameCollection" => self.handle_rename_collection(body),
             "createIndexes" => self.handle_create_indexes(body),
             "dropIndexes" => self.handle_drop_indexes(body),
             "insert" => self.handle_insert(body),
@@ -798,6 +799,71 @@ impl Broker {
             "ns": format!("{database}.{collection}"),
             "nIndexesWas": index_count,
         })
+    }
+
+    fn handle_rename_collection(&self, body: &Document) -> Result<Document, CommandError> {
+        let source_namespace = body.get_str("renameCollection").map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "renameCollection requires a namespace string",
+            )
+        })?;
+        let target_namespace = body.get_str("to").map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "renameCollection requires a target namespace",
+            )
+        })?;
+        let drop_target = body.get_bool("dropTarget").unwrap_or(false);
+        let (source_database, source_collection) = parse_namespace(source_namespace)?;
+        let (target_database, target_collection) = parse_namespace(target_namespace)?;
+
+        let mut storage = self.storage.write();
+        let source_state = storage
+            .catalog()
+            .get_collection(source_database, source_collection)?
+            .clone();
+
+        if source_database == target_database && source_collection == target_collection {
+            return Ok(Document::new());
+        }
+
+        let target_exists = storage
+            .catalog()
+            .get_collection(target_database, target_collection)
+            .is_ok();
+        if target_exists {
+            if !drop_target {
+                return Err(CatalogError::NamespaceExists(
+                    target_database.to_string(),
+                    target_collection.to_string(),
+                )
+                .into());
+            }
+            storage
+                .commit_mutation(WalMutation::DropCollection {
+                    database: target_database.to_string(),
+                    collection: target_collection.to_string(),
+                })
+                .map_err(internal_error)?;
+        }
+
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: target_database.to_string(),
+                collection: target_collection.to_string(),
+                collection_state: source_state,
+            })
+            .map_err(internal_error)?;
+        storage
+            .commit_mutation(WalMutation::DropCollection {
+                database: source_database.to_string(),
+                collection: source_collection.to_string(),
+            })
+            .map_err(internal_error)?;
+        Ok(Document::new())
     }
 
     fn handle_create_indexes(&self, body: &Document) -> Result<Document, CommandError> {
@@ -1315,12 +1381,23 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$currentOp");
+        let starts_with_index_stats = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$indexStats");
 
         if starts_with_coll_stats && is_collectionless {
             return Err(CommandError::new(
                 73,
                 "InvalidNamespace",
                 "$collStats must be run against a collection namespace",
+            ));
+        }
+        if starts_with_index_stats && is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$indexStats must be run against a collection namespace",
             ));
         }
         if starts_with_current_op && !is_collectionless {
@@ -1346,6 +1423,19 @@ impl Broker {
                 CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
             })?;
             return self.handle_coll_stats_aggregate(
+                &database,
+                collection_name,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_index_stats {
+            let collection_name = body.get_str("aggregate").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
+            })?;
+            return self.handle_index_stats_aggregate(
                 &database,
                 collection_name,
                 batch_size,
@@ -1466,6 +1556,73 @@ impl Broker {
                 )?
             } else {
                 vec![stats_document]
+            }
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_index_stats_aggregate(
+        &self,
+        database: &str,
+        collection_name: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.{collection_name}");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let collection = storage
+                .catalog()
+                .get_collection(database, collection_name)?;
+            let index_stats = execution_pipeline
+                .first()
+                .and_then(|stage| stage.get("$indexStats"))
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$indexStats aggregation requires an $indexStats stage document",
+                    )
+                })?;
+            parse_index_stats_stage(index_stats)?;
+            let index_stats_documents = build_index_stats_results(collection);
+            if execution_pipeline.len() > 1 {
+                run_pipeline_with_resolver(
+                    index_stats_documents,
+                    &execution_pipeline[1..],
+                    database,
+                    &resolver,
+                )?
+            } else {
+                index_stats_documents
             }
         };
 
@@ -1751,6 +1908,44 @@ fn approximate_index_size(index: &IndexCatalog) -> i64 {
         .iter()
         .map(|entry| bson::to_vec(&entry.key).unwrap_or_default().len() as i64 + 8)
         .sum()
+}
+
+fn parse_index_stats_stage(spec: &Bson) -> Result<(), CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(9, "FailedToParse", "$indexStats must take a nested object")
+    })?;
+    if !spec.is_empty() {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "$indexStats stage specification must be an empty object",
+        ));
+    }
+    Ok(())
+}
+
+fn build_index_stats_results(collection: &CollectionCatalog) -> Vec<Document> {
+    let since = bson::DateTime::now();
+    collection
+        .indexes
+        .values()
+        .map(|index| {
+            doc! {
+                "name": index.name.clone(),
+                "key": index.key.clone(),
+                "spec": {
+                    "name": index.name.clone(),
+                    "key": index.key.clone(),
+                    "unique": index.unique,
+                },
+                "accesses": {
+                    "ops": 0_i64,
+                    "since": since,
+                },
+                "host": "mqlite",
+            }
+        })
+        .collect()
 }
 
 impl Broker {
@@ -3776,6 +3971,24 @@ fn database_name(body: &Document) -> Result<String, CommandError> {
     body.get_str("$db")
         .map(str::to_string)
         .map_err(|_| CommandError::new(9, "FailedToParse", "command is missing `$db`"))
+}
+
+fn parse_namespace(namespace: &str) -> Result<(&str, &str), CommandError> {
+    let (database, collection) = namespace.split_once('.').ok_or_else(|| {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            "namespace must be a `database.collection` string",
+        )
+    })?;
+    if database.is_empty() || collection.is_empty() {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "namespace must be a `database.collection` string",
+        ));
+    }
+    Ok((database, collection))
 }
 
 fn body_batch_size(body: &Document, field: &str) -> Option<i64> {

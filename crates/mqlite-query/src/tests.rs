@@ -1911,6 +1911,40 @@ fn coll_stats_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn index_stats_stage_reports_synthetic_index_metadata() {
+    let results = run_pipeline_ok(Vec::new(), &[doc! { "$indexStats": {} }]);
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "name": "_id_",
+            "key": { "_id": 1 },
+            "spec": { "name": "_id_", "key": { "_id": 1 }, "unique": true },
+            "accesses": { "ops": 0_i64, "since": DateTime::from_millis(0) },
+            "host": "mqlite",
+        }]
+    );
+}
+
+#[test]
+fn index_stats_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$indexStats": 1 },
+        doc! { "$indexStats": { "verbose": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[doc! { "$match": { "_id": 1 } }, doc! { "$indexStats": {} }],
+    )
+    .expect_err("$indexStats should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

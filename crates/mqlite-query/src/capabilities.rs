@@ -37,6 +37,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$currentOp",
     "$documents",
     "$facet",
+    "$indexStats",
     "$lookup",
     "$sample",
     "$sortByCount",

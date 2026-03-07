@@ -252,6 +252,7 @@ The broker command path is:
    - parse each stage into the supported Rust-native semantics
    - synthesize collectionless metadata-stage input for supported first stages such as `$currentOp`
    - synthesize collection metadata-stage input for supported first stages such as `$collStats`
+   - synthesize collection index metadata-stage input for supported first stages such as `$indexStats`
    - execute pure document stages in memory
    - resolve same-file foreign namespaces for `$unionWith` and `$lookup`
    - thread `$lookup` `let` variables through correlated subpipelines

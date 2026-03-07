@@ -1106,6 +1106,7 @@ mod tests {
                 Vec::new(),
                 vec![doc! { "$currentOp": { "localOps": true } }],
             ),
+            "$indexStats" => (Vec::new(), vec![doc! { "$indexStats": {} }]),
             "$documents" => (
                 vec![doc! { "ignored": true }],
                 vec![doc! { "$documents": [{ "qty": 1 }] }],

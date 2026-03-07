@@ -76,6 +76,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
+            "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -1082,6 +1083,32 @@ fn coll_stats_documents(
         coll_stats.storage_stats_scale,
         coll_stats.include_count,
     )])
+}
+
+fn index_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if !spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(vec![doc! {
+        "name": "_id_",
+        "key": { "_id": 1 },
+        "spec": {
+            "name": "_id_",
+            "key": { "_id": 1 },
+            "unique": true,
+        },
+        "accesses": {
+            "ops": 0_i64,
+            "since": bson::DateTime::from_millis(0),
+        },
+        "host": "mqlite",
+    }])
 }
 
 #[derive(Debug, Clone, Copy)]

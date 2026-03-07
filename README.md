@@ -140,6 +140,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `create`
 - `dropDatabase`
 - `drop`
+- `renameCollection`
 - `createIndexes`
 - `dropIndexes`
 - `insert`
@@ -180,6 +181,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$collStats`
   - `$currentOp`
   - `$lookup`
+  - `$indexStats`
   - `$sample`
   - `$sortByCount`
   - `$unionWith`
@@ -204,6 +206,8 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
 - Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.
+- Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
+- Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
 ## Unsupported Features
 
