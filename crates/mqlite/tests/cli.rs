@@ -208,6 +208,60 @@ fn command_aggregate_supports_sample_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_sort_by_count_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-sort-by-count.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"team":"red"},{"team":"blue"},{"team":"blue"},{"team":"green"},{"team":"green"},{"team":"green"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$sortByCount":"$team"}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "_id": "green", "count": 3 }),
+            json!({ "_id": "blue", "count": 2 }),
+            json!({ "_id": "red", "count": 1 }),
+        ]
+    );
+}
+
+#[test]
 fn command_find_supports_size_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-size.mongodb");

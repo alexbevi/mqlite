@@ -1098,6 +1098,10 @@ mod tests {
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],
             ),
+            "$sortByCount" => (
+                vec![doc! { "team": "red" }],
+                vec![doc! { "$sortByCount": "$team" }],
+            ),
             "$match" => (
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$match": { "qty": { "$gte": 1 } } }],

@@ -83,6 +83,7 @@ pub fn run_pipeline(
                 let skip = integer_value(stage_spec).ok_or(QueryError::InvalidStage)?;
                 current.into_iter().skip(skip.max(0) as usize).collect()
             }
+            "$sortByCount" => sort_by_count(current, stage_spec)?,
             "$sort" => {
                 let sort = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current.sort_by(|left, right| compare_documents_by_sort(left, right, sort));
@@ -171,6 +172,30 @@ fn sample_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Documen
         .take(size as usize)
         .map(|(_, _, document)| document)
         .collect())
+}
+
+fn sort_by_count(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    let expression = match spec {
+        Bson::String(path) if path.starts_with('$') && path.len() > 1 => Bson::String(path.clone()),
+        Bson::Document(document)
+            if document
+                .iter()
+                .next()
+                .is_some_and(|(field, _)| field.starts_with('$')) =>
+        {
+            Bson::Document(document.clone())
+        }
+        _ => return Err(QueryError::InvalidStage),
+    };
+
+    let group_spec = doc! {
+        "_id": expression,
+        "count": { "$sum": 1 },
+    };
+    let mut results = group_documents(documents, &group_spec)?;
+    let sort_spec = doc! { "count": -1 };
+    results.sort_by(|left, right| compare_documents_by_sort(left, right, &sort_spec));
+    Ok(results)
 }
 
 fn parse_unset(spec: &Bson) -> Result<Vec<String>, QueryError> {

@@ -894,6 +894,55 @@ fn multiple_sample_stages_are_allowed() {
 }
 
 #[test]
+fn sort_by_count_groups_and_sorts_descending() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "team": "red" },
+            doc! { "team": "blue" },
+            doc! { "team": "blue" },
+            doc! { "team": "green" },
+            doc! { "team": "green" },
+            doc! { "team": "green" },
+        ],
+        &[doc! { "$sortByCount": "$team" }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": "green", "count": 3_i64 },
+            doc! { "_id": "blue", "count": 2_i64 },
+            doc! { "_id": "red", "count": 1_i64 },
+        ]
+    );
+}
+
+#[test]
+fn sort_by_count_accepts_expression_objects() {
+    let results = run_pipeline_ok(
+        vec![doc! { "_id": 1 }, doc! { "_id": 2 }],
+        &[doc! { "$sortByCount": { "$literal": "all" } }],
+    );
+
+    assert_eq!(results, vec![doc! { "_id": "all", "count": 2_i64 }]);
+}
+
+#[test]
+fn sort_by_count_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$sortByCount": "team" },
+        doc! { "$sortByCount": "" },
+        doc! { "$sortByCount": 1 },
+        doc! { "$sortByCount": {} },
+        doc! { "$sortByCount": { "team": "$team" } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "team": "red" }], &[stage]).expect_err("invalid stage");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn count_stage_uses_dynamic_output_field() {
     let results = run_pipeline(
         vec![doc! { "value": 1 }, doc! { "value": 2 }],
