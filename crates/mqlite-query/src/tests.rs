@@ -1047,6 +1047,41 @@ fn replace_with_alias_matches_replace_root_behavior() {
 }
 
 #[test]
+fn documents_stage_replaces_input_when_first() {
+    let results = run_pipeline_ok(
+        vec![doc! { "_id": 0, "ignored": true }],
+        &[doc! { "$documents": [{ "a": 1 }, { "a": 2 }] }],
+    );
+
+    assert_eq!(results, vec![doc! { "a": 1 }, doc! { "a": 2 }]);
+}
+
+#[test]
+fn documents_stage_must_be_first() {
+    let error = run_pipeline(
+        vec![doc! { "_id": 0 }],
+        &[
+            doc! { "$project": { "_id": 1 } },
+            doc! { "$documents": [{ "a": 1 }] },
+        ],
+    )
+    .expect_err("$documents should only be allowed as the first stage");
+
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
+fn documents_stage_rejects_non_array_specs_and_non_document_elements() {
+    let scalar_error =
+        run_pipeline(Vec::new(), &[doc! { "$documents": "not-an-array" }]).expect_err("invalid");
+    assert!(matches!(scalar_error, QueryError::InvalidStage));
+
+    let element_error =
+        run_pipeline(Vec::new(), &[doc! { "$documents": [{ "a": 1 }, 2] }]).expect_err("invalid");
+    assert!(matches!(element_error, QueryError::ExpectedDocument));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

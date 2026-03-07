@@ -33,6 +33,7 @@
   "aggregation_stages": [
     "$addFields",
     "$count",
+    "$documents",
     "$group",
     "$limit",
     "$match",

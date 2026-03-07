@@ -16,13 +16,14 @@ pub fn run_pipeline(
 ) -> Result<Vec<Document>, QueryError> {
     let mut current = documents;
 
-    for stage in pipeline {
+    for (stage_index, stage) in pipeline.iter().enumerate() {
         if stage.len() != 1 {
             return Err(QueryError::InvalidStage);
         }
 
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
+            "$documents" => documents_stage(stage_index, stage_spec)?,
             "$match" => {
                 let filter = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -103,6 +104,23 @@ pub fn run_pipeline(
     }
 
     Ok(current)
+}
+
+fn documents_stage(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let documents = spec.as_array().ok_or(QueryError::InvalidStage)?;
+    documents
+        .iter()
+        .map(|value| {
+            value
+                .as_document()
+                .cloned()
+                .ok_or(QueryError::ExpectedDocument)
+        })
+        .collect()
 }
 
 fn parse_unset(spec: &Bson) -> Result<Vec<String>, QueryError> {

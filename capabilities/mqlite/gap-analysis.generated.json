@@ -1129,10 +1129,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 57,
-    "total_supported": 13,
-    "public_supported": 13,
-    "total_unsupported": 71,
-    "public_unsupported": 44,
+    "total_supported": 14,
+    "public_supported": 14,
+    "total_unsupported": 70,
+    "public_unsupported": 43,
     "items": [
       {
         "name": "$_internalAllCollectionStats",
@@ -1795,8 +1795,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$facet",

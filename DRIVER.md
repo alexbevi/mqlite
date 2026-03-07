@@ -97,6 +97,7 @@ The current supported and unsupported query and aggregation surface is tracked i
 - `capabilities/mqlite/gap-analysis.generated.md`
 
 Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
+`mqlite` also supports collectionless `aggregate: 1` commands when the pipeline begins with `$documents`, which is the direct validation path for collectionless aggregation before any driver-specific adapter work.
 Server-side JavaScript is permanently out of scope for `mqlite`, so `$where` and `$function` should remain explicit unsupported-operator failures rather than compatibility gaps to close later.
 
 ## Driver Test Checklist

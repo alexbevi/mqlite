@@ -1046,12 +1046,6 @@ impl Broker {
 
     fn handle_aggregate(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
-        let collection_name = body
-            .get("aggregate")
-            .and_then(Bson::as_str)
-            .ok_or_else(|| {
-                CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
-            })?;
         let pipeline = body
             .get_array("pipeline")
             .map_err(|_| {
@@ -1065,20 +1059,51 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let batch_size = body_batch_size(body, "cursor");
+        let starts_with_documents = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$documents");
 
         let storage = self.storage.read();
-        let input = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .map(|collection| collection.documents())
-            .unwrap_or_default();
+        let (namespace, input) = match body.get("aggregate") {
+            Some(Bson::String(collection_name)) => {
+                if starts_with_documents {
+                    return Err(CommandError::new(
+                        73,
+                        "InvalidNamespace",
+                        "$documents is only valid for collectionless aggregates and subpipelines",
+                    ));
+                }
+                let input = storage
+                    .catalog()
+                    .get_collection(&database, collection_name)
+                    .map(|collection| collection.documents())
+                    .unwrap_or_default();
+                (format!("{database}.{collection_name}"), input)
+            }
+            Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {
+                if !starts_with_documents {
+                    return Err(CommandError::new(
+                        73,
+                        "InvalidNamespace",
+                        "collectionless aggregate requires $documents as the first stage",
+                    ));
+                }
+                (format!("{database}.$cmd.aggregate"), Vec::new())
+            }
+            _ => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "aggregate requires a collection name or 1 for collectionless aggregate",
+                ));
+            }
+        };
         let results = run_pipeline(input, &pipeline)?;
-        let cursor = self.cursors.lock().open(
-            format!("{database}.{collection_name}"),
-            results,
-            batch_size,
-            false,
-        );
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
     }
 }

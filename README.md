@@ -168,6 +168,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.
 - Aggregation stages:
+  - `$documents`
   - `$match`
   - `$project`
   - `$set`
@@ -181,6 +182,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `$group`
 - `$replaceRoot`
 - `$replaceWith`
+- Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
 
 ## Unsupported Features
 

@@ -31,6 +31,7 @@ pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
+    "$documents",
     "$match",
     "$project",
     "$set",

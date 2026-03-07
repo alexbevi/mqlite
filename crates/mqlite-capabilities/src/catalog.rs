@@ -1090,6 +1090,10 @@ mod tests {
 
     fn supported_stage_fixture(name: &str) -> (Vec<Document>, Vec<Document>) {
         match name {
+            "$documents" => (
+                vec![doc! { "ignored": true }],
+                vec![doc! { "$documents": [{ "qty": 1 }] }],
+            ),
             "$match" => (
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$match": { "qty": { "$gte": 1 } } }],
