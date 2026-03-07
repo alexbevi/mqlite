@@ -16,6 +16,8 @@
 - Indexed `find` planning should be directly observable through `explain`, not just inferred from behavior.
 - Compound-prefix and sort-aware index plans must match persisted index key order, including descending key parts, after checkpoint and reopen.
 - Planner selection should use measurable work such as keys examined, docs examined, sort work, and coverage, not fixed heuristic scores alone.
+- `find` planning should prefer histogram-style index statistics, bounded interval estimates, and a sequence-keyed plan cache before falling back to exact execution work.
+- Covered index execution must preserve explicit `null` versus missing-field semantics using persisted index-entry presence metadata, not by silently fetching documents.
 
 ## Upstream Reference Anchors
 - Server generic command fields and unsupported envelope behavior are keyed off `../mongo/src/mongo/idl/generic_argument.idl`.
@@ -44,6 +46,6 @@
 - Add storage recovery and page-format tests whenever the file format or mutation log changes, including persisted index-page checks.
 - Add planner tests and `explain` coverage whenever index scan selection changes.
 - Add storage-level regression tests whenever index ordering semantics change so descending or compound key behavior is validated after reopen, not only in memory.
-- Add planner regressions for cost-based ranking, covered projections, and point-interval prefix handling whenever `find` planning changes.
+- Add planner regressions for cost-based ranking, plan-cache usage, covered projections, null-vs-missing covered execution, and point- or multi-interval prefix handling whenever `find` planning changes.
 - Add regression tests for every bug fix.
 - Preserve cross-platform behavior by keeping CI green on macOS, Linux, and Windows.

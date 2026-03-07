@@ -16,17 +16,17 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR4";
-pub const FILE_FORMAT_VERSION: u32 = 4;
+pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR5";
+pub const FILE_FORMAT_VERSION: u32 = 5;
 pub const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 4096;
 const SUPERBLOCK_LEN: usize = 512;
 const SUPERBLOCK_COUNT: usize = 2;
 const DATA_START_OFFSET: u64 = (HEADER_LEN + (SUPERBLOCK_LEN * SUPERBLOCK_COUNT)) as u64;
-const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB04";
+const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB05";
 const WAL_FRAME_MAGIC: &[u8; 4] = b"WAL1";
 const WAL_HEADER_LEN: usize = 40;
-const PAGE_MAGIC: &[u8; 8] = b"MQLTPG04";
+const PAGE_MAGIC: &[u8; 8] = b"MQLTPG05";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
 const PAGE_KIND_RECORD: u16 = 1;
@@ -1048,7 +1048,7 @@ fn build_leaf_index_pages(
     let mut page_entries = Vec::<IndexEntry>::new();
 
     for entry in entries {
-        let payload = bson::to_vec(&entry.key)?;
+        let payload = bson::to_vec(&encode_index_entry_payload(entry)?)?;
         if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
             return Err(StorageError::RecordTooLarge.into());
         }
@@ -1058,7 +1058,7 @@ fn build_leaf_index_pages(
             builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_INDEX_LEAF, 0);
             page_entries.clear();
         }
-        builder.insert(entry.record_id, &entry.key)?;
+        builder.insert(entry.record_id, &encode_index_entry_payload(entry)?)?;
         page_entries.push(entry.clone());
     }
 
@@ -1251,7 +1251,7 @@ fn read_index_tree(
         PAGE_KIND_INDEX_LEAF => page
             .entries
             .into_iter()
-            .map(|(record_id, key)| Ok(IndexEntry { record_id, key }))
+            .map(|(record_id, payload)| decode_index_entry_payload(record_id, payload))
             .collect(),
         PAGE_KIND_INDEX_INTERNAL => {
             if page.page_extra == 0 {
@@ -1351,6 +1351,18 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<DecodedPage> {
     })
 }
 
+fn encode_index_entry_payload(entry: &IndexEntry) -> Result<bson::Document> {
+    bson::to_document(entry).map_err(Into::into)
+}
+
+fn decode_index_entry_payload(record_id: u64, payload: bson::Document) -> Result<IndexEntry> {
+    let mut entry = bson::from_document::<IndexEntry>(payload)?;
+    entry.record_id = record_id;
+    entry.present_fields.sort();
+    entry.present_fields.dedup();
+    Ok(entry)
+}
+
 fn is_skippable_checkpoint_error(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<StorageError>(),
@@ -1427,6 +1439,7 @@ fn current_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs::OpenOptions,
         io::{Read, Seek, SeekFrom, Write},
     };
@@ -1537,6 +1550,81 @@ mod tests {
         assert_eq!(
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
+        );
+    }
+
+    #[test]
+    fn reopens_index_entry_presence_for_null_and_missing_fields() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("presence-persist.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "missing" });
+            insert_record(
+                &mut collection,
+                2,
+                doc! { "_id": 2, "sku": "null", "flag": bson::Bson::Null },
+            );
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "flag": 1, "sku": 1 }, "name": "flag_1_sku_1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let index = collection
+            .indexes
+            .get("flag_1_sku_1")
+            .expect("compound index");
+        let entries_by_record = index
+            .entries
+            .iter()
+            .map(|entry| (entry.record_id, entry))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            entries_by_record
+                .get(&1)
+                .expect("missing-field entry")
+                .present_fields,
+            vec!["sku".to_string()]
+        );
+        assert_eq!(
+            entries_by_record
+                .get(&2)
+                .expect("null-field entry")
+                .present_fields,
+            vec!["flag".to_string(), "sku".to_string()]
+        );
+        assert_eq!(
+            entries_by_record
+                .get(&1)
+                .expect("missing-field entry")
+                .key
+                .get("flag"),
+            Some(&bson::Bson::Null)
+        );
+        assert_eq!(
+            entries_by_record
+                .get(&2)
+                .expect("null-field entry")
+                .key
+                .get("flag"),
+            Some(&bson::Bson::Null)
         );
     }
 

@@ -81,7 +81,7 @@ file:///absolute/path/to/database.mongodb?db=app
 
 - The URI path is always the filesystem path to the database file.
 - The optional `db` query parameter selects the default database.
-- Drivers must reject incompatible network-style options for `file://`.
+- Drivers must reject incompatible network-style options for `file://`, including auth, TLS, proxying, network compression, non-primary read preference, read concern, write concern, replica-set/load-balanced options, and retryable reads or writes.
 
 ## Supported Features
 
@@ -121,19 +121,19 @@ file:///absolute/path/to/database.mongodb?db=app
 - `distinct`
 - `aggregate`
 - Persistent `_id_` and secondary index durability across broker restarts.
-- Cost-based `find` planning that ranks collection and index scans by actual keys examined, docs examined, sort work, and projection coverage on the current collection state.
-- Planner-backed `find` index scans for single-field and compound-prefix predicates, including point-interval prefixes, sort-aware plans, and reverse scans over compatible indexes.
-- Covered projection plans when the filter, sort, and projected fields can be satisfied from index keys alone.
-- `explain` reports `IXSCAN` vs `COLLSCAN`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, concrete lower/upper index bounds, and keys/docs examined.
+- Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache.
+- Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.
+- Covered projection plans when the filter, sort, and projected fields can be satisfied from index keys alone, including explicit `null` versus missing-field distinctions recovered from persisted index-entry presence metadata.
+- `explain` reports `IXSCAN` vs `COLLSCAN`, `planCacheUsed`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, single-interval bounds or multi-interval arrays, and keys/docs examined.
 
 ### Query semantics currently implemented
 - Equality and comparison matching on dotted field paths.
 - Boolean query composition with `$and` and `$or`.
 - Basic projection.
-- Compound-prefix index selection for equality prefixes, point-interval prefixes, and range bounds.
+- Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.
 - Sort-aware index planning for compatible `find` sorts, including reverse scans over descending key parts.
-- Cost-based index choice when multiple candidate indexes are available.
-- Covered projection execution from index keys for compatible `find` projections.
+- Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available.
+- Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Aggregation stages:
   - `$match`
@@ -201,11 +201,11 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, and reopened compound descending index order checks.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, reopened compound descending index order checks, and persisted index-entry presence metadata for explicit `null` versus missing fields.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify compound-prefix, point-prefix, range, cost-based, and covered-projection `find` plans return the expected `IXSCAN` metadata and work counters.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` metadata and work counters.
 
 ## CLI
 
@@ -345,4 +345,4 @@ If the goal is to make `mqlite` feel closer to `sqlite3` without losing the Mong
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, cost-based compound-prefix and covered-projection `find` planning, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, stats-backed and plan-cached compound `find` planning, covered null-vs-missing index execution, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.

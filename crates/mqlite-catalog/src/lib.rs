@@ -183,6 +183,8 @@ pub struct IndexCatalog {
     pub entries: Vec<IndexEntry>,
     #[serde(skip, default)]
     pub tree: IndexTree,
+    #[serde(skip, default)]
+    pub stats: IndexStats,
 }
 
 impl IndexCatalog {
@@ -193,11 +195,13 @@ impl IndexCatalog {
             unique,
             entries: Vec::new(),
             tree: IndexTree::default(),
+            stats: IndexStats::default(),
         }
     }
 
     pub fn rebuild_tree(&mut self) {
         self.tree = IndexTree::build(&self.entries);
+        self.stats = IndexStats::build(&self.entries, &self.key);
     }
 
     pub fn scan_entries(&self, bounds: &IndexBounds) -> Vec<IndexEntry> {
@@ -209,6 +213,70 @@ impl IndexCatalog {
             .into_iter()
             .map(|entry| entry.record_id)
             .collect()
+    }
+
+    pub fn sort_entries(&self, entries: &mut [IndexEntry]) {
+        entries.sort_by(|left, right| compare_index_entries(left, right, &self.key));
+    }
+
+    pub fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        let start = bounds.lower.as_ref().map_or(0, |bound| {
+            lower_bound_index(&self.entries, bound, &self.key)
+        });
+        let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
+            upper_bound_index(&self.entries, bound, &self.key)
+        });
+        end.saturating_sub(start)
+    }
+
+    pub fn covers_paths(&self, paths: &BTreeSet<String>) -> bool {
+        paths.iter().all(|path| self.key.contains_key(path))
+    }
+
+    pub fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize> {
+        self.stats
+            .value_frequencies
+            .get(field)
+            .and_then(|frequencies| {
+                frequencies
+                    .iter()
+                    .find(|frequency| compare_bson(&frequency.value, value).is_eq())
+                    .map(|frequency| frequency.count)
+            })
+    }
+
+    pub fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize> {
+        values.iter().try_fold(0_usize, |total, value| {
+            self.estimate_value_count(field, value)
+                .map(|count| total + count)
+        })
+    }
+
+    pub fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        self.stats.value_frequencies.get(field).map(|frequencies| {
+            frequencies
+                .iter()
+                .filter(|frequency| {
+                    lower.is_none_or(|(value, inclusive)| {
+                        let ordering = compare_bson(&frequency.value, value);
+                        ordering.is_gt() || (inclusive && ordering.is_eq())
+                    }) && upper.is_none_or(|(value, inclusive)| {
+                        let ordering = compare_bson(&frequency.value, value);
+                        ordering.is_lt() || (inclusive && ordering.is_eq())
+                    })
+                })
+                .map(|frequency| frequency.count)
+                .sum()
+        })
+    }
+
+    pub fn present_count(&self, field: &str) -> Option<usize> {
+        self.stats.present_fields.get(field).copied()
     }
 }
 
@@ -257,6 +325,66 @@ impl IndexTree {
 pub struct IndexEntry {
     pub record_id: u64,
     pub key: Document,
+    #[serde(default)]
+    pub present_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexStats {
+    pub entry_count: usize,
+    pub present_fields: BTreeMap<String, usize>,
+    pub value_frequencies: BTreeMap<String, Vec<ValueFrequency>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueFrequency {
+    pub value: Bson,
+    pub count: usize,
+}
+
+impl IndexStats {
+    fn build(entries: &[IndexEntry], key_pattern: &Document) -> Self {
+        let mut stats = Self {
+            entry_count: entries.len(),
+            present_fields: key_pattern
+                .keys()
+                .cloned()
+                .map(|field| (field, 0_usize))
+                .collect(),
+            value_frequencies: key_pattern
+                .keys()
+                .cloned()
+                .map(|field| (field, Vec::new()))
+                .collect(),
+        };
+        for entry in entries {
+            for field in &entry.present_fields {
+                if let Some(count) = stats.present_fields.get_mut(field) {
+                    *count += 1;
+                }
+            }
+            for (field, value) in &entry.key {
+                let frequencies = stats
+                    .value_frequencies
+                    .get_mut(field)
+                    .expect("frequency field");
+                match frequencies
+                    .iter_mut()
+                    .find(|frequency| compare_bson(&frequency.value, value).is_eq())
+                {
+                    Some(frequency) => frequency.count += 1,
+                    None => frequencies.push(ValueFrequency {
+                        value: value.clone(),
+                        count: 1,
+                    }),
+                }
+            }
+        }
+        for frequencies in stats.value_frequencies.values_mut() {
+            frequencies.sort_by(|left, right| compare_bson(&left.value, &right.value));
+        }
+        stats
+    }
 }
 
 #[derive(Debug, Error)]
@@ -577,6 +705,18 @@ pub fn validate_collection_indexes(collection: &CollectionCatalog) -> Result<(),
                     index.name, entry.record_id
                 )));
             }
+            let expected_present_fields = index
+                .key
+                .keys()
+                .filter(|field| lookup_path_owned(document, field).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            if expected_present_fields != entry.present_fields {
+                return Err(CatalogError::InvalidIndexState(format!(
+                    "index `{}` presence mismatch for record id {}",
+                    index.name, entry.record_id
+                )));
+            }
 
             if let Some(previous_entry) = previous {
                 let ordering = compare_index_entries(previous_entry, entry, &index.key);
@@ -636,9 +776,16 @@ fn index_entry_for_document(
     document: &Document,
     key_pattern: &Document,
 ) -> IndexEntry {
+    let mut present_fields = Vec::new();
+    for (field, _) in key_pattern {
+        if lookup_path_owned(document, field).is_some() {
+            present_fields.push(field.clone());
+        }
+    }
     IndexEntry {
         record_id,
         key: index_key_for_document(document, key_pattern),
+        present_fields,
     }
 }
 
@@ -757,6 +904,20 @@ fn scan_node(
             }
         }
     }
+}
+
+fn lower_bound_index(entries: &[IndexEntry], bound: &IndexBound, key_pattern: &Document) -> usize {
+    entries.partition_point(|entry| {
+        let ordering = compare_index_keys(&entry.key, &bound.key, key_pattern);
+        ordering.is_lt() || (bound.inclusive && ordering.is_eq())
+    })
+}
+
+fn upper_bound_index(entries: &[IndexEntry], bound: &IndexBound, key_pattern: &Document) -> usize {
+    entries.partition_point(|entry| {
+        let ordering = compare_index_keys(&entry.key, &bound.key, key_pattern);
+        ordering.is_lt() || (!bound.inclusive && ordering.is_eq())
+    })
 }
 
 fn child_start_index(separators: &[Document], bound: &IndexBound, key_pattern: &Document) -> usize {

@@ -495,3 +495,370 @@ fn command_explain_reports_projection_covered() {
     assert_eq!(response["queryPlanner"]["winningPlan"]["sortCovered"], true);
     assert_eq!(response["queryPlanner"]["winningPlan"]["docsExamined"], 0);
 }
+
+#[test]
+fn command_explain_reports_plan_cache_usage_and_invalidation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-plan-cache.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let explain_command = r#"{"explain":{"find":"widgets","filter":{"sku":"alpha"}}}"#;
+
+    let mut first_explain = Command::cargo_bin("mqlite").expect("binary");
+    let first_output = first_explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            explain_command,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_response: Value = serde_json::from_slice(&first_output).expect("json response");
+    assert_eq!(first_response["queryPlanner"]["planCacheUsed"], false);
+
+    let mut second_explain = Command::cargo_bin("mqlite").expect("binary");
+    let second_output = second_explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            explain_command,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_response: Value = serde_json::from_slice(&second_output).expect("json response");
+    assert_eq!(second_response["queryPlanner"]["planCacheUsed"], true);
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut third_explain = Command::cargo_bin("mqlite").expect("binary");
+    let third_output = third_explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            explain_command,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let third_response: Value = serde_json::from_slice(&third_output).expect("json response");
+    assert_eq!(third_response["queryPlanner"]["planCacheUsed"], false);
+}
+
+#[test]
+fn command_explain_reports_multi_interval_or_scan() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-multi-interval.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"category":1,"sku":1},"name":"category_1_sku_1"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [
+            { "_id": 1, "category": "tools", "sku": "a" },
+            { "_id": 2, "category": "tools", "sku": "b" },
+            { "_id": 3, "category": "tools", "sku": "c" },
+            { "_id": 4, "category": "garden", "sku": "a" }
+        ]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let explain_command = json!({
+        "explain": {
+            "find": "widgets",
+            "filter": {
+                "$or": [
+                    { "category": "tools", "sku": "a" },
+                    { "category": "tools", "sku": "b" }
+                ]
+            },
+            "projection": { "_id": 0, "category": 1, "sku": 1 },
+            "sort": { "sku": 1 }
+        }
+    })
+    .to_string();
+
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let explain_output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&explain_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_response: Value = serde_json::from_slice(&explain_output).expect("json response");
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["stage"],
+        "IXSCAN"
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["intervalCount"],
+        2
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["matchedFields"],
+        2
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["projectionCovered"],
+        true
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["docsExamined"],
+        0
+    );
+
+    let find_command = json!({
+        "find": "widgets",
+        "filter": {
+            "$or": [
+                { "category": "tools", "sku": "a" },
+                { "category": "tools", "sku": "b" }
+            ]
+        },
+        "projection": { "_id": 0, "category": 1, "sku": 1 },
+        "sort": { "sku": 1 }
+    })
+    .to_string();
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let find_output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&find_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let find_response: Value = serde_json::from_slice(&find_output).expect("json response");
+    let skus = find_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .iter()
+        .map(|document| document["sku"].as_str().expect("sku"))
+        .collect::<Vec<_>>();
+    assert_eq!(skus, vec!["a", "b"]);
+}
+
+#[test]
+fn command_find_distinguishes_null_from_missing_in_covered_scan() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-null-vs-missing.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"flag":1,"sku":1},"name":"flag_1_sku_1"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [
+            { "_id": 1, "sku": "missing" },
+            { "_id": 2, "sku": "null", "flag": Value::Null },
+            { "_id": 3, "sku": "set", "flag": "yes" }
+        ]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let explain_command = json!({
+        "explain": {
+            "find": "widgets",
+            "filter": { "flag": Value::Null },
+            "projection": { "_id": 0, "flag": 1, "sku": 1 },
+            "sort": { "sku": 1 }
+        }
+    })
+    .to_string();
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let explain_output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&explain_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_response: Value = serde_json::from_slice(&explain_output).expect("json response");
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["projectionCovered"],
+        true
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["docsExamined"],
+        0
+    );
+
+    let find_command = json!({
+        "find": "widgets",
+        "filter": { "flag": Value::Null },
+        "projection": { "_id": 0, "flag": 1, "sku": 1 },
+        "sort": { "sku": 1 }
+    })
+    .to_string();
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let find_output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&find_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let find_response: Value = serde_json::from_slice(&find_output).expect("json response");
+    let first_batch = find_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(first_batch.len(), 1);
+    let document = first_batch[0].as_object().expect("document");
+    assert_eq!(
+        document.get("sku"),
+        Some(&Value::String("null".to_string()))
+    );
+    assert!(document.contains_key("flag"));
+    assert_eq!(document.get("flag"), Some(&Value::Null));
+}

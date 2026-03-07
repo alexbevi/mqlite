@@ -33,6 +33,8 @@ use thiserror::Error;
 const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
 const MAX_MESSAGE_SIZE_BYTES: i32 = 48 * 1024 * 1024;
 const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
+const MAX_MULTI_INTERVALS: usize = 128;
+const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -55,6 +57,7 @@ pub struct Broker {
     paths: BrokerPaths,
     storage: Arc<RwLock<DatabaseFile>>,
     cursors: Arc<Mutex<CursorManager>>,
+    plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
     active_connections: Arc<AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
 }
@@ -145,6 +148,7 @@ impl Broker {
             paths,
             storage: Arc::new(RwLock::new(storage)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
+            plan_cache: Arc::new(Mutex::new(BTreeMap::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
@@ -199,6 +203,42 @@ impl Broker {
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
         Ok(())
+    }
+
+    fn cached_find_plan(
+        &self,
+        namespace: String,
+        sequence: u64,
+        collection: &CollectionCatalog,
+        filter: &Document,
+        sort: Option<&Document>,
+        projection: Option<&Document>,
+    ) -> Result<CachedFindPlan, CommandError> {
+        let cache_key = build_plan_cache_key(&namespace, filter, sort, projection)?;
+        let preferred_index = self
+            .plan_cache
+            .lock()
+            .get(&cache_key)
+            .filter(|cached| cached.sequence == sequence)
+            .and_then(|cached| cached.index_name.clone());
+        let plan = plan_find(
+            collection,
+            filter,
+            sort,
+            projection,
+            preferred_index.as_deref(),
+        )?;
+        self.plan_cache.lock().insert(
+            cache_key,
+            CachedPlan {
+                sequence,
+                index_name: planned_index_name(&plan),
+            },
+        );
+        Ok(CachedFindPlan {
+            plan,
+            cache_used: preferred_index.is_some(),
+        })
     }
 
     async fn handle_connection(&self, mut stream: BoxedStream) -> Result<()> {
@@ -400,19 +440,33 @@ impl Broker {
         let sort = command.get_document("sort").ok().cloned();
         let projection = command.get_document("projection").ok().cloned();
         let storage = self.storage.read();
-        let winning_plan = match storage.catalog().get_collection(&database, collection_name) {
-            Ok(collection) => plan_find(collection, &filter, sort.as_ref(), projection.as_ref())?,
-            Err(CatalogError::NamespaceNotFound(_, _)) => PlannedFind::CollectionScan {
-                documents: Vec::new(),
-                docs_examined: 0,
-                sort_required: sort.is_some(),
+        let sequence = storage.last_applied_sequence();
+        let namespace = format!("{database}.{collection_name}");
+        let cached_plan = match storage.catalog().get_collection(&database, collection_name) {
+            Ok(collection) => self.cached_find_plan(
+                namespace.clone(),
+                sequence,
+                collection,
+                &filter,
+                sort.as_ref(),
+                projection.as_ref(),
+            )?,
+            Err(CatalogError::NamespaceNotFound(_, _)) => CachedFindPlan {
+                plan: PlannedFind::CollectionScan {
+                    documents: Vec::new(),
+                    docs_examined: 0,
+                    sort_required: sort.is_some(),
+                },
+                cache_used: false,
             },
             Err(error) => return Err(error.into()),
         };
+        let winning_plan = cached_plan.plan;
 
         Ok(doc! {
             "queryPlanner": {
-                "namespace": format!("{database}.{collection_name}"),
+                "namespace": namespace,
+                "planCacheUsed": cached_plan.cache_used,
                 "winningPlan": winning_plan.to_document(),
             }
         })
@@ -606,10 +660,20 @@ impl Broker {
         let single_batch = body.get_bool("singleBatch").unwrap_or(false);
 
         let storage = self.storage.read();
+        let sequence = storage.last_applied_sequence();
+        let namespace = format!("{database}.{collection}");
         let execution = match storage.catalog().get_collection(&database, collection) {
-            Ok(collection) => {
-                execute_find(collection, &filter, sort.as_ref(), projection.as_ref())?
-            }
+            Ok(collection) => self
+                .cached_find_plan(
+                    namespace,
+                    sequence,
+                    collection,
+                    &filter,
+                    sort.as_ref(),
+                    projection.as_ref(),
+                )?
+                .plan
+                .into_execution(),
             Err(CatalogError::NamespaceNotFound(_, _)) => FindExecution {
                 documents: Vec::new(),
                 sort_covered: false,
@@ -949,13 +1013,14 @@ impl Broker {
 #[derive(Debug, Clone, Default)]
 struct FieldBounds {
     eq: Option<Bson>,
+    in_values: Option<Vec<Bson>>,
     lower: Option<(Bson, bool)>,
     upper: Option<(Bson, bool)>,
 }
 
 #[derive(Debug, Clone)]
 struct IndexBoundsPlan {
-    bounds: IndexBounds,
+    bounds: Vec<IndexBounds>,
     matched_fields: usize,
 }
 
@@ -975,6 +1040,26 @@ struct FindExecution {
     documents: Vec<Document>,
     sort_covered: bool,
     projection_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanCacheKey {
+    namespace: String,
+    filter_shape: String,
+    sort_shape: String,
+    projection_shape: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPlan {
+    sequence: u64,
+    index_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFindPlan {
+    plan: PlannedFind,
+    cache_used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1010,7 +1095,7 @@ enum PlannedFind {
     },
     IndexScan {
         index_name: String,
-        bounds: Box<IndexBounds>,
+        bounds: Vec<IndexBounds>,
         documents: Vec<Document>,
         matched_fields: usize,
         filter_covered: bool,
@@ -1046,13 +1131,35 @@ impl PlannedFind {
                     "stage": "IXSCAN",
                     "indexName": index_name.clone(),
                 };
-                if let Some(lower) = bounds.lower.as_ref() {
-                    document.insert("lowerBound", Bson::Document(lower.key.clone()));
-                    document.insert("lowerInclusive", lower.inclusive);
-                }
-                if let Some(upper) = bounds.upper.as_ref() {
-                    document.insert("upperBound", Bson::Document(upper.key.clone()));
-                    document.insert("upperInclusive", upper.inclusive);
+                if bounds.len() == 1 {
+                    if let Some(lower) = bounds[0].lower.as_ref() {
+                        document.insert("lowerBound", Bson::Document(lower.key.clone()));
+                        document.insert("lowerInclusive", lower.inclusive);
+                    }
+                    if let Some(upper) = bounds[0].upper.as_ref() {
+                        document.insert("upperBound", Bson::Document(upper.key.clone()));
+                        document.insert("upperInclusive", upper.inclusive);
+                    }
+                } else {
+                    let intervals = bounds
+                        .iter()
+                        .map(|interval| {
+                            let mut interval_document = Document::new();
+                            if let Some(lower) = interval.lower.as_ref() {
+                                interval_document
+                                    .insert("lowerBound", Bson::Document(lower.key.clone()));
+                                interval_document.insert("lowerInclusive", lower.inclusive);
+                            }
+                            if let Some(upper) = interval.upper.as_ref() {
+                                interval_document
+                                    .insert("upperBound", Bson::Document(upper.key.clone()));
+                                interval_document.insert("upperInclusive", upper.inclusive);
+                            }
+                            Bson::Document(interval_document)
+                        })
+                        .collect::<Vec<_>>();
+                    document.insert("intervalCount", bounds.len() as i32);
+                    document.insert("intervals", Bson::Array(intervals));
                 }
                 if let PlannedFind::IndexScan {
                     matched_fields,
@@ -1136,20 +1243,12 @@ impl PlannedFind {
     }
 }
 
-fn execute_find(
-    collection: &CollectionCatalog,
-    filter: &Document,
-    sort: Option<&Document>,
-    projection: Option<&Document>,
-) -> Result<FindExecution, CommandError> {
-    Ok(plan_find(collection, filter, sort, projection)?.into_execution())
-}
-
 fn plan_find(
     collection: &CollectionCatalog,
     filter: &Document,
     sort: Option<&Document>,
     projection: Option<&Document>,
+    preferred_index: Option<&str>,
 ) -> Result<PlannedFind, CommandError> {
     let expression = parse_filter(filter)?;
     let field_bounds = extract_field_bounds(&expression).unwrap_or_default();
@@ -1171,7 +1270,37 @@ fn plan_find(
     };
 
     let mut best_plan = plan_collection_scan(collection, filter, sort)?;
-    for index in collection.indexes.values() {
+    if let Some(index_name) = preferred_index {
+        if let Some(index) = collection.indexes.get(index_name) {
+            if let Some(candidate) = evaluate_index_plan(&context, index)? {
+                if candidate.cost() < best_plan.cost() {
+                    best_plan = candidate;
+                }
+            }
+        }
+        return Ok(best_plan);
+    }
+
+    let mut estimated_candidates = collection
+        .indexes
+        .values()
+        .filter_map(|index| {
+            estimate_index_candidate(&context, index).map(|cost| (cost, index.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    estimated_candidates.sort_by(|(left_cost, left_name), (right_cost, right_name)| {
+        left_cost
+            .cmp(right_cost)
+            .then_with(|| left_name.cmp(right_name))
+    });
+
+    for (_, index_name) in estimated_candidates
+        .into_iter()
+        .take(MAX_ESTIMATED_INDEX_CANDIDATES)
+    {
+        let Some(index) = collection.indexes.get(&index_name) else {
+            continue;
+        };
         if let Some(candidate) = evaluate_index_plan(&context, index)? {
             if candidate.cost() < best_plan.cost() {
                 best_plan = candidate;
@@ -1211,21 +1340,8 @@ fn evaluate_index_plan(
 ) -> Result<Option<PlannedFind>, CommandError> {
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
-    let index_fields = index.key.keys().cloned().collect::<BTreeSet<_>>();
-    let filter_supported = !context.filter.is_empty()
-        && context
-            .filter_paths
-            .iter()
-            .all(|path| index_fields.contains(path));
-    let projection_supported = context
-        .projection_requirements
-        .filter(|requirements| {
-            requirements
-                .dependencies
-                .iter()
-                .all(|path| index_fields.contains(path))
-        })
-        .filter(|_| context.sort.is_none() || sort_plan.is_some());
+    let filter_supported = !context.filter.is_empty() && index.covers_paths(context.filter_paths);
+    let projection_supported = projection_supported(index, context, sort_plan);
 
     if filter_plan.is_none()
         && sort_plan.is_none()
@@ -1238,23 +1354,16 @@ fn evaluate_index_plan(
     let bounds = filter_plan
         .as_ref()
         .map(|plan| plan.bounds.clone())
-        .unwrap_or(IndexBounds {
-            lower: None,
-            upper: None,
-        });
-    let mut entries = index.scan_entries(&bounds);
+        .unwrap_or_else(|| vec![full_range_bounds()]);
     let scan_direction = sort_plan
         .map(|plan| plan.direction)
         .unwrap_or(ScanDirection::Forward);
-    if scan_direction == ScanDirection::Backward {
-        entries.reverse();
-    }
+    let (entries, keys_examined) = scan_index_intervals(index, &bounds, scan_direction);
 
     let matched_fields = filter_plan
         .as_ref()
         .map(|plan| plan.matched_fields)
         .unwrap_or(0);
-    let keys_examined = entries.len();
     let mut docs_examined = 0_usize;
     let mut documents = Vec::new();
     let mut filter_covered = filter_supported;
@@ -1262,11 +1371,10 @@ fn evaluate_index_plan(
 
     for entry in entries {
         let index_document = materialize_index_document(&entry)?;
-        let index_can_filter = filter_supported && entry_covers_paths(&entry, context.filter_paths);
         let mut fetched = None;
         let matches = if context.filter.is_empty() {
             true
-        } else if index_can_filter {
+        } else if filter_supported {
             document_matches(&index_document, context.filter)?
         } else {
             filter_covered = false;
@@ -1280,8 +1388,7 @@ fn evaluate_index_plan(
             continue;
         }
 
-        let can_project_from_index = projection_supported
-            .is_some_and(|requirements| entry_covers_paths(&entry, &requirements.dependencies));
+        let can_project_from_index = projection_supported.is_some();
         if projection_supported.is_some() && !can_project_from_index {
             projection_covered = false;
         }
@@ -1302,7 +1409,7 @@ fn evaluate_index_plan(
 
     Ok(Some(PlannedFind::IndexScan {
         index_name: index.name.clone(),
-        bounds: Box::new(bounds),
+        bounds,
         documents,
         matched_fields,
         filter_covered,
@@ -1314,6 +1421,150 @@ fn evaluate_index_plan(
         keys_examined,
         docs_examined,
     }))
+}
+
+fn estimate_index_candidate(
+    context: &FindPlanContext<'_>,
+    index: &IndexCatalog,
+) -> Option<PlanCost> {
+    let filter_plan = build_index_bounds(index, context.field_bounds);
+    let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
+    let filter_supported = !context.filter.is_empty() && index.covers_paths(context.filter_paths);
+    let projection_supported = projection_supported(index, context, sort_plan);
+
+    if filter_plan.is_none()
+        && sort_plan.is_none()
+        && !filter_supported
+        && projection_supported.is_none()
+    {
+        return None;
+    }
+
+    let bounds = filter_plan
+        .as_ref()
+        .map(|plan| plan.bounds.as_slice())
+        .unwrap_or(&[]);
+    let estimated_keys_examined = if bounds.is_empty() {
+        index.stats.entry_count
+    } else {
+        bounds
+            .iter()
+            .map(|interval| index.estimate_bounds_count(interval))
+            .sum::<usize>()
+    };
+    let estimated_matches = estimate_filter_matches(
+        index,
+        context.field_bounds,
+        context.filter_paths,
+        filter_supported,
+        estimated_keys_examined,
+    );
+    let estimated_docs_examined = if !context.filter.is_empty() && !filter_supported {
+        estimated_keys_examined
+    } else if projection_supported.is_some() {
+        0
+    } else if context.filter.is_empty() || filter_supported {
+        estimated_matches
+    } else {
+        estimated_keys_examined
+    };
+
+    Some(PlanCost {
+        docs_examined: estimated_docs_examined,
+        requires_sort: context.sort.is_some() && sort_plan.is_none(),
+        keys_examined: estimated_keys_examined,
+        projection_not_covered: context.projection.is_some() && projection_supported.is_none(),
+        collection_scan: false,
+    })
+}
+
+fn estimate_filter_matches(
+    index: &IndexCatalog,
+    field_bounds: &BTreeMap<String, FieldBounds>,
+    filter_paths: &BTreeSet<String>,
+    filter_supported: bool,
+    base_count: usize,
+) -> usize {
+    if !filter_supported || filter_paths.is_empty() {
+        return base_count;
+    }
+
+    let mut estimates = vec![base_count.min(index.stats.entry_count)];
+    for path in filter_paths {
+        let Some(bounds) = field_bounds.get(path) else {
+            continue;
+        };
+        let estimate = if let Some(value) = bounds.eq.as_ref() {
+            index.estimate_value_count(path, value)
+        } else if let Some(values) = bounds.in_values.as_ref() {
+            index.estimate_values_count(path, values)
+        } else if bounds.lower.is_some() || bounds.upper.is_some() {
+            index.estimate_range_count(
+                path,
+                bounds
+                    .lower
+                    .as_ref()
+                    .map(|(value, inclusive)| (value, *inclusive)),
+                bounds
+                    .upper
+                    .as_ref()
+                    .map(|(value, inclusive)| (value, *inclusive)),
+            )
+        } else {
+            index.present_count(path)
+        };
+        if let Some(estimate) = estimate {
+            estimates.push(estimate);
+        }
+    }
+
+    estimates.into_iter().min().unwrap_or(base_count)
+}
+
+fn projection_supported<'a>(
+    index: &IndexCatalog,
+    context: &FindPlanContext<'a>,
+    sort_plan: Option<SortPlan>,
+) -> Option<&'a ProjectionRequirements> {
+    context
+        .projection_requirements
+        .filter(|requirements| index.covers_paths(&requirements.dependencies))
+        .filter(|_| context.sort.is_none() || sort_plan.is_some())
+}
+
+fn full_range_bounds() -> IndexBounds {
+    IndexBounds {
+        lower: None,
+        upper: None,
+    }
+}
+
+fn scan_index_intervals(
+    index: &IndexCatalog,
+    bounds: &[IndexBounds],
+    scan_direction: ScanDirection,
+) -> (Vec<IndexEntry>, usize) {
+    let intervals = if bounds.is_empty() {
+        vec![full_range_bounds()]
+    } else {
+        bounds.to_vec()
+    };
+    let mut keys_examined = 0_usize;
+    let mut entry_by_record_id = BTreeMap::<u64, IndexEntry>::new();
+    for interval in intervals {
+        let entries = index.scan_entries(&interval);
+        keys_examined += entries.len();
+        for entry in entries {
+            entry_by_record_id.entry(entry.record_id).or_insert(entry);
+        }
+    }
+
+    let mut entries = entry_by_record_id.into_values().collect::<Vec<_>>();
+    index.sort_entries(&mut entries);
+    if scan_direction == ScanDirection::Backward {
+        entries.reverse();
+    }
+    (entries, keys_examined)
 }
 
 fn extract_field_bounds(expression: &MatchExpr) -> Option<BTreeMap<String, FieldBounds>> {
@@ -1335,6 +1586,13 @@ fn collect_field_bounds(
         }
         MatchExpr::Eq { path, value } => {
             field_bounds.entry(path.clone()).or_default().eq = Some(value.clone());
+            Some(())
+        }
+        MatchExpr::In { path, values } => {
+            merge_in_values(
+                field_bounds.entry(path.clone()).or_default(),
+                values.clone(),
+            );
             Some(())
         }
         MatchExpr::Gt { path, value } => {
@@ -1369,10 +1627,117 @@ fn collect_field_bounds(
             );
             Some(())
         }
-        MatchExpr::Ne { .. }
-        | MatchExpr::In { .. }
-        | MatchExpr::Exists { .. }
-        | MatchExpr::Or(_) => None,
+        MatchExpr::Or(items) => collect_or_field_bounds(items, field_bounds),
+        MatchExpr::Ne { .. } | MatchExpr::Exists { .. } => None,
+    }
+}
+
+fn collect_or_field_bounds(
+    items: &[MatchExpr],
+    field_bounds: &mut BTreeMap<String, FieldBounds>,
+) -> Option<()> {
+    let branches = items.iter().map(point_map).collect::<Option<Vec<_>>>()?;
+    let first_branch = branches.first()?;
+    let branch_fields = first_branch.keys().cloned().collect::<Vec<_>>();
+    if branch_fields.is_empty()
+        || branches
+            .iter()
+            .any(|branch| branch.keys().cloned().collect::<Vec<_>>() != branch_fields)
+    {
+        return None;
+    }
+
+    let varying_fields = branch_fields
+        .iter()
+        .filter(|field| {
+            let first_value = first_branch.get(*field).expect("first branch field");
+            branches.iter().skip(1).any(|branch| {
+                let value = branch.get(*field).expect("branch field");
+                !compare_bson(value, first_value).is_eq()
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if varying_fields.len() > 1 {
+        return None;
+    }
+
+    for field in branch_fields {
+        if varying_fields
+            .first()
+            .is_some_and(|varying| varying == &field)
+        {
+            let values = branches
+                .iter()
+                .map(|branch| branch.get(&field).expect("branch field").clone())
+                .collect::<Vec<_>>();
+            merge_in_values(field_bounds.entry(field).or_default(), values);
+        } else {
+            field_bounds.entry(field.clone()).or_default().eq = Some(
+                first_branch
+                    .get(&field)
+                    .expect("first branch field")
+                    .clone(),
+            );
+        }
+    }
+    Some(())
+}
+
+fn point_map(expression: &MatchExpr) -> Option<BTreeMap<String, Bson>> {
+    match expression {
+        MatchExpr::Eq { path, value } => Some(BTreeMap::from([(path.clone(), value.clone())])),
+        MatchExpr::And(items) => {
+            let mut points = BTreeMap::new();
+            for item in items {
+                for (path, value) in point_map(item)? {
+                    if let Some(existing) = points.insert(path.clone(), value.clone()) {
+                        if !compare_bson(&existing, &value).is_eq() {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(points)
+        }
+        MatchExpr::Gt { path, value: _ }
+        | MatchExpr::Gte { path, value: _ }
+        | MatchExpr::Lt { path, value: _ }
+        | MatchExpr::Lte { path, value: _ } => {
+            let mut bounds = BTreeMap::new();
+            collect_field_bounds(expression, &mut bounds)?;
+            if bounds.len() != 1 {
+                return None;
+            }
+            point_value(bounds.get(path)?).map(|point| BTreeMap::from([(path.clone(), point)]))
+        }
+        _ => None,
+    }
+}
+
+fn merge_in_values(bounds: &mut FieldBounds, mut values: Vec<Bson>) {
+    values.sort_by(compare_bson);
+    values.dedup_by(|left, right| compare_bson(left, right).is_eq());
+    match (&bounds.eq, &bounds.in_values) {
+        (Some(eq), _) => {
+            if values.iter().any(|value| compare_bson(value, eq).is_eq()) {
+                bounds.eq = Some(eq.clone());
+            }
+        }
+        (None, Some(existing)) => {
+            bounds.in_values = Some(
+                existing
+                    .iter()
+                    .filter(|candidate| {
+                        values
+                            .iter()
+                            .any(|value| compare_bson(candidate, value).is_eq())
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+        (None, None) => bounds.in_values = Some(values),
     }
 }
 
@@ -1491,19 +1856,11 @@ fn collect_expression_dependencies(expression: &Bson, dependencies: &mut BTreeSe
     }
 }
 
-fn entry_covers_paths(entry: &IndexEntry, paths: &BTreeSet<String>) -> bool {
-    paths.iter().all(|path| {
-        entry
-            .key
-            .get(path)
-            .is_some_and(|value| !matches!(value, Bson::Null))
-    })
-}
-
 fn materialize_index_document(entry: &IndexEntry) -> Result<Document, CommandError> {
     let mut document = Document::new();
+    let present_fields = entry.present_fields.iter().collect::<BTreeSet<_>>();
     for (field, value) in &entry.key {
-        if matches!(value, Bson::Null) {
+        if !present_fields.contains(&field) {
             continue;
         }
         set_path(&mut document, field, value.clone()).map_err(|_| {
@@ -1523,6 +1880,76 @@ fn fetch_record_document(
         .ok_or_else(|| CommandError::new(8, "UnknownError", "missing record for index entry"))
 }
 
+fn build_plan_cache_key(
+    namespace: &str,
+    filter: &Document,
+    sort: Option<&Document>,
+    projection: Option<&Document>,
+) -> Result<PlanCacheKey, CommandError> {
+    Ok(PlanCacheKey {
+        namespace: namespace.to_string(),
+        filter_shape: filter_shape(&parse_filter(filter)?),
+        sort_shape: sort_shape(sort),
+        projection_shape: projection_shape(projection),
+    })
+}
+
+fn planned_index_name(plan: &PlannedFind) -> Option<String> {
+    match plan {
+        PlannedFind::IndexScan { index_name, .. } => Some(index_name.clone()),
+        PlannedFind::CollectionScan { .. } => None,
+    }
+}
+
+fn filter_shape(expression: &MatchExpr) -> String {
+    match expression {
+        MatchExpr::And(items) => format!(
+            "and({})",
+            items.iter().map(filter_shape).collect::<Vec<_>>().join(",")
+        ),
+        MatchExpr::Or(items) => format!(
+            "or({})",
+            items.iter().map(filter_shape).collect::<Vec<_>>().join(",")
+        ),
+        MatchExpr::Eq { path, .. } => format!("{path}:eq"),
+        MatchExpr::Ne { path, .. } => format!("{path}:ne"),
+        MatchExpr::Gt { path, .. } => format!("{path}:gt"),
+        MatchExpr::Gte { path, .. } => format!("{path}:gte"),
+        MatchExpr::Lt { path, .. } => format!("{path}:lt"),
+        MatchExpr::Lte { path, .. } => format!("{path}:lte"),
+        MatchExpr::In { path, values } => format!("{path}:in{}", values.len()),
+        MatchExpr::Exists { path, exists } => format!("{path}:exists{exists}"),
+    }
+}
+
+fn sort_shape(sort: Option<&Document>) -> String {
+    sort.map_or_else(
+        || "-".to_string(),
+        |sort| {
+            sort.iter()
+                .map(|(field, direction)| format!("{field}:{}", direction.as_i64().unwrap_or(1)))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    )
+}
+
+fn projection_shape(projection: Option<&Document>) -> String {
+    projection.map_or_else(
+        || "-".to_string(),
+        |projection| {
+            projection
+                .iter()
+                .map(|(field, value)| match projection_flag(value) {
+                    Some(flag) => format!("{field}:{}", i32::from(flag)),
+                    None => format!("{field}:expr"),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    )
+}
+
 fn build_index_bounds(
     index: &IndexCatalog,
     field_bounds: &BTreeMap<String, FieldBounds>,
@@ -1532,67 +1959,132 @@ fn build_index_bounds(
         .iter()
         .map(|(field, direction)| (field.clone(), direction_sign(direction).unwrap_or(1)))
         .collect::<Vec<_>>();
+    let mut bounds = Vec::new();
     let mut equality_prefix = Vec::<(String, Bson)>::new();
+    let matched_fields = collect_index_bounds(
+        &key_fields,
+        field_bounds,
+        0,
+        &mut equality_prefix,
+        &mut bounds,
+    )?;
+    (!bounds.is_empty()).then_some(IndexBoundsPlan {
+        bounds,
+        matched_fields,
+    })
+}
 
-    for (field, direction) in &key_fields {
-        let Some(bounds) = field_bounds.get(field) else {
-            break;
-        };
+fn collect_index_bounds(
+    key_fields: &[(String, i32)],
+    field_bounds: &BTreeMap<String, FieldBounds>,
+    position: usize,
+    equality_prefix: &mut Vec<(String, Bson)>,
+    intervals: &mut Vec<IndexBounds>,
+) -> Option<usize> {
+    if intervals.len() > MAX_MULTI_INTERVALS {
+        return None;
+    }
 
-        if let Some(value) = point_value(bounds) {
-            equality_prefix.push((field.clone(), value));
-            continue;
+    let Some((field, direction)) = key_fields.get(position) else {
+        if equality_prefix.is_empty() {
+            return None;
         }
+        push_prefix_interval(key_fields, equality_prefix, intervals);
+        return Some(equality_prefix.len());
+    };
 
-        if bounds.lower.is_some() || bounds.upper.is_some() {
-            let (lower_value, lower_inclusive) = index_order_lower_bound(*direction, bounds);
-            let (upper_value, upper_inclusive) = index_order_upper_bound(*direction, bounds);
-            let lower = Some(IndexBound {
+    let Some(bounds) = field_bounds.get(field) else {
+        if equality_prefix.is_empty() {
+            return None;
+        }
+        push_prefix_interval(key_fields, equality_prefix, intervals);
+        return Some(equality_prefix.len());
+    };
+
+    if let Some(value) = point_value(bounds) {
+        equality_prefix.push((field.clone(), value));
+        let matched_fields = collect_index_bounds(
+            key_fields,
+            field_bounds,
+            position + 1,
+            equality_prefix,
+            intervals,
+        );
+        equality_prefix.pop();
+        return matched_fields;
+    }
+
+    if let Some(values) = point_values(bounds).filter(|values| values.len() > 1) {
+        let mut matched_fields = equality_prefix.len() + 1;
+        for value in values {
+            equality_prefix.push((field.clone(), value));
+            let branch_matched = collect_index_bounds(
+                key_fields,
+                field_bounds,
+                position + 1,
+                equality_prefix,
+                intervals,
+            )?;
+            matched_fields = matched_fields.max(branch_matched);
+            equality_prefix.pop();
+            if intervals.len() > MAX_MULTI_INTERVALS {
+                return None;
+            }
+        }
+        return Some(matched_fields);
+    }
+
+    if bounds.lower.is_some() || bounds.upper.is_some() {
+        let (lower_value, lower_inclusive) = index_order_lower_bound(*direction, bounds);
+        let (upper_value, upper_inclusive) = index_order_upper_bound(*direction, bounds);
+        intervals.push(IndexBounds {
+            lower: Some(IndexBound {
                 key: build_compound_bound_key(
-                    &key_fields,
-                    &equality_prefix,
+                    key_fields,
+                    equality_prefix,
                     field,
                     lower_value,
                     true,
                 ),
                 inclusive: lower_inclusive,
-            });
-            let upper = Some(IndexBound {
+            }),
+            upper: Some(IndexBound {
                 key: build_compound_bound_key(
-                    &key_fields,
-                    &equality_prefix,
+                    key_fields,
+                    equality_prefix,
                     field,
                     upper_value,
                     false,
                 ),
                 inclusive: upper_inclusive,
-            });
-            return Some(IndexBoundsPlan {
-                bounds: IndexBounds { lower, upper },
-                matched_fields: equality_prefix.len() + 1,
-            });
-        }
-
-        break;
+            }),
+        });
+        return Some(equality_prefix.len() + 1);
     }
 
     if equality_prefix.is_empty() {
-        return None;
+        None
+    } else {
+        push_prefix_interval(key_fields, equality_prefix, intervals);
+        Some(equality_prefix.len())
     }
+}
 
-    Some(IndexBoundsPlan {
-        bounds: IndexBounds {
-            lower: Some(IndexBound {
-                key: build_prefix_bound_key(&key_fields, &equality_prefix, true),
-                inclusive: true,
-            }),
-            upper: Some(IndexBound {
-                key: build_prefix_bound_key(&key_fields, &equality_prefix, false),
-                inclusive: true,
-            }),
-        },
-        matched_fields: equality_prefix.len(),
-    })
+fn push_prefix_interval(
+    key_fields: &[(String, i32)],
+    equality_prefix: &[(String, Bson)],
+    intervals: &mut Vec<IndexBounds>,
+) {
+    intervals.push(IndexBounds {
+        lower: Some(IndexBound {
+            key: build_prefix_bound_key(key_fields, equality_prefix, true),
+            inclusive: true,
+        }),
+        upper: Some(IndexBound {
+            key: build_prefix_bound_key(key_fields, equality_prefix, false),
+            inclusive: true,
+        }),
+    });
 }
 
 fn analyze_sort(
@@ -1732,6 +2224,9 @@ fn point_value(bounds: &FieldBounds) -> Option<Bson> {
     if let Some(value) = bounds.eq.as_ref() {
         return Some(value.clone());
     }
+    if let Some(values) = bounds.in_values.as_ref().filter(|values| values.len() == 1) {
+        return values.first().cloned();
+    }
 
     match (&bounds.lower, &bounds.upper) {
         (Some((lower, true)), Some((upper, true))) if compare_bson(lower, upper).is_eq() => {
@@ -1739,6 +2234,13 @@ fn point_value(bounds: &FieldBounds) -> Option<Bson> {
         }
         _ => None,
     }
+}
+
+fn point_values(bounds: &FieldBounds) -> Option<Vec<Bson>> {
+    bounds
+        .in_values
+        .clone()
+        .or_else(|| point_value(bounds).map(|value| vec![value]))
 }
 
 fn direction_sign(value: &Bson) -> Option<i32> {
@@ -2606,6 +3108,327 @@ mod tests {
                 .get_bool("upperInclusive")
                 .expect("upper inclusive")
         );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_reports_plan_cache_usage_and_invalidates_after_write() {
+        let (serve_task, _temp_dir, manifest) = start_broker("plan-cache.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let first_explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_planner = first_explain
+            .get_document("queryPlanner")
+            .expect("query planner");
+        assert!(
+            !first_planner
+                .get_bool("planCacheUsed")
+                .expect("plan cache used")
+        );
+
+        let second_explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let second_planner = second_explain
+            .get_document("queryPlanner")
+            .expect("query planner");
+        assert!(
+            second_planner
+                .get_bool("planCacheUsed")
+                .expect("plan cache used")
+        );
+        assert_eq!(
+            second_planner
+                .get_document("winningPlan")
+                .expect("winning plan")
+                .get_str("indexName")
+                .expect("index name"),
+            "sku_1"
+        );
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1, "sku": "alpha" }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let third_explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let third_planner = third_explain
+            .get_document("queryPlanner")
+            .expect("query planner");
+        assert!(
+            !third_planner
+                .get_bool("planCacheUsed")
+                .expect("plan cache used")
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_uses_multi_interval_or_scan_with_compound_suffix_bounds() {
+        let (serve_task, _temp_dir, manifest) = start_broker("multi-interval.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "category": 1, "sku": 1 }, "name": "category_1_sku_1" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "category": "tools", "sku": "a" },
+                    { "_id": 2, "category": "tools", "sku": "b" },
+                    { "_id": 3, "category": "tools", "sku": "c" },
+                    { "_id": 4, "category": "garden", "sku": "a" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": {
+                        "$or": [
+                            { "category": "tools", "sku": "a" },
+                            { "category": "tools", "sku": "b" }
+                        ]
+                    },
+                    "projection": { "_id": 0, "category": 1, "sku": 1 },
+                    "sort": { "sku": 1 }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert_eq!(
+            winning_plan.get_str("indexName").expect("index"),
+            "category_1_sku_1"
+        );
+        assert_eq!(
+            winning_plan
+                .get_i32("intervalCount")
+                .expect("interval count"),
+            2
+        );
+        assert_eq!(winning_plan.get_i32("matchedFields").expect("matched"), 2);
+        assert!(winning_plan.get_bool("sortCovered").expect("sort covered"));
+        assert!(
+            winning_plan
+                .get_bool("projectionCovered")
+                .expect("projection covered")
+        );
+        assert_eq!(winning_plan.get_i32("docsExamined").expect("docs"), 0);
+
+        let find = send_command(
+            &mut stream,
+            doc! {
+                "find": "widgets",
+                "filter": {
+                    "$or": [
+                        { "category": "tools", "sku": "a" },
+                        { "category": "tools", "sku": "b" }
+                    ]
+                },
+                "projection": { "_id": 0, "category": 1, "sku": 1 },
+                "sort": { "sku": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("first batch");
+        assert_eq!(
+            first_batch
+                .iter()
+                .map(|value| {
+                    value
+                        .as_document()
+                        .expect("document")
+                        .get_str("sku")
+                        .expect("sku")
+                })
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_uses_covered_index_scan_for_null_and_missing_distinction() {
+        let (serve_task, _temp_dir, manifest) = start_broker("null-vs-missing.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "flag": 1, "sku": 1 }, "name": "flag_1_sku_1" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "missing" },
+                    { "_id": 2, "sku": "null", "flag": Bson::Null },
+                    { "_id": 3, "sku": "set", "flag": "yes" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "flag": Bson::Null },
+                    "projection": { "_id": 0, "flag": 1, "sku": 1 },
+                    "sort": { "sku": 1 }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert!(
+            winning_plan
+                .get_bool("filterCovered")
+                .expect("filter covered")
+        );
+        assert!(
+            winning_plan
+                .get_bool("projectionCovered")
+                .expect("projection covered")
+        );
+        assert_eq!(winning_plan.get_i32("docsExamined").expect("docs"), 0);
+
+        let find = send_command(
+            &mut stream,
+            doc! {
+                "find": "widgets",
+                "filter": { "flag": Bson::Null },
+                "projection": { "_id": 0, "flag": 1, "sku": 1 },
+                "sort": { "sku": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("first batch");
+        assert_eq!(first_batch.len(), 1);
+        let document = first_batch[0].as_document().expect("document");
+        assert_eq!(document.get_str("sku").expect("sku"), "null");
+        assert_eq!(document.get("flag"), Some(&Bson::Null));
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

@@ -23,17 +23,21 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
   - auth options
   - TLS options
   - network compression
+  - proxy options
   - `replicaSet`
   - `loadBalanced`
   - `readConcern`
   - `writeConcern`
   - read preference other than primary/direct single
+  - `retryReads`
+  - `retryWrites`
   - session and transaction enabling knobs when exposed directly
 - Preserve local client-side options such as:
   - `appName`
   - pool sizing
   - timeout values
   - monitoring toggles
+  - Node-only broker spawn controls such as `mqliteSpawnPath`, `mqliteSpawnTimeoutMS`, and `mqliteIdleShutdownSecs`
 
 ### Broker lifecycle
 - Compute the manifest path adjacent to the target `.mongodb` file.
@@ -92,6 +96,6 @@ Any driver integration should include:
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
-- `explain` smoke tests so compound-prefix, point-prefix, range, cost-based, and covered-projection `IXSCAN` selection can be validated over the file-backed broker, including `keysExamined` and `docsExamined`.
+- `explain` smoke tests so plan-cache usage, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.
