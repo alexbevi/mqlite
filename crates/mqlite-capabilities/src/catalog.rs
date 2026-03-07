@@ -291,7 +291,7 @@ pub fn build_gap_analysis(upstream: &UpstreamCatalog) -> GapAnalysis {
         aggregation_expression_operators: build_gap_category(
             &upstream.aggregation_expression_operators,
             &support.aggregation_expression_operators,
-            |_item| false,
+            |item| item.feature_flagged,
             |_item| ValidationMode::Rejection,
         ),
         aggregation_accumulator_operators: build_gap_category(
@@ -973,6 +973,35 @@ mod tests {
                 .is_some_and(|item| item.ignored)
         );
         assert_eq!(gap.aggregation_stages.public_unsupported, 0);
+    }
+
+    #[test]
+    fn ignored_feature_flagged_aggregation_expressions_are_not_counted_as_backlog() {
+        let repo_root = repo_root();
+        let upstream = load_upstream_snapshot(&repo_root).expect("upstream snapshot");
+        let gap = build_gap_analysis(&upstream);
+
+        assert!(
+            gap.aggregation_expression_operators
+                .items
+                .iter()
+                .find(|item| item.name == "$bottom")
+                .is_some_and(|item| item.ignored)
+        );
+        assert!(
+            gap.aggregation_expression_operators
+                .items
+                .iter()
+                .find(|item| item.name == "$createObjectId")
+                .is_some_and(|item| item.ignored)
+        );
+        assert!(
+            gap.aggregation_expression_operators
+                .items
+                .iter()
+                .find(|item| item.name == "$toUUID")
+                .is_some_and(|item| item.ignored)
+        );
     }
 
     #[test]

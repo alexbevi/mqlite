@@ -2799,8 +2799,8 @@
     "total_supported": 12,
     "public_supported": 12,
     "total_unsupported": 172,
-    "public_unsupported": 164,
-    "public_ignored": 0,
+    "public_unsupported": 141,
+    "public_ignored": 23,
     "items": [
       {
         "name": "$_internalFindAllValuesAtPath",
@@ -3320,7 +3320,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3338,7 +3338,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3536,7 +3536,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3554,7 +3554,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3572,7 +3572,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3806,7 +3806,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3842,7 +3842,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3860,7 +3860,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3878,7 +3878,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -3896,7 +3896,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -4112,7 +4112,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -4130,7 +4130,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5102,7 +5102,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5228,7 +5228,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5246,7 +5246,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5264,7 +5264,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5282,7 +5282,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5588,7 +5588,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5678,7 +5678,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5840,7 +5840,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5894,7 +5894,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5930,7 +5930,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },
@@ -5948,7 +5948,7 @@
         ],
         "feature_flagged": true,
         "conditional": false,
-        "ignored": false,
+        "ignored": true,
         "status": "unsupported",
         "validation": "rejection"
       },

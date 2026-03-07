@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 12 | 164 | 0 |
+| Aggregation expression operators | 176 | 12 | 141 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
+Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 
 ### Supported Public
 
@@ -257,8 +257,6 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$bitNot`
 - `$bitOr`
 - `$bitXor`
-- `$bottom` (feature-flagged)
-- `$bottomN` (feature-flagged)
 - `$bsonSize`
 - `$ceil`
 - `$cmp`
@@ -268,9 +266,6 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$convert`
 - `$cos`
 - `$cosh`
-- `$createObjectId` (feature-flagged)
-- `$createUUID` (feature-flagged)
-- `$currentDate` (feature-flagged)
 - `$dateAdd`
 - `$dateDiff`
 - `$dateFromParts`
@@ -283,12 +278,7 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$dayOfWeek`
 - `$dayOfYear`
 - `$degreesToRadians`
-- `$deserializeEJSON` (feature-flagged)
 - `$divide`
-- `$encStrContains` (feature-flagged)
-- `$encStrEndsWith` (feature-flagged)
-- `$encStrNormalizedEq` (feature-flagged)
-- `$encStrStartsWith` (feature-flagged)
 - `$exp`
 - `$expr`
 - `$filter`
@@ -297,8 +287,6 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$floor`
 - `$function`
 - `$getField`
-- `$hash` (feature-flagged)
-- `$hexHash` (feature-flagged)
 - `$hour`
 - `$ifNull`
 - `$indexOfArray`
@@ -345,17 +333,12 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$round`
 - `$rtrim`
 - `$second`
-- `$serializeEJSON` (feature-flagged)
 - `$setDifference`
 - `$setEquals`
 - `$setField`
 - `$setIntersection`
 - `$setIsSubset`
 - `$setUnion`
-- `$sigmoid` (feature-flagged)
-- `$similarityCosine` (feature-flagged)
-- `$similarityDotProduct` (feature-flagged)
-- `$similarityEuclidean` (feature-flagged)
 - `$sin`
 - `$sinh`
 - `$size`
@@ -372,12 +355,10 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$substrBytes`
 - `$substrCP`
 - `$subtract`
-- `$subtype` (feature-flagged)
 - `$sum`
 - `$switch`
 - `$tan`
 - `$tanh`
-- `$toArray` (feature-flagged)
 - `$toBool`
 - `$toDate`
 - `$toDecimal`
@@ -386,13 +367,9 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 - `$toInt`
 - `$toLong`
 - `$toLower`
-- `$toObject` (feature-flagged)
 - `$toObjectId`
 - `$toString`
-- `$toUUID` (feature-flagged)
 - `$toUpper`
-- `$top` (feature-flagged)
-- `$topN` (feature-flagged)
 - `$trim`
 - `$trunc`
 - `$tsIncrement`
@@ -405,7 +382,29 @@ Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 
 ### Ignored Public
 
-- None
+- `$bottom` (feature-flagged, ignored)
+- `$bottomN` (feature-flagged, ignored)
+- `$createObjectId` (feature-flagged, ignored)
+- `$createUUID` (feature-flagged, ignored)
+- `$currentDate` (feature-flagged, ignored)
+- `$deserializeEJSON` (feature-flagged, ignored)
+- `$encStrContains` (feature-flagged, ignored)
+- `$encStrEndsWith` (feature-flagged, ignored)
+- `$encStrNormalizedEq` (feature-flagged, ignored)
+- `$encStrStartsWith` (feature-flagged, ignored)
+- `$hash` (feature-flagged, ignored)
+- `$hexHash` (feature-flagged, ignored)
+- `$serializeEJSON` (feature-flagged, ignored)
+- `$sigmoid` (feature-flagged, ignored)
+- `$similarityCosine` (feature-flagged, ignored)
+- `$similarityDotProduct` (feature-flagged, ignored)
+- `$similarityEuclidean` (feature-flagged, ignored)
+- `$subtype` (feature-flagged, ignored)
+- `$toArray` (feature-flagged, ignored)
+- `$toObject` (feature-flagged, ignored)
+- `$toUUID` (feature-flagged, ignored)
+- `$top` (feature-flagged, ignored)
+- `$topN` (feature-flagged, ignored)
 
 ### Internal Or Server-Only Upstream
 
