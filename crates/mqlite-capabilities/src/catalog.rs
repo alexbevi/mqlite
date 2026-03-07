@@ -1147,6 +1147,10 @@ mod tests {
                 Vec::new(),
                 vec![doc! { "$listSampledQueries": { "namespace": "app.widgets" } }],
             ),
+            "$listSearchIndexes" => (
+                Vec::new(),
+                vec![doc! { "$listSearchIndexes": { "name": "search-index" } }],
+            ),
             "$listSessions" => (
                 Vec::new(),
                 vec![doc! { "$listSessions": { "allUsers": true } }],

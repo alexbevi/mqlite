@@ -85,6 +85,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             }
             "$listLocalSessions" => list_local_sessions_documents(stage_index, stage_spec)?,
             "$listSampledQueries" => list_sampled_queries_documents(stage_index, stage_spec)?,
+            "$listSearchIndexes" => list_search_indexes_documents(stage_index, stage_spec)?,
             "$listSessions" => list_sessions_documents(stage_index, stage_spec)?,
             "$listMqlEntities" => list_mql_entities_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
@@ -1246,6 +1247,18 @@ fn list_sampled_queries_documents(
     Ok(Vec::new())
 }
 
+fn list_search_indexes_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    parse_list_search_indexes_spec(spec)?;
+    Ok(Vec::new())
+}
+
 fn query_settings_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
     if stage_index != 0 {
         return Err(QueryError::InvalidStage);
@@ -1352,6 +1365,34 @@ fn parse_list_sampled_queries_spec(spec: &Bson) -> Result<(), QueryError> {
             }
             _ => return Err(QueryError::InvalidStage),
         }
+    }
+
+    Ok(())
+}
+
+fn parse_list_search_indexes_spec(spec: &Bson) -> Result<(), QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut has_id = false;
+    let mut has_name = false;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "id" => {
+                value.as_str().ok_or(QueryError::InvalidStage)?;
+                has_id = true;
+            }
+            "name" => {
+                value.as_str().ok_or(QueryError::InvalidStage)?;
+                has_name = true;
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    if has_id && has_name {
+        return Err(QueryError::InvalidArgument(
+            "Cannot set both `name` and `id` for $listSearchIndexes.".to_string(),
+        ));
     }
 
     Ok(())

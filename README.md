@@ -192,6 +192,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$listCachedAndActiveUsers`
   - `$listLocalSessions`
   - `$listSampledQueries`
+  - `$listSearchIndexes`
   - `$listSessions`
   - `$listMqlEntities`
   - `$planCacheStats`
@@ -226,6 +227,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `$listCachedAndActiveUsers` as an empty diagnostic source because authentication and user caching are out of scope for `mqlite`.
 - Collectionless `$listLocalSessions` aggregation with the public `allUsers` and `users` filters, returning an empty result because `mqlite` does not implement logical sessions or a local session cache.
 - Collectionless `$listSampledQueries` aggregation on `admin`, accepting the public optional `namespace` filter and returning an empty result because `mqlite` does not implement query sampling.
+- Collection-backed `$listSearchIndexes` aggregation, accepting the public optional `name` or `id` filter and returning an empty result because `mqlite` does not implement a search-index subsystem.
 - `$listSessions` aggregation on `config.system.sessions`, accepting the public `allUsers` and `users` filters and returning an empty result because `mqlite` does not implement persisted logical sessions.
 - Collectionless `$querySettings` aggregation on `admin`, accepting the public `showDebugQueryShape` option and returning an empty result until `mqlite` grows a query-settings store.
 - Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.

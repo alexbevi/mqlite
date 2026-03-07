@@ -2249,6 +2249,48 @@ fn list_sampled_queries_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn list_search_indexes_stage_accepts_public_specs() {
+    for stage in [
+        doc! { "$listSearchIndexes": {} },
+        doc! { "$listSearchIndexes": { "name": "search-index" } },
+        doc! { "$listSearchIndexes": { "id": "index-id" } },
+    ] {
+        let results = run_pipeline_ok(Vec::new(), &[stage]);
+        assert!(results.is_empty());
+    }
+}
+
+#[test]
+fn list_search_indexes_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listSearchIndexes": 1 },
+        doc! { "$listSearchIndexes": { "name": 1 } },
+        doc! { "$listSearchIndexes": { "id": 1 } },
+        doc! { "$listSearchIndexes": { "unknown": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        Vec::new(),
+        &[doc! { "$listSearchIndexes": { "name": "search-index", "id": "index-id" } }],
+    )
+    .expect_err("name and id cannot both be set");
+    assert!(matches!(error, QueryError::InvalidArgument(_)));
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$listSearchIndexes": {} },
+        ],
+    )
+    .expect_err("$listSearchIndexes should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn query_settings_stage_accepts_public_specs() {
     for stage in [
         doc! { "$querySettings": {} },

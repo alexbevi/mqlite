@@ -44,6 +44,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$listCachedAndActiveUsers",
     "$listLocalSessions",
     "$listSampledQueries",
+    "$listSearchIndexes",
     "$listSessions",
     "$listMqlEntities",
     "$planCacheStats",

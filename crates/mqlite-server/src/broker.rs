@@ -1551,6 +1551,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$listSampledQueries");
+        let starts_with_list_search_indexes = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$listSearchIndexes");
         let starts_with_list_sessions = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1608,6 +1612,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$listSampledQueries must be run against the 'admin' database with {aggregate: 1}",
+            ));
+        }
+        if starts_with_list_search_indexes && is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$listSearchIndexes must be run against a collection namespace",
             ));
         }
         if starts_with_list_sessions
