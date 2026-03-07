@@ -157,6 +157,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collection-backed aggregation with a trailing `$out` stage, replacing the target collection and returning an empty cursor.
 - Null-byte database or collection names are rejected with `InvalidNamespace`.
 - TTL index metadata such as `expireAfterSeconds` is preserved in catalog state and returned by `listIndexes`, even though document expiration itself is not implemented.
+- `configureFailPoint: "failCommand"` supports local driver-test compatibility for `mode: "off"`, `mode: "alwaysOn"`, and `mode: { times: N }`, with `failCommands`, `errorCode`, `errorLabels`, `blockConnection`, `blockTimeMS`, and `closeConnection`.
 - Persistent `_id_` and secondary index durability across broker restarts.
 - Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.

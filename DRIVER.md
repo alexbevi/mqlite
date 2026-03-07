@@ -82,6 +82,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
 - Null-byte database or collection names are rejected with `InvalidNamespace`
 - TTL index metadata such as `expireAfterSeconds` is stored and returned by `listIndexes`
+- `configureFailPoint: "failCommand"` supports local driver-test compatibility for `mode: "off"`, `mode: "alwaysOn"`, and `mode: { times: N }`, with `failCommands`, `errorCode`, `errorLabels`, `blockConnection`, `blockTimeMS`, and `closeConnection`
 - Update operations accept aggregation pipeline updates over the matched document stream
   - `dropDatabase` is supported for local test setup and teardown
   - `renameCollection` is supported for local collection management, including `dropTarget`

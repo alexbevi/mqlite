@@ -62,8 +62,33 @@ pub struct Broker {
     storage: Arc<RwLock<DatabaseFile>>,
     cursors: Arc<Mutex<CursorManager>>,
     plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
+    fail_command: Arc<Mutex<Option<FailCommandState>>>,
     active_connections: Arc<AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
+}
+
+#[derive(Clone, Debug)]
+struct FailCommandState {
+    commands: BTreeSet<String>,
+    mode: FailCommandMode,
+    error_code: Option<i32>,
+    error_labels: Vec<String>,
+    block_connection: bool,
+    block_time_ms: Option<u64>,
+    close_connection: bool,
+}
+
+#[derive(Clone, Debug)]
+enum FailCommandMode {
+    AlwaysOn,
+    Times(u64),
+}
+
+#[derive(Debug)]
+enum FailCommandAction {
+    Continue,
+    Respond(Document),
+    CloseConnection,
 }
 
 #[derive(Debug, Error)]
@@ -164,6 +189,7 @@ impl Broker {
             storage: Arc::new(RwLock::new(storage)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
             plan_cache: Arc::new(Mutex::new(plan_cache)),
+            fail_command: Arc::new(Mutex::new(None)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
@@ -297,8 +323,13 @@ impl Broker {
             };
 
             let body = request.materialize_command()?;
-            let response_body = match self.dispatch(&body) {
-                Ok(document) => ok_response(document),
+            let response_body = match self.maybe_apply_fail_command(&body).await {
+                Ok(FailCommandAction::Continue) => match self.dispatch(&body) {
+                    Ok(document) => ok_response(document),
+                    Err(error) => error.to_document(),
+                },
+                Ok(FailCommandAction::Respond(document)) => document,
+                Ok(FailCommandAction::CloseConnection) => return Ok(()),
                 Err(error) => error.to_document(),
             };
             let response = OpMsg::new(
@@ -327,6 +358,7 @@ impl Broker {
                 "maxMessageSizeBytes": MAX_MESSAGE_SIZE_BYTES,
                 "maxWriteBatchSize": MAX_WRITE_BATCH_SIZE,
             }),
+            "configureFailPoint" => self.handle_configure_fail_point(body),
             "getParameter" => Ok(self.handle_get_parameter(body)),
             "killAllSessions" => Ok(Document::new()),
             "listDatabases" => self.handle_list_databases(body),
@@ -354,6 +386,120 @@ impl Broker {
                 format!("command `{other}` is not supported"),
             )),
         }
+    }
+
+    async fn maybe_apply_fail_command(
+        &self,
+        body: &Document,
+    ) -> Result<FailCommandAction, CommandError> {
+        let Some(command_name) = command_name(body) else {
+            return Ok(FailCommandAction::Continue);
+        };
+        if command_name == "configureFailPoint" {
+            return Ok(FailCommandAction::Continue);
+        }
+
+        let state = {
+            let mut configured = self.fail_command.lock();
+            let Some(mut fail_command) = configured.take() else {
+                return Ok(FailCommandAction::Continue);
+            };
+            let command_name = command_name.to_ascii_lowercase();
+            if !fail_command.commands.contains(&command_name) {
+                *configured = Some(fail_command);
+                return Ok(FailCommandAction::Continue);
+            }
+
+            let state = fail_command.clone();
+            match &mut fail_command.mode {
+                FailCommandMode::AlwaysOn => {
+                    *configured = Some(fail_command);
+                }
+                FailCommandMode::Times(remaining) => {
+                    if *remaining > 1 {
+                        *remaining -= 1;
+                        *configured = Some(fail_command);
+                    } else {
+                        *configured = None;
+                    }
+                }
+            }
+            state
+        };
+
+        if state.block_connection {
+            if let Some(block_time_ms) = state.block_time_ms {
+                tokio::time::sleep(Duration::from_millis(block_time_ms)).await;
+            }
+        }
+
+        if state.close_connection {
+            return Ok(FailCommandAction::CloseConnection);
+        }
+
+        if state.error_code.is_none() && state.error_labels.is_empty() {
+            return Ok(FailCommandAction::Continue);
+        }
+
+        let mut response = doc! {
+            "ok": 0.0,
+            "errmsg": format!("failCommand failpoint triggered for `{command_name}`"),
+            "code": state.error_code.unwrap_or(8),
+            "codeName": "FailPointEnabled",
+        };
+        if !state.error_labels.is_empty() {
+            response.insert(
+                "errorLabels",
+                Bson::Array(
+                    state
+                        .error_labels
+                        .into_iter()
+                        .map(Bson::String)
+                        .collect(),
+                ),
+            );
+        }
+        Ok(FailCommandAction::Respond(response))
+    }
+
+    fn handle_configure_fail_point(&self, body: &Document) -> Result<Document, CommandError> {
+        database_name(body)?;
+
+        let fail_point = body.get_str("configureFailPoint").map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint requires a failpoint name",
+            )
+        })?;
+        if fail_point != "failCommand" {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                format!("configureFailPoint `{fail_point}` is not supported"),
+            ));
+        }
+
+        let mode = parse_fail_command_mode(
+            body.get("mode")
+                .ok_or_else(|| CommandError::new(9, "FailedToParse", "mode is required"))?,
+        )?;
+        match mode {
+            ParsedFailCommandMode::Off => {
+                *self.fail_command.lock() = None;
+            }
+            ParsedFailCommandMode::Enabled(mode) => {
+                let data = body.get_document("data").map_err(|_| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "configureFailPoint failCommand requires a data document",
+                    )
+                })?;
+                *self.fail_command.lock() = Some(parse_fail_command_data(data, mode)?);
+            }
+        }
+        Ok(Document::new())
     }
 
     fn handle_hello(&self) -> Document {
@@ -4605,6 +4751,140 @@ fn validate_collection_name(collection: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
+enum ParsedFailCommandMode {
+    Off,
+    Enabled(FailCommandMode),
+}
+
+fn parse_fail_command_mode(value: &Bson) -> Result<ParsedFailCommandMode, CommandError> {
+    match value {
+        Bson::String(mode) if mode == "off" => Ok(ParsedFailCommandMode::Off),
+        Bson::String(mode) if mode == "alwaysOn" => {
+            Ok(ParsedFailCommandMode::Enabled(FailCommandMode::AlwaysOn))
+        }
+        Bson::Document(mode) => {
+            let times = match mode.get("times") {
+                Some(Bson::Int32(value)) => i64::from(*value),
+                Some(Bson::Int64(value)) => *value,
+                _ => {
+                    return Err(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "configureFailPoint mode.times must be an integer",
+                    ));
+                }
+            };
+            if times <= 0 {
+                Ok(ParsedFailCommandMode::Off)
+            } else {
+                Ok(ParsedFailCommandMode::Enabled(FailCommandMode::Times(
+                    times as u64,
+                )))
+            }
+        }
+        _ => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "configureFailPoint mode must be `off`, `alwaysOn`, or { times: N }",
+        )),
+    }
+}
+
+fn parse_fail_command_data(
+    data: &Document,
+    mode: FailCommandMode,
+) -> Result<FailCommandState, CommandError> {
+    let commands = data
+        .get_array("failCommands")
+        .map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint failCommand requires a failCommands array",
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str()
+                .map(|command| command.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "configureFailPoint failCommands entries must be strings",
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let error_code = match data.get("errorCode") {
+        Some(Bson::Int32(code)) => Some(*code),
+        Some(Bson::Int64(code)) => Some((*code).try_into().map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint errorCode must fit in i32",
+            )
+        })?),
+        Some(_) => {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint errorCode must be an integer",
+            ));
+        }
+        None => None,
+    };
+
+    let error_labels = match data.get("errorLabels") {
+        Some(Bson::Array(labels)) => labels
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "configureFailPoint errorLabels entries must be strings",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint errorLabels must be an array",
+            ));
+        }
+        None => Vec::new(),
+    };
+
+    let block_connection = data.get_bool("blockConnection").unwrap_or(false);
+    let block_time_ms = match data.get("blockTimeMS") {
+        Some(Bson::Int32(value)) if *value >= 0 => Some(*value as u64),
+        Some(Bson::Int64(value)) if *value >= 0 => Some(*value as u64),
+        Some(_) => {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                "configureFailPoint blockTimeMS must be a non-negative integer",
+            ));
+        }
+        None => None,
+    };
+    let close_connection = data.get_bool("closeConnection").unwrap_or(false);
+
+    Ok(FailCommandState {
+        commands,
+        mode,
+        error_code,
+        error_labels,
+        block_connection,
+        block_time_ms,
+        close_connection,
+    })
+}
+
 fn body_batch_size(body: &Document, field: &str) -> Option<i64> {
     body.get_document(field)
         .ok()
@@ -6613,6 +6893,115 @@ mod tests {
                 .expect("expireAfterSeconds"),
             1
         );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fail_command_injects_error_labels_and_clears_on_off() {
+        let (serve_task, _temp_dir, manifest) = start_broker("fail-command.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let configure = send_command(
+            &mut stream,
+            doc! {
+                "configureFailPoint": "failCommand",
+                "mode": "alwaysOn",
+                "data": {
+                    "failCommands": ["insert"],
+                    "errorCode": 2,
+                    "errorLabels": ["SystemOverloadedError", "RetryableError"]
+                },
+                "$db": "admin"
+            },
+        )
+        .await;
+        assert_eq!(configure.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1 }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 0.0);
+        assert_eq!(insert.get_i32("code").expect("code"), 2);
+        assert_eq!(
+            insert
+                .get_array("errorLabels")
+                .expect("labels")
+                .iter()
+                .map(|value| value.as_str().expect("label"))
+                .collect::<Vec<_>>(),
+            vec!["SystemOverloadedError", "RetryableError"]
+        );
+
+        let clear = send_command(
+            &mut stream,
+            doc! {
+                "configureFailPoint": "failCommand",
+                "mode": "off",
+                "$db": "admin"
+            },
+        )
+        .await;
+        assert_eq!(clear.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1 }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fail_command_times_mode_only_applies_once() {
+        let (serve_task, _temp_dir, manifest) = start_broker("fail-command-times.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let configure = send_command(
+            &mut stream,
+            doc! {
+                "configureFailPoint": "failCommand",
+                "mode": { "times": 1 },
+                "data": {
+                    "failCommands": ["ping"],
+                    "errorCode": 91
+                },
+                "$db": "admin"
+            },
+        )
+        .await;
+        assert_eq!(configure.get_f64("ok").expect("ok"), 1.0);
+
+        let first = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
+        assert_eq!(first.get_f64("ok").expect("ok"), 0.0);
+        assert_eq!(first.get_i32("code").expect("code"), 91);
+
+        let second = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
+        assert_eq!(second.get_f64("ok").expect("ok"), 1.0);
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
