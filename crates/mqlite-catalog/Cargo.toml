@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 bson.workspace = true
+mqlite-bson = { path = "../mqlite-bson" }
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

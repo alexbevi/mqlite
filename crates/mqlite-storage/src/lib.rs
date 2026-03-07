@@ -9,21 +9,24 @@ use std::{
 use anyhow::Result;
 use blake3::Hasher;
 use fs4::FileExt;
-use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, DatabaseCatalog, IndexCatalog};
+use mqlite_catalog::{
+    Catalog, CatalogError, CollectionCatalog, CollectionRecord, DatabaseCatalog, IndexCatalog,
+    IndexEntry, validate_collection_indexes,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR3";
-pub const FILE_FORMAT_VERSION: u32 = 3;
+pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR4";
+pub const FILE_FORMAT_VERSION: u32 = 4;
 pub const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 4096;
 const SUPERBLOCK_LEN: usize = 512;
 const SUPERBLOCK_COUNT: usize = 2;
 const DATA_START_OFFSET: u64 = (HEADER_LEN + (SUPERBLOCK_LEN * SUPERBLOCK_COUNT)) as u64;
-const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB03";
+const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB04";
 const WAL_FRAME_MAGIC: &[u8; 4] = b"WAL1";
 const WAL_HEADER_LEN: usize = 40;
-const PAGE_MAGIC: &[u8; 8] = b"MQLTPG03";
+const PAGE_MAGIC: &[u8; 8] = b"MQLTPG04";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
 
@@ -59,8 +62,7 @@ pub struct DatabaseFile {
     wal_records_since_checkpoint: usize,
     wal_bytes_since_checkpoint: u64,
     truncated_wal_tail: bool,
-    checkpoint_page_count: usize,
-    checkpoint_record_count: usize,
+    checkpoint_counts: CheckpointCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,7 +74,10 @@ pub struct VerifyReport {
     pub databases: usize,
     pub collections: usize,
     pub record_count: usize,
+    pub index_entry_count: usize,
     pub page_count: usize,
+    pub record_page_count: usize,
+    pub index_page_count: usize,
     pub wal_records_since_checkpoint: usize,
     pub truncated_wal_tail: bool,
 }
@@ -91,8 +96,12 @@ pub struct InspectReport {
     pub wal_offset: u64,
     pub page_size: usize,
     pub checkpoint_page_count: usize,
+    pub checkpoint_record_page_count: usize,
+    pub checkpoint_index_page_count: usize,
     pub checkpoint_record_count: usize,
+    pub checkpoint_index_entry_count: usize,
     pub current_record_count: usize,
+    pub current_index_entry_count: usize,
     pub wal_records_since_checkpoint: usize,
     pub wal_bytes_since_checkpoint: u64,
     pub truncated_wal_tail: bool,
@@ -126,6 +135,8 @@ pub enum StorageError {
     InvalidPage,
     #[error("invalid page reference")]
     InvalidPageReference,
+    #[error("invalid persisted index state")]
+    InvalidIndexState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,8 +172,7 @@ struct LoadedState {
     valid_superblocks: usize,
     wal_recovery: WalRecovery,
     file_size: u64,
-    checkpoint_page_count: usize,
-    checkpoint_record_count: usize,
+    checkpoint_counts: CheckpointCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,9 +196,17 @@ struct SnapshotDatabaseCatalog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotCollectionCatalog {
     options: bson::Document,
-    indexes: BTreeMap<String, IndexCatalog>,
-    pages: Vec<PageRef>,
+    indexes: BTreeMap<String, SnapshotIndexCatalog>,
+    record_pages: Vec<PageRef>,
     record_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotIndexCatalog {
+    key: bson::Document,
+    unique: bool,
+    pages: Vec<PageRef>,
+    entry_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +215,7 @@ struct PageRef {
     offset: u64,
     checksum: [u8; 32],
     page_len: u32,
-    record_count: u16,
+    entry_count: u16,
 }
 
 #[derive(Debug)]
@@ -205,14 +223,17 @@ struct EncodedPage {
     page_id: u64,
     bytes: Vec<u8>,
     checksum: [u8; 32],
-    record_count: u16,
+    entry_count: u16,
 }
 
 #[derive(Debug, Default)]
 struct EncodedSnapshotCatalog {
     catalog: SnapshotCatalog,
     pages: Vec<EncodedPage>,
+    record_page_count: usize,
+    index_page_count: usize,
     record_count: usize,
+    index_entry_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -222,6 +243,15 @@ struct SlottedPageBuilder {
     slot_count: u16,
     free_start: usize,
     free_end: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CheckpointCounts {
+    page_count: usize,
+    record_page_count: usize,
+    index_page_count: usize,
+    record_count: usize,
+    index_entry_count: usize,
 }
 
 impl DatabaseFile {
@@ -254,8 +284,7 @@ impl DatabaseFile {
             wal_records_since_checkpoint: 0,
             wal_bytes_since_checkpoint: 0,
             truncated_wal_tail: false,
-            checkpoint_page_count: 0,
-            checkpoint_record_count: 0,
+            checkpoint_counts: CheckpointCounts::default(),
         };
 
         if database.file.metadata()?.len() == 0 {
@@ -324,9 +353,13 @@ impl DatabaseFile {
             snapshot_len: loaded.active_superblock.snapshot_len,
             wal_offset: loaded.active_superblock.wal_offset,
             page_size: PAGE_SIZE,
-            checkpoint_page_count: loaded.checkpoint_page_count,
-            checkpoint_record_count: loaded.checkpoint_record_count,
+            checkpoint_page_count: loaded.checkpoint_counts.page_count,
+            checkpoint_record_page_count: loaded.checkpoint_counts.record_page_count,
+            checkpoint_index_page_count: loaded.checkpoint_counts.index_page_count,
+            checkpoint_record_count: loaded.checkpoint_counts.record_count,
+            checkpoint_index_entry_count: loaded.checkpoint_counts.index_entry_count,
             current_record_count: record_count(&loaded.state.catalog),
+            current_index_entry_count: index_entry_count(&loaded.state.catalog),
             wal_records_since_checkpoint: loaded.wal_recovery.records,
             wal_bytes_since_checkpoint: loaded.wal_recovery.bytes,
             truncated_wal_tail: loaded.wal_recovery.truncated_tail,
@@ -354,7 +387,10 @@ impl DatabaseFile {
             databases: loaded.state.catalog.databases.len(),
             collections,
             record_count: record_count(&loaded.state.catalog),
-            page_count: loaded.checkpoint_page_count,
+            index_entry_count: index_entry_count(&loaded.state.catalog),
+            page_count: loaded.checkpoint_counts.page_count,
+            record_page_count: loaded.checkpoint_counts.record_page_count,
+            index_page_count: loaded.checkpoint_counts.index_page_count,
             wal_records_since_checkpoint: loaded.wal_recovery.records,
             truncated_wal_tail: loaded.wal_recovery.truncated_tail,
         })
@@ -380,8 +416,7 @@ impl DatabaseFile {
         self.wal_records_since_checkpoint = loaded.wal_recovery.records;
         self.wal_bytes_since_checkpoint = loaded.wal_recovery.bytes;
         self.truncated_wal_tail = loaded.wal_recovery.truncated_tail;
-        self.checkpoint_page_count = loaded.checkpoint_page_count;
-        self.checkpoint_record_count = loaded.checkpoint_record_count;
+        self.checkpoint_counts = loaded.checkpoint_counts;
         Ok(())
     }
 
@@ -400,7 +435,7 @@ impl DatabaseFile {
                 offset: page_offset,
                 checksum: page.checksum,
                 page_len: page.bytes.len() as u32,
-                record_count: page.record_count,
+                entry_count: page.entry_count,
             });
             page_offset += page.bytes.len() as u64;
         }
@@ -444,8 +479,13 @@ impl DatabaseFile {
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
         self.truncated_wal_tail = false;
-        self.checkpoint_page_count = page_refs.len();
-        self.checkpoint_record_count = encoded_catalog.record_count;
+        self.checkpoint_counts = CheckpointCounts {
+            page_count: page_refs.len(),
+            record_page_count: encoded_catalog.record_page_count,
+            index_page_count: encoded_catalog.index_page_count,
+            record_count: encoded_catalog.record_count,
+            index_entry_count: encoded_catalog.index_entry_count,
+        };
         Ok(())
     }
 }
@@ -469,8 +509,8 @@ impl SlottedPageBuilder {
         self.free_start + SLOT_ENTRY_LEN <= self.free_end.saturating_sub(payload_len)
     }
 
-    fn insert(&mut self, record: &CollectionRecord) -> Result<()> {
-        let payload = bson::to_vec(&record.document)?;
+    fn insert(&mut self, entry_id: u64, payload_document: &bson::Document) -> Result<()> {
+        let payload = bson::to_vec(payload_document)?;
         if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
             return Err(StorageError::RecordTooLarge.into());
         }
@@ -482,7 +522,7 @@ impl SlottedPageBuilder {
         self.bytes[self.free_end..self.free_end + payload.len()].copy_from_slice(&payload);
 
         let slot_offset = self.free_start;
-        self.bytes[slot_offset..slot_offset + 8].copy_from_slice(&record.record_id.to_le_bytes());
+        self.bytes[slot_offset..slot_offset + 8].copy_from_slice(&entry_id.to_le_bytes());
         self.bytes[slot_offset + 8..slot_offset + 10]
             .copy_from_slice(&(self.free_end as u16).to_le_bytes());
         self.bytes[slot_offset + 10..slot_offset + 12]
@@ -507,7 +547,7 @@ impl SlottedPageBuilder {
             page_id: self.page_id,
             checksum: hash_bytes(&self.bytes),
             bytes: self.bytes,
-            record_count: self.slot_count,
+            entry_count: self.slot_count,
         }
     }
 }
@@ -570,30 +610,18 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
             Err(error) if is_skippable_checkpoint_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        let (state, checkpoint_pages, checkpoint_records) = match read_snapshot(file, &superblock) {
+        let (state, checkpoint_counts) = match read_snapshot(file, &superblock) {
             Ok(loaded) => loaded,
             Err(error) if is_skippable_checkpoint_error(&error) => continue,
             Err(error) => return Err(error),
         };
         valid_superblocks += 1;
-        candidates.push((
-            slot,
-            superblock,
-            state,
-            checkpoint_pages,
-            checkpoint_records,
-        ));
+        candidates.push((slot, superblock, state, checkpoint_counts));
     }
 
-    let Some((
-        active_slot,
-        active_superblock,
-        mut state,
-        checkpoint_page_count,
-        checkpoint_record_count,
-    )) = candidates
+    let Some((active_slot, active_superblock, mut state, checkpoint_counts)) = candidates
         .into_iter()
-        .max_by_key(|(_, superblock, _, _, _)| superblock.generation)
+        .max_by_key(|(_, superblock, _, _)| superblock.generation)
     else {
         return Err(StorageError::NoValidSuperblock.into());
     };
@@ -615,8 +643,7 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
         valid_superblocks,
         wal_recovery,
         file_size,
-        checkpoint_page_count,
-        checkpoint_record_count,
+        checkpoint_counts,
     })
 }
 
@@ -679,7 +706,7 @@ fn encode_superblock(superblock: &Superblock) -> [u8; SUPERBLOCK_LEN] {
 fn read_snapshot(
     file: &mut File,
     superblock: &Superblock,
-) -> Result<(PersistedState, usize, usize)> {
+) -> Result<(PersistedState, CheckpointCounts)> {
     if superblock.snapshot_offset < DATA_START_OFFSET
         || superblock.wal_offset < superblock.snapshot_offset
     {
@@ -699,7 +726,7 @@ fn read_snapshot(
         return Err(StorageError::UnsupportedVersion(snapshot_state.file_format_version).into());
     }
 
-    let (catalog, page_count, record_count) = restore_catalog(file, &snapshot_state.catalog)?;
+    let (catalog, checkpoint_counts) = restore_catalog(file, &snapshot_state.catalog)?;
     Ok((
         PersistedState {
             file_format_version: FILE_FORMAT_VERSION,
@@ -707,8 +734,7 @@ fn read_snapshot(
             last_checkpoint_unix_ms: snapshot_state.last_checkpoint_unix_ms,
             catalog,
         },
-        page_count,
-        record_count,
+        checkpoint_counts,
     ))
 }
 
@@ -792,7 +818,10 @@ fn apply_mutation(catalog: &mut Catalog, mutation: &WalMutation) -> Result<()> {
             database,
             collection,
             collection_state,
-        } => catalog.replace_collection(database, collection, collection_state.clone()),
+        } => {
+            validate_collection_indexes(collection_state).map_err(map_catalog_error)?;
+            catalog.replace_collection(database, collection, collection_state.clone());
+        }
         WalMutation::DropCollection {
             database,
             collection,
@@ -813,28 +842,44 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
         };
 
         for (collection_name, collection) in &database.collections {
-            let pages = encode_collection_pages(&collection.records, &mut next_page_id)?;
-            let page_count_before = encoded_catalog.pages.len();
-            encoded_catalog.pages.extend(pages);
-            let page_indexes = (page_count_before..encoded_catalog.pages.len())
+            validate_collection_indexes(collection).map_err(map_catalog_error)?;
+
+            let record_pages = encode_collection_pages(&collection.records, &mut next_page_id)?;
+            let record_page_count_before = encoded_catalog.pages.len();
+            encoded_catalog.record_page_count += record_pages.len();
+            encoded_catalog.pages.extend(record_pages);
+            let record_page_ids = (record_page_count_before..encoded_catalog.pages.len())
                 .map(|index| encoded_catalog.pages[index].page_id)
                 .collect::<Vec<_>>();
+
+            let mut snapshot_indexes = BTreeMap::new();
+            for (index_name, index) in &collection.indexes {
+                let index_pages = encode_index_pages(&index.entries, &mut next_page_id)?;
+                let index_page_count_before = encoded_catalog.pages.len();
+                encoded_catalog.index_page_count += index_pages.len();
+                encoded_catalog.index_entry_count += index.entries.len();
+                encoded_catalog.pages.extend(index_pages);
+                let index_page_ids = (index_page_count_before..encoded_catalog.pages.len())
+                    .map(|position| encoded_catalog.pages[position].page_id)
+                    .collect::<Vec<_>>();
+
+                snapshot_indexes.insert(
+                    index_name.clone(),
+                    SnapshotIndexCatalog {
+                        key: index.key.clone(),
+                        unique: index.unique,
+                        pages: placeholder_page_refs(index_page_ids),
+                        entry_count: index.entries.len(),
+                    },
+                );
+            }
 
             snapshot_database.collections.insert(
                 collection_name.clone(),
                 SnapshotCollectionCatalog {
                     options: collection.options.clone(),
-                    indexes: collection.indexes.clone(),
-                    pages: page_indexes
-                        .into_iter()
-                        .map(|page_id| PageRef {
-                            page_id,
-                            offset: 0,
-                            checksum: [0_u8; 32],
-                            page_len: 0,
-                            record_count: 0,
-                        })
-                        .collect(),
+                    indexes: snapshot_indexes,
+                    record_pages: placeholder_page_refs(record_page_ids),
                     record_count: collection.records.len(),
                 },
             );
@@ -861,8 +906,8 @@ fn resolve_snapshot_catalog(
 
     for database in pending_catalog.databases.values_mut() {
         for collection in database.collections.values_mut() {
-            collection.pages = collection
-                .pages
+            collection.record_pages = collection
+                .record_pages
                 .iter()
                 .map(|page_ref| {
                     page_ref_by_id
@@ -871,6 +916,18 @@ fn resolve_snapshot_catalog(
                         .ok_or(StorageError::InvalidPageReference)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            for index in collection.indexes.values_mut() {
+                index.pages = index
+                    .pages
+                    .iter()
+                    .map(|page_ref| {
+                        page_ref_by_id
+                            .get(&page_ref.page_id)
+                            .cloned()
+                            .ok_or(StorageError::InvalidPageReference)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
         }
     }
 
@@ -881,11 +938,30 @@ fn encode_collection_pages(
     records: &[CollectionRecord],
     next_page_id: &mut u64,
 ) -> Result<Vec<EncodedPage>> {
+    encode_document_pages(
+        records
+            .iter()
+            .map(|record| (record.record_id, &record.document)),
+        next_page_id,
+    )
+}
+
+fn encode_index_pages(entries: &[IndexEntry], next_page_id: &mut u64) -> Result<Vec<EncodedPage>> {
+    encode_document_pages(
+        entries.iter().map(|entry| (entry.record_id, &entry.key)),
+        next_page_id,
+    )
+}
+
+fn encode_document_pages<'a, I>(entries: I, next_page_id: &mut u64) -> Result<Vec<EncodedPage>>
+where
+    I: IntoIterator<Item = (u64, &'a bson::Document)>,
+{
     let mut pages = Vec::new();
     let mut builder = SlottedPageBuilder::new(*next_page_id);
 
-    for record in records {
-        let payload = bson::to_vec(&record.document)?;
+    for (entry_id, document) in entries {
+        let payload = bson::to_vec(document)?;
         if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
             return Err(StorageError::RecordTooLarge.into());
         }
@@ -894,7 +970,7 @@ fn encode_collection_pages(
             *next_page_id += 1;
             builder = SlottedPageBuilder::new(*next_page_id);
         }
-        builder.insert(record)?;
+        builder.insert(entry_id, document)?;
     }
 
     if !builder.is_empty() {
@@ -908,10 +984,9 @@ fn encode_collection_pages(
 fn restore_catalog(
     file: &mut File,
     snapshot_catalog: &SnapshotCatalog,
-) -> Result<(Catalog, usize, usize)> {
+) -> Result<(Catalog, CheckpointCounts)> {
     let mut catalog = Catalog::new();
-    let mut page_count = 0;
-    let mut record_count_total = 0;
+    let mut counts = CheckpointCounts::default();
 
     for (database_name, database) in &snapshot_catalog.databases {
         let mut restored_database = DatabaseCatalog {
@@ -920,9 +995,10 @@ fn restore_catalog(
 
         for (collection_name, collection) in &database.collections {
             let mut records = Vec::with_capacity(collection.record_count);
-            for page_ref in &collection.pages {
-                let page_records = decode_page(file, page_ref)?;
-                page_count += 1;
+            for page_ref in &collection.record_pages {
+                let page_records = decode_record_page(file, page_ref)?;
+                counts.page_count += 1;
+                counts.record_page_count += 1;
                 records.extend(page_records);
             }
 
@@ -930,15 +1006,46 @@ fn restore_catalog(
                 return Err(StorageError::InvalidPage.into());
             }
 
-            record_count_total += records.len();
-            restored_database.collections.insert(
-                collection_name.clone(),
-                CollectionCatalog {
-                    options: collection.options.clone(),
-                    indexes: collection.indexes.clone(),
-                    records,
-                },
-            );
+            let mut indexes = BTreeMap::new();
+            for (index_name, index) in &collection.indexes {
+                let mut entries = Vec::with_capacity(index.entry_count);
+                for page_ref in &index.pages {
+                    let page_entries = decode_index_page(file, page_ref)?;
+                    counts.page_count += 1;
+                    counts.index_page_count += 1;
+                    entries.extend(page_entries);
+                }
+
+                if entries.len() != index.entry_count {
+                    return Err(StorageError::InvalidPage.into());
+                }
+
+                indexes.insert(
+                    index_name.clone(),
+                    IndexCatalog {
+                        name: index_name.clone(),
+                        key: index.key.clone(),
+                        unique: index.unique,
+                        entries,
+                    },
+                );
+            }
+
+            let collection_state = CollectionCatalog {
+                options: collection.options.clone(),
+                indexes,
+                records,
+            };
+            validate_collection_indexes(&collection_state).map_err(map_catalog_error)?;
+            counts.record_count += collection_state.records.len();
+            counts.index_entry_count += collection_state
+                .indexes
+                .values()
+                .map(|index| index.entries.len())
+                .sum::<usize>();
+            restored_database
+                .collections
+                .insert(collection_name.clone(), collection_state);
         }
 
         catalog
@@ -946,10 +1053,29 @@ fn restore_catalog(
             .insert(database_name.clone(), restored_database);
     }
 
-    Ok((catalog, page_count, record_count_total))
+    Ok((catalog, counts))
 }
 
-fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<CollectionRecord>> {
+fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<CollectionRecord>> {
+    decode_page(file, page_ref)?
+        .into_iter()
+        .map(|(record_id, document)| {
+            Ok(CollectionRecord {
+                record_id,
+                document,
+            })
+        })
+        .collect()
+}
+
+fn decode_index_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<IndexEntry>> {
+    decode_page(file, page_ref)?
+        .into_iter()
+        .map(|(record_id, key)| Ok(IndexEntry { record_id, key }))
+        .collect()
+}
+
+fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<(u64, bson::Document)>> {
     if page_ref.page_len as usize != PAGE_SIZE || page_ref.offset < DATA_START_OFFSET {
         return Err(StorageError::InvalidPageReference.into());
     }
@@ -984,10 +1110,10 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<CollectionReco
         return Err(StorageError::InvalidPage.into());
     }
 
-    let mut records = Vec::with_capacity(slot_count as usize);
+    let mut entries = Vec::with_capacity(slot_count as usize);
     for slot_index in 0..slot_count as usize {
         let slot_offset = PAGE_HEADER_LEN + slot_index * SLOT_ENTRY_LEN;
-        let record_id = u64::from_le_bytes(
+        let entry_id = u64::from_le_bytes(
             page[slot_offset..slot_offset + 8]
                 .try_into()
                 .expect("record id"),
@@ -1009,17 +1135,14 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<CollectionReco
 
         let document =
             bson::from_slice::<bson::Document>(&page[record_offset..record_offset + record_len])?;
-        records.push(CollectionRecord {
-            record_id,
-            document,
-        });
+        entries.push((entry_id, document));
     }
 
-    if records.len() != page_ref.record_count as usize {
+    if entries.len() != page_ref.entry_count as usize {
         return Err(StorageError::InvalidPage.into());
     }
 
-    Ok(records)
+    Ok(entries)
 }
 
 fn is_skippable_checkpoint_error(error: &anyhow::Error) -> bool {
@@ -1032,6 +1155,7 @@ fn is_skippable_checkpoint_error(error: &anyhow::Error) -> bool {
                 | StorageError::InvalidPageChecksum
                 | StorageError::InvalidPage
                 | StorageError::InvalidPageReference
+                | StorageError::InvalidIndexState
         )
     )
 }
@@ -1047,6 +1171,38 @@ fn record_count(catalog: &Catalog) -> usize {
         .flat_map(|database| database.collections.values())
         .map(|collection| collection.records.len())
         .sum()
+}
+
+fn index_entry_count(catalog: &Catalog) -> usize {
+    catalog
+        .databases
+        .values()
+        .flat_map(|database| database.collections.values())
+        .flat_map(|collection| collection.indexes.values())
+        .map(|index| index.entries.len())
+        .sum()
+}
+
+fn placeholder_page_refs(page_ids: Vec<u64>) -> Vec<PageRef> {
+    page_ids
+        .into_iter()
+        .map(|page_id| PageRef {
+            page_id,
+            offset: 0,
+            checksum: [0_u8; 32],
+            page_len: 0,
+            entry_count: 0,
+        })
+        .collect()
+}
+
+fn map_catalog_error(error: CatalogError) -> anyhow::Error {
+    match error {
+        CatalogError::DuplicateKey(_) | CatalogError::InvalidIndexState(_) => {
+            StorageError::InvalidIndexState.into()
+        }
+        other => anyhow::Error::new(other),
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
@@ -1066,16 +1222,38 @@ fn current_unix_ms() -> u64 {
 mod tests {
     use std::{
         fs::OpenOptions,
-        io::{Seek, SeekFrom, Write},
+        io::{Read, Seek, SeekFrom, Write},
     };
 
     use bson::doc;
-    use mqlite_catalog::{CollectionCatalog, CollectionRecord};
+    use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
     use super::{
-        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_SIZE, VerifyReport, WalMutation,
+        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_SIZE, SnapshotState,
+        VerifyReport, WalMutation, read_superblock,
     };
+
+    fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
+        collection
+            .insert_record(CollectionRecord {
+                record_id,
+                document,
+            })
+            .expect("insert record");
+    }
+
+    fn latest_snapshot(path: &std::path::Path, slot: usize) -> SnapshotState {
+        let mut file = OpenOptions::new().read(true).open(path).expect("open file");
+        let superblock = read_superblock(&mut file, slot)
+            .expect("read superblock")
+            .expect("superblock");
+        file.seek(SeekFrom::Start(superblock.snapshot_offset))
+            .expect("seek snapshot");
+        let mut snapshot = vec![0_u8; superblock.snapshot_len as usize];
+        file.read_exact(&mut snapshot).expect("read snapshot");
+        bson::from_slice::<SnapshotState>(&snapshot).expect("decode snapshot")
+    }
 
     #[test]
     fn recovers_replace_collection_from_wal_without_checkpoint() {
@@ -1086,10 +1264,7 @@ mod tests {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection =
                 CollectionCatalog::new(doc! { "validator": { "qty": { "$gte": 0 } } });
-            collection.records.push(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "a", "qty": 4 },
-            });
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "a", "qty": 4 });
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
@@ -1114,14 +1289,21 @@ mod tests {
         {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection = CollectionCatalog::new(doc! {});
-            collection.records.push(CollectionRecord {
-                record_id: 7,
-                document: doc! { "_id": 1, "sku": "alpha", "qty": 1 },
-            });
-            collection.records.push(CollectionRecord {
-                record_id: 12,
-                document: doc! { "_id": 2, "sku": "beta", "qty": 2 },
-            });
+            insert_record(
+                &mut collection,
+                7,
+                doc! { "_id": 1, "sku": "alpha", "qty": 1 },
+            );
+            insert_record(
+                &mut collection,
+                12,
+                doc! { "_id": 2, "sku": "beta", "qty": 2 },
+            );
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
@@ -1140,6 +1322,10 @@ mod tests {
         assert_eq!(collection.records.len(), 2);
         assert_eq!(collection.records[0].record_id, 7);
         assert_eq!(collection.records[1].record_id, 12);
+        let sku_index = collection.indexes.get("sku_1").expect("sku index");
+        assert_eq!(sku_index.entries.len(), 2);
+        assert_eq!(sku_index.entries[0].record_id, 7);
+        assert_eq!(sku_index.entries[1].record_id, 12);
         assert_eq!(
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
@@ -1155,13 +1341,14 @@ mod tests {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection = CollectionCatalog::new(doc! {});
             for record_id in 1..=12_u64 {
-                collection.records.push(CollectionRecord {
+                insert_record(
+                    &mut collection,
                     record_id,
-                    document: doc! {
+                    doc! {
                         "_id": record_id as i64,
                         "payload": "x".repeat(PAGE_SIZE / 3),
                     },
-                });
+                );
             }
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
@@ -1174,8 +1361,44 @@ mod tests {
         }
 
         let inspect = DatabaseFile::inspect(&path).expect("inspect");
-        assert!(inspect.checkpoint_page_count >= 2);
+        assert!(inspect.checkpoint_record_page_count >= 2);
         assert_eq!(inspect.checkpoint_record_count, 12);
+        assert_eq!(inspect.checkpoint_index_entry_count, 12);
+    }
+
+    #[test]
+    fn spills_large_index_entries_across_multiple_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("index-pages.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=300_u64 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! { "_id": record_id as i64, "sku": format!("sku-{record_id:04}") },
+                );
+            }
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert!(inspect.checkpoint_index_page_count >= 2);
+        assert_eq!(inspect.checkpoint_index_entry_count, 600);
     }
 
     #[test]
@@ -1186,10 +1409,7 @@ mod tests {
         {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection = CollectionCatalog::new(doc! {});
-            collection.records.push(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1 },
-            });
+            insert_record(&mut collection, 1, doc! { "_id": 1 });
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
@@ -1221,10 +1441,7 @@ mod tests {
         {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection = CollectionCatalog::new(doc! {});
-            collection.records.push(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "payload": "hello" },
-            });
+            insert_record(&mut collection, 1, doc! { "_id": 1, "payload": "hello" });
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
@@ -1236,21 +1453,89 @@ mod tests {
         }
 
         let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let page_offset = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection")
+            .record_pages[0]
+            .offset;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .expect("open raw file");
-        let page_offset = inspect.snapshot_offset - PAGE_SIZE as u64;
         file.seek(SeekFrom::Start(page_offset))
             .expect("seek to page");
         file.write_all(&[0xFF]).expect("corrupt first byte");
         file.flush().expect("flush");
 
         let report = DatabaseFile::verify(&path).expect("verify should fall back");
-        assert_eq!(inspect.checkpoint_page_count, 1);
+        assert_eq!(inspect.checkpoint_page_count, 2);
         assert_eq!(report.page_count, 0);
         assert_eq!(report.record_count, 1);
+        assert_eq!(report.index_entry_count, 1);
+        assert_eq!(report.last_applied_sequence, 1);
+    }
+
+    #[test]
+    fn falls_back_to_previous_superblock_when_latest_index_pages_are_corrupted() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("corrupt-index.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            insert_record(&mut collection, 2, doc! { "_id": 2, "sku": "beta" });
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let index_page_offset = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection")
+            .indexes
+            .get("sku_1")
+            .expect("index")
+            .pages[0]
+            .offset;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open raw file");
+        file.seek(SeekFrom::Start(index_page_offset))
+            .expect("seek to page");
+        file.write_all(&[0xAA]).expect("corrupt first byte");
+        file.flush().expect("flush");
+
+        let report = DatabaseFile::verify(&path).expect("verify should fall back");
+        assert_eq!(report.record_count, 2);
+        assert_eq!(report.index_entry_count, 4);
+        assert_eq!(report.page_count, 0);
         assert_eq!(report.last_applied_sequence, 1);
     }
 
@@ -1271,7 +1556,10 @@ mod tests {
                 databases: 0,
                 collections: 0,
                 record_count: 0,
+                index_entry_count: 0,
                 page_count: 0,
+                record_page_count: 0,
+                index_page_count: 0,
                 wal_records_since_checkpoint: 0,
                 truncated_wal_tail: false,
             }

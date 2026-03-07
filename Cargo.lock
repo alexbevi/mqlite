@@ -546,6 +546,7 @@ name = "mqlite-catalog"
 version = "0.1.0"
 dependencies = [
  "bson",
+ "mqlite-bson",
  "pretty_assertions",
  "serde",
  "thiserror",

@@ -97,3 +97,66 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
     assert_eq!(first_batch[0]["sku"], "alpha");
     assert_eq!(first_batch[0]["qty"], 2);
 }
+
+#[test]
+fn command_preserves_unique_indexes_across_restart() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-index.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    thread::sleep(Duration::from_secs(2));
+
+    let mut duplicate = Command::cargo_bin("mqlite").expect("binary");
+    let output = duplicate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":2,"sku":"alpha"}]}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["code"], 11000);
+}

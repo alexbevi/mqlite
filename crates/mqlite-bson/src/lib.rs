@@ -90,7 +90,7 @@ pub fn compare_bson(left: &Bson, right: &Bson) -> Ordering {
     }
 }
 
-fn compare_documents(left: &Document, right: &Document) -> Ordering {
+pub fn compare_documents(left: &Document, right: &Document) -> Ordering {
     let left_items = left.iter().collect::<Vec<_>>();
     let right_items = right.iter().collect::<Vec<_>>();
 

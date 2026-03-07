@@ -6,7 +6,7 @@
 
 The repository now contains a working Rust workspace baseline with:
 - A cross-crate architecture aligned to the long-term plan.
-- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots backed by slotted record pages.
+- A single-file durable store with a fixed header, dual superblocks, append-only WAL, and checkpoint snapshots backed by slotted record pages plus persisted slotted index pages.
 - Local IPC manifest and endpoint generation.
 - `OP_MSG` encoding and decoding.
 - A broker with core command handling and cursor support.
@@ -62,9 +62,10 @@ file:///absolute/path/to/database.mongodb?db=app
 - Fixed file header and rotating superblocks.
 - Append-only WAL for typed collection mutations.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
+- Secondary and unique index entries are stored in dedicated index pages keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
 - Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged.
 - Multiple databases and collections in one file.
-- Collection catalog metadata and index metadata.
+- Collection catalog metadata and persistent index state.
 
 ### Query and command surface
 - `listDatabases`
@@ -83,6 +84,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `count`
 - `distinct`
 - `aggregate`
+- Persistent `_id_` and secondary index durability across broker restarts.
 
 ### Query semantics currently implemented
 - Equality and comparison matching on dotted field paths.
@@ -155,11 +157,11 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill, truncated-tail handling, and fallback to older checkpoints when newer pages are corrupted.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and indexes, truncated-tail handling, and fallback to older checkpoints when newer record or index pages are corrupted.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, and CLI tests that validate broker auto-spawn and restart recovery without any patched driver.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, and broker restart tests that prove unique indexes survive checkpoint and reopen.
 
 ## CLI
 
@@ -185,4 +187,4 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages at checkpoint time, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, persistent index structures, and planner execution beyond the current in-memory catalog model.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted slotted index pages, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, richer on-disk index layouts beyond the current sorted leaf-page model, and planner execution beyond the current in-memory catalog model.

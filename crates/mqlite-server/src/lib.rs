@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -108,6 +109,8 @@ impl From<CatalogError> for CommandError {
                 Self::new(85, "IndexOptionsConflict", error.to_string())
             }
             CatalogError::IndexNotFound(_) => Self::new(27, "IndexNotFound", error.to_string()),
+            CatalogError::DuplicateKey(_) => Self::new(11000, "DuplicateKey", error.to_string()),
+            CatalogError::InvalidIndexState(_) => Self::new(8, "UnknownError", error.to_string()),
         }
     }
 }
@@ -520,22 +523,16 @@ impl Broker {
             .get_collection(&database, collection_name)
             .cloned()
             .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
-        let indexes = collection_state
-            .indexes
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let inserted_total = documents.len() as i32;
 
         for mut document in documents {
             ensure_object_id(&mut document);
-            enforce_unique_indexes(&indexes, &collection_state.records, &document, None)?;
             let record_id = collection_state.next_record_id();
-            collection_state.records.push(CollectionRecord {
+            collection_state.insert_record(CollectionRecord {
                 record_id,
                 document,
-            });
+            })?;
         }
-        let inserted_total = collection_state.records.len() as i32;
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
                 database,
@@ -671,11 +668,6 @@ impl Broker {
             .get_collection(&database, collection_name)
             .cloned()
             .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
-        let indexes = collection_state
-            .indexes
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
 
         let mut matched = 0_i32;
         let mut modified = 0_i32;
@@ -708,12 +700,11 @@ impl Broker {
                     let mut document = upsert_seed_from_query(query);
                     apply_update(&mut document, &update_spec)?;
                     let upserted_id = ensure_object_id(&mut document);
-                    enforce_unique_indexes(&indexes, &collection_state.records, &document, None)?;
                     let record_id = collection_state.next_record_id();
-                    collection_state.records.push(CollectionRecord {
+                    collection_state.insert_record(CollectionRecord {
                         record_id,
                         document,
-                    });
+                    })?;
                     upserted.push(doc! { "index": operation_index as i32, "_id": upserted_id });
                 }
                 continue;
@@ -724,15 +715,10 @@ impl Broker {
                 let original = collection_state.records[document_index].document.clone();
                 let mut updated = original.clone();
                 apply_update(&mut updated, &update_spec)?;
-                enforce_unique_indexes(
-                    &indexes,
-                    &collection_state.records,
-                    &updated,
-                    Some(document_index),
-                )?;
                 matched += 1;
-                if updated != original {
-                    collection_state.records[document_index].document = updated;
+                if updated != original
+                    && collection_state.update_record_at(document_index, updated)?
+                {
                     modified += 1;
                 }
                 touched += 1;
@@ -785,17 +771,17 @@ impl Broker {
                 CommandError::new(9, "FailedToParse", "delete operations require `q`")
             })?;
             let limit = operation.get_i32("limit").unwrap_or(0);
-            let mut removed = 0_i32;
-            collection_state.records.retain(|record| {
-                let matches = document_matches(&record.document, query).unwrap_or(false);
-                if matches && (limit == 0 || removed == 0) {
-                    removed += 1;
-                    deleted += 1;
-                    false
-                } else {
-                    true
+            let mut removed_record_ids = BTreeSet::new();
+            for record in &collection_state.records {
+                if !document_matches(&record.document, query).unwrap_or(false) {
+                    continue;
                 }
-            });
+                removed_record_ids.insert(record.record_id);
+                if limit == 1 {
+                    break;
+                }
+            }
+            deleted += collection_state.delete_records(&removed_record_ids) as i32;
         }
 
         storage
@@ -989,45 +975,6 @@ fn internal_error(error: anyhow::Error) -> CommandError {
     CommandError::new(8, "UnknownError", error.to_string())
 }
 
-fn enforce_unique_indexes(
-    indexes: &[IndexCatalog],
-    existing_records: &[CollectionRecord],
-    candidate: &Document,
-    skip_index: Option<usize>,
-) -> Result<(), CommandError> {
-    for index in indexes.iter().filter(|index| index.unique) {
-        let candidate_key = unique_index_key(candidate, index);
-        let conflict = existing_records
-            .iter()
-            .enumerate()
-            .any(|(position, record)| {
-                if skip_index == Some(position) {
-                    return false;
-                }
-                unique_index_key(&record.document, index) == candidate_key
-            });
-        if conflict {
-            return Err(CommandError::new(
-                11000,
-                "DuplicateKey",
-                format!("duplicate key error on index `{}`", index.name),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn unique_index_key(document: &Document, index: &IndexCatalog) -> Document {
-    let mut key = Document::new();
-    for (field, _) in &index.key {
-        key.insert(
-            field,
-            lookup_path_owned(document, field).unwrap_or(Bson::Null),
-        );
-    }
-    key
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1071,6 +1018,17 @@ mod tests {
         }
     }
 
+    async fn start_broker_at(
+        database_path: &Path,
+    ) -> (JoinHandle<anyhow::Result<()>>, mqlite_ipc::BrokerManifest) {
+        let broker = Broker::new(BrokerConfig::new(database_path, 1)).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        (serve_task, manifest)
+    }
+
     async fn start_broker(
         database_name: &str,
     ) -> (
@@ -1080,11 +1038,7 @@ mod tests {
     ) {
         let temp_dir = tempdir().expect("tempdir");
         let database_path = temp_dir.path().join(database_name);
-        let broker = Broker::new(BrokerConfig::new(&database_path, 1)).expect("broker");
-        let manifest_path = broker.paths().manifest_path.clone();
-        let serve_task = tokio::spawn(broker.clone().serve());
-        wait_for_manifest(&manifest_path, &serve_task).await;
-        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
         (serve_task, temp_dir, manifest)
     }
 
@@ -1174,6 +1128,72 @@ mod tests {
                 .get("total"),
             Some(&Bson::Int64(4))
         );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_unique_indexes_across_broker_restart() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("persisted-index.mongodb");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "alpha" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+        let duplicate = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 2, "sku": "alpha" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(duplicate.get_f64("ok").expect("ok"), 0.0);
+        assert_eq!(duplicate.get_i32("code").expect("code"), 11000);
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

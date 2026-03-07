@@ -91,5 +91,6 @@ Any driver integration should include:
 - Idle shutdown and reconnect behavior.
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
+- Broker restart tests after index creation so unique-index durability is exercised through reopen.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.
