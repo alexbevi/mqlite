@@ -1132,6 +1132,10 @@ mod tests {
             "$listCachedAndActiveUsers" => {
                 (vec![doc! { "_id": 1 }], vec![doc! { "$listCachedAndActiveUsers": {} }])
             }
+            "$listMqlEntities" => (
+                Vec::new(),
+                vec![doc! { "$listMqlEntities": { "entityType": "aggregationStages" } }],
+            ),
             "$merge" => (vec![doc! { "_id": 1 }], vec![doc! { "$merge": "archive" }]),
             "$out" => (vec![doc! { "_id": 1 }], vec![doc! { "$out": "archive" }]),
             "$planCacheStats" => (Vec::new(), vec![doc! { "$planCacheStats": {} }]),

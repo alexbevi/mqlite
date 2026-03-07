@@ -654,6 +654,66 @@ fn command_aggregate_supports_list_cached_and_active_users_stage() {
 }
 
 #[test]
+fn command_collectionless_aggregate_supports_list_mql_entities_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-mql-entities.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listMqlEntities":{"entityType":"aggregationStages"}},{"$match":{"name":"$match"}},{"$project":{"_id":0,"name":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch, &vec![json!({ "name": "$match" })]);
+}
+
+#[test]
+fn command_collectionless_aggregate_rejects_list_mql_entities_stage_outside_admin() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-mql-entities-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listMqlEntities":{"entityType":"aggregationStages"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
 fn command_aggregate_supports_bucket_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-bucket.mongodb");

@@ -185,6 +185,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$indexStats`
   - `$listCatalog`
   - `$listCachedAndActiveUsers`
+  - `$listMqlEntities`
   - `$planCacheStats`
   - `$sample`
   - `$sortByCount`
@@ -213,6 +214,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
 - Collectionless `$listCatalog` aggregation on `admin` and collection-scoped `$listCatalog` aggregation on existing namespaces, returning the local file-backed namespace catalog.
 - `$listCachedAndActiveUsers` as an empty diagnostic source because authentication and user caching are out of scope for `mqlite`.
+- Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 

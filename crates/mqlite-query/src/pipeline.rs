@@ -9,6 +9,7 @@ use mqlite_bson::{compare_bson, lookup_path, remove_path, set_path};
 
 use crate::{
     QueryError,
+    capabilities::SUPPORTED_AGGREGATION_STAGES,
     expression::{eval_expression_with_variables, integer_value, number_bson, numeric_value},
     filter::document_matches_with_variables,
     projection::apply_projection_with_variables,
@@ -81,6 +82,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$listCachedAndActiveUsers" => {
                 list_cached_and_active_users_documents(stage_index, stage_spec)?
             }
+            "$listMqlEntities" => list_mql_entities_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
@@ -1177,6 +1179,28 @@ fn list_cached_and_active_users_documents(
     }
 
     Ok(Vec::new())
+}
+
+fn list_mql_entities_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    match spec.get_str("entityType") {
+        Ok("aggregationStages") if spec.len() == 1 => {}
+        _ => return Err(QueryError::InvalidStage),
+    }
+
+    let mut stage_names = SUPPORTED_AGGREGATION_STAGES.to_vec();
+    stage_names.sort_unstable();
+    Ok(stage_names
+        .into_iter()
+        .map(|name| doc! { "name": name })
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy)]

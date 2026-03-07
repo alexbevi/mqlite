@@ -2064,6 +2064,47 @@ fn list_cached_and_active_users_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn list_mql_entities_stage_reports_supported_aggregation_stages() {
+    let results = run_pipeline_ok(
+        Vec::new(),
+        &[doc! { "$listMqlEntities": { "entityType": "aggregationStages" } }],
+    );
+
+    assert!(results.iter().any(|document| {
+        document
+            .get_str("name")
+            .map(|name| name == "$match")
+            .unwrap_or(false)
+    }));
+    assert!(results.windows(2).all(|pair| {
+        pair[0].get_str("name").expect("name") <= pair[1].get_str("name").expect("name")
+    }));
+}
+
+#[test]
+fn list_mql_entities_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listMqlEntities": "" },
+        doc! { "$listMqlEntities": {} },
+        doc! { "$listMqlEntities": { "improperField": "aggregationStages" } },
+        doc! { "$listMqlEntities": { "entityType": "improperValue" } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$documents": [{ "_id": 1 }] },
+            doc! { "$listMqlEntities": { "entityType": "aggregationStages" } },
+        ],
+    )
+    .expect_err("$listMqlEntities should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],
