@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,7 +11,7 @@ use regex::{Regex as RustRegex, RegexBuilder};
 
 use crate::{
     QueryError,
-    expression::{eval_expression, expression_truthy, validate_expression},
+    expression::{eval_expression_with_variables, expression_truthy, validate_expression},
     types::{BitTestMode, MatchExpr, TypeSet},
 };
 
@@ -94,26 +95,46 @@ fn parse_filter_with_context(
 }
 
 pub fn document_matches(document: &Document, filter: &Document) -> Result<bool, QueryError> {
+    document_matches_with_variables(document, filter, &BTreeMap::new())
+}
+
+pub(crate) fn document_matches_with_variables(
+    document: &Document,
+    filter: &Document,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<bool, QueryError> {
     let expression = parse_filter(filter)?;
-    Ok(matches_expression(document, &expression))
+    Ok(matches_expression(document, &expression, variables))
 }
 
 pub fn document_matches_expression(document: &Document, expression: &MatchExpr) -> bool {
-    matches_expression(document, expression)
+    matches_expression(document, expression, &BTreeMap::new())
 }
 
-fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
+fn matches_expression(
+    document: &Document,
+    expression: &MatchExpr,
+    variables: &BTreeMap<String, Bson>,
+) -> bool {
     match expression {
         MatchExpr::AlwaysFalse => false,
         MatchExpr::AlwaysTrue => true,
         MatchExpr::SampleRate { rate, seed } => sample_rate_matches(document, *rate, *seed),
-        MatchExpr::And(items) => items.iter().all(|item| matches_expression(document, item)),
-        MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
-        MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
-        MatchExpr::Not(expression) => !matches_expression(document, expression),
-        MatchExpr::Expr(expression) => eval_expression(document, expression)
-            .map(|value| expression_truthy(&value))
-            .unwrap_or(false),
+        MatchExpr::And(items) => items
+            .iter()
+            .all(|item| matches_expression(document, item, variables)),
+        MatchExpr::Or(items) => items
+            .iter()
+            .any(|item| matches_expression(document, item, variables)),
+        MatchExpr::Nor(items) => items
+            .iter()
+            .all(|item| !matches_expression(document, item, variables)),
+        MatchExpr::Not(expression) => !matches_expression(document, expression, variables),
+        MatchExpr::Expr(expression) => {
+            eval_expression_with_variables(document, expression, variables)
+                .map(|value| expression_truthy(&value))
+                .unwrap_or(false)
+        }
         MatchExpr::Eq { path, value } => path_candidates(document, path)
             .into_iter()
             .any(|existing| matches_equality(existing, value)),
@@ -169,7 +190,7 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
             value_case,
         } => path_candidates(document, path)
             .into_iter()
-            .any(|value| matches_elem_match(value, spec, *value_case)),
+            .any(|value| matches_elem_match(value, spec, *value_case, variables)),
         MatchExpr::Regex {
             path,
             pattern,
@@ -771,7 +792,12 @@ fn matches_type(value: &Bson, type_set: &TypeSet) -> bool {
         }
 }
 
-fn matches_elem_match(value: &Bson, spec: &Document, value_case: bool) -> bool {
+fn matches_elem_match(
+    value: &Bson,
+    spec: &Document,
+    value_case: bool,
+    variables: &BTreeMap<String, Bson>,
+) -> bool {
     let Some(items) = value.as_array() else {
         return false;
     };
@@ -782,14 +808,16 @@ fn matches_elem_match(value: &Bson, spec: &Document, value_case: bool) -> bool {
             document.insert("_elem", item.clone());
             let mut filter = Document::new();
             filter.insert("_elem", Bson::Document(spec.clone()));
-            return document_matches(&document, &filter).unwrap_or(false);
+            return document_matches_with_variables(&document, &filter, variables).unwrap_or(false);
         }
 
         match item {
-            Bson::Document(document) => document_matches(document, spec).unwrap_or(false),
+            Bson::Document(document) => {
+                document_matches_with_variables(document, spec, variables).unwrap_or(false)
+            }
             Bson::Array(items) => {
                 let document = array_as_document(items);
-                document_matches(&document, spec).unwrap_or(false)
+                document_matches_with_variables(&document, spec, variables).unwrap_or(false)
             }
             _ => false,
         }

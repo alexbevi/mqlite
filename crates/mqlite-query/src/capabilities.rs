@@ -34,6 +34,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$bucket",
     "$documents",
     "$facet",
+    "$lookup",
     "$sample",
     "$sortByCount",
     "$unionWith",

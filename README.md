@@ -135,6 +135,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `listCollections`
 - `listIndexes`
 - `explain` for `find`
+- `explain` for collection-backed `aggregate` pipelines that do not end in `$out`, returning a `$cursor.queryPlanner` stage
 - `create`
 - `drop`
 - `createIndexes`
@@ -148,6 +149,8 @@ file:///absolute/path/to/database.mongodb?db=app
 - `count`
 - `distinct`
 - `aggregate`
+- Collectionless `db.aggregate([{ $currentOp: { localOps: true } }])` compatibility on `admin`, returning the in-flight aggregate command for driver CRUD coverage.
+- Collection-backed aggregation with a trailing `$out` stage, replacing the target collection and returning an empty cursor.
 - Persistent `_id_` and secondary index durability across broker restarts.
 - Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.
@@ -171,6 +174,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$documents`
   - `$facet`
   - `$bucket`
+  - `$lookup`
   - `$sample`
   - `$sortByCount`
   - `$unionWith`
@@ -184,11 +188,12 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$sort`
   - `$count`
   - `$unwind`
-- `$group`
-- `$replaceRoot`
-- `$replaceWith`
-- Same-file cross-namespace aggregation via `$unionWith`, including collection-backed unions and collectionless `$documents` union subpipelines.
+  - `$group`
+  - `$replaceRoot`
+  - `$replaceWith`
+- Same-file cross-namespace aggregation via `$unionWith` and `$lookup`, including collection-backed namespace resolution and collectionless `$documents` subpipelines for both stages.
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
+- Collectionless `$currentOp` aggregation with `localOps: true` as a driver-compatibility helper.
 
 ## Unsupported Features
 

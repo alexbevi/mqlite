@@ -1102,6 +1102,19 @@ mod tests {
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$facet": { "all": [{ "$project": { "qty": 1 } }] } }],
             ),
+            "$lookup" => (
+                vec![doc! { "wanted": 2 }],
+                vec![doc! {
+                    "$lookup": {
+                        "as": "matches",
+                        "let": { "wanted": "$wanted" },
+                        "pipeline": [
+                            { "$documents": [{ "x": 1 }, { "x": 2 }] },
+                            { "$match": { "$expr": { "$eq": ["$$wanted", "$x"] } } }
+                        ]
+                    }
+                }],
+            ),
             "$sample" => (
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],
@@ -1210,6 +1223,10 @@ mod tests {
             "$push" => (
                 vec![doc! { "qty": 1 }, doc! { "qty": 2 }],
                 vec![doc! { "$group": { "_id": Bson::Null, "value": { "$push": "$qty" } } }],
+            ),
+            "$addToSet" => (
+                vec![doc! { "qty": 1 }, doc! { "qty": 1 }, doc! { "qty": 2 }],
+                vec![doc! { "$group": { "_id": Bson::Null, "value": { "$addToSet": "$qty" } } }],
             ),
             "$avg" => (
                 vec![doc! { "qty": 1 }, doc! { "qty": 3 }],

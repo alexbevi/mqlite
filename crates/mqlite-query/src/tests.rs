@@ -1289,6 +1289,199 @@ fn union_with_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn lookup_stage_matches_local_and_foreign_fields_with_pipeline_and_let_variables() {
+    let resolver = StaticResolver::default().with_collection(
+        "app",
+        "locations",
+        vec![
+            doc! {
+                "_id": "doghouse",
+                "coordinates": [25.0, 60.0],
+                "extra": { "breeds": ["terrier", "dachshund", "bulldog"] }
+            },
+            doc! {
+                "_id": "bullpen",
+                "coordinates": [-25.0, -60.0],
+                "extra": { "breeds": "Scottish Highland", "feeling": "bullish" }
+            },
+            doc! {
+                "_id": "puppyhouse",
+                "coordinates": [-25.0, 60.0],
+                "extra": { "breeds": 1, "feeling": ["cute", "small"] }
+            },
+        ],
+    );
+    let results = run_pipeline_with_static_resolver(
+        vec![
+            doc! { "_id": "dog", "locationId": "doghouse" },
+            doc! { "_id": "bull", "locationId": "bullpen" },
+            doc! { "_id": "puppy", "locationId": "puppyhouse", "breed": 1 },
+        ],
+        &[doc! {
+            "$lookup": {
+                "from": "locations",
+                "localField": "locationId",
+                "foreignField": "_id",
+                "as": "location",
+                "let": { "animal_breed": "$breed" },
+                "pipeline": [
+                    { "$match": { "$expr": { "$eq": ["$$animal_breed", "$extra.breeds"] } } }
+                ]
+            }
+        }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": "dog", "locationId": "doghouse", "location": [] },
+            doc! { "_id": "bull", "locationId": "bullpen", "location": [] },
+            doc! {
+                "_id": "puppy",
+                "locationId": "puppyhouse",
+                "breed": 1,
+                "location": [{
+                    "_id": "puppyhouse",
+                    "coordinates": [-25.0, 60.0],
+                    "extra": { "breeds": 1, "feeling": ["cute", "small"] }
+                }]
+            },
+        ]
+    );
+}
+
+#[test]
+fn lookup_stage_supports_collectionless_documents_pipeline_with_join_fields() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": "a", "wanted": 2 },
+            doc! { "_id": "b", "wanted": 3 },
+        ],
+        &[doc! {
+            "$lookup": {
+                "localField": "wanted",
+                "foreignField": "x",
+                "as": "matches",
+                "pipeline": [
+                    { "$documents": [{ "x": 1, "label": "one" }, { "x": 2, "label": "two" }, { "x": 3, "label": "three" }] },
+                    { "$project": { "_id": 0, "x": 1, "label": 1 } }
+                ]
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": "a", "wanted": 2, "matches": [{ "x": 2, "label": "two" }] },
+            doc! { "_id": "b", "wanted": 3, "matches": [{ "x": 3, "label": "three" }] },
+        ]
+    );
+}
+
+#[test]
+fn lookup_stage_exposes_outer_let_variables_to_nested_lookup_pipelines() {
+    let resolver = StaticResolver::default()
+        .with_collection(
+            "app",
+            "locations",
+            vec![doc! { "locId": "north", "regionId": "r1" }],
+        )
+        .with_collection(
+            "app",
+            "regions",
+            vec![
+                doc! { "regionId": "r1", "climate": "cold" },
+                doc! { "regionId": "r1", "climate": "warm" },
+            ],
+        );
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "_id": "fox", "loc": "north", "wantedClimate": "cold" }],
+        &[doc! {
+            "$lookup": {
+                "from": "locations",
+                "localField": "loc",
+                "foreignField": "locId",
+                "as": "matches",
+                "let": { "wantedClimate": "$wantedClimate" },
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "regions",
+                            "localField": "regionId",
+                            "foreignField": "regionId",
+                            "as": "regionMatches",
+                            "pipeline": [
+                                { "$match": { "$expr": { "$eq": ["$$wantedClimate", "$climate"] } } },
+                                { "$project": { "_id": 0, "climate": 1 } }
+                            ]
+                        }
+                    },
+                    { "$project": { "_id": 0, "locId": 1, "regionMatches": 1 } }
+                ]
+            }
+        }],
+        &resolver,
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "_id": "fox",
+            "loc": "north",
+            "wantedClimate": "cold",
+            "matches": [{
+                "locId": "north",
+                "regionMatches": [{ "climate": "cold" }]
+            }]
+        }]
+    );
+}
+
+#[test]
+fn lookup_stage_returns_empty_arrays_for_missing_foreign_collections() {
+    let results = run_pipeline_with_static_resolver(
+        vec![doc! { "_id": "fox", "loc": "north" }],
+        &[doc! {
+            "$lookup": {
+                "from": "missing",
+                "localField": "loc",
+                "foreignField": "locId",
+                "as": "matches"
+            }
+        }],
+        &StaticResolver::default(),
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! { "_id": "fox", "loc": "north", "matches": [] }]
+    );
+}
+
+#[test]
+fn lookup_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$lookup": 1 },
+        doc! { "$lookup": {} },
+        doc! { "$lookup": { "from": "other" } },
+        doc! { "$lookup": { "from": "other", "as": "joined" } },
+        doc! { "$lookup": { "from": "other", "as": "joined", "localField": "a" } },
+        doc! { "$lookup": { "from": "other", "as": "joined", "foreignField": "b" } },
+        doc! { "$lookup": { "from": "other", "as": "joined", "localField": "a", "foreignField": "b", "let": { "v": "$a" } } },
+        doc! { "$lookup": { "pipeline": [{ "$match": {} }], "as": "joined" } },
+        doc! { "$lookup": { "from": { "db": "app" }, "pipeline": [{ "$documents": [{ "x": 1 }] }], "as": "joined" } },
+        doc! { "$lookup": { "from": "other", "as": "joined", "pipeline": 1 } },
+        doc! { "$lookup": { "from": "other", "as": "joined", "pipeline": [], "unknown": true } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "_id": "base" }], &[stage]).expect_err("invalid lookup");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn bucket_stage_supports_default_bucket_and_default_count_output() {
     let results = run_pipeline_ok(
         vec![doc! { "price": 10 }, doc! { "price": 120 }],
@@ -1480,20 +1673,6 @@ fn filter_rejects_where_operator() {
     assert!(matches!(
         error,
         crate::QueryError::UnsupportedOperator(operator) if operator == "$where"
-    ));
-}
-
-#[test]
-fn pipeline_rejects_unsupported_stage() {
-    let error = run_pipeline(
-        vec![doc! { "qty": 1 }],
-        &[doc! { "$lookup": { "from": "other" } }],
-    )
-    .expect_err("unsupported stage");
-
-    assert!(matches!(
-        error,
-        crate::QueryError::UnsupportedStage(stage) if stage == "$lookup"
     ));
 }
 

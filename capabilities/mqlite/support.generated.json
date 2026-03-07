@@ -38,6 +38,7 @@
     "$facet",
     "$group",
     "$limit",
+    "$lookup",
     "$match",
     "$project",
     "$replaceRoot",

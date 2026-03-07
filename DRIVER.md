@@ -68,6 +68,9 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - Expect minimal admin compatibility helpers to exist for test harness setup:
   - `killAllSessions` succeeds as a no-op cleanup command
   - `getParameter` returns at least `authenticationMechanisms` and `requireApiVersion`
+  - `db.aggregate([{ $currentOp: { localOps: true } }])` on `admin` returns the in-flight aggregate command
+  - collection-backed `aggregate(...).explain()` returns a `$cursor.queryPlanner` stage for non-`$out` pipelines
+  - collection-backed aggregation accepts a trailing `$out` stage and returns an empty cursor
   - session and transaction envelopes are still rejected explicitly
 
 ## Node Driver Adaptation Notes
@@ -102,7 +105,7 @@ The current supported and unsupported query and aggregation surface is tracked i
 
 Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
 `mqlite` also supports collectionless `aggregate: 1` commands when the pipeline begins with `$documents`, which is the direct validation path for collectionless aggregation before any driver-specific adapter work.
-Cross-namespace aggregation stages operate only within the same local `.mongodb` file; there is no network federation, so stages such as `$unionWith` resolve foreign namespaces from the same broker-owned file.
+Cross-namespace aggregation stages operate only within the same local `.mongodb` file; there is no network federation, so stages such as `$unionWith` and `$lookup` resolve foreign namespaces from the same broker-owned file.
 Server-side JavaScript is permanently out of scope for `mqlite`, so `$where` and `$function` should remain explicit unsupported-operator failures rather than compatibility gaps to close later.
 
 ## Driver Test Checklist

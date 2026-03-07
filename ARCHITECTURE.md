@@ -126,6 +126,33 @@ Current index capabilities:
 - stable BSON ordering plus `RecordId` tie-breaking
 - persisted missing-vs-null metadata
 
+## Aggregation Execution
+
+Aggregation execution lives in `mqlite-query` and is intentionally split between pure document
+transforms and broker-backed collection resolution.
+
+- `run_pipeline()` executes stages against an in-memory document stream only.
+- `run_pipeline_with_resolver()` adds a `CollectionResolver` so stages can read sibling namespaces
+  from the same broker-owned file.
+- `PipelineContext` carries:
+  - the active database
+  - whether execution is inside `$facet`
+  - the collection resolver
+  - expression variables for correlated subpipelines
+
+Current cross-namespace aggregation behavior:
+
+- `$unionWith` resolves a foreign collection from the same `.mongodb` file or runs a collectionless
+  subpipeline that starts with `$documents`.
+- `$lookup` resolves a foreign collection from the same `.mongodb` file and supports:
+  - `localField` and `foreignField` equality joins
+  - optional `pipeline` filters or reshaping on the joined documents
+  - `let` variables for correlated subpipelines
+  - collectionless `$documents` subpipelines when `from` is omitted
+- Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
+  continue to work in nested stages.
+- The current implementation does not federate across files or processes.
+
 ## WAL And Recovery
 
 Mutations are durable through an append-only WAL.
@@ -216,8 +243,13 @@ The broker command path is:
    - consult the sequence-keyed plan cache
    - choose a collection, index, or branch-union `OR` plan
    - execute the plan and return documents or explain metadata
-8. Cursor-producing commands hand results to `mqlite-exec`.
-9. The broker writes the reply back as `OP_MSG`.
+8. `aggregate` uses the pipeline runner:
+   - parse each stage into the supported Rust-native semantics
+   - execute pure document stages in memory
+   - resolve same-file foreign namespaces for `$unionWith` and `$lookup`
+   - thread `$lookup` `let` variables through correlated subpipelines
+9. Cursor-producing commands hand results to `mqlite-exec`.
+10. The broker writes the reply back as `OP_MSG`.
 
 ## Explain Surface
 

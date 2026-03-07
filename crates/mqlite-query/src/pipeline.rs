@@ -9,9 +9,9 @@ use mqlite_bson::{compare_bson, lookup_path, remove_path, set_path};
 
 use crate::{
     QueryError,
-    expression::{eval_expression, integer_value, number_bson, numeric_value},
-    filter::document_matches,
-    projection::apply_projection,
+    expression::{eval_expression_with_variables, integer_value, number_bson, numeric_value},
+    filter::document_matches_with_variables,
+    projection::apply_projection_with_variables,
 };
 
 pub trait CollectionResolver {
@@ -45,15 +45,17 @@ pub fn run_pipeline_with_resolver<R: CollectionResolver>(
         inside_facet: false,
         database,
         resolver,
+        variables: BTreeMap::new(),
     };
     run_pipeline_with_context(documents, pipeline, &context)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PipelineContext<'a, R> {
     inside_facet: bool,
     database: &'a str,
     resolver: &'a R,
+    variables: BTreeMap<String, Bson>,
 }
 
 fn run_pipeline_with_context<R: CollectionResolver>(
@@ -70,17 +72,19 @@ fn run_pipeline_with_context<R: CollectionResolver>(
 
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
-            "$bucket" => bucket_documents(current, stage_spec)?,
+            "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$facet" => facet_documents(current, stage_spec, context)?,
+            "$lookup" => lookup_documents(current, stage_spec, context)?,
             "$match" => {
                 let filter = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
                     .into_iter()
                     .map(|document| {
-                        document_matches(&document, filter).map(|matches| (document, matches))
+                        document_matches_with_variables(&document, filter, &context.variables)
+                            .map(|matches| (document, matches))
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
@@ -91,7 +95,13 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 let projection = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
                     .into_iter()
-                    .map(|document| apply_projection(&document, Some(projection)))
+                    .map(|document| {
+                        apply_projection_with_variables(
+                            &document,
+                            Some(projection),
+                            &context.variables,
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?
             }
             "$set" | "$addFields" => {
@@ -100,7 +110,11 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                     .into_iter()
                     .map(|mut document| {
                         for (field, expr) in spec {
-                            let value = eval_expression(&document, expr)?;
+                            let value = eval_expression_with_variables(
+                                &document,
+                                expr,
+                                &context.variables,
+                            )?;
                             set_path(&mut document, field, value)
                                 .map_err(|_| QueryError::InvalidStructure)?;
                         }
@@ -130,7 +144,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 let skip = integer_value(stage_spec).ok_or(QueryError::InvalidStage)?;
                 current.into_iter().skip(skip.max(0) as usize).collect()
             }
-            "$sortByCount" => sort_by_count(current, stage_spec)?,
+            "$sortByCount" => sort_by_count(current, stage_spec, &context.variables)?,
             "$sort" => {
                 let sort = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current.sort_by(|left, right| compare_documents_by_sort(left, right, sort));
@@ -146,12 +160,14 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$group" => group_documents(
                 current,
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
+                &context.variables,
             )?,
             "$replaceRoot" => replace_root(
                 current,
                 stage_spec.as_document().ok_or(QueryError::InvalidStage)?,
+                &context.variables,
             )?,
-            "$replaceWith" => replace_with(current, stage_spec)?,
+            "$replaceWith" => replace_with(current, stage_spec, &context.variables)?,
             "$unionWith" => union_with_documents(current, stage_spec, context)?,
             other => return Err(QueryError::UnsupportedStage(other.to_string())),
         };
@@ -182,6 +198,7 @@ fn facet_documents<R: CollectionResolver>(
             inside_facet: true,
             database: context.database,
             resolver: context.resolver,
+            variables: context.variables.clone(),
         };
         let results = run_pipeline_with_context(documents.clone(), &stages, &facet_context)?;
         output.insert(
@@ -210,10 +227,249 @@ fn union_with_documents<R: CollectionResolver>(
         inside_facet: false,
         database: union_database,
         resolver: context.resolver,
+        variables: context.variables.clone(),
     };
     let results = run_pipeline_with_context(input, &union_spec.pipeline, &union_context)?;
     documents.extend(results);
     Ok(documents)
+}
+
+fn lookup_documents<R: CollectionResolver>(
+    documents: Vec<Document>,
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<Vec<Document>, QueryError> {
+    let lookup_spec = parse_lookup_spec(spec)?;
+    let lookup_database = lookup_spec.database.as_deref().unwrap_or(context.database);
+    let initial_input = lookup_spec
+        .collection
+        .as_deref()
+        .map(|collection| {
+            context
+                .resolver
+                .resolve_collection(lookup_database, collection)
+        })
+        .unwrap_or_default();
+
+    documents
+        .into_iter()
+        .map(|mut local_document| {
+            let mut variables = context.variables.clone();
+            for (name, expression) in &lookup_spec.let_variables {
+                let value = eval_expression_with_variables(
+                    &local_document,
+                    expression,
+                    &context.variables,
+                )?;
+                variables.insert(name.clone(), value);
+            }
+
+            let joined = if lookup_spec.collection.is_none()
+                && lookup_spec.local_field.is_some()
+                && lookup_spec.foreign_field.is_some()
+            {
+                let (source_stage, remaining_stages) = lookup_spec
+                    .pipeline
+                    .split_first()
+                    .ok_or(QueryError::InvalidStage)?;
+                let lookup_context = PipelineContext {
+                    inside_facet: false,
+                    database: lookup_database,
+                    resolver: context.resolver,
+                    variables: variables.clone(),
+                };
+                let source_documents = run_pipeline_with_context(
+                    Vec::new(),
+                    std::slice::from_ref(source_stage),
+                    &lookup_context,
+                )?;
+                let matched = apply_lookup_join(
+                    source_documents,
+                    &local_document,
+                    lookup_spec.local_field.as_deref(),
+                    lookup_spec.foreign_field.as_deref(),
+                )?;
+                run_pipeline_with_context(matched, remaining_stages, &lookup_context)?
+            } else {
+                let matched = apply_lookup_join(
+                    initial_input.clone(),
+                    &local_document,
+                    lookup_spec.local_field.as_deref(),
+                    lookup_spec.foreign_field.as_deref(),
+                )?;
+                let lookup_context = PipelineContext {
+                    inside_facet: false,
+                    database: lookup_database,
+                    resolver: context.resolver,
+                    variables: variables.clone(),
+                };
+                run_pipeline_with_context(matched, &lookup_spec.pipeline, &lookup_context)?
+            };
+
+            set_path(
+                &mut local_document,
+                &lookup_spec.as_field,
+                Bson::Array(joined.into_iter().map(Bson::Document).collect()),
+            )
+            .map_err(|_| QueryError::InvalidStructure)?;
+            Ok(local_document)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct LookupStage {
+    database: Option<String>,
+    collection: Option<String>,
+    as_field: String,
+    local_field: Option<String>,
+    foreign_field: Option<String>,
+    pipeline: Vec<Document>,
+    let_variables: BTreeMap<String, Bson>,
+}
+
+fn parse_lookup_spec(spec: &Bson) -> Result<LookupStage, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut database = None;
+    let mut collection = None;
+    let mut as_field = None;
+    let mut local_field = None;
+    let mut foreign_field = None;
+    let mut pipeline = Vec::new();
+    let mut has_pipeline = false;
+    let mut let_variables = BTreeMap::new();
+    let mut from_is_namespace_document = false;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "from" => match value {
+                Bson::String(collection_name) => collection = Some(collection_name.clone()),
+                Bson::Document(namespace) => {
+                    from_is_namespace_document = true;
+                    for (field, value) in namespace {
+                        match field.as_str() {
+                            "db" => {
+                                database = Some(
+                                    value.as_str().ok_or(QueryError::InvalidStage)?.to_string(),
+                                );
+                            }
+                            "coll" => {
+                                collection = Some(
+                                    value.as_str().ok_or(QueryError::InvalidStage)?.to_string(),
+                                );
+                            }
+                            _ => return Err(QueryError::InvalidStage),
+                        }
+                    }
+                }
+                _ => return Err(QueryError::InvalidStage),
+            },
+            "as" => {
+                as_field = Some(value.as_str().ok_or(QueryError::InvalidStage)?.to_string());
+            }
+            "localField" => {
+                local_field = Some(value.as_str().ok_or(QueryError::InvalidStage)?.to_string());
+            }
+            "foreignField" => {
+                foreign_field = Some(value.as_str().ok_or(QueryError::InvalidStage)?.to_string());
+            }
+            "pipeline" => {
+                has_pipeline = true;
+                pipeline = value
+                    .as_array()
+                    .ok_or(QueryError::InvalidStage)?
+                    .iter()
+                    .map(|value| value.as_document().cloned().ok_or(QueryError::InvalidStage))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "let" => {
+                for (name, expression) in value.as_document().ok_or(QueryError::InvalidStage)? {
+                    let_variables.insert(name.clone(), expression.clone());
+                }
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let starts_with_documents = pipeline
+        .first()
+        .and_then(|stage| stage.keys().next())
+        .is_some_and(|stage_name| stage_name == "$documents");
+    let has_local_field = local_field.is_some();
+    let has_foreign_field = foreign_field.is_some();
+
+    if as_field.is_none() {
+        return Err(QueryError::InvalidStage);
+    }
+    if has_pipeline {
+        if has_local_field != has_foreign_field {
+            return Err(QueryError::InvalidStage);
+        }
+    } else {
+        if !has_local_field || !has_foreign_field || !let_variables.is_empty() {
+            return Err(QueryError::InvalidStage);
+        }
+    }
+    if from_is_namespace_document && collection.is_none() {
+        return Err(QueryError::InvalidStage);
+    }
+    if collection.is_none() && (!has_pipeline || !starts_with_documents) {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(LookupStage {
+        database,
+        collection,
+        as_field: as_field.expect("validated"),
+        local_field,
+        foreign_field,
+        pipeline,
+        let_variables,
+    })
+}
+
+fn apply_lookup_join(
+    documents: Vec<Document>,
+    local_document: &Document,
+    local_field: Option<&str>,
+    foreign_field: Option<&str>,
+) -> Result<Vec<Document>, QueryError> {
+    let (Some(local_field), Some(foreign_field)) = (local_field, foreign_field) else {
+        return Ok(documents);
+    };
+
+    let local_values = join_values_at_path(local_document, local_field);
+    if local_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(documents
+        .into_iter()
+        .filter(|document| join_values_match(&local_values, document, foreign_field))
+        .collect())
+}
+
+fn join_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
+    match mqlite_bson::lookup_path_owned(document, path) {
+        Some(Bson::Array(values)) if values.is_empty() => Vec::new(),
+        Some(Bson::Array(values)) => values,
+        Some(value) => vec![value],
+        None => vec![Bson::Null],
+    }
+}
+
+fn join_values_match(
+    local_values: &[Bson],
+    foreign_document: &Document,
+    foreign_field: &str,
+) -> bool {
+    let foreign_values = join_values_at_path(foreign_document, foreign_field);
+    local_values.iter().any(|local| {
+        foreign_values
+            .iter()
+            .any(|foreign| compare_bson(local, foreign).is_eq())
+    })
 }
 
 struct UnionWithStage {
@@ -284,7 +540,11 @@ fn parse_union_with_spec(
     }
 }
 
-fn bucket_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+fn bucket_documents(
+    documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
     let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
 
     let mut group_by = None;
@@ -364,7 +624,7 @@ fn bucket_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Documen
         BTreeMap::new();
 
     for document in documents {
-        let value = eval_expression(&document, &group_by)?;
+        let value = eval_expression_with_variables(&document, &group_by, variables)?;
         let bucket_id = match bucket_assignment(&value, &boundaries, default.as_ref())? {
             Some(bucket_id) => bucket_id,
             None => continue,
@@ -380,7 +640,7 @@ fn bucket_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Documen
         });
         for (field, accumulator) in &output_specs {
             let state = entry.1.get_mut(field).expect("bucket state exists");
-            state.apply(&document, accumulator)?;
+            state.apply(&document, accumulator, variables)?;
         }
     }
 
@@ -515,7 +775,11 @@ fn sample_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Documen
         .collect())
 }
 
-fn sort_by_count(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+fn sort_by_count(
+    documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
     let expression = match spec {
         Bson::String(path) if path.starts_with('$') && path.len() > 1 => Bson::String(path.clone()),
         Bson::Document(document)
@@ -533,7 +797,7 @@ fn sort_by_count(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>,
         "_id": expression,
         "count": { "$sum": 1 },
     };
-    let mut results = group_documents(documents, &group_spec)?;
+    let mut results = group_documents(documents, &group_spec, variables)?;
     let sort_spec = doc! { "count": -1 };
     results.sort_by(|left, right| compare_documents_by_sort(left, right, &sort_spec));
     Ok(results)
@@ -610,7 +874,11 @@ fn unwind_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Documen
     Ok(unwound)
 }
 
-fn group_documents(documents: Vec<Document>, spec: &Document) -> Result<Vec<Document>, QueryError> {
+fn group_documents(
+    documents: Vec<Document>,
+    spec: &Document,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
     let id_expression = spec.get("_id").cloned().unwrap_or(Bson::Null);
     let accumulator_specs = spec
         .iter()
@@ -622,7 +890,7 @@ fn group_documents(documents: Vec<Document>, spec: &Document) -> Result<Vec<Docu
         BTreeMap::new();
 
     for document in documents {
-        let group_key = eval_expression(&document, &id_expression)?;
+        let group_key = eval_expression_with_variables(&document, &id_expression, variables)?;
         let group_id = bson::to_vec(&doc! { "_id": group_key.clone() })
             .map_err(|_| QueryError::InvalidStage)?;
         let entry = groups.entry(group_id).or_insert_with(|| {
@@ -635,7 +903,7 @@ fn group_documents(documents: Vec<Document>, spec: &Document) -> Result<Vec<Docu
 
         for (field, accumulator) in &accumulator_specs {
             let state = entry.1.get_mut(field).expect("state exists");
-            state.apply(&document, accumulator)?;
+            state.apply(&document, accumulator, variables)?;
         }
     }
 
@@ -652,24 +920,36 @@ fn group_documents(documents: Vec<Document>, spec: &Document) -> Result<Vec<Docu
         .collect()
 }
 
-fn replace_root(documents: Vec<Document>, spec: &Document) -> Result<Vec<Document>, QueryError> {
+fn replace_root(
+    documents: Vec<Document>,
+    spec: &Document,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
     let new_root = spec.get("newRoot").ok_or(QueryError::InvalidStage)?;
     documents
         .into_iter()
-        .map(|document| match eval_expression(&document, new_root)? {
-            Bson::Document(document) => Ok(document),
-            _ => Err(QueryError::ExpectedDocument),
-        })
+        .map(
+            |document| match eval_expression_with_variables(&document, new_root, variables)? {
+                Bson::Document(document) => Ok(document),
+                _ => Err(QueryError::ExpectedDocument),
+            },
+        )
         .collect()
 }
 
-fn replace_with(documents: Vec<Document>, expression: &Bson) -> Result<Vec<Document>, QueryError> {
+fn replace_with(
+    documents: Vec<Document>,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
     documents
         .into_iter()
-        .map(|document| match eval_expression(&document, expression)? {
-            Bson::Document(document) => Ok(document),
-            _ => Err(QueryError::ExpectedDocument),
-        })
+        .map(
+            |document| match eval_expression_with_variables(&document, expression, variables)? {
+                Bson::Document(document) => Ok(document),
+                _ => Err(QueryError::ExpectedDocument),
+            },
+        )
         .collect()
 }
 
@@ -720,24 +1000,31 @@ impl GroupAccumulatorState {
         &mut self,
         document: &Document,
         spec: &GroupAccumulatorSpec,
+        variables: &BTreeMap<String, Bson>,
     ) -> Result<(), QueryError> {
         match (self, spec) {
             (Self::Sum(total), GroupAccumulatorSpec::Sum(expression)) => {
-                *total += numeric_value(&eval_expression(document, expression)?)?;
+                *total += numeric_value(&eval_expression_with_variables(
+                    document, expression, variables,
+                )?)?;
                 Ok(())
             }
             (Self::First(current), GroupAccumulatorSpec::First(expression)) => {
                 if current.is_none() {
-                    *current = Some(eval_expression(document, expression)?);
+                    *current = Some(eval_expression_with_variables(
+                        document, expression, variables,
+                    )?);
                 }
                 Ok(())
             }
             (Self::Push(values), GroupAccumulatorSpec::Push(expression)) => {
-                values.push(eval_expression(document, expression)?);
+                values.push(eval_expression_with_variables(
+                    document, expression, variables,
+                )?);
                 Ok(())
             }
             (Self::AddToSet(values), GroupAccumulatorSpec::AddToSet(expression)) => {
-                let value = eval_expression(document, expression)?;
+                let value = eval_expression_with_variables(document, expression, variables)?;
                 if !values
                     .iter()
                     .any(|existing| compare_bson(existing, &value).is_eq())
@@ -747,7 +1034,9 @@ impl GroupAccumulatorState {
                 Ok(())
             }
             (Self::Avg { sum, count }, GroupAccumulatorSpec::Avg(expression)) => {
-                *sum += numeric_value(&eval_expression(document, expression)?)?;
+                *sum += numeric_value(&eval_expression_with_variables(
+                    document, expression, variables,
+                )?)?;
                 *count += 1;
                 Ok(())
             }

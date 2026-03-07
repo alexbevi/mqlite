@@ -275,6 +275,76 @@ fn command_aggregate_supports_union_with_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_lookup_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-lookup.mongodb");
+
+    let mut insert_animals = Command::cargo_bin("mqlite").expect("binary");
+    insert_animals
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"animals","documents":[{"name":"cat","loc":"barn","breed":"tabby"},{"name":"dog","loc":"kennel","breed":"terrier"},{"name":"puppy","loc":"kennel","breed":"corgi"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert_locations = Command::cargo_bin("mqlite").expect("binary");
+    insert_locations
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"locations","documents":[{"locId":"barn","breed":"tabby","label":"hayloft"},{"locId":"kennel","breed":"terrier","label":"dog run"},{"locId":"kennel","breed":"husky","label":"sled shed"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"animals","pipeline":[{"$lookup":{"from":"locations","localField":"loc","foreignField":"locId","as":"matches","let":{"wantedBreed":"$breed"},"pipeline":[{"$match":{"$expr":{"$eq":["$$wantedBreed","$breed"]}}},{"$project":{"_id":0,"label":1,"locId":1}}]}},{"$project":{"_id":0,"name":1,"matches":1}},{"$sort":{"name":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "name": "cat", "matches": [{ "label": "hayloft", "locId": "barn" }] }),
+            json!({ "name": "dog", "matches": [{ "label": "dog run", "locId": "kennel" }] }),
+            json!({ "name": "puppy", "matches": [] }),
+        ]
+    );
+}
+
+#[test]
 fn command_aggregate_supports_sample_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-sample.mongodb");

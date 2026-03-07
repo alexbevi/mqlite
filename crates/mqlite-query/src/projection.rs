@@ -1,11 +1,21 @@
+use std::collections::BTreeMap;
+
 use bson::{Bson, Document};
 use mqlite_bson::{lookup_path, remove_path, set_path};
 
-use crate::{QueryError, expression::eval_expression};
+use crate::{QueryError, expression::eval_expression_with_variables};
 
 pub fn apply_projection(
     document: &Document,
     projection: Option<&Document>,
+) -> Result<Document, QueryError> {
+    apply_projection_with_variables(document, projection, &BTreeMap::new())
+}
+
+pub(crate) fn apply_projection_with_variables(
+    document: &Document,
+    projection: Option<&Document>,
+    variables: &BTreeMap<String, Bson>,
 ) -> Result<Document, QueryError> {
     let Some(projection) = projection else {
         return Ok(document.clone());
@@ -60,7 +70,10 @@ pub fn apply_projection(
                 }
                 Some(false) => {}
                 None => {
-                    projected.insert(field, eval_expression(document, value)?);
+                    projected.insert(
+                        field,
+                        eval_expression_with_variables(document, value, variables)?,
+                    );
                 }
             }
         }

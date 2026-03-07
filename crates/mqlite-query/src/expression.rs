@@ -1,37 +1,55 @@
+use std::collections::BTreeMap;
+
 use bson::{Bson, Document};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 
 use crate::QueryError;
 
 pub(crate) fn eval_expression(document: &Document, expression: &Bson) -> Result<Bson, QueryError> {
+    eval_expression_with_variables(document, expression, &BTreeMap::new())
+}
+
+pub(crate) fn eval_expression_with_variables(
+    document: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Bson, QueryError> {
     match expression {
-        Bson::String(path) if path.starts_with("$$") => Err(QueryError::InvalidStructure),
+        Bson::String(path) if path.starts_with("$$") => {
+            Ok(variable_value(document, path, variables))
+        }
         Bson::String(path) if path.starts_with('$') => {
             Ok(lookup_path_owned(document, &path[1..]).unwrap_or(Bson::Null))
         }
         Bson::Document(spec) if spec.len() == 1 => {
             let (field, value) = spec.iter().next().expect("single field");
             if field.starts_with('$') {
-                return eval_expression_operator(document, field, value);
+                return eval_expression_operator(document, field, value, variables);
             }
 
             let mut evaluated = Document::new();
             for (field, value) in spec {
-                evaluated.insert(field, eval_expression(document, value)?);
+                evaluated.insert(
+                    field,
+                    eval_expression_with_variables(document, value, variables)?,
+                );
             }
             Ok(Bson::Document(evaluated))
         }
         Bson::Document(spec) => {
             let mut evaluated = Document::new();
             for (field, value) in spec {
-                evaluated.insert(field, eval_expression(document, value)?);
+                evaluated.insert(
+                    field,
+                    eval_expression_with_variables(document, value, variables)?,
+                );
             }
             Ok(Bson::Document(evaluated))
         }
         Bson::Array(items) => Ok(Bson::Array(
             items
                 .iter()
-                .map(|item| eval_expression(document, item))
+                .map(|item| eval_expression_with_variables(document, item, variables))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         _ => Ok(expression.clone()),
@@ -46,13 +64,14 @@ fn eval_expression_operator(
     document: &Document,
     operator: &str,
     value: &Bson,
+    variables: &BTreeMap<String, Bson>,
 ) -> Result<Bson, QueryError> {
     match operator {
         "$literal" => Ok(value.clone()),
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
             let [left, right] = expression_arguments::<2>(value)?;
-            let left = eval_expression(document, left)?;
-            let right = eval_expression(document, right)?;
+            let left = eval_expression_with_variables(document, left, variables)?;
+            let right = eval_expression_with_variables(document, right, variables)?;
             let ordering = compare_bson(&left, &right);
             Ok(Bson::Boolean(match operator {
                 "$eq" => ordering.is_eq(),
@@ -76,7 +95,10 @@ fn eval_expression_operator(
                 true,
                 |result, argument| {
                     Ok::<_, QueryError>(
-                        result && expression_truthy(&eval_expression(document, argument)?),
+                        result
+                            && expression_truthy(&eval_expression_with_variables(
+                                document, argument, variables,
+                            )?),
                     )
                 },
             )?))
@@ -87,21 +109,24 @@ fn eval_expression_operator(
                 false,
                 |result, argument| {
                     Ok::<_, QueryError>(
-                        result || expression_truthy(&eval_expression(document, argument)?),
+                        result
+                            || expression_truthy(&eval_expression_with_variables(
+                                document, argument, variables,
+                            )?),
                     )
                 },
             )?))
         }
         "$not" => {
             let [argument] = expression_arguments::<1>(value)?;
-            Ok(Bson::Boolean(!expression_truthy(&eval_expression(
-                document, argument,
-            )?)))
+            Ok(Bson::Boolean(!expression_truthy(
+                &eval_expression_with_variables(document, argument, variables)?,
+            )))
         }
         "$in" => {
             let [needle, haystack] = expression_arguments::<2>(value)?;
-            let needle = eval_expression(document, needle)?;
-            let haystack = eval_expression(document, haystack)?;
+            let needle = eval_expression_with_variables(document, needle, variables)?;
+            let haystack = eval_expression_with_variables(document, haystack, variables)?;
             let values = haystack.as_array().ok_or(QueryError::InvalidStructure)?;
             Ok(Bson::Boolean(
                 values
@@ -110,6 +135,25 @@ fn eval_expression_operator(
             ))
         }
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
+    }
+}
+
+fn variable_value(document: &Document, path: &str, variables: &BTreeMap<String, Bson>) -> Bson {
+    let mut segments = path[2..].splitn(2, '.');
+    let name = segments.next().unwrap_or_default();
+    let remainder = segments.next();
+
+    let source = match name {
+        "ROOT" | "CURRENT" => Bson::Document(document.clone()),
+        _ => variables.get(name).cloned().unwrap_or(Bson::Null),
+    };
+
+    match remainder {
+        Some(path) => match source {
+            Bson::Document(document) => lookup_path_owned(&document, path).unwrap_or(Bson::Null),
+            _ => Bson::Null,
+        },
+        None => source,
     }
 }
 
