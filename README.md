@@ -169,6 +169,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.
 - Aggregation stages:
   - `$documents`
+  - `$sample`
   - `$match`
   - `$project`
   - `$set`

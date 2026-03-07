@@ -1094,6 +1094,10 @@ mod tests {
                 vec![doc! { "ignored": true }],
                 vec![doc! { "$documents": [{ "qty": 1 }] }],
             ),
+            "$sample" => (
+                vec![doc! { "_id": 1 }],
+                vec![doc! { "$sample": { "size": 1 } }],
+            ),
             "$match" => (
                 vec![doc! { "qty": 1 }],
                 vec![doc! { "$match": { "qty": { "$gte": 1 } } }],

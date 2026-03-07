@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, lookup_path, remove_path, set_path};
@@ -74,6 +78,7 @@ pub fn run_pipeline(
                 let limit = integer_value(stage_spec).ok_or(QueryError::InvalidStage)?;
                 current.into_iter().take(limit.max(0) as usize).collect()
             }
+            "$sample" => sample_documents(current, stage_spec)?,
             "$skip" => {
                 let skip = integer_value(stage_spec).ok_or(QueryError::InvalidStage)?;
                 current.into_iter().skip(skip.max(0) as usize).collect()
@@ -121,6 +126,51 @@ fn documents_stage(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, Que
                 .ok_or(QueryError::ExpectedDocument)
         })
         .collect()
+}
+
+fn sample_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if spec.len() != 1 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let size = match spec.get("size") {
+        Some(Bson::Int32(value)) => i64::from(*value),
+        Some(Bson::Int64(value)) => *value,
+        Some(Bson::Double(value)) if value.fract() == 0.0 => *value as i64,
+        _ => return Err(QueryError::InvalidStage),
+    };
+
+    if size <= 0 {
+        return Err(QueryError::InvalidStage);
+    }
+    if size as usize >= documents.len() {
+        return Ok(documents);
+    }
+
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut scored = documents
+        .into_iter()
+        .enumerate()
+        .map(|(position, document)| {
+            let mut hasher = DefaultHasher::new();
+            seed.hash(&mut hasher);
+            position.hash(&mut hasher);
+            bson::to_vec(&document)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            (hasher.finish(), position, document)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(score, position, _)| (*score, *position));
+    Ok(scored
+        .into_iter()
+        .take(size as usize)
+        .map(|(_, _, document)| document)
+        .collect())
 }
 
 fn parse_unset(spec: &Bson) -> Result<Vec<String>, QueryError> {

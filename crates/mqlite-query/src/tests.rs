@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use bson::{
     Binary, Bson, DateTime, Decimal128, Document, Timestamp, doc, oid::ObjectId,
@@ -847,6 +847,50 @@ fn skip_and_limit_trim_pipeline_results() {
     );
 
     assert_eq!(results, vec![doc! { "_id": 2 }, doc! { "_id": 3 }]);
+}
+
+#[test]
+fn sample_stage_returns_a_unique_subset_or_all_documents() {
+    let input = vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }];
+    let sampled = run_pipeline_ok(input.clone(), &[doc! { "$sample": { "size": 2 } }]);
+    assert_eq!(sampled.len(), 2);
+    let ids = sampled
+        .iter()
+        .map(|document| document.get_i32("_id").expect("_id"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|id| (1..=3).contains(id)));
+
+    let all = run_pipeline_ok(input, &[doc! { "$sample": { "size": 10 } }]);
+    assert_eq!(all.len(), 3);
+}
+
+#[test]
+fn sample_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$sample": "string" },
+        doc! { "$sample": {} },
+        doc! { "$sample": { "size": "two" } },
+        doc! { "$sample": { "size": 0 } },
+        doc! { "$sample": { "size": -1 } },
+        doc! { "$sample": { "size": 1, "unknownOpt": true } },
+    ] {
+        let error = run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid sample");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
+fn multiple_sample_stages_are_allowed() {
+    let input = vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }];
+    let results = run_pipeline_ok(
+        input,
+        &[
+            doc! { "$sample": { "size": 3 } },
+            doc! { "$sample": { "size": 1 } },
+        ],
+    );
+    assert_eq!(results.len(), 1);
 }
 
 #[test]

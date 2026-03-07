@@ -152,6 +152,62 @@ fn command_collection_aggregate_rejects_documents_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_sample_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-sample.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1},{"_id":2},{"_id":3}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$sample":{"size":2}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 2);
+    let ids = first_batch
+        .iter()
+        .map(|document| {
+            let id = document.get("_id").expect("_id");
+            assert_ne!(id, &Value::Null);
+            id.to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
 fn command_find_supports_size_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-size.mongodb");
