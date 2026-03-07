@@ -79,6 +79,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
             "$listCatalog" => list_catalog_documents(stage_index, stage_spec)?,
+            "$listClusterCatalog" => list_cluster_catalog_documents(stage_index, stage_spec)?,
             "$listCachedAndActiveUsers" => {
                 list_cached_and_active_users_documents(stage_index, stage_spec)?
             }
@@ -1169,6 +1170,33 @@ fn list_catalog_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Documen
     }])
 }
 
+fn list_cluster_catalog_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let stage = parse_list_cluster_catalog_spec(spec)?;
+    let mut result = doc! {
+        "db": "app",
+        "ns": "app.synthetic",
+        "type": "collection",
+        "options": {},
+        "info": { "readOnly": false },
+        "idIndex": { "name": "_id_", "key": { "_id": 1 }, "unique": true },
+        "sharded": false,
+    };
+    if stage.tracked {
+        result.insert("tracked", false);
+    }
+    if stage.shards {
+        result.insert("shards", Bson::Array(Vec::new()));
+    }
+    Ok(vec![result])
+}
+
 fn list_cached_and_active_users_documents(
     stage_index: usize,
     spec: &Bson,
@@ -1247,6 +1275,37 @@ fn list_mql_entities_documents(
         .into_iter()
         .map(|name| doc! { "name": name })
         .collect())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListClusterCatalogStage {
+    shards: bool,
+    tracked: bool,
+}
+
+fn parse_list_cluster_catalog_spec(spec: &Bson) -> Result<ListClusterCatalogStage, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut stage = ListClusterCatalogStage {
+        shards: false,
+        tracked: false,
+    };
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "shards" => {
+                stage.shards = value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            "tracked" => {
+                stage.tracked = value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            "balancingConfiguration" => {
+                value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(stage)
 }
 
 fn parse_list_sessions_spec(spec: &Bson) -> Result<(), QueryError> {

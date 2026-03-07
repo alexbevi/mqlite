@@ -40,6 +40,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$indexStats",
     "$lookup",
     "$listCatalog",
+    "$listClusterCatalog",
     "$listCachedAndActiveUsers",
     "$listLocalSessions",
     "$listSampledQueries",

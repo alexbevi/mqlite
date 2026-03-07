@@ -2016,7 +2016,60 @@ fn list_catalog_stage_reports_synthetic_catalog_entries() {
 
 #[test]
 fn list_catalog_stage_rejects_invalid_specs() {
-    for stage in [doc! { "$listCatalog": 1 }, doc! { "$listCatalog": { "all": true } }] {
+    for stage in [
+        doc! { "$listCatalog": 1 },
+        doc! { "$listCatalog": { "all": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[doc! { "$match": { "_id": 1 } }, doc! { "$listCatalog": {} }],
+    )
+    .expect_err("$listCatalog should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
+fn list_cluster_catalog_stage_reports_synthetic_catalog_entries() {
+    let results = run_pipeline_ok(
+        Vec::new(),
+        &[doc! {
+            "$listClusterCatalog": {
+                "shards": true,
+                "tracked": true,
+                "balancingConfiguration": true,
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "db": "app",
+            "ns": "app.synthetic",
+            "type": "collection",
+            "options": {},
+            "info": { "readOnly": false },
+            "idIndex": { "name": "_id_", "key": { "_id": 1 }, "unique": true },
+            "sharded": false,
+            "tracked": false,
+            "shards": [],
+        }]
+    );
+}
+
+#[test]
+fn list_cluster_catalog_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listClusterCatalog": 1 },
+        doc! { "$listClusterCatalog": { "shards": 1 } },
+        doc! { "$listClusterCatalog": { "tracked": "yes" } },
+        doc! { "$listClusterCatalog": { "balancingConfiguration": 1 } },
+        doc! { "$listClusterCatalog": { "unknown": true } },
+    ] {
         let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
         assert!(matches!(error, QueryError::InvalidStage));
     }
@@ -2025,10 +2078,10 @@ fn list_catalog_stage_rejects_invalid_specs() {
         vec![doc! { "_id": 1 }],
         &[
             doc! { "$match": { "_id": 1 } },
-            doc! { "$listCatalog": {} },
+            doc! { "$listClusterCatalog": {} },
         ],
     )
-    .expect_err("$listCatalog should only be valid as the first stage");
+    .expect_err("$listClusterCatalog should only be valid as the first stage");
     assert!(matches!(error, QueryError::InvalidStage));
 }
 

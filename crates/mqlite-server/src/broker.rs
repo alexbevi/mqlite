@@ -1539,6 +1539,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$listCatalog");
+        let starts_with_list_cluster_catalog = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$listClusterCatalog");
         let starts_with_list_local_sessions = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1583,6 +1587,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "Collectionless $listCatalog must be run against the 'admin' database with {aggregate: 1}",
+            ));
+        }
+        if starts_with_list_cluster_catalog && !is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$listClusterCatalog must be run against the database with {aggregate: 1}, not a collection",
             ));
         }
         if starts_with_list_local_sessions && !is_collectionless {
@@ -1691,6 +1702,15 @@ impl Broker {
             return self.handle_list_catalog_aggregate(
                 &database,
                 collection_name,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_list_cluster_catalog {
+            return self.handle_list_cluster_catalog_aggregate(
+                &database,
                 batch_size,
                 execution_pipeline,
                 out_target,
@@ -2035,6 +2055,70 @@ impl Broker {
                 catalog: storage.catalog(),
             };
             run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_list_cluster_catalog_aggregate(
+        &self,
+        database: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.$cmd.aggregate");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let list_cluster_catalog = execution_pipeline
+                .first()
+                .and_then(|stage| stage.get("$listClusterCatalog"))
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$listClusterCatalog aggregation requires a $listClusterCatalog stage document",
+                    )
+                })?;
+            let stage = parse_list_cluster_catalog_stage(list_cluster_catalog)?;
+            let list_cluster_catalog_documents =
+                build_list_cluster_catalog_results(storage.catalog(), database, stage);
+            if execution_pipeline.len() > 1 {
+                run_pipeline_with_resolver(
+                    list_cluster_catalog_documents,
+                    &execution_pipeline[1..],
+                    database,
+                    &resolver,
+                )?
+            } else {
+                list_cluster_catalog_documents
+            }
         };
 
         if let Some(target) = out_target {
@@ -2638,6 +2722,65 @@ fn parse_list_catalog_stage(spec: &Bson) -> Result<(), CommandError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ListClusterCatalogStage {
+    shards: bool,
+    tracked: bool,
+}
+
+fn parse_list_cluster_catalog_stage(spec: &Bson) -> Result<ListClusterCatalogStage, CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            "$listClusterCatalog must take a nested object",
+        )
+    })?;
+    let mut stage = ListClusterCatalogStage {
+        shards: false,
+        tracked: false,
+    };
+    for (key, value) in spec {
+        match key.as_str() {
+            "shards" => {
+                stage.shards = value.as_bool().ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "The $listClusterCatalog stage field `shards` must be a boolean",
+                    )
+                })?;
+            }
+            "tracked" => {
+                stage.tracked = value.as_bool().ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "The $listClusterCatalog stage field `tracked` must be a boolean",
+                    )
+                })?;
+            }
+            "balancingConfiguration" => {
+                value.as_bool().ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "The $listClusterCatalog stage field `balancingConfiguration` must be a boolean",
+                    )
+                })?;
+            }
+            _ => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!("Unrecognized $listClusterCatalog option `{key}`"),
+                ));
+            }
+        }
+    }
+    Ok(stage)
+}
+
 fn build_list_catalog_results(
     catalog: &Catalog,
     database: &str,
@@ -2675,6 +2818,84 @@ fn list_catalog_document(
         "options": collection.options.clone(),
         "indexCount": collection.indexes.len() as i64,
     }
+}
+
+fn build_list_cluster_catalog_results(
+    catalog: &Catalog,
+    database: &str,
+    stage: ListClusterCatalogStage,
+) -> Vec<Document> {
+    if database == "admin" {
+        return catalog
+            .databases
+            .iter()
+            .flat_map(|(database_name, database_catalog)| {
+                database_catalog
+                    .collections
+                    .iter()
+                    .map(|(collection_name, collection)| {
+                        list_cluster_catalog_document(
+                            database_name,
+                            collection_name,
+                            collection,
+                            stage,
+                        )
+                    })
+            })
+            .collect();
+    }
+
+    catalog
+        .databases
+        .get(database)
+        .map(|database_catalog| {
+            database_catalog
+                .collections
+                .iter()
+                .map(|(collection_name, collection)| {
+                    list_cluster_catalog_document(database, collection_name, collection, stage)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn list_cluster_catalog_document(
+    database: &str,
+    collection_name: &str,
+    collection: &CollectionCatalog,
+    stage: ListClusterCatalogStage,
+) -> Document {
+    let mut document = doc! {
+        "db": database,
+        "ns": format!("{database}.{collection_name}"),
+        "type": "collection",
+        "options": collection.options.clone(),
+        "info": { "readOnly": false },
+        "idIndex": id_index_document(collection),
+        "sharded": false,
+    };
+    if stage.tracked {
+        document.insert("tracked", false);
+    }
+    if stage.shards {
+        document.insert("shards", Bson::Array(Vec::new()));
+    }
+    document
+}
+
+fn id_index_document(collection: &CollectionCatalog) -> Document {
+    let Some(index) = collection.indexes.get("_id_") else {
+        return doc! { "name": "_id_", "key": { "_id": 1 }, "unique": true };
+    };
+
+    let mut document = Document::new();
+    document.insert("name", index.name.clone());
+    document.insert("key", Bson::Document(index.key.clone()));
+    if index.unique {
+        document.insert("unique", true);
+    }
+    document
 }
 
 impl Broker {

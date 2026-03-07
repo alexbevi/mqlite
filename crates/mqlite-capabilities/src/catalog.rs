@@ -1129,9 +1129,16 @@ mod tests {
                 }],
             ),
             "$listCatalog" => (Vec::new(), vec![doc! { "$listCatalog": {} }]),
-            "$listCachedAndActiveUsers" => {
-                (vec![doc! { "_id": 1 }], vec![doc! { "$listCachedAndActiveUsers": {} }])
-            }
+            "$listClusterCatalog" => (
+                Vec::new(),
+                vec![
+                    doc! { "$listClusterCatalog": { "shards": true, "tracked": true, "balancingConfiguration": true } },
+                ],
+            ),
+            "$listCachedAndActiveUsers" => (
+                vec![doc! { "_id": 1 }],
+                vec![doc! { "$listCachedAndActiveUsers": {} }],
+            ),
             "$listLocalSessions" => (
                 Vec::new(),
                 vec![doc! { "$listLocalSessions": { "allUsers": true } }],

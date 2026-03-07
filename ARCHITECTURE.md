@@ -254,6 +254,7 @@ The broker command path is:
    - synthesize collection metadata-stage input for supported first stages such as `$collStats`
    - synthesize collection index metadata-stage input for supported first stages such as `$indexStats`
    - synthesize collection catalog metadata-stage input for supported first stages such as `$listCatalog`
+   - synthesize cluster-catalog metadata-stage input for supported first stages such as `$listClusterCatalog`
    - synthesize auth-diagnostic metadata-stage input for supported first stages such as `$listCachedAndActiveUsers`
    - synthesize session-metadata input for supported first stages such as `$listLocalSessions` and `$listSessions`
    - synthesize query-sampling metadata input for supported first stages such as `$listSampledQueries`

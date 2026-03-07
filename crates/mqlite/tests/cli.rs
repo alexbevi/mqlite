@@ -607,6 +607,204 @@ fn command_collectionless_aggregate_rejects_list_catalog_stage_outside_admin() {
 }
 
 #[test]
+fn command_collectionless_aggregate_supports_list_cluster_catalog_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-cluster-catalog.mongodb");
+
+    let mut create_widgets = Command::cargo_bin("mqlite").expect("binary");
+    create_widgets
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_metrics = Command::cargo_bin("mqlite").expect("binary");
+    create_metrics
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"create":"metrics"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listClusterCatalog":{"shards":true,"tracked":true,"balancingConfiguration":true}},{"$project":{"_id":0,"db":1,"ns":1,"sharded":1,"tracked":1,"shards":1}},{"$sort":{"ns":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "db": "analytics", "ns": "analytics.metrics", "sharded": false, "tracked": false, "shards": [] }),
+            json!({ "db": "app", "ns": "app.widgets", "sharded": false, "tracked": false, "shards": [] }),
+        ]
+    );
+}
+
+#[test]
+fn command_collectionless_aggregate_limits_list_cluster_catalog_stage_to_the_target_database() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-cluster-catalog-scoped.mongodb");
+
+    let mut create_widgets = Command::cargo_bin("mqlite").expect("binary");
+    create_widgets
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_metrics = Command::cargo_bin("mqlite").expect("binary");
+    create_metrics
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"create":"metrics"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listClusterCatalog":{}},{"$project":{"_id":0,"ns":1}},{"$sort":{"ns":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch, &vec![json!({ "ns": "analytics.metrics" })]);
+}
+
+#[test]
+fn command_collectionless_aggregate_returns_empty_list_cluster_catalog_for_missing_database() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-cluster-catalog-missing.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "missing",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listClusterCatalog":{}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert!(first_batch.is_empty());
+}
+
+#[test]
+fn command_collection_aggregate_rejects_list_cluster_catalog_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-cluster-catalog-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$listClusterCatalog":{}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
 fn command_aggregate_supports_list_cached_and_active_users_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-list-cached-users.mongodb");

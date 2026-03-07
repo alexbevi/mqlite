@@ -188,6 +188,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$lookup`
   - `$indexStats`
   - `$listCatalog`
+  - `$listClusterCatalog`
   - `$listCachedAndActiveUsers`
   - `$listLocalSessions`
   - `$listSampledQueries`
@@ -221,6 +222,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.
 - Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
 - Collectionless `$listCatalog` aggregation on `admin` and collection-scoped `$listCatalog` aggregation on existing namespaces, returning the local file-backed namespace catalog.
+- Collectionless `$listClusterCatalog` aggregation on any database, returning local file-backed namespace metadata for that database or for the full file when run on `admin`, with `sharded: false`, optional `tracked: false`, and optional empty `shards` arrays because sharding is out of scope.
 - `$listCachedAndActiveUsers` as an empty diagnostic source because authentication and user caching are out of scope for `mqlite`.
 - Collectionless `$listLocalSessions` aggregation with the public `allUsers` and `users` filters, returning an empty result because `mqlite` does not implement logical sessions or a local session cache.
 - Collectionless `$listSampledQueries` aggregation on `admin`, accepting the public optional `namespace` filter and returning an empty result because `mqlite` does not implement query sampling.
