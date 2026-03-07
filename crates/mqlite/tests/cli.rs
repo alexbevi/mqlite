@@ -412,6 +412,78 @@ fn command_find_supports_bit_test_filters() {
 }
 
 #[test]
+fn command_find_supports_sample_rate_extremes() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-sample-rate.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"sku":"alpha"},{"sku":"beta"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find_all = Command::cargo_bin("mqlite").expect("binary");
+    let all_output = find_all
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"$sampleRate":1.0}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let all_response: Value = serde_json::from_slice(&all_output).expect("json response");
+    let all_batch = all_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(all_batch.len(), 2);
+
+    let mut find_none = Command::cargo_bin("mqlite").expect("binary");
+    let none_output = find_none
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"$sampleRate":0.0}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let none_response: Value = serde_json::from_slice(&none_output).expect("json response");
+    let none_batch = none_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert!(none_batch.is_empty());
+}
+
+#[test]
 fn command_find_supports_not_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-not.mongodb");

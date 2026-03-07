@@ -1866,7 +1866,7 @@ fn collect_field_bounds(
     field_bounds: &mut BTreeMap<String, FieldBounds>,
 ) -> Option<()> {
     match expression {
-        MatchExpr::AlwaysFalse | MatchExpr::AlwaysTrue => Some(()),
+        MatchExpr::AlwaysFalse | MatchExpr::AlwaysTrue | MatchExpr::SampleRate { .. } => Some(()),
         MatchExpr::And(items) => {
             for item in items {
                 collect_field_bounds(item, field_bounds)?;
@@ -2051,7 +2051,7 @@ fn collect_match_paths(expression: &MatchExpr) -> BTreeSet<String> {
 
 fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>) {
     match expression {
-        MatchExpr::AlwaysFalse | MatchExpr::AlwaysTrue => {}
+        MatchExpr::AlwaysFalse | MatchExpr::AlwaysTrue | MatchExpr::SampleRate { .. } => {}
         MatchExpr::And(items) | MatchExpr::Or(items) | MatchExpr::Nor(items) => {
             for item in items {
                 collect_match_paths_into(item, paths);
@@ -2231,6 +2231,7 @@ fn filter_shape(expression: &MatchExpr) -> String {
     match expression {
         MatchExpr::AlwaysFalse => "alwaysFalse".to_string(),
         MatchExpr::AlwaysTrue => "alwaysTrue".to_string(),
+        MatchExpr::SampleRate { .. } => "sampleRate".to_string(),
         MatchExpr::And(items) => format!(
             "and({})",
             items.iter().map(filter_shape).collect::<Vec<_>>().join(",")

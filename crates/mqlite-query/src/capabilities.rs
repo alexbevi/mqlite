@@ -27,6 +27,7 @@ pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$options",
     "$elemMatch",
     "$expr",
+    "$sampleRate",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[

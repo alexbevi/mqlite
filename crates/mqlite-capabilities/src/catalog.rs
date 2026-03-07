@@ -1069,6 +1069,7 @@ mod tests {
                 doc! { "qty": 5, "limit": 4 },
                 doc! { "$expr": { "$gt": ["$qty", "$limit"] } },
             ),
+            "$sampleRate" => (doc! { "qty": 5 }, doc! { "$sampleRate": 1.0 }),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

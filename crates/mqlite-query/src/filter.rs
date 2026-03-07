@@ -1,3 +1,9 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use bson::{Bson, Document};
 use mqlite_bson::compare_bson;
 use regex::{Regex as RustRegex, RegexBuilder};
@@ -28,6 +34,7 @@ fn parse_filter_with_context(
                 parse_always_boolean(value)?;
                 expressions.push(MatchExpr::AlwaysTrue);
             }
+            "$sampleRate" => expressions.push(parse_sample_rate(value)?),
             "$and" => {
                 let items = value.as_array().ok_or(QueryError::InvalidStructure)?;
                 let parsed = items
@@ -99,6 +106,7 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
     match expression {
         MatchExpr::AlwaysFalse => false,
         MatchExpr::AlwaysTrue => true,
+        MatchExpr::SampleRate { rate, seed } => sample_rate_matches(document, *rate, *seed),
         MatchExpr::And(items) => items.iter().all(|item| matches_expression(document, item)),
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
         MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
@@ -355,6 +363,23 @@ fn parse_always_boolean(value: &Bson) -> Result<(), QueryError> {
     }
 }
 
+fn parse_sample_rate(value: &Bson) -> Result<MatchExpr, QueryError> {
+    let rate = numeric_probability(value).ok_or(QueryError::InvalidStructure)?;
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(QueryError::InvalidStructure);
+    }
+    if rate == 0.0 {
+        return Ok(MatchExpr::AlwaysFalse);
+    }
+    if rate == 1.0 {
+        return Ok(MatchExpr::AlwaysTrue);
+    }
+    Ok(MatchExpr::SampleRate {
+        rate,
+        seed: next_sample_seed(),
+    })
+}
+
 fn path_candidates<'a>(document: &'a Document, path: &str) -> Vec<&'a Bson> {
     let segments = path.split('.').collect::<Vec<_>>();
     if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
@@ -599,6 +624,19 @@ fn bit_positions_from_numeric_value(value: &Bson) -> Option<u64> {
     }
 }
 
+fn numeric_probability(value: &Bson) -> Option<f64> {
+    match value {
+        Bson::Int32(value) => Some(*value as f64),
+        Bson::Int64(value) => Some(*value as f64),
+        Bson::Double(value) if value.is_finite() => Some(*value),
+        Bson::Decimal128(value) => {
+            let parsed = value.to_string().parse::<f64>().ok()?;
+            parsed.is_finite().then_some(parsed)
+        }
+        _ => None,
+    }
+}
+
 fn bit_positions_from_mask(mask: u64) -> Vec<u32> {
     (0_u32..64)
         .filter(|position| ((mask >> position) & 1) == 1)
@@ -669,6 +707,22 @@ fn numeric_bits(value: &Bson) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+fn next_sample_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn sample_rate_matches(document: &Document, rate: f64, seed: u64) -> bool {
+    let bytes = bson::to_vec(document).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    let bucket = hasher.finish() as f64 / u64::MAX as f64;
+    bucket < rate
 }
 
 fn all_value_uses_expression(value: &Bson) -> bool {

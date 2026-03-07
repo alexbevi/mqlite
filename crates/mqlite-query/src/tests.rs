@@ -7,7 +7,8 @@ use bson::{
 use pretty_assertions::assert_eq;
 
 use crate::{
-    QueryError, apply_projection, apply_update, document_matches, parse_update, run_pipeline,
+    QueryError, apply_projection, apply_update, document_matches, document_matches_expression,
+    parse_filter, parse_update, run_pipeline,
 };
 
 // These cases are grounded in MongoDB matcher and pipeline tests such as
@@ -278,6 +279,23 @@ fn supports_top_level_comment_filters() {
 }
 
 #[test]
+fn supports_sample_rate_filters() {
+    let filter = doc! { "$sampleRate": 0.5 };
+    let expression = parse_filter(&filter).expect("sample rate filter");
+    let documents = (0..20)
+        .map(|value| doc! { "_id": value, "qty": value })
+        .collect::<Vec<_>>();
+    let matches = documents
+        .iter()
+        .filter(|document| document_matches_expression(document, &expression))
+        .count();
+
+    assert_filter(&doc! { "qty": 5 }, doc! { "$sampleRate": 1.0 }, true);
+    assert_filter(&doc! { "qty": 5 }, doc! { "$sampleRate": 0.0 }, false);
+    assert!((1..documents.len()).contains(&matches));
+}
+
+#[test]
 fn rejects_expression_values_inside_all_filters() {
     assert!(matches!(
         document_matches(
@@ -285,6 +303,26 @@ fn rejects_expression_values_inside_all_filters() {
             &doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "red" } }] } }
         ),
         Err(QueryError::InvalidStructure)
+    ));
+}
+
+#[test]
+fn rejects_malformed_sample_rate_filters() {
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "$sampleRate": -1 }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "$sampleRate": 2.0 }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "$sampleRate": "x" }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$sampleRate": 0.5 } }),
+        Err(QueryError::UnsupportedOperator(operator)) if operator == "$sampleRate"
     ));
 }
 

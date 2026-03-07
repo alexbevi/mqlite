@@ -18,6 +18,10 @@ pub struct TypeSet {
 pub enum MatchExpr {
     AlwaysFalse,
     AlwaysTrue,
+    SampleRate {
+        rate: f64,
+        seed: u64,
+    },
     And(Vec<MatchExpr>),
     Or(Vec<MatchExpr>),
     Nor(Vec<MatchExpr>),
