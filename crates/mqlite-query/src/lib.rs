@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size", "$mod", "$all",
+    "$size", "$mod", "$all", "$not",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -35,6 +35,7 @@ pub enum MatchExpr {
     And(Vec<MatchExpr>),
     Or(Vec<MatchExpr>),
     Nor(Vec<MatchExpr>),
+    Not(Box<MatchExpr>),
     Eq {
         path: String,
         value: Bson,
@@ -431,6 +432,7 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::And(items) => items.iter().all(|item| matches_expression(document, item)),
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
         MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
+        MatchExpr::Not(expression) => !matches_expression(document, expression),
         MatchExpr::Eq { path, value } => lookup_path(document, path)
             .is_some_and(|existing| compare_bson(existing, value).is_eq()),
         MatchExpr::Ne { path, value } => lookup_path(document, path)
@@ -534,6 +536,7 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                             values,
                         }
                     }
+                    "$not" => MatchExpr::Not(Box::new(parse_not_expression(path, operator_value)?)),
                     "$exists" => MatchExpr::Exists {
                         path: path.to_string(),
                         exists: operator_value
@@ -592,6 +595,15 @@ fn projection_flag(value: &Bson) -> Option<bool> {
         Bson::Int32(value) => Some(*value != 0),
         Bson::Int64(value) => Some(*value != 0),
         _ => None,
+    }
+}
+
+fn parse_not_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryError> {
+    match value {
+        Bson::Document(document) if document.keys().all(|key| key.starts_with('$')) => {
+            parse_field_expression(path, value)
+        }
+        _ => Err(QueryError::InvalidStructure),
     }
 }
 
@@ -1110,6 +1122,31 @@ mod tests {
                 &doc! { "tags": ["red"] },
                 &doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "red" } }] } }
             ),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn supports_not_filters() {
+        let document = doc! { "qty": 12, "tags": ["red", "blue"] };
+
+        assert_filter(
+            &document,
+            doc! { "qty": { "$not": { "$mod": [5, 1] } } },
+            true,
+        );
+        assert_filter(&document, doc! { "qty": { "$not": { "$gt": 5 } } }, false);
+        assert_filter(
+            &document,
+            doc! { "tags": { "$not": { "$all": ["red", "green"] } } },
+            true,
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_not_filters() {
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$not": 5 } }),
             Err(QueryError::InvalidStructure)
         ));
     }

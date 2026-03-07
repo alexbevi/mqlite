@@ -1033,6 +1033,10 @@ mod tests {
                 doc! { "tags": ["red", "blue"] },
                 doc! { "tags": { "$all": ["red", "blue"] } },
             ),
+            "$not" => (
+                doc! { "qty": 12 },
+                doc! { "qty": { "$not": { "$mod": [5, 1] } } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

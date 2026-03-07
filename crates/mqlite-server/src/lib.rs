@@ -1843,6 +1843,7 @@ fn collect_field_bounds(
             }
             Some(())
         }
+        MatchExpr::Not(_) => None,
         MatchExpr::Nor(_) => None,
         MatchExpr::Eq { path, value } => {
             field_bounds.entry(path.clone()).or_default().eq = Some(value.clone());
@@ -1964,6 +1965,7 @@ fn point_map(expression: &MatchExpr) -> Option<BTreeMap<String, Bson>> {
             }
             Some(points)
         }
+        MatchExpr::Not(_) => None,
         MatchExpr::Nor(_) => None,
         MatchExpr::Gt { path, value: _ }
         | MatchExpr::Gte { path, value: _ }
@@ -2019,6 +2021,7 @@ fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>
                 collect_match_paths_into(item, paths);
             }
         }
+        MatchExpr::Not(expression) => collect_match_paths_into(expression, paths),
         MatchExpr::Eq { path, .. }
         | MatchExpr::Ne { path, .. }
         | MatchExpr::Gt { path, .. }
@@ -2197,6 +2200,7 @@ fn filter_shape(expression: &MatchExpr) -> String {
             "nor({})",
             items.iter().map(filter_shape).collect::<Vec<_>>().join(",")
         ),
+        MatchExpr::Not(expression) => format!("not({})", filter_shape(expression)),
         MatchExpr::Eq { path, .. } => format!("{path}:eq"),
         MatchExpr::Ne { path, .. } => format!("{path}:ne"),
         MatchExpr::Gt { path, .. } => format!("{path}:gt"),
@@ -2290,6 +2294,7 @@ fn dnf_branches(expression: &MatchExpr) -> Option<Vec<Vec<MatchExpr>>> {
             }
             Some(branches)
         }
+        MatchExpr::Not(_) => None,
         MatchExpr::Nor(_) => None,
         other => Some(vec![vec![other.clone()]]),
     }
