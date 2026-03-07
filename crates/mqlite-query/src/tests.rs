@@ -1,6 +1,9 @@
 use std::str::FromStr;
 
-use bson::{Bson, DateTime, Decimal128, Document, Timestamp, doc, oid::ObjectId};
+use bson::{
+    Binary, Bson, DateTime, Decimal128, Document, Timestamp, doc, oid::ObjectId,
+    spec::BinarySubtype,
+};
 use pretty_assertions::assert_eq;
 
 use crate::{
@@ -139,6 +142,53 @@ fn supports_size_filters() {
 }
 
 #[test]
+fn supports_bit_test_filters() {
+    let numeric = doc! { "qty": 54, "values": [1.1, 54], "negative": -1_i32 };
+    let binary = doc! {
+        "payload": Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![0b0000_0011],
+        }),
+    };
+
+    assert_filter(&numeric, doc! { "qty": { "$bitsAllSet": 54 } }, true);
+    assert_filter(&numeric, doc! { "qty": { "$bitsAllSet": 55 } }, false);
+    assert_filter(&numeric, doc! { "qty": { "$bitsAllClear": 129 } }, true);
+    assert_filter(&numeric, doc! { "qty": { "$bitsAnySet": [1, 4] } }, true);
+    assert_filter(&numeric, doc! { "qty": { "$bitsAnyClear": [0, 3] } }, true);
+    assert_filter(&numeric, doc! { "values": { "$bitsAllSet": 54 } }, true);
+    assert_filter(
+        &numeric,
+        doc! { "negative": { "$bitsAllSet": [0, 63] } },
+        true,
+    );
+    assert_filter(
+        &binary,
+        doc! {
+            "payload": {
+                "$bitsAllSet": Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes: vec![0b0000_0001],
+                })
+            }
+        },
+        true,
+    );
+    assert_filter(
+        &binary,
+        doc! {
+            "payload": {
+                "$bitsAnyClear": Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes: vec![0b0000_0110],
+                })
+            }
+        },
+        true,
+    );
+}
+
+#[test]
 fn supports_mod_filters() {
     let document = doc! { "qty": 12, "score": 4.7, "values": [1, 8] };
 
@@ -161,6 +211,28 @@ fn rejects_malformed_mod_filters() {
     ));
     assert!(matches!(
         document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$mod": ["x", 0] } }),
+        Err(QueryError::InvalidStructure)
+    ));
+}
+
+#[test]
+fn rejects_malformed_bit_test_filters() {
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$bitsAllSet": -1 } }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(
+            &doc! { "qty": 12 },
+            &doc! { "qty": { "$bitsAnySet": ["x"] } }
+        ),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(
+            &doc! { "qty": 12 },
+            &doc! { "qty": { "$bitsAnyClear": "x" } }
+        ),
         Err(QueryError::InvalidStructure)
     ));
 }

@@ -1008,6 +1008,10 @@ mod tests {
                 doc! { "qty": 5, "sku": "abc" },
                 doc! { "$and": [{ "qty": { "$gte": 5 } }, { "sku": "abc" }] },
             ),
+            "$bitsAllClear" => (doc! { "qty": 54 }, doc! { "qty": { "$bitsAllClear": 129 } }),
+            "$bitsAllSet" => (doc! { "qty": 54 }, doc! { "qty": { "$bitsAllSet": 54 } }),
+            "$bitsAnyClear" => (doc! { "qty": 54 }, doc! { "qty": { "$bitsAnyClear": 9 } }),
+            "$bitsAnySet" => (doc! { "qty": 54 }, doc! { "qty": { "$bitsAnySet": 18 } }),
             "$or" => (
                 doc! { "qty": 5, "sku": "abc" },
                 doc! { "$or": [{ "qty": { "$lt": 0 } }, { "sku": "abc" }] },

@@ -5,7 +5,7 @@ use regex::{Regex as RustRegex, RegexBuilder};
 use crate::{
     QueryError,
     expression::{eval_expression, expression_truthy, validate_expression},
-    types::{MatchExpr, TypeSet},
+    types::{BitTestMode, MatchExpr, TypeSet},
 };
 
 pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
@@ -172,6 +172,13 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::Size { path, size } => path_candidates(document, path)
             .into_iter()
             .any(|value| value.as_array().is_some_and(|values| values.len() == *size)),
+        MatchExpr::BitTest {
+            path,
+            mode,
+            positions,
+        } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_bit_test(value, *mode, positions)),
         MatchExpr::Mod {
             path,
             divisor,
@@ -283,6 +290,26 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                                 .ok_or(QueryError::InvalidStructure)?,
                         )
                         .map_err(|_| QueryError::InvalidStructure)?,
+                    },
+                    "$bitsAllSet" => MatchExpr::BitTest {
+                        path: path.to_string(),
+                        mode: BitTestMode::AllSet,
+                        positions: parse_bit_positions(operator_value)?,
+                    },
+                    "$bitsAllClear" => MatchExpr::BitTest {
+                        path: path.to_string(),
+                        mode: BitTestMode::AllClear,
+                        positions: parse_bit_positions(operator_value)?,
+                    },
+                    "$bitsAnySet" => MatchExpr::BitTest {
+                        path: path.to_string(),
+                        mode: BitTestMode::AnySet,
+                        positions: parse_bit_positions(operator_value)?,
+                    },
+                    "$bitsAnyClear" => MatchExpr::BitTest {
+                        path: path.to_string(),
+                        mode: BitTestMode::AnyClear,
+                        positions: parse_bit_positions(operator_value)?,
                     },
                     "$mod" => {
                         let values = operator_value
@@ -524,6 +551,123 @@ fn matches_mod(value: &Bson, divisor: i64, remainder: i64) -> bool {
             .iter()
             .any(|item| matches_mod(item, divisor, remainder)),
         _ => coerce_to_i64(value).is_some_and(|coerced| coerced % divisor == remainder),
+    }
+}
+
+fn parse_bit_positions(value: &Bson) -> Result<Vec<u32>, QueryError> {
+    let mut positions = match value {
+        Bson::Array(values) => values
+            .iter()
+            .map(bit_position_from_bson)
+            .collect::<Result<Vec<_>, _>>()?,
+        Bson::Binary(binary) => bit_positions_from_bytes(&binary.bytes),
+        _ => bit_positions_from_numeric_value(value)
+            .map(bit_positions_from_mask)
+            .ok_or(QueryError::InvalidStructure)?,
+    };
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
+}
+
+fn bit_position_from_bson(value: &Bson) -> Result<u32, QueryError> {
+    let Some(position) = integer_value(value) else {
+        return Err(QueryError::InvalidStructure);
+    };
+    if position < 0 {
+        return Err(QueryError::InvalidStructure);
+    }
+    u32::try_from(position).map_err(|_| QueryError::InvalidStructure)
+}
+
+fn bit_positions_from_numeric_value(value: &Bson) -> Option<u64> {
+    match value {
+        Bson::Int32(value) if *value >= 0 => Some(*value as u64),
+        Bson::Int64(value) if *value >= 0 => Some(*value as u64),
+        Bson::Double(value) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 => {
+            (*value <= u64::MAX as f64).then_some(*value as u64)
+        }
+        Bson::Decimal128(value) => {
+            let parsed = value.to_string().parse::<f64>().ok()?;
+            (parsed.is_finite()
+                && parsed >= 0.0
+                && parsed.fract() == 0.0
+                && parsed <= u64::MAX as f64)
+                .then_some(parsed as u64)
+        }
+        _ => None,
+    }
+}
+
+fn bit_positions_from_mask(mask: u64) -> Vec<u32> {
+    (0_u32..64)
+        .filter(|position| ((mask >> position) & 1) == 1)
+        .collect()
+}
+
+fn bit_positions_from_bytes(bytes: &[u8]) -> Vec<u32> {
+    let mut positions = Vec::new();
+    for (byte_index, byte) in bytes.iter().enumerate() {
+        for bit_index in 0..8_u32 {
+            if (byte & (1_u8 << bit_index)) != 0 {
+                positions.push((byte_index as u32 * 8) + bit_index);
+            }
+        }
+    }
+    positions
+}
+
+fn matches_bit_test(value: &Bson, mode: BitTestMode, positions: &[u32]) -> bool {
+    match value {
+        Bson::Array(items) => items
+            .iter()
+            .any(|item| matches_bit_test(item, mode, positions)),
+        Bson::Binary(binary) => evaluate_bit_test(mode, positions, |position| {
+            let byte_index = (position / 8) as usize;
+            let bit_index = position % 8;
+            binary
+                .bytes
+                .get(byte_index)
+                .is_some_and(|byte| (byte & (1_u8 << bit_index)) != 0)
+        }),
+        _ => numeric_bits(value).is_some_and(|bits| {
+            evaluate_bit_test(mode, positions, |position| {
+                position < 64 && ((bits >> position) & 1) == 1
+            })
+        }),
+    }
+}
+
+fn evaluate_bit_test(
+    mode: BitTestMode,
+    positions: &[u32],
+    bit_is_set: impl Fn(u32) -> bool,
+) -> bool {
+    match mode {
+        BitTestMode::AllSet => positions.iter().copied().all(bit_is_set),
+        BitTestMode::AllClear => positions
+            .iter()
+            .copied()
+            .all(|position| !bit_is_set(position)),
+        BitTestMode::AnySet => positions.iter().copied().any(bit_is_set),
+        BitTestMode::AnyClear => positions
+            .iter()
+            .copied()
+            .any(|position| !bit_is_set(position)),
+    }
+}
+
+fn numeric_bits(value: &Bson) -> Option<u64> {
+    match value {
+        Bson::Int32(value) => Some(*value as i64 as u64),
+        Bson::Int64(value) => Some(*value as u64),
+        Bson::Double(value) if value.is_finite() && value.fract() == 0.0 => {
+            truncate_f64_to_i64(*value).map(|value| value as u64)
+        }
+        Bson::Decimal128(value) => {
+            truncate_f64_to_i64(value.to_string().parse::<f64>().ok()?).map(|value| value as u64)
+        }
+        _ => None,
     }
 }
 

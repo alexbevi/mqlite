@@ -16,7 +16,7 @@ pub use error::QueryError;
 pub use filter::{document_matches, document_matches_expression, parse_filter};
 pub use pipeline::run_pipeline;
 pub use projection::apply_projection;
-pub use types::{MatchExpr, TypeSet, UpdateModifier, UpdateSpec};
+pub use types::{BitTestMode, MatchExpr, TypeSet, UpdateModifier, UpdateSpec};
 pub use update::{apply_update, parse_update, upsert_seed_from_query};
 
 #[cfg(test)]

@@ -1,5 +1,13 @@
 use bson::{Bson, Document};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitTestMode {
+    AllSet,
+    AllClear,
+    AnySet,
+    AnyClear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSet {
     pub all_numbers: bool,
@@ -72,6 +80,11 @@ pub enum MatchExpr {
     Size {
         path: String,
         size: usize,
+    },
+    BitTest {
+        path: String,
+        mode: BitTestMode,
+        positions: Vec<u32>,
     },
     Mod {
         path: String,

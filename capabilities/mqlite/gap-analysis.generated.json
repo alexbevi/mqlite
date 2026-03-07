@@ -14,10 +14,10 @@
   "query_operators": {
     "total_upstream": 65,
     "public_upstream": 38,
-    "total_supported": 24,
-    "public_supported": 24,
-    "total_unsupported": 41,
-    "public_unsupported": 14,
+    "total_supported": 28,
+    "public_supported": 28,
+    "total_unsupported": 37,
+    "public_unsupported": 10,
     "items": [
       {
         "name": "$_internalBucketGeoWithin",
@@ -560,8 +560,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bitsAllSet",
@@ -577,8 +577,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bitsAnyClear",
@@ -594,8 +594,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bitsAnySet",
@@ -611,8 +611,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$comment",

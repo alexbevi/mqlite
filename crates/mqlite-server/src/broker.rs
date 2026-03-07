@@ -1893,6 +1893,7 @@ fn collect_field_bounds(
         MatchExpr::ElemMatch { .. } => None,
         MatchExpr::Regex { .. } => None,
         MatchExpr::Size { .. } => None,
+        MatchExpr::BitTest { .. } => Some(()),
         MatchExpr::Mod { .. } => None,
         MatchExpr::Gt { path, value } => {
             tighten_lower(
@@ -2072,6 +2073,7 @@ fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>
         | MatchExpr::ElemMatch { path, .. }
         | MatchExpr::Regex { path, .. }
         | MatchExpr::Size { path, .. }
+        | MatchExpr::BitTest { path, .. }
         | MatchExpr::Mod { path, .. } => {
             paths.insert(path.clone());
         }
@@ -2267,6 +2269,11 @@ fn filter_shape(expression: &MatchExpr) -> String {
         } => format!("{path}:elem{}:{}", i32::from(*value_case), spec.len()),
         MatchExpr::Regex { path, options, .. } => format!("{path}:regex{options}"),
         MatchExpr::Size { path, size } => format!("{path}:size{size}"),
+        MatchExpr::BitTest {
+            path,
+            mode,
+            positions,
+        } => format!("{path}:bit{:?}{}", mode, positions.len()),
         MatchExpr::Mod {
             path,
             divisor,
