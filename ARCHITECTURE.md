@@ -50,6 +50,7 @@ The broker is the only writer for a database file.
 - Reads are served from in-process state loaded from the file plus any applied WAL mutations.
 - Writes append WAL records, update in-memory state, and become durable before command success.
 - Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
+- CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
 
 ## Durable File Layout
@@ -83,8 +84,30 @@ Each checkpoint snapshot stores the minimum metadata needed to reopen the durabl
 - Record page references per collection
 - Index page references, root page ids, key patterns, and uniqueness flags
 - Persisted plan-cache entries keyed by namespace and query shape
+- Persisted change-event page references plus change-event counts
 
 The snapshot does not inline all records and index entries directly. Those live in fixed-size pages referenced by the snapshot metadata.
+
+## Change-Event Storage
+
+`$changeStream` is backed by a persisted local change-event log inside the main `.mongodb` file.
+
+- Change events are stored separately from collection records and index pages.
+- Checkpoints encode them as slotted BSON pages so reopen does not depend on the transient WAL.
+- WAL mutations carry both the collection change and the associated change-event entries together.
+- Recovery replays change events and collection state from the same WAL records, so a crash cannot leave the catalog ahead of the change-stream history or vice versa.
+
+Each persisted change event records:
+
+- a local resume token
+- `clusterTime` and `wallTime`
+- namespace scope
+- operation type
+- optional `documentKey`
+- optional post-image and pre-image documents
+- optional update description
+- whether the event is part of the expanded-event surface
+- extra stage-visible metadata such as rename targets or index specs
 
 ## Record Storage
 
@@ -136,6 +159,7 @@ transforms and broker-backed collection resolution.
   from the same broker-owned file.
 - `PipelineContext` carries:
   - the active database
+  - the active source collection, if any
   - whether execution is inside `$facet`
   - the collection resolver
   - expression variables for correlated subpipelines
@@ -149,6 +173,12 @@ Current cross-namespace aggregation behavior:
   - optional `pipeline` filters or reshaping on the joined documents
   - `let` variables for correlated subpipelines
   - collectionless `$documents` subpipelines when `from` is omitted
+- `$changeStream` resolves the persisted local change-event log from the same `.mongodb` file and supports:
+  - collection, database, and cluster scopes
+  - `resumeAfter`, `startAfter`, and `startAtOperationTime`
+  - `fullDocument` and `fullDocumentBeforeChange`
+  - `showExpandedEvents`
+  - finite historical reads over the durable local log at aggregate start time
 - `$setWindowFields` executes locally over the in-memory document stream after the stage-level
   sort and partition step, with:
   - `partitionBy` expression partitioning
@@ -258,6 +288,7 @@ The broker command path is:
    - execute the plan and return documents or explain metadata
 8. `aggregate` uses the pipeline runner:
    - parse each stage into the supported Rust-native semantics
+   - resolve persisted local change-event input for `$changeStream`
    - synthesize collectionless metadata-stage input for supported first stages such as `$currentOp`
    - synthesize collection metadata-stage input for supported first stages such as `$collStats`
    - synthesize collection index metadata-stage input for supported first stages such as `$indexStats`

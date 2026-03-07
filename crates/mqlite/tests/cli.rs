@@ -947,7 +947,9 @@ fn command_aggregate_supports_list_sessions_stage() {
 #[test]
 fn command_aggregate_rejects_list_sessions_stage_on_wrong_namespace() {
     let temp_dir = tempdir().expect("tempdir");
-    let database_path = temp_dir.path().join("command-list-sessions-invalid.mongodb");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-sessions-invalid.mongodb");
 
     let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
     let output = aggregate
@@ -1766,7 +1768,9 @@ fn command_collectionless_aggregate_supports_query_settings_stage() {
 #[test]
 fn command_collection_aggregate_rejects_query_settings_stage() {
     let temp_dir = tempdir().expect("tempdir");
-    let database_path = temp_dir.path().join("command-query-settings-invalid.mongodb");
+    let database_path = temp_dir
+        .path()
+        .join("command-query-settings-invalid.mongodb");
 
     let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
     let output = aggregate
@@ -1826,7 +1830,9 @@ fn command_collectionless_aggregate_supports_list_mql_entities_stage() {
 #[test]
 fn command_collectionless_aggregate_rejects_list_mql_entities_stage_outside_admin() {
     let temp_dir = tempdir().expect("tempdir");
-    let database_path = temp_dir.path().join("command-list-mql-entities-invalid.mongodb");
+    let database_path = temp_dir
+        .path()
+        .join("command-list-mql-entities-invalid.mongodb");
 
     let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
     let output = aggregate
@@ -4193,4 +4199,180 @@ fn command_find_distinguishes_null_from_missing_in_covered_scan() {
     );
     assert!(document.contains_key("flag"));
     assert_eq!(document.get("flag"), Some(&Value::Null));
+}
+
+#[test]
+fn command_aggregate_change_stream_reports_collection_events() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("change-stream.mongodb");
+
+    for command in [
+        json!({ "create": "widgets" }).to_string(),
+        json!({ "insert": "widgets", "documents": [{ "_id": 1, "qty": 1 }] }).to_string(),
+        json!({
+            "update": "widgets",
+            "updates": [{ "q": { "_id": 1 }, "u": { "$set": { "qty": 2 } } }]
+        })
+        .to_string(),
+        json!({
+            "createIndexes": "widgets",
+            "indexes": [{ "name": "qty_1", "key": { "qty": 1 } }]
+        })
+        .to_string(),
+        json!({
+            "delete": "widgets",
+            "deletes": [{ "q": { "_id": 1 }, "limit": 1 }]
+        })
+        .to_string(),
+    ] {
+        let mut apply = Command::cargo_bin("mqlite").expect("binary");
+        apply
+            .args([
+                "command",
+                "--file",
+                database_path.to_str().expect("path"),
+                "--db",
+                "app",
+                "--idle-shutdown-secs",
+                "1",
+                "--eval",
+            ])
+            .arg(&command)
+            .assert()
+            .success();
+    }
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$changeStream": {
+                    "fullDocument": "updateLookup",
+                    "fullDocumentBeforeChange": "whenAvailable",
+                    "showExpandedEvents": true
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "operationType": 1,
+                    "documentKey": 1,
+                    "fullDocument.qty": 1,
+                    "fullDocumentBeforeChange.qty": 1,
+                    "operationDescription": 1
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    let operation_types = first_batch
+        .iter()
+        .map(|document| document["operationType"].as_str().expect("type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operation_types,
+        vec!["create", "insert", "update", "createIndexes", "delete"]
+    );
+    assert_eq!(first_batch[2]["fullDocument"]["qty"], 2);
+    assert_eq!(first_batch[2]["fullDocumentBeforeChange"]["qty"], 1);
+    assert_eq!(
+        first_batch[3]["operationDescription"]["indexes"][0]["name"],
+        "qty_1"
+    );
+}
+
+#[test]
+fn command_collectionless_aggregate_supports_change_stream_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("collectionless-change-stream.mongodb");
+
+    for command in [
+        json!({ "create": "widgets" }).to_string(),
+        json!({ "insert": "widgets", "documents": [{ "_id": 1, "sku": "alpha" }] }).to_string(),
+        json!({ "create": "gadgets" }).to_string(),
+        json!({ "insert": "gadgets", "documents": [{ "_id": 2, "sku": "beta" }] }).to_string(),
+    ] {
+        let mut apply = Command::cargo_bin("mqlite").expect("binary");
+        apply
+            .args([
+                "command",
+                "--file",
+                database_path.to_str().expect("path"),
+                "--db",
+                "app",
+                "--idle-shutdown-secs",
+                "1",
+                "--eval",
+            ])
+            .arg(&command)
+            .assert()
+            .success();
+    }
+
+    let aggregate_command = json!({
+        "aggregate": 1,
+        "pipeline": [
+            { "$changeStream": {} },
+            { "$project": { "_id": 0, "operationType": 1, "ns.coll": 1 } }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    let namespaces = first_batch
+        .iter()
+        .map(|document| document["ns"]["coll"].as_str().expect("collection"))
+        .collect::<Vec<_>>();
+    assert_eq!(namespaces, vec!["widgets", "gadgets"]);
+    assert!(
+        first_batch
+            .iter()
+            .all(|document| document["operationType"] == "insert")
+    );
 }

@@ -224,7 +224,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Same-file cross-namespace aggregation via `$unionWith` and `$lookup`, including collection-backed namespace resolution and collectionless `$documents` subpipelines for both stages.
 - Same-file aggregation write stages via `$out`, including string targets and `{ db, coll }` targets within the same `.mongodb` file.
 - Same-file aggregation write stages via `$merge`, including string targets or `{ db, coll }` targets, `on` fields, and the currently supported string mode combinations for `whenMatched` and `whenNotMatched`.
-- Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
+- Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents` or `$changeStream`.
 - Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.
 - Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
@@ -244,6 +244,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `$graphLookup` for same-file recursive foreign-collection traversal, including `startWith`, `connectFromField`, `connectToField`, `maxDepth`, `depthField`, `restrictSearchWithMatch`, and outer-scope variable resolution inside nested pipelines.
 - `$redact` aggregation with recursive `$$KEEP`, `$$PRUNE`, and `$$DESCEND` semantics over nested documents and arrays.
 - `$setWindowFields` for local partitioned window execution with `partitionBy`, `sortBy`, document windows, single-sort-key range windows, supported accumulator window functions (`$sum`, `$avg`, `$first`, `$last`, `$push`, `$addToSet`, `$min`, `$max`, `$count`), ranking functions (`$documentNumber`, `$rank`, `$denseRank`), `$shift`, `$locf`, and `$linearFill`.
+- `$changeStream` over a persisted local change-event log, including collection-scoped, database-scoped (`aggregate: 1`), and cluster-scoped (`admin` plus `allChangesForCluster: true`) streams, `resumeAfter`, `startAfter`, `startAtOperationTime`, `fullDocument`, `fullDocumentBeforeChange`, and `showExpandedEvents`. The current implementation returns the durable local history visible when the aggregate starts; it does not keep a live awaitData cursor open.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
 ## Unsupported Features
@@ -274,8 +275,6 @@ These are already part of the tested failure surface:
 
 ### Distributed consistency features
 - Retryable reads
-- Change streams
-- `$changeStream`
 - `$changeStreamSplitLargeEvent`
 
 ### Storage features
@@ -305,13 +304,13 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, reopened compound descending index order checks, and persisted index-entry presence metadata for explicit `null` versus missing fields.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records, B-tree indexes, and persisted change-event pages, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, reopened compound descending index order checks, and persisted index-entry presence metadata for explicit `null` versus missing fields.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
 - Capability snapshot tests keep the checked-in MongoDB operator and stage catalog in sync with the current `mqlite` support surface, and direct parser/executor contract tests validate that supported query operators, aggregation stages, expression operators, accumulators, and window functions are accepted while unsupported ones are rejected predictably.
 - Focused query and aggregation unit tests, inspired by MongoDB server matcher and pipeline tests, cover every currently supported query operator, aggregation stage, `$literal` expression operator, supported group accumulator, and supported `$setWindowFields` window operator.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, direct CLI coverage for collection-scoped and collectionless `$changeStream`, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
 - The Node driver workspace now also carries a dedicated `file://` harness (`test/mocha_mqlite.js` and `test/tools/runner/run_mqlite.cjs`) so existing `node-mongodb-native` integration suites can be replayed against mqlite without editing the suites themselves. The default suite list lives in `test/tools/runner/mqlite_suite_registry.ts`, so unwanted suites can be removed by commenting out lines there. `npm run check:mqlite` runs that broad registry, `npm run check:mqlite:crud` keeps a small green bring-up subset, and `npm run check:mqlite:operations` runs the larger operation-focused set covering CRUD, aggregation, indexing, commands, BSON options, and example-style operation suites. Extra Mocha flags can be forwarded after `--`, so `npm run check:mqlite -- --reporter min` still expands the mqlite registry instead of falling back to recursive test discovery.
 
 ## CLI

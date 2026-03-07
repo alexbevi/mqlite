@@ -16,22 +16,23 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR6";
-pub const FILE_FORMAT_VERSION: u32 = 6;
+pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR7";
+pub const FILE_FORMAT_VERSION: u32 = 7;
 pub const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 4096;
 const SUPERBLOCK_LEN: usize = 512;
 const SUPERBLOCK_COUNT: usize = 2;
 const DATA_START_OFFSET: u64 = (HEADER_LEN + (SUPERBLOCK_LEN * SUPERBLOCK_COUNT)) as u64;
-const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB06";
+const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB07";
 const WAL_FRAME_MAGIC: &[u8; 4] = b"WAL1";
 const WAL_HEADER_LEN: usize = 40;
-const PAGE_MAGIC: &[u8; 8] = b"MQLTPG06";
+const PAGE_MAGIC: &[u8; 8] = b"MQLTPG07";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
 const PAGE_KIND_RECORD: u16 = 1;
 const PAGE_KIND_INDEX_LEAF: u16 = 2;
 const PAGE_KIND_INDEX_INTERNAL: u16 = 3;
+const PAGE_KIND_CHANGE_EVENT: u16 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedState {
@@ -40,7 +41,26 @@ pub struct PersistedState {
     pub last_checkpoint_unix_ms: u64,
     pub catalog: Catalog,
     #[serde(default)]
+    pub change_events: Vec<PersistedChangeEvent>,
+    #[serde(default)]
     pub plan_cache_entries: Vec<PersistedPlanCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedChangeEvent {
+    pub token: bson::Document,
+    pub cluster_time: bson::Timestamp,
+    pub wall_time: bson::DateTime,
+    pub database: String,
+    pub collection: Option<String>,
+    pub operation_type: String,
+    pub document_key: Option<bson::Document>,
+    pub full_document: Option<bson::Document>,
+    pub full_document_before_change: Option<bson::Document>,
+    pub update_description: Option<bson::Document>,
+    pub expanded: bool,
+    #[serde(default)]
+    pub extra_fields: bson::Document,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,10 +86,14 @@ pub enum WalMutation {
         database: String,
         collection: String,
         collection_state: CollectionCatalog,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
     },
     DropCollection {
         database: String,
         collection: String,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
     },
 }
 
@@ -97,9 +121,11 @@ pub struct VerifyReport {
     pub collections: usize,
     pub record_count: usize,
     pub index_entry_count: usize,
+    pub change_event_count: usize,
     pub page_count: usize,
     pub record_page_count: usize,
     pub index_page_count: usize,
+    pub change_event_page_count: usize,
     pub wal_records_since_checkpoint: usize,
     pub truncated_wal_tail: bool,
 }
@@ -120,10 +146,13 @@ pub struct InspectReport {
     pub checkpoint_page_count: usize,
     pub checkpoint_record_page_count: usize,
     pub checkpoint_index_page_count: usize,
+    pub checkpoint_change_event_page_count: usize,
     pub checkpoint_record_count: usize,
     pub checkpoint_index_entry_count: usize,
+    pub checkpoint_change_event_count: usize,
     pub current_record_count: usize,
     pub current_index_entry_count: usize,
+    pub current_change_event_count: usize,
     pub wal_records_since_checkpoint: usize,
     pub wal_bytes_since_checkpoint: u64,
     pub truncated_wal_tail: bool,
@@ -204,6 +233,10 @@ struct SnapshotState {
     last_checkpoint_unix_ms: u64,
     catalog: SnapshotCatalog,
     #[serde(default)]
+    change_event_pages: Vec<PageRef>,
+    #[serde(default)]
+    change_event_count: usize,
+    #[serde(default)]
     plan_cache_entries: Vec<PersistedPlanCacheEntry>,
 }
 
@@ -255,11 +288,14 @@ struct EncodedPage {
 #[derive(Debug, Default)]
 struct EncodedSnapshotCatalog {
     catalog: SnapshotCatalog,
+    change_event_page_ids: Vec<u64>,
     pages: Vec<EncodedPage>,
     record_page_count: usize,
     index_page_count: usize,
+    change_event_page_count: usize,
     record_count: usize,
     index_entry_count: usize,
+    change_event_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -298,8 +334,10 @@ struct CheckpointCounts {
     page_count: usize,
     record_page_count: usize,
     index_page_count: usize,
+    change_event_page_count: usize,
     record_count: usize,
     index_entry_count: usize,
+    change_event_count: usize,
 }
 
 impl DatabaseFile {
@@ -325,6 +363,7 @@ impl DatabaseFile {
                 last_applied_sequence: 0,
                 last_checkpoint_unix_ms: current_unix_ms(),
                 catalog: Catalog::new(),
+                change_events: Vec::new(),
                 plan_cache_entries: Vec::new(),
             },
             active_slot: 0,
@@ -353,6 +392,10 @@ impl DatabaseFile {
         self.state.last_applied_sequence
     }
 
+    pub fn change_events(&self) -> &[PersistedChangeEvent] {
+        &self.state.change_events
+    }
+
     pub fn has_pending_wal(&self) -> bool {
         self.wal_records_since_checkpoint > 0
     }
@@ -368,10 +411,10 @@ impl DatabaseFile {
     }
 
     pub fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
-        let mut catalog = self.state.catalog.clone();
-        apply_mutation(&mut catalog, &mutation)?;
+        let mut state = self.state.clone();
+        let sequence = state.last_applied_sequence + 1;
+        apply_mutation(&mut state, sequence, &mutation)?;
 
-        let sequence = self.state.last_applied_sequence + 1;
         let appended_bytes = append_wal_entry(
             &mut self.file,
             &WalEntry {
@@ -380,8 +423,7 @@ impl DatabaseFile {
             },
         )?;
 
-        self.state.catalog = catalog;
-        self.state.last_applied_sequence = sequence;
+        self.state = state;
         self.wal_records_since_checkpoint += 1;
         self.wal_bytes_since_checkpoint += appended_bytes;
         self.truncated_wal_tail = false;
@@ -415,10 +457,13 @@ impl DatabaseFile {
             checkpoint_page_count: loaded.checkpoint_counts.page_count,
             checkpoint_record_page_count: loaded.checkpoint_counts.record_page_count,
             checkpoint_index_page_count: loaded.checkpoint_counts.index_page_count,
+            checkpoint_change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
             checkpoint_record_count: loaded.checkpoint_counts.record_count,
             checkpoint_index_entry_count: loaded.checkpoint_counts.index_entry_count,
+            checkpoint_change_event_count: loaded.checkpoint_counts.change_event_count,
             current_record_count: record_count(&loaded.state.catalog),
             current_index_entry_count: index_entry_count(&loaded.state.catalog),
+            current_change_event_count: loaded.state.change_events.len(),
             wal_records_since_checkpoint: loaded.wal_recovery.records,
             wal_bytes_since_checkpoint: loaded.wal_recovery.bytes,
             truncated_wal_tail: loaded.wal_recovery.truncated_tail,
@@ -447,9 +492,11 @@ impl DatabaseFile {
             collections,
             record_count: record_count(&loaded.state.catalog),
             index_entry_count: index_entry_count(&loaded.state.catalog),
+            change_event_count: loaded.state.change_events.len(),
             page_count: loaded.checkpoint_counts.page_count,
             record_page_count: loaded.checkpoint_counts.record_page_count,
             index_page_count: loaded.checkpoint_counts.index_page_count,
+            change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
             wal_records_since_checkpoint: loaded.wal_recovery.records,
             truncated_wal_tail: loaded.wal_recovery.truncated_tail,
         })
@@ -484,7 +531,8 @@ impl DatabaseFile {
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
         let pages_start = self.file.metadata()?.len().max(DATA_START_OFFSET);
-        let encoded_catalog = encode_snapshot_catalog(&self.state.catalog)?;
+        let encoded_catalog =
+            encode_snapshot_catalog(&self.state.catalog, &self.state.change_events)?;
 
         let mut page_refs = Vec::with_capacity(encoded_catalog.pages.len());
         let mut page_offset = pages_start;
@@ -499,19 +547,33 @@ impl DatabaseFile {
             page_offset += page.bytes.len() as u64;
         }
 
-        let snapshot_catalog = resolve_snapshot_catalog(encoded_catalog.catalog, &page_refs)?;
+        let EncodedSnapshotCatalog {
+            catalog,
+            change_event_page_ids,
+            pages,
+            record_page_count,
+            index_page_count,
+            change_event_page_count,
+            record_count,
+            index_entry_count,
+            change_event_count,
+        } = encoded_catalog;
+
+        let snapshot_catalog = resolve_snapshot_catalog(catalog, &page_refs)?;
         let snapshot_state = SnapshotState {
             file_format_version: FILE_FORMAT_VERSION,
             last_applied_sequence: self.state.last_applied_sequence,
             last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
             catalog: snapshot_catalog,
+            change_event_pages: resolve_page_id_refs(&change_event_page_ids, &page_refs)?,
+            change_event_count: self.state.change_events.len(),
             plan_cache_entries: self.state.plan_cache_entries.clone(),
         };
         let snapshot = bson::to_vec(&snapshot_state)?;
         let snapshot_offset = page_offset;
 
         self.file.seek(SeekFrom::Start(pages_start))?;
-        for page in &encoded_catalog.pages {
+        for page in &pages {
             self.file.write_all(&page.bytes)?;
         }
         self.file.write_all(&snapshot)?;
@@ -541,10 +603,12 @@ impl DatabaseFile {
         self.truncated_wal_tail = false;
         self.checkpoint_counts = CheckpointCounts {
             page_count: page_refs.len(),
-            record_page_count: encoded_catalog.record_page_count,
-            index_page_count: encoded_catalog.index_page_count,
-            record_count: encoded_catalog.record_count,
-            index_entry_count: encoded_catalog.index_entry_count,
+            record_page_count,
+            index_page_count,
+            change_event_page_count,
+            record_count,
+            index_entry_count,
+            change_event_count,
         };
         Ok(())
     }
@@ -688,12 +752,7 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
         return Err(StorageError::NoValidSuperblock.into());
     };
 
-    let wal_recovery = replay_wal(
-        file,
-        active_superblock.wal_offset,
-        &mut state.catalog,
-        state.last_applied_sequence,
-    )?;
+    let wal_recovery = replay_wal(file, active_superblock.wal_offset, &mut state)?;
     if let Some(last_sequence) = wal_recovery.last_sequence {
         state.last_applied_sequence = last_sequence;
     }
@@ -789,15 +848,25 @@ fn read_snapshot(
     }
 
     let (catalog, checkpoint_counts) = restore_catalog(file, &snapshot_state.catalog)?;
+    let change_events = restore_change_events(file, &snapshot_state.change_event_pages)?;
+    if change_events.len() != snapshot_state.change_event_count {
+        return Err(StorageError::InvalidPage.into());
+    }
     Ok((
         PersistedState {
             file_format_version: FILE_FORMAT_VERSION,
             last_applied_sequence: snapshot_state.last_applied_sequence,
             last_checkpoint_unix_ms: snapshot_state.last_checkpoint_unix_ms,
             catalog,
+            change_events,
             plan_cache_entries: snapshot_state.plan_cache_entries,
         },
-        checkpoint_counts,
+        CheckpointCounts {
+            page_count: checkpoint_counts.page_count + snapshot_state.change_event_pages.len(),
+            change_event_page_count: snapshot_state.change_event_pages.len(),
+            change_event_count: snapshot_state.change_event_count,
+            ..checkpoint_counts
+        },
     ))
 }
 
@@ -820,8 +889,7 @@ fn append_wal_entry(file: &mut File, entry: &WalEntry) -> Result<u64> {
 fn replay_wal(
     file: &mut File,
     start_offset: u64,
-    catalog: &mut Catalog,
-    mut last_applied_sequence: u64,
+    state: &mut PersistedState,
 ) -> Result<WalRecovery> {
     let file_size = file.metadata()?.len();
     if start_offset > file_size {
@@ -829,6 +897,7 @@ fn replay_wal(
     }
 
     let mut recovery = WalRecovery::default();
+    let mut last_applied_sequence = state.last_applied_sequence;
     let mut offset = start_offset;
     while offset < file_size {
         if file_size - offset < WAL_HEADER_LEN as u64 {
@@ -862,7 +931,7 @@ fn replay_wal(
 
         let entry = bson::from_slice::<WalEntry>(&payload)?;
         if entry.sequence > last_applied_sequence {
-            apply_mutation(catalog, &entry.mutation)?;
+            apply_mutation(state, entry.sequence, &entry.mutation)?;
             last_applied_sequence = entry.sequence;
             recovery.last_sequence = Some(entry.sequence);
             recovery.records += 1;
@@ -875,29 +944,39 @@ fn replay_wal(
     Ok(recovery)
 }
 
-fn apply_mutation(catalog: &mut Catalog, mutation: &WalMutation) -> Result<()> {
+fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutation) -> Result<()> {
     match mutation {
         WalMutation::ReplaceCollection {
             database,
             collection,
             collection_state,
+            change_events,
         } => {
             let mut hydrated = collection_state.clone();
             hydrated.hydrate_indexes();
             validate_collection_indexes(&hydrated).map_err(map_catalog_error)?;
-            catalog.replace_collection(database, collection, hydrated);
+            state
+                .catalog
+                .replace_collection(database, collection, hydrated);
+            state.change_events.extend(change_events.iter().cloned());
         }
         WalMutation::DropCollection {
             database,
             collection,
+            change_events,
         } => {
-            catalog.drop_collection(database, collection)?;
+            state.catalog.drop_collection(database, collection)?;
+            state.change_events.extend(change_events.iter().cloned());
         }
     }
+    state.last_applied_sequence = sequence;
     Ok(())
 }
 
-fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> {
+fn encode_snapshot_catalog(
+    catalog: &Catalog,
+    change_events: &[PersistedChangeEvent],
+) -> Result<EncodedSnapshotCatalog> {
     let mut encoded_catalog = EncodedSnapshotCatalog::default();
     let mut next_page_id = 1_u64;
 
@@ -960,6 +1039,16 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
             .insert(database_name.clone(), snapshot_database);
     }
 
+    let change_event_page_count_before = encoded_catalog.pages.len();
+    let change_event_pages = encode_change_event_pages(change_events, &mut next_page_id)?;
+    encoded_catalog.change_event_page_count = change_event_pages.len();
+    encoded_catalog.change_event_count = change_events.len();
+    encoded_catalog.pages.extend(change_event_pages);
+    encoded_catalog.change_event_page_ids = (change_event_page_count_before
+        ..encoded_catalog.pages.len())
+        .map(|index| encoded_catalog.pages[index].page_id)
+        .collect();
+
     Ok(encoded_catalog)
 }
 
@@ -1014,6 +1103,35 @@ fn encode_collection_pages(
         0,
         next_page_id,
     )
+}
+
+fn encode_change_event_pages(
+    events: &[PersistedChangeEvent],
+    next_page_id: &mut u64,
+) -> Result<Vec<EncodedPage>> {
+    let mut pages = Vec::new();
+    let mut builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_CHANGE_EVENT, 0);
+
+    for (index, event) in events.iter().enumerate() {
+        let document = change_event_as_document(event)?;
+        let payload = bson::to_vec(&document)?;
+        if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
+            return Err(StorageError::RecordTooLarge.into());
+        }
+        if !builder.can_fit(payload.len()) && !builder.is_empty() {
+            pages.push(builder.finish());
+            *next_page_id += 1;
+            builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_CHANGE_EVENT, 0);
+        }
+        builder.insert(index as u64, &document)?;
+    }
+
+    if !builder.is_empty() {
+        pages.push(builder.finish());
+        *next_page_id += 1;
+    }
+
+    Ok(pages)
 }
 
 fn encode_document_pages<'a, I>(
@@ -1219,6 +1337,23 @@ fn restore_catalog(
     Ok((catalog, counts))
 }
 
+fn restore_change_events(
+    file: &mut File,
+    page_refs: &[PageRef],
+) -> Result<Vec<PersistedChangeEvent>> {
+    let mut events = Vec::new();
+    for page_ref in page_refs {
+        let page = decode_page(file, page_ref)?;
+        if page.page_kind != PAGE_KIND_CHANGE_EVENT {
+            return Err(StorageError::InvalidPage.into());
+        }
+        for (_, document) in page.entries {
+            events.push(bson::from_document(document)?);
+        }
+    }
+    Ok(events)
+}
+
 fn restore_index(
     file: &mut File,
     index_name: &str,
@@ -1265,6 +1400,26 @@ fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<Collect
                 record_id,
                 document,
             })
+        })
+        .collect()
+}
+
+fn change_event_as_document(event: &PersistedChangeEvent) -> Result<bson::Document> {
+    Ok(bson::to_document(event)?)
+}
+
+fn resolve_page_id_refs(page_ids: &[u64], page_refs: &[PageRef]) -> Result<Vec<PageRef>> {
+    let page_ref_by_id = page_refs
+        .iter()
+        .map(|page_ref| (page_ref.page_id, page_ref.clone()))
+        .collect::<BTreeMap<_, _>>();
+    page_ids
+        .iter()
+        .map(|page_id| {
+            page_ref_by_id
+                .get(page_id)
+                .cloned()
+                .ok_or(StorageError::InvalidPageReference.into())
         })
         .collect()
 }
@@ -1481,7 +1636,7 @@ mod tests {
         io::{Read, Seek, SeekFrom, Write},
     };
 
-    use bson::doc;
+    use bson::{DateTime, Document, Timestamp, doc};
     use mqlite_catalog::{
         CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, apply_index_specs,
     };
@@ -1489,8 +1644,8 @@ mod tests {
 
     use super::{
         DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE,
-        PersistedPlanCacheChoice, PersistedPlanCacheEntry, SnapshotState, VerifyReport,
-        WalMutation, decode_page, read_superblock,
+        PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, SnapshotState,
+        VerifyReport, WalMutation, decode_page, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -1514,6 +1669,26 @@ mod tests {
         bson::from_slice::<SnapshotState>(&snapshot).expect("decode snapshot")
     }
 
+    fn sample_change_event(sequence: i64, operation_type: &str) -> PersistedChangeEvent {
+        PersistedChangeEvent {
+            token: doc! { "sequence": sequence, "event": 1_i32 },
+            cluster_time: Timestamp {
+                time: sequence as u32,
+                increment: 1,
+            },
+            wall_time: DateTime::from_millis(sequence),
+            database: "app".to_string(),
+            collection: Some("widgets".to_string()),
+            operation_type: operation_type.to_string(),
+            document_key: Some(doc! { "_id": sequence }),
+            full_document: Some(doc! { "_id": sequence, "qty": sequence }),
+            full_document_before_change: None,
+            update_description: None,
+            expanded: false,
+            extra_fields: Document::new(),
+        }
+    }
+
     #[test]
     fn recovers_replace_collection_from_wal_without_checkpoint() {
         let temp_dir = tempdir().expect("tempdir");
@@ -1529,6 +1704,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("commit mutation");
         }
@@ -1568,6 +1744,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1613,6 +1790,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1657,6 +1835,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1732,6 +1911,67 @@ mod tests {
     }
 
     #[test]
+    fn recovers_change_events_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("change-events-wal.mongodb");
+        let change_events = vec![sample_change_event(1, "insert")];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "qty": 1 });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: change_events.clone(),
+                })
+                .expect("mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        assert_eq!(reopened.change_events(), change_events.as_slice());
+    }
+
+    #[test]
+    fn checkpoints_persist_change_event_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("change-events-checkpoint.mongodb");
+        let change_events = vec![
+            sample_change_event(1, "insert"),
+            sample_change_event(2, "update"),
+        ];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "qty": 2 });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: change_events.clone(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        assert_eq!(reopened.change_events(), change_events.as_slice());
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.current_change_event_count, 2);
+        assert_eq!(inspect.checkpoint_change_event_count, 2);
+        assert!(inspect.checkpoint_change_event_page_count >= 1);
+
+        let verify = DatabaseFile::verify(&path).expect("verify");
+        assert_eq!(verify.change_event_count, 2);
+        assert!(verify.change_event_page_count >= 1);
+    }
+
+    #[test]
     fn reopens_compound_descending_indexes_in_persisted_order() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("compound-descending.mongodb");
@@ -1769,6 +2009,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1827,6 +2068,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1863,6 +2105,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1911,6 +2154,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
         }
@@ -1943,6 +2187,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -1998,6 +2243,7 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     collection_state: collection,
+                    change_events: Vec::new(),
                 })
                 .expect("mutation");
             database.checkpoint().expect("checkpoint");
@@ -2053,9 +2299,11 @@ mod tests {
                 collections: 0,
                 record_count: 0,
                 index_entry_count: 0,
+                change_event_count: 0,
                 page_count: 0,
                 record_page_count: 0,
                 index_page_count: 0,
+                change_event_page_count: 0,
                 wal_records_since_checkpoint: 0,
                 truncated_wal_tail: false,
             }

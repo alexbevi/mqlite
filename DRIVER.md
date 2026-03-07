@@ -87,6 +87,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.collection.aggregate([{ $graphLookup: { from: "foreign", startWith: "$seed", connectFromField: "neighbors", connectToField: "name", as: "results" } }])` performs same-file recursive graph traversal with optional `maxDepth`, `depthField`, `restrictSearchWithMatch`, and outer-variable resolution inside nested pipelines
 - `db.collection.aggregate([{ $redact: { $cond: [{ $lte: ["$level", 2] }, "$$DESCEND", "$$PRUNE"] } }])` applies recursive redaction with `$$KEEP`, `$$PRUNE`, and `$$DESCEND`
 - `db.collection.aggregate([{ $setWindowFields: { partitionBy: "$team", sortBy: { seq: 1 }, output: { runningQty: { $sum: "$qty", window: { documents: ["unbounded", "current"] } }, dense: { $denseRank: {} } } } }])` performs local window execution with document windows, single-sort-key range windows, supported accumulator window functions, ranking functions, `$shift`, `$locf`, and `$linearFill`
+- `db.collection.aggregate([{ $changeStream: { fullDocument: "updateLookup", fullDocumentBeforeChange: "whenAvailable", showExpandedEvents: true } }])` reads the persisted local change-event log for the file-backed namespace, supports collection, database, and cluster scopes plus `resumeAfter`, `startAfter`, and `startAtOperationTime`, and currently returns the durable history visible when the aggregate starts rather than a live awaitData stream
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
 - Null-byte database or collection names are rejected with `InvalidNamespace`
 - TTL index metadata such as `expireAfterSeconds` is stored and returned by `listIndexes`
@@ -131,7 +132,7 @@ The current supported and unsupported query and aggregation surface is tracked i
 - `capabilities/mqlite/gap-analysis.generated.md`
 
 Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
-`mqlite` also supports collectionless `aggregate: 1` commands when the pipeline begins with `$documents` or `$currentOp`, which is the direct validation path for collectionless aggregation before any driver-specific adapter work.
+`mqlite` also supports collectionless `aggregate: 1` commands when the pipeline begins with `$documents`, `$currentOp`, or `$changeStream`, which is the direct validation path for collectionless aggregation before any driver-specific adapter work.
 Cross-namespace aggregation stages operate only within the same local `.mongodb` file; there is no network federation, so stages such as `$unionWith` and `$lookup` resolve foreign namespaces from the same broker-owned file, and write stages such as `$out` and `$merge` only target namespaces in that same file.
 Server-side JavaScript is permanently out of scope for `mqlite`, so `$where` and `$function` should remain explicit unsupported-operator failures rather than compatibility gaps to close later.
 

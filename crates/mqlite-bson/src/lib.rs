@@ -52,14 +52,14 @@ pub fn remove_path(document: &mut Document, path: &str) -> Result<(), BsonToolsE
     Ok(())
 }
 
-pub fn ensure_object_id(document: &mut Document) -> ObjectId {
-    if let Some(Bson::ObjectId(existing)) = document.get("_id") {
-        return *existing;
+pub fn ensure_object_id(document: &mut Document) -> Bson {
+    if let Some(existing) = document.get("_id") {
+        return existing.clone();
     }
 
     let generated = ObjectId::new();
     document.insert("_id", Bson::ObjectId(generated));
-    generated
+    Bson::ObjectId(generated)
 }
 
 pub fn compare_bson(left: &Bson, right: &Bson) -> Ordering {
@@ -288,13 +288,13 @@ mod tests {
     fn preserves_existing_object_id() {
         let id = bson::oid::ObjectId::new();
         let mut document = doc! { "_id": id };
-        assert_eq!(ensure_object_id(&mut document), id);
+        assert_eq!(ensure_object_id(&mut document), Bson::ObjectId(id));
+
+        let mut scalar_id = doc! { "_id": 1, "name": "Ada" };
+        assert_eq!(ensure_object_id(&mut scalar_id), Bson::Int32(1));
 
         let mut without_id = doc! { "name": "Grace" };
         let created = ensure_object_id(&mut without_id);
-        assert_eq!(
-            lookup_path(&without_id, "_id"),
-            Some(&Bson::ObjectId(created))
-        );
+        assert_eq!(lookup_path(&without_id, "_id"), Some(&created));
     }
 }

@@ -22,6 +22,10 @@ use crate::{
 
 pub trait CollectionResolver {
     fn resolve_collection(&self, database: &str, collection: &str) -> Vec<Document>;
+
+    fn resolve_change_events(&self) -> Vec<Document> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,18 +42,20 @@ pub fn run_pipeline(
     pipeline: &[Document],
 ) -> Result<Vec<Document>, QueryError> {
     let resolver = NoopResolver;
-    run_pipeline_with_resolver(documents, pipeline, "", &resolver)
+    run_pipeline_with_resolver(documents, pipeline, "", None, &resolver)
 }
 
 pub fn run_pipeline_with_resolver<R: CollectionResolver>(
     documents: Vec<Document>,
     pipeline: &[Document],
     database: &str,
+    source_collection: Option<&str>,
     resolver: &R,
 ) -> Result<Vec<Document>, QueryError> {
     let context = PipelineContext {
         inside_facet: false,
         database,
+        source_collection,
         resolver,
         variables: BTreeMap::new(),
     };
@@ -60,6 +66,7 @@ pub fn run_pipeline_with_resolver<R: CollectionResolver>(
 struct PipelineContext<'a, R> {
     inside_facet: bool,
     database: &'a str,
+    source_collection: Option<&'a str>,
     resolver: &'a R,
     variables: BTreeMap<String, Bson>,
 }
@@ -70,6 +77,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
     context: &PipelineContext<'_, R>,
 ) -> Result<Vec<Document>, QueryError> {
     let mut current = documents;
+    let mut saw_change_stream = false;
 
     for (stage_index, stage) in pipeline.iter().enumerate() {
         if stage.len() != 1 {
@@ -78,6 +86,16 @@ fn run_pipeline_with_context<R: CollectionResolver>(
 
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
+            "$changeStream" if context.inside_facet || stage_index != 0 => {
+                return Err(QueryError::InvalidStage);
+            }
+            "$changeStream" => {
+                if saw_change_stream {
+                    return Err(QueryError::InvalidStage);
+                }
+                saw_change_stream = true;
+                change_stream_documents(stage_spec, context)?
+            }
             "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
@@ -247,6 +265,7 @@ fn facet_documents<R: CollectionResolver>(
         let facet_context = PipelineContext {
             inside_facet: true,
             database: context.database,
+            source_collection: context.source_collection,
             resolver: context.resolver,
             variables: context.variables.clone(),
         };
@@ -258,6 +277,303 @@ fn facet_documents<R: CollectionResolver>(
     }
 
     Ok(vec![output])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeStreamFullDocumentMode {
+    Default,
+    UpdateLookup,
+    WhenAvailable,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeStreamFullDocumentBeforeChangeMode {
+    Off,
+    WhenAvailable,
+    Required,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeStreamSpec {
+    resume_after: Option<Document>,
+    start_after: Option<Document>,
+    start_at_operation_time: Option<bson::Timestamp>,
+    full_document: ChangeStreamFullDocumentMode,
+    full_document_before_change: ChangeStreamFullDocumentBeforeChangeMode,
+    all_changes_for_cluster: bool,
+    show_expanded_events: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InternalChangeEvent {
+    token: Document,
+    cluster_time: bson::Timestamp,
+    wall_time: bson::DateTime,
+    database: String,
+    collection: Option<String>,
+    operation_type: String,
+    document_key: Option<Document>,
+    full_document: Option<Document>,
+    full_document_before_change: Option<Document>,
+    update_description: Option<Document>,
+    expanded: bool,
+    extra_fields: Document,
+}
+
+fn change_stream_documents<R: CollectionResolver>(
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<Vec<Document>, QueryError> {
+    let spec = parse_change_stream_spec(spec, context)?;
+    let mut events = context
+        .resolver
+        .resolve_change_events()
+        .into_iter()
+        .map(parse_internal_change_event)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    events.retain(|event| change_stream_namespace_matches(event, &spec, context));
+    if !spec.show_expanded_events {
+        events.retain(|event| !event.expanded);
+    }
+
+    if let Some(start_at_operation_time) = spec.start_at_operation_time {
+        events.retain(|event| {
+            compare_bson(
+                &Bson::Timestamp(event.cluster_time),
+                &Bson::Timestamp(start_at_operation_time),
+            )
+            .is_ge()
+        });
+    }
+
+    if let Some(token) = spec.resume_after.as_ref().or(spec.start_after.as_ref()) {
+        let Some(position) = events.iter().position(|event| {
+            compare_bson(
+                &Bson::Document(event.token.clone()),
+                &Bson::Document(token.clone()),
+            )
+            .is_eq()
+        }) else {
+            return Err(QueryError::InvalidArgument(
+                "resume token does not exist in the local change-event log".to_string(),
+            ));
+        };
+        events = events.into_iter().skip(position + 1).collect();
+    }
+
+    events
+        .into_iter()
+        .map(|event| materialize_change_stream_event(event, &spec))
+        .collect()
+}
+
+fn parse_change_stream_spec<R: CollectionResolver>(
+    spec: &Bson,
+    context: &PipelineContext<'_, R>,
+) -> Result<ChangeStreamSpec, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut resume_after = None;
+    let mut start_after = None;
+    let mut start_at_operation_time = None;
+    let mut full_document = ChangeStreamFullDocumentMode::Default;
+    let mut full_document_before_change = ChangeStreamFullDocumentBeforeChangeMode::Off;
+    let mut all_changes_for_cluster = false;
+    let mut show_expanded_events = false;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "resumeAfter" => {
+                resume_after = Some(value.as_document().ok_or(QueryError::InvalidStage)?.clone())
+            }
+            "startAfter" => {
+                start_after = Some(value.as_document().ok_or(QueryError::InvalidStage)?.clone())
+            }
+            "startAtOperationTime" => {
+                start_at_operation_time =
+                    Some(value.as_timestamp().ok_or(QueryError::InvalidStage)?)
+            }
+            "fullDocument" => {
+                full_document = match value.as_str().ok_or(QueryError::InvalidStage)? {
+                    "default" => ChangeStreamFullDocumentMode::Default,
+                    "updateLookup" => ChangeStreamFullDocumentMode::UpdateLookup,
+                    "whenAvailable" => ChangeStreamFullDocumentMode::WhenAvailable,
+                    "required" => ChangeStreamFullDocumentMode::Required,
+                    _ => return Err(QueryError::InvalidStage),
+                };
+            }
+            "fullDocumentBeforeChange" => {
+                full_document_before_change =
+                    match value.as_str().ok_or(QueryError::InvalidStage)? {
+                        "off" => ChangeStreamFullDocumentBeforeChangeMode::Off,
+                        "whenAvailable" => ChangeStreamFullDocumentBeforeChangeMode::WhenAvailable,
+                        "required" => ChangeStreamFullDocumentBeforeChangeMode::Required,
+                        _ => return Err(QueryError::InvalidStage),
+                    };
+            }
+            "allChangesForCluster" => {
+                all_changes_for_cluster = value.as_bool().ok_or(QueryError::InvalidStage)?
+            }
+            "showExpandedEvents" => {
+                show_expanded_events = value.as_bool().ok_or(QueryError::InvalidStage)?
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let resume_options = usize::from(resume_after.is_some())
+        + usize::from(start_after.is_some())
+        + usize::from(start_at_operation_time.is_some());
+    if resume_options > 1 {
+        return Err(QueryError::InvalidStage);
+    }
+    if all_changes_for_cluster
+        && !(context.database == "admin" && context.source_collection.is_none())
+    {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(ChangeStreamSpec {
+        resume_after,
+        start_after,
+        start_at_operation_time,
+        full_document,
+        full_document_before_change,
+        all_changes_for_cluster,
+        show_expanded_events,
+    })
+}
+
+fn parse_internal_change_event(document: Document) -> Result<InternalChangeEvent, QueryError> {
+    Ok(InternalChangeEvent {
+        token: document
+            .get_document("token")
+            .map_err(|_| QueryError::InvalidStage)?
+            .clone(),
+        cluster_time: document
+            .get_timestamp("clusterTime")
+            .map_err(|_| QueryError::InvalidStage)?,
+        wall_time: *document
+            .get_datetime("wallTime")
+            .map_err(|_| QueryError::InvalidStage)?,
+        database: document
+            .get_str("database")
+            .map_err(|_| QueryError::InvalidStage)?
+            .to_string(),
+        collection: document.get_str("collection").ok().map(ToString::to_string),
+        operation_type: document
+            .get_str("operationType")
+            .map_err(|_| QueryError::InvalidStage)?
+            .to_string(),
+        document_key: document.get_document("documentKey").ok().cloned(),
+        full_document: document.get_document("fullDocument").ok().cloned(),
+        full_document_before_change: document
+            .get_document("fullDocumentBeforeChange")
+            .ok()
+            .cloned(),
+        update_description: document.get_document("updateDescription").ok().cloned(),
+        expanded: document.get_bool("expanded").unwrap_or(false),
+        extra_fields: document
+            .get_document("extraFields")
+            .ok()
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+fn change_stream_namespace_matches<R: CollectionResolver>(
+    event: &InternalChangeEvent,
+    spec: &ChangeStreamSpec,
+    context: &PipelineContext<'_, R>,
+) -> bool {
+    if spec.all_changes_for_cluster {
+        return true;
+    }
+    if event.database != context.database {
+        return false;
+    }
+    match context.source_collection {
+        Some(collection) => event.collection.as_deref() == Some(collection),
+        None => true,
+    }
+}
+
+fn materialize_change_stream_event(
+    event: InternalChangeEvent,
+    spec: &ChangeStreamSpec,
+) -> Result<Document, QueryError> {
+    let mut document = Document::new();
+    document.insert("_id", Bson::Document(event.token.clone()));
+    document.insert("operationType", event.operation_type.clone());
+    document.insert("clusterTime", Bson::Timestamp(event.cluster_time));
+    document.insert("wallTime", Bson::DateTime(event.wall_time));
+
+    let mut namespace = doc! { "db": event.database.clone() };
+    if let Some(collection) = &event.collection {
+        namespace.insert("coll", collection.clone());
+    }
+    document.insert("ns", Bson::Document(namespace));
+
+    if let Some(document_key) = event.document_key.clone() {
+        document.insert("documentKey", Bson::Document(document_key));
+    }
+    if let Some(update_description) = event.update_description.clone() {
+        document.insert("updateDescription", Bson::Document(update_description));
+    }
+
+    let include_full_document = match event.operation_type.as_str() {
+        "insert" | "replace" => true,
+        "update" => !matches!(spec.full_document, ChangeStreamFullDocumentMode::Default),
+        _ => false,
+    };
+    if include_full_document {
+        match (event.full_document.clone(), spec.full_document) {
+            (Some(full_document), _) => {
+                document.insert("fullDocument", Bson::Document(full_document));
+            }
+            (None, ChangeStreamFullDocumentMode::WhenAvailable) => {
+                document.insert("fullDocument", Bson::Null);
+            }
+            (None, ChangeStreamFullDocumentMode::Required) => {
+                return Err(QueryError::InvalidArgument(
+                    "change stream event is missing a required fullDocument".to_string(),
+                ));
+            }
+            (None, _) => {}
+        }
+    }
+
+    match spec.full_document_before_change {
+        ChangeStreamFullDocumentBeforeChangeMode::Off => {}
+        ChangeStreamFullDocumentBeforeChangeMode::WhenAvailable => {
+            if let Some(full_document_before_change) = event.full_document_before_change.clone() {
+                document.insert(
+                    "fullDocumentBeforeChange",
+                    Bson::Document(full_document_before_change),
+                );
+            }
+        }
+        ChangeStreamFullDocumentBeforeChangeMode::Required => {
+            let Some(full_document_before_change) = event.full_document_before_change.clone()
+            else {
+                return Err(QueryError::InvalidArgument(
+                    "change stream event is missing a required fullDocumentBeforeChange"
+                        .to_string(),
+                ));
+            };
+            document.insert(
+                "fullDocumentBeforeChange",
+                Bson::Document(full_document_before_change),
+            );
+        }
+    }
+
+    for (field, value) in event.extra_fields {
+        document.insert(field, value);
+    }
+
+    Ok(document)
 }
 
 fn union_with_documents<R: CollectionResolver>(
@@ -276,6 +592,7 @@ fn union_with_documents<R: CollectionResolver>(
     let union_context = PipelineContext {
         inside_facet: false,
         database: union_database,
+        source_collection: union_spec.collection.as_deref(),
         resolver: context.resolver,
         variables: context.variables.clone(),
     };
@@ -325,6 +642,7 @@ fn lookup_documents<R: CollectionResolver>(
                 let lookup_context = PipelineContext {
                     inside_facet: false,
                     database: lookup_database,
+                    source_collection: lookup_spec.collection.as_deref(),
                     resolver: context.resolver,
                     variables: variables.clone(),
                 };
@@ -350,6 +668,7 @@ fn lookup_documents<R: CollectionResolver>(
                 let lookup_context = PipelineContext {
                     inside_facet: false,
                     database: lookup_database,
+                    source_collection: lookup_spec.collection.as_deref(),
                     resolver: context.resolver,
                     variables: variables.clone(),
                 };

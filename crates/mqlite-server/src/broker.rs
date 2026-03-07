@@ -13,8 +13,8 @@ use anyhow::Result;
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
-    Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
-    IndexEntry, apply_index_specs, drop_indexes_from_collection,
+    Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
+    IndexCatalog, IndexEntry, apply_index_specs, drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
@@ -27,7 +27,8 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    DatabaseFile, PersistedPlanCacheChoice, PersistedPlanCacheEntry, WalMutation,
+    DatabaseFile, PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry,
+    WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Mutex, RwLock};
@@ -450,13 +451,7 @@ impl Broker {
         if !state.error_labels.is_empty() {
             response.insert(
                 "errorLabels",
-                Bson::Array(
-                    state
-                        .error_labels
-                        .into_iter()
-                        .map(Bson::String)
-                        .collect(),
-                ),
+                Bson::Array(state.error_labels.into_iter().map(Bson::String).collect()),
             );
         }
         Ok(FailCommandAction::Respond(response))
@@ -895,11 +890,29 @@ impl Broker {
         {
             return Err(CatalogError::NamespaceExists(database, collection.to_string()).into());
         }
+        let sequence = storage.last_applied_sequence() + 1;
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
-                database,
+                database: database.clone(),
                 collection: collection.to_string(),
                 collection_state: CollectionCatalog::new(options),
+                change_events: vec![change_stream_event(
+                    sequence,
+                    0,
+                    &database,
+                    Some(collection),
+                    "create",
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    doc! {
+                        "operationDescription": {
+                            "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                        }
+                    },
+                )],
             })
             .map_err(internal_error)?;
         Ok(Document::new())
@@ -916,11 +929,57 @@ impl Broker {
         };
 
         let mut storage = self.storage.write();
-        for collection in collections {
+        let collection_count = collections.len();
+        for (index, collection) in collections.into_iter().enumerate() {
+            let sequence = storage.last_applied_sequence() + 1;
+            let mut change_events = vec![
+                change_stream_event(
+                    sequence,
+                    0,
+                    &database,
+                    Some(&collection),
+                    "drop",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Document::new(),
+                ),
+                change_stream_event(
+                    sequence,
+                    1,
+                    &database,
+                    Some(&collection),
+                    "invalidate",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Document::new(),
+                ),
+            ];
+            if index + 1 == collection_count {
+                change_events.push(change_stream_event(
+                    sequence,
+                    change_events.len(),
+                    &database,
+                    None,
+                    "dropDatabase",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Document::new(),
+                ));
+            }
             storage
                 .commit_mutation(WalMutation::DropCollection {
                     database: database.clone(),
                     collection,
+                    change_events,
                 })
                 .map_err(internal_error)?;
         }
@@ -939,10 +998,39 @@ impl Broker {
             .get_collection(&database, collection)?
             .indexes
             .len() as i32;
+        let sequence = storage.last_applied_sequence() + 1;
         storage
             .commit_mutation(WalMutation::DropCollection {
                 database: database.clone(),
                 collection: collection.to_string(),
+                change_events: vec![
+                    change_stream_event(
+                        sequence,
+                        0,
+                        &database,
+                        Some(collection),
+                        "drop",
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        Document::new(),
+                    ),
+                    change_stream_event(
+                        sequence,
+                        1,
+                        &database,
+                        Some(collection),
+                        "invalidate",
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        Document::new(),
+                    ),
+                ],
             })
             .map_err(internal_error)?;
         Ok(doc! {
@@ -992,10 +1080,39 @@ impl Broker {
                 )
                 .into());
             }
+            let sequence = storage.last_applied_sequence() + 1;
             storage
                 .commit_mutation(WalMutation::DropCollection {
                     database: target_database.to_string(),
                     collection: target_collection.to_string(),
+                    change_events: vec![
+                        change_stream_event(
+                            sequence,
+                            0,
+                            target_database,
+                            Some(target_collection),
+                            "drop",
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                            Document::new(),
+                        ),
+                        change_stream_event(
+                            sequence,
+                            1,
+                            target_database,
+                            Some(target_collection),
+                            "invalidate",
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                            Document::new(),
+                        ),
+                    ],
                 })
                 .map_err(internal_error)?;
         }
@@ -1005,12 +1122,44 @@ impl Broker {
                 database: target_database.to_string(),
                 collection: target_collection.to_string(),
                 collection_state: source_state,
+                change_events: Vec::new(),
             })
             .map_err(internal_error)?;
+        let drop_sequence = storage.last_applied_sequence() + 1;
         storage
             .commit_mutation(WalMutation::DropCollection {
                 database: source_database.to_string(),
                 collection: source_collection.to_string(),
+                change_events: vec![
+                    change_stream_event(
+                        drop_sequence,
+                        0,
+                        source_database,
+                        Some(source_collection),
+                        "rename",
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        doc! {
+                            "to": { "db": target_database, "coll": target_collection }
+                        },
+                    ),
+                    change_stream_event(
+                        drop_sequence,
+                        1,
+                        source_database,
+                        Some(source_collection),
+                        "invalidate",
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        Document::new(),
+                    ),
+                ],
             })
             .map_err(internal_error)?;
         Ok(Document::new())
@@ -1054,11 +1203,57 @@ impl Broker {
             .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
         let before = collection_state.indexes.len() as i32;
         let created = apply_index_specs(&mut collection_state, &specs)?;
+        let sequence = storage.last_applied_sequence() + 1;
+        let mut change_events = Vec::new();
+        if !collection_exists {
+            change_events.push(change_stream_event(
+                sequence,
+                change_events.len(),
+                &database,
+                Some(collection),
+                "create",
+                None,
+                None,
+                None,
+                None,
+                true,
+                doc! {
+                    "operationDescription": {
+                        "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                    }
+                },
+            ));
+        }
+        if !created.is_empty() {
+            change_events.push(change_stream_event(
+                sequence,
+                change_events.len(),
+                &database,
+                Some(collection),
+                "createIndexes",
+                None,
+                None,
+                None,
+                None,
+                true,
+                doc! {
+                    "operationDescription": {
+                        "indexes": created
+                            .iter()
+                            .cloned()
+                            .map(index_to_document)
+                            .map(Bson::Document)
+                            .collect::<Vec<_>>()
+                    }
+                },
+            ));
+        }
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
                 database,
                 collection: collection.to_string(),
                 collection_state,
+                change_events,
             })
             .map_err(internal_error)?;
         Ok(doc! {
@@ -1083,11 +1278,29 @@ impl Broker {
             .get_collection(&database, collection)?
             .clone();
         let removed = drop_indexes_from_collection(&mut collection_state, target)?;
+        let sequence = storage.last_applied_sequence() + 1;
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
-                database,
+                database: database.clone(),
                 collection: collection.to_string(),
                 collection_state,
+                change_events: vec![change_stream_event(
+                    sequence,
+                    0,
+                    &database,
+                    Some(collection),
+                    "dropIndexes",
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    doc! {
+                        "operationDescription": {
+                            "index": target
+                        }
+                    },
+                )],
             })
             .map_err(internal_error)?;
         Ok(doc! { "nIndexesWas": removed as i32 })
@@ -1110,26 +1323,67 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
+        let collection_exists = storage
+            .catalog()
+            .get_collection(&database, collection_name)
+            .is_ok();
         let mut collection_state = storage
             .catalog()
             .get_collection(&database, collection_name)
             .cloned()
             .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
         let inserted_total = documents.len() as i32;
+        let sequence = storage.last_applied_sequence() + 1;
+        let mut change_events = Vec::new();
+        if !collection_exists {
+            change_events.push(change_stream_event(
+                sequence,
+                change_events.len(),
+                &database,
+                Some(collection_name),
+                "create",
+                None,
+                None,
+                None,
+                None,
+                true,
+                doc! {
+                    "operationDescription": {
+                        "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                    }
+                },
+            ));
+        }
 
         for mut document in documents {
             ensure_object_id(&mut document);
             let record_id = collection_state.next_record_id();
+            let document_key = document_key_for_change_stream(&document);
+            let full_document = document.clone();
             collection_state.insert_record(CollectionRecord {
                 record_id,
                 document,
             })?;
+            change_events.push(change_stream_event(
+                sequence,
+                change_events.len(),
+                &database,
+                Some(collection_name),
+                "insert",
+                document_key,
+                Some(full_document),
+                None,
+                None,
+                false,
+                Document::new(),
+            ));
         }
         storage
             .commit_mutation(WalMutation::ReplaceCollection {
                 database,
                 collection: collection_name.to_string(),
                 collection_state,
+                change_events,
             })
             .map_err(internal_error)?;
         Ok(doc! { "n": inserted_total })
@@ -1284,6 +1538,10 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
+        let collection_exists = storage
+            .catalog()
+            .get_collection(&database, collection_name)
+            .is_ok();
         let mut collection_state = storage
             .catalog()
             .get_collection(&database, collection_name)
@@ -1293,6 +1551,8 @@ impl Broker {
         let mut matched = 0_i32;
         let mut modified = 0_i32;
         let mut upserted = Vec::new();
+        let sequence = storage.last_applied_sequence() + 1;
+        let mut change_events = Vec::new();
 
         for (operation_index, operation) in operations.iter().enumerate() {
             let query = operation.get_document("q").map_err(|_| {
@@ -1318,15 +1578,49 @@ impl Broker {
 
             if matching_indexes.is_empty() {
                 if upsert {
+                    if !collection_exists && change_events.is_empty() {
+                        change_events.push(change_stream_event(
+                            sequence,
+                            change_events.len(),
+                            &database,
+                            Some(collection_name),
+                            "create",
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            doc! {
+                                "operationDescription": {
+                                    "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                                }
+                            },
+                        ));
+                    }
                     let mut document = upsert_seed_from_query(query);
                     apply_update(&mut document, &update_spec)?;
                     let upserted_id = ensure_object_id(&mut document);
                     let record_id = collection_state.next_record_id();
+                    let full_document = document.clone();
                     collection_state.insert_record(CollectionRecord {
                         record_id,
                         document,
                     })?;
-                    upserted.push(doc! { "index": operation_index as i32, "_id": upserted_id });
+                    upserted
+                        .push(doc! { "index": operation_index as i32, "_id": upserted_id.clone() });
+                    change_events.push(change_stream_event(
+                        sequence,
+                        change_events.len(),
+                        &database,
+                        Some(collection_name),
+                        "insert",
+                        Some(doc! { "_id": upserted_id.clone() }),
+                        Some(full_document),
+                        None,
+                        None,
+                        false,
+                        Document::new(),
+                    ));
                 }
                 continue;
             }
@@ -1341,6 +1635,43 @@ impl Broker {
                     && collection_state.update_record_at(document_index, updated)?
                 {
                     modified += 1;
+                    let updated_document =
+                        collection_state.records[document_index].document.clone();
+                    let document_key = document_key_for_change_stream(&updated_document);
+                    match &update_spec {
+                        mqlite_query::UpdateSpec::Replacement(_) => {
+                            change_events.push(change_stream_event(
+                                sequence,
+                                change_events.len(),
+                                &database,
+                                Some(collection_name),
+                                "replace",
+                                document_key,
+                                Some(updated_document),
+                                Some(original),
+                                None,
+                                false,
+                                Document::new(),
+                            ));
+                        }
+                        _ => {
+                            let update_description =
+                                build_update_description(&original, &updated_document);
+                            change_events.push(change_stream_event(
+                                sequence,
+                                change_events.len(),
+                                &database,
+                                Some(collection_name),
+                                "update",
+                                document_key,
+                                Some(updated_document),
+                                Some(original),
+                                Some(update_description),
+                                false,
+                                Document::new(),
+                            ));
+                        }
+                    }
                 }
                 touched += 1;
                 if !multi && touched >= 1 {
@@ -1354,6 +1685,7 @@ impl Broker {
                 database,
                 collection: collection_name.to_string(),
                 collection_state,
+                change_events,
             })
             .map_err(internal_error)?;
         Ok(doc! {
@@ -1399,6 +1731,8 @@ impl Broker {
                 Err(error) => return Err(error.into()),
             };
         let mut deleted = 0_i32;
+        let sequence = storage.last_applied_sequence() + 1;
+        let mut change_events = Vec::new();
 
         for (query, limit) in validated_operations {
             let mut removed_record_ids = BTreeSet::new();
@@ -1407,6 +1741,19 @@ impl Broker {
                     continue;
                 }
                 removed_record_ids.insert(record.record_id);
+                change_events.push(change_stream_event(
+                    sequence,
+                    change_events.len(),
+                    &database,
+                    Some(collection_name),
+                    "delete",
+                    document_key_for_change_stream(&record.document),
+                    None,
+                    Some(record.document.clone()),
+                    None,
+                    false,
+                    Document::new(),
+                ));
                 if limit == 1 {
                     break;
                 }
@@ -1419,6 +1766,7 @@ impl Broker {
                 database,
                 collection: collection_name.to_string(),
                 collection_state,
+                change_events,
             })
             .map_err(internal_error)?;
         Ok(doc! { "n": deleted })
@@ -1523,6 +1871,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$documents");
+        let starts_with_change_stream = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$changeStream");
         let starts_with_coll_stats = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1782,8 +2134,9 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
-            let (namespace, input) = match body.get("aggregate") {
+            let (namespace, source_collection, input) = match body.get("aggregate") {
                 Some(Bson::String(collection_name)) => {
                     if starts_with_documents {
                         return Err(CommandError::new(
@@ -1797,17 +2150,21 @@ impl Broker {
                         .get_collection(&database, collection_name)
                         .map(|collection| collection.documents())
                         .unwrap_or_default();
-                    (format!("{database}.{collection_name}"), input)
+                    (
+                        format!("{database}.{collection_name}"),
+                        Some(collection_name),
+                        input,
+                    )
                 }
                 Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {
-                    if !starts_with_documents {
+                    if !starts_with_documents && !starts_with_change_stream {
                         return Err(CommandError::new(
                             73,
                             "InvalidNamespace",
-                            "collectionless aggregate requires $documents as the first stage",
+                            "collectionless aggregate requires $documents or $changeStream as the first stage",
                         ));
                     }
-                    (format!("{database}.$cmd.aggregate"), Vec::new())
+                    (format!("{database}.$cmd.aggregate"), None, Vec::new())
                 }
                 _ => {
                     return Err(CommandError::new(
@@ -1817,8 +2174,13 @@ impl Broker {
                     ));
                 }
             };
-            let results =
-                run_pipeline_with_resolver(input, execution_pipeline, &database, &resolver)?;
+            let results = run_pipeline_with_resolver(
+                input,
+                execution_pipeline,
+                &database,
+                source_collection.map(|collection| collection.as_str()),
+                &resolver,
+            )?;
             (namespace, results)
         };
         if let Some(target) = out_target {
@@ -1859,6 +2221,7 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             let collection = storage
                 .catalog()
@@ -1885,6 +2248,7 @@ impl Broker {
                     vec![stats_document],
                     &execution_pipeline[1..],
                     database,
+                    Some(collection_name),
                     &resolver,
                 )?
             } else {
@@ -1931,6 +2295,7 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             let collection = storage
                 .catalog()
@@ -1952,6 +2317,7 @@ impl Broker {
                     index_stats_documents,
                     &execution_pipeline[1..],
                     database,
+                    Some(collection_name),
                     &resolver,
                 )?
             } else {
@@ -2000,6 +2366,7 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             let list_catalog = execution_pipeline
                 .first()
@@ -2019,6 +2386,7 @@ impl Broker {
                     list_catalog_documents,
                     &execution_pipeline[1..],
                     database,
+                    collection_name,
                     &resolver,
                 )?
             } else {
@@ -2064,8 +2432,9 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
-            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, None, &resolver)?
         };
 
         if let Some(target) = out_target {
@@ -2106,6 +2475,7 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             let list_cluster_catalog = execution_pipeline
                 .first()
@@ -2125,6 +2495,7 @@ impl Broker {
                     list_cluster_catalog_documents,
                     &execution_pipeline[1..],
                     database,
+                    None,
                     &resolver,
                 )?
             } else {
@@ -2170,8 +2541,9 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
-            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, None, &resolver)?
         };
 
         if let Some(target) = out_target {
@@ -2212,8 +2584,9 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
-            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, None, &resolver)?
         };
 
         if let Some(target) = out_target {
@@ -2254,8 +2627,9 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
-            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, None, &resolver)?
         };
 
         if let Some(target) = out_target {
@@ -2297,6 +2671,7 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             let plan_cache_stats = execution_pipeline
                 .first()
@@ -2315,6 +2690,7 @@ impl Broker {
                     plan_cache_documents,
                     &execution_pipeline[1..],
                     database,
+                    Some(collection_name),
                     &resolver,
                 )?
             } else {
@@ -2406,11 +2782,13 @@ impl Broker {
             let storage = self.storage.read();
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
+                change_events: storage.change_events(),
             };
             run_pipeline_with_resolver(
                 vec![operation],
                 &execution_pipeline[1..],
                 database,
+                None,
                 &resolver,
             )?
         } else {
@@ -2716,7 +3094,7 @@ fn render_plan_cache_choice(choice: &PersistedPlanCacheChoice) -> Bson {
                 .map(render_plan_cache_choice)
                 .collect::<Vec<_>>(),
         }),
-        }
+    }
 }
 
 fn parse_list_catalog_stage(spec: &Bson) -> Result<(), CommandError> {
@@ -2808,9 +3186,12 @@ fn build_list_catalog_results(
             .databases
             .iter()
             .flat_map(|(database_name, database_catalog)| {
-                database_catalog.collections.iter().map(|(collection_name, collection)| {
-                    list_catalog_document(database_name, collection_name, collection)
-                })
+                database_catalog
+                    .collections
+                    .iter()
+                    .map(|(collection_name, collection)| {
+                        list_catalog_document(database_name, collection_name, collection)
+                    })
             })
             .collect(),
     }
@@ -2937,6 +3318,7 @@ impl Broker {
                 database: database.to_string(),
                 collection: collection.to_string(),
                 collection_state,
+                change_events: Vec::new(),
             })
             .map(|_| ())
             .map_err(internal_error)
@@ -3043,6 +3425,7 @@ impl Broker {
                 database: database.to_string(),
                 collection: target.collection.clone(),
                 collection_state,
+                change_events: Vec::new(),
             })
             .map_err(internal_error)?;
 
@@ -3297,8 +3680,100 @@ fn merge_fields_match(left: &Document, right: &Document, on_fields: &[String]) -
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn change_stream_event(
+    sequence: u64,
+    event_index: usize,
+    database: &str,
+    collection: Option<&str>,
+    operation_type: &str,
+    document_key: Option<Document>,
+    full_document: Option<Document>,
+    full_document_before_change: Option<Document>,
+    update_description: Option<Document>,
+    expanded: bool,
+    extra_fields: Document,
+) -> PersistedChangeEvent {
+    PersistedChangeEvent {
+        token: doc! {
+            "sequence": sequence as i64,
+            "event": event_index as i32 + 1,
+        },
+        cluster_time: bson::Timestamp {
+            time: sequence.min(u64::from(u32::MAX)) as u32,
+            increment: event_index as u32 + 1,
+        },
+        wall_time: bson::DateTime::now(),
+        database: database.to_string(),
+        collection: collection.map(ToString::to_string),
+        operation_type: operation_type.to_string(),
+        document_key,
+        full_document,
+        full_document_before_change,
+        update_description,
+        expanded,
+        extra_fields,
+    }
+}
+
+fn document_key_for_change_stream(document: &Document) -> Option<Document> {
+    document
+        .get("_id")
+        .cloned()
+        .map(|value| doc! { "_id": value })
+}
+
+fn build_update_description(before: &Document, after: &Document) -> Document {
+    let mut updated_fields = Document::new();
+    let mut removed_fields = Vec::<Bson>::new();
+    diff_documents("", before, after, &mut updated_fields, &mut removed_fields);
+    doc! {
+        "updatedFields": updated_fields,
+        "removedFields": removed_fields,
+    }
+}
+
+fn diff_documents(
+    prefix: &str,
+    before: &Document,
+    after: &Document,
+    updated_fields: &mut Document,
+    removed_fields: &mut Vec<Bson>,
+) {
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match (before.get(&key), after.get(&key)) {
+            (Some(Bson::Document(before_doc)), Some(Bson::Document(after_doc))) => {
+                diff_documents(&path, before_doc, after_doc, updated_fields, removed_fields);
+            }
+            (Some(before_value), Some(after_value)) => {
+                if compare_bson(before_value, after_value).is_ne() {
+                    updated_fields.insert(path, after_value.clone());
+                }
+            }
+            (None, Some(after_value)) => {
+                updated_fields.insert(path, after_value.clone());
+            }
+            (Some(_), None) => {
+                removed_fields.push(Bson::String(path));
+            }
+            (None, None) => {}
+        }
+    }
+}
+
 struct BrokerCollectionResolver<'a> {
     catalog: &'a mqlite_catalog::Catalog,
+    change_events: &'a [PersistedChangeEvent],
 }
 
 impl CollectionResolver for BrokerCollectionResolver<'_> {
@@ -3307,6 +3782,45 @@ impl CollectionResolver for BrokerCollectionResolver<'_> {
             .get_collection(database, collection)
             .map(|collection| collection.documents())
             .unwrap_or_default()
+    }
+
+    fn resolve_change_events(&self) -> Vec<Document> {
+        self.change_events
+            .iter()
+            .map(|event| {
+                let mut document = doc! {
+                    "token": Bson::Document(event.token.clone()),
+                    "clusterTime": Bson::Timestamp(event.cluster_time),
+                    "wallTime": Bson::DateTime(event.wall_time),
+                    "database": event.database.clone(),
+                    "operationType": event.operation_type.clone(),
+                    "expanded": event.expanded,
+                    "extraFields": Bson::Document(event.extra_fields.clone()),
+                };
+                if let Some(collection) = &event.collection {
+                    document.insert("collection", collection.clone());
+                }
+                if let Some(document_key) = &event.document_key {
+                    document.insert("documentKey", Bson::Document(document_key.clone()));
+                }
+                if let Some(full_document) = &event.full_document {
+                    document.insert("fullDocument", Bson::Document(full_document.clone()));
+                }
+                if let Some(full_document_before_change) = &event.full_document_before_change {
+                    document.insert(
+                        "fullDocumentBeforeChange",
+                        Bson::Document(full_document_before_change.clone()),
+                    );
+                }
+                if let Some(update_description) = &event.update_description {
+                    document.insert(
+                        "updateDescription",
+                        Bson::Document(update_description.clone()),
+                    );
+                }
+                document
+            })
+            .collect()
     }
 }
 
@@ -5037,7 +5551,8 @@ fn parse_fail_command_data(
         })?
         .iter()
         .map(|value| {
-            value.as_str()
+            value
+                .as_str()
                 .map(|command| command.to_ascii_lowercase())
                 .ok_or_else(|| {
                     CommandError::new(
@@ -7041,7 +7556,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn accepts_majority_write_concern_as_a_standalone_compatibility_noop() {
-        let (serve_task, _temp_dir, manifest) = start_broker("majority-write-concern.mongodb").await;
+        let (serve_task, _temp_dir, manifest) =
+            start_broker("majority-write-concern.mongodb").await;
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
 
         let insert = send_command(
@@ -7067,11 +7583,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_null_bytes_in_database_and_collection_names() {
-        assert_rejected(
-            doc! { "create": "widgets", "$db": "app\0invalid" },
-            73,
-        )
-        .await;
+        assert_rejected(doc! { "create": "widgets", "$db": "app\0invalid" }, 73).await;
         assert_rejected(
             doc! {
                 "insert": "widgets\0invalid",
@@ -7106,9 +7618,11 @@ mod tests {
         .await;
         assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
 
-        let list_indexes =
-            send_command(&mut stream, doc! { "listIndexes": "widgets", "cursor": {}, "$db": "app" })
-                .await;
+        let list_indexes = send_command(
+            &mut stream,
+            doc! { "listIndexes": "widgets", "cursor": {}, "$db": "app" },
+        )
+        .await;
         let first_batch = list_indexes
             .get_document("cursor")
             .expect("cursor")

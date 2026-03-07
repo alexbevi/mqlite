@@ -28,6 +28,7 @@ fn run_pipeline_ok(documents: Vec<Document>, pipeline: &[Document]) -> Vec<Docum
 #[derive(Default)]
 struct StaticResolver {
     collections: BTreeMap<(String, String), Vec<Document>>,
+    change_events: Vec<Document>,
 }
 
 impl StaticResolver {
@@ -41,6 +42,11 @@ impl StaticResolver {
             .insert((database.to_string(), collection.to_string()), documents);
         self
     }
+
+    fn with_change_events(mut self, change_events: Vec<Document>) -> Self {
+        self.change_events = change_events;
+        self
+    }
 }
 
 impl CollectionResolver for StaticResolver {
@@ -50,6 +56,10 @@ impl CollectionResolver for StaticResolver {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn resolve_change_events(&self) -> Vec<Document> {
+        self.change_events.clone()
+    }
 }
 
 fn run_pipeline_with_static_resolver(
@@ -57,7 +67,50 @@ fn run_pipeline_with_static_resolver(
     pipeline: &[Document],
     resolver: &StaticResolver,
 ) -> Vec<Document> {
-    run_pipeline_with_resolver(documents, pipeline, "app", resolver).expect("pipeline")
+    run_pipeline_with_resolver(documents, pipeline, "app", None, resolver).expect("pipeline")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn change_event(
+    sequence: i64,
+    database: &str,
+    collection: Option<&str>,
+    operation_type: &str,
+    document_key: Option<Document>,
+    full_document: Option<Document>,
+    full_document_before_change: Option<Document>,
+    update_description: Option<Document>,
+    expanded: bool,
+    extra_fields: Document,
+) -> Document {
+    let mut document = doc! {
+        "token": { "sequence": sequence },
+        "clusterTime": Timestamp { time: sequence as u32, increment: 0 },
+        "wallTime": DateTime::from_millis(sequence),
+        "database": database,
+        "operationType": operation_type,
+        "expanded": expanded,
+        "extraFields": extra_fields,
+    };
+    if let Some(collection) = collection {
+        document.insert("collection", collection);
+    }
+    if let Some(document_key) = document_key {
+        document.insert("documentKey", Bson::Document(document_key));
+    }
+    if let Some(full_document) = full_document {
+        document.insert("fullDocument", Bson::Document(full_document));
+    }
+    if let Some(full_document_before_change) = full_document_before_change {
+        document.insert(
+            "fullDocumentBeforeChange",
+            Bson::Document(full_document_before_change),
+        );
+    }
+    if let Some(update_description) = update_description {
+        document.insert("updateDescription", Bson::Document(update_description));
+    }
+    document
 }
 
 fn assert_filter(document: &Document, filter: Document, expected: bool) {
@@ -2944,6 +2997,224 @@ fn replace_root_errors_when_new_root_is_not_a_document() {
     .expect_err("replaceRoot should reject scalars");
 
     assert!(matches!(error, QueryError::ExpectedDocument));
+}
+
+#[test]
+fn change_stream_stage_materializes_insert_update_delete_and_expanded_events() {
+    let resolver = StaticResolver::default().with_change_events(vec![
+        change_event(
+            1,
+            "app",
+            Some("widgets"),
+            "insert",
+            Some(doc! { "_id": 1 }),
+            Some(doc! { "_id": 1, "qty": 1 }),
+            None,
+            None,
+            false,
+            Document::new(),
+        ),
+        change_event(
+            2,
+            "app",
+            Some("widgets"),
+            "update",
+            Some(doc! { "_id": 1 }),
+            Some(doc! { "_id": 1, "qty": 2 }),
+            Some(doc! { "_id": 1, "qty": 1 }),
+            Some(doc! { "updatedFields": { "qty": 2 }, "removedFields": [] }),
+            false,
+            Document::new(),
+        ),
+        change_event(
+            3,
+            "app",
+            Some("widgets"),
+            "createIndexes",
+            None,
+            None,
+            None,
+            None,
+            true,
+            doc! { "operationDescription": { "indexes": [{ "name": "qty_1" }] } },
+        ),
+        change_event(
+            4,
+            "app",
+            Some("widgets"),
+            "delete",
+            Some(doc! { "_id": 1 }),
+            None,
+            Some(doc! { "_id": 1, "qty": 2 }),
+            None,
+            false,
+            Document::new(),
+        ),
+    ]);
+
+    let results = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "fullDocument": "updateLookup", "fullDocumentBeforeChange": "whenAvailable", "showExpandedEvents": true } }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("change stream");
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].get_str("operationType").expect("type"), "insert");
+    assert_eq!(
+        results[1]
+            .get_document("fullDocument")
+            .expect("fullDocument")
+            .get_i32("qty")
+            .expect("qty"),
+        2
+    );
+    assert_eq!(
+        results[1]
+            .get_document("fullDocumentBeforeChange")
+            .expect("fullDocumentBeforeChange")
+            .get_i32("qty")
+            .expect("qty"),
+        1
+    );
+    assert_eq!(
+        results[2].get_str("operationType").expect("type"),
+        "createIndexes"
+    );
+    assert_eq!(
+        results[3]
+            .get_document("fullDocumentBeforeChange")
+            .expect("fullDocumentBeforeChange")
+            .get_i32("qty")
+            .expect("qty"),
+        2
+    );
+}
+
+#[test]
+fn change_stream_stage_supports_resume_after_and_start_at_operation_time() {
+    let resolver = StaticResolver::default().with_change_events(vec![
+        change_event(
+            1,
+            "app",
+            Some("widgets"),
+            "insert",
+            Some(doc! { "_id": 1 }),
+            Some(doc! { "_id": 1 }),
+            None,
+            None,
+            false,
+            Document::new(),
+        ),
+        change_event(
+            2,
+            "app",
+            Some("widgets"),
+            "insert",
+            Some(doc! { "_id": 2 }),
+            Some(doc! { "_id": 2 }),
+            None,
+            None,
+            false,
+            Document::new(),
+        ),
+    ]);
+
+    let resumed = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "resumeAfter": { "sequence": 1 } } }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("resumed change stream");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        resumed[0]
+            .get_document("documentKey")
+            .expect("documentKey")
+            .get_i32("_id")
+            .expect("_id"),
+        2
+    );
+
+    let started = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "startAtOperationTime": Timestamp { time: 2, increment: 0 } } }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("startAtOperationTime change stream");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].get_str("operationType").expect("type"), "insert");
+}
+
+#[test]
+fn change_stream_stage_rejects_invalid_position_or_cluster_scope() {
+    let invalid_position = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$changeStream": {} },
+        ],
+    )
+    .expect_err("change stream must be first");
+    assert!(matches!(invalid_position, QueryError::InvalidStage));
+
+    let invalid_cluster_scope = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "allChangesForCluster": true } }],
+        "app",
+        None,
+        &StaticResolver::default(),
+    )
+    .expect_err("cluster change stream requires admin collectionless aggregate");
+    assert!(matches!(invalid_cluster_scope, QueryError::InvalidStage));
+}
+
+#[test]
+fn change_stream_stage_errors_when_required_images_or_resume_tokens_are_missing() {
+    let resolver = StaticResolver::default().with_change_events(vec![change_event(
+        1,
+        "app",
+        Some("widgets"),
+        "update",
+        Some(doc! { "_id": 1 }),
+        None,
+        None,
+        Some(doc! { "updatedFields": { "qty": 2 }, "removedFields": [] }),
+        false,
+        Document::new(),
+    )]);
+
+    let missing_full_document = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "fullDocument": "required" } }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect_err("required fullDocument");
+    assert!(matches!(
+        missing_full_document,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let missing_resume_token = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! { "$changeStream": { "resumeAfter": { "sequence": 9 } } }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect_err("missing resume token");
+    assert!(matches!(
+        missing_resume_token,
+        QueryError::InvalidArgument(_)
+    ));
 }
 
 #[test]
