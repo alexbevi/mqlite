@@ -1029,6 +1029,10 @@ mod tests {
                 doc! { "tags": { "$size": 2 } },
             ),
             "$mod" => (doc! { "qty": 12 }, doc! { "qty": { "$mod": [5, 2] } }),
+            "$all" => (
+                doc! { "tags": ["red", "blue"] },
+                doc! { "tags": { "$all": ["red", "blue"] } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

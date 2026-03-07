@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size", "$mod",
+    "$size", "$mod", "$all",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -64,6 +64,10 @@ pub enum MatchExpr {
         values: Vec<Bson>,
     },
     Nin {
+        path: String,
+        values: Vec<Bson>,
+    },
+    All {
         path: String,
         values: Vec<Bson>,
     },
@@ -457,6 +461,9 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
                 .iter()
                 .all(|value| !compare_bson(existing, value).is_eq())
         }),
+        MatchExpr::All { path, values } => {
+            lookup_path(document, path).is_some_and(|value| matches_all(value, values))
+        }
         MatchExpr::Exists { path, exists } => lookup_path(document, path).is_some() == *exists,
         MatchExpr::Size { path, size } => lookup_path(document, path)
             .and_then(Bson::as_array)
@@ -514,6 +521,19 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                             .ok_or(QueryError::InvalidStructure)?
                             .clone(),
                     },
+                    "$all" => {
+                        let values = operator_value
+                            .as_array()
+                            .ok_or(QueryError::InvalidStructure)?
+                            .clone();
+                        if values.iter().any(all_value_uses_expression) {
+                            return Err(QueryError::InvalidStructure);
+                        }
+                        MatchExpr::All {
+                            path: path.to_string(),
+                            values,
+                        }
+                    }
                     "$exists" => MatchExpr::Exists {
                         path: path.to_string(),
                         exists: operator_value
@@ -624,6 +644,40 @@ fn matches_mod(value: &Bson, divisor: i64, remainder: i64) -> bool {
             .any(|item| matches_mod(item, divisor, remainder)),
         _ => coerce_to_i64(value).is_some_and(|coerced| coerced % divisor == remainder),
     }
+}
+
+fn all_value_uses_expression(value: &Bson) -> bool {
+    value
+        .as_document()
+        .and_then(|document| document.iter().next())
+        .is_some_and(|(field, _)| field.starts_with('$'))
+}
+
+fn matches_all(value: &Bson, expected_values: &[Bson]) -> bool {
+    let values = dedup_values(expected_values);
+    !values.is_empty()
+        && values
+            .iter()
+            .all(|expected| matches_all_term(value, expected))
+}
+
+fn matches_all_term(value: &Bson, expected: &Bson) -> bool {
+    match value {
+        Bson::Array(items) => {
+            compare_bson(value, expected).is_eq()
+                || items
+                    .iter()
+                    .any(|item| compare_bson(item, expected).is_eq())
+        }
+        _ => compare_bson(value, expected).is_eq(),
+    }
+}
+
+fn dedup_values(values: &[Bson]) -> Vec<Bson> {
+    let mut unique = values.to_vec();
+    unique.sort_by(compare_bson);
+    unique.dedup_by(|left, right| compare_bson(left, right).is_eq());
+    unique
 }
 
 fn number_bson(value: f64) -> Bson {
@@ -1022,6 +1076,40 @@ mod tests {
         ));
         assert!(matches!(
             document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$mod": ["x", 0] } }),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn supports_all_filters() {
+        let document = doc! { "tags": ["red", "blue", "green"], "status": "red" };
+
+        assert_filter(
+            &document,
+            doc! { "tags": { "$all": ["red", "blue"] } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "tags": { "$all": ["red", "missing"] } },
+            false,
+        );
+        assert_filter(
+            &document,
+            doc! { "tags": { "$all": ["blue", "blue"] } },
+            true,
+        );
+        assert_filter(&document, doc! { "tags": { "$all": [] } }, false);
+        assert_filter(&document, doc! { "status": { "$all": ["red"] } }, true);
+    }
+
+    #[test]
+    fn rejects_expression_values_inside_all_filters() {
+        assert!(matches!(
+            document_matches(
+                &doc! { "tags": ["red"] },
+                &doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "red" } }] } }
+            ),
             Err(QueryError::InvalidStructure)
         ));
     }
