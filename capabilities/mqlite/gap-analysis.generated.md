@@ -29,7 +29,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 |
-| Aggregation stages | 57 | 36 | 21 |
+| Aggregation stages | 54 | 36 | 18 |
 | Aggregation expression operators | 176 | 11 | 165 |
 | Aggregation accumulators | 25 | 5 | 20 |
 | Aggregation window functions | 36 | 0 | 36 |
@@ -114,7 +114,7 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 
 ## Aggregation Stages
 
-Public upstream: 57. Supported: 36. Unsupported: 21.
+Public upstream: 54. Supported: 36. Unsupported: 18.
 
 ### Supported Public
 
@@ -165,7 +165,6 @@ Public upstream: 57. Supported: 36. Unsupported: 21.
 - `$graphLookup`
 - `$listExtensions` (feature-flagged)
 - `$queryStats` (feature-flagged)
-- `$queue`
 - `$rankFusion`
 - `$redact`
 - `$score`
@@ -173,8 +172,6 @@ Public upstream: 57. Supported: 36. Unsupported: 21.
 - `$search`
 - `$searchBeta`
 - `$searchMeta`
-- `$setMetadata`
-- `$setVariableFromSubPipeline`
 - `$setWindowFields`
 - `$shardedDataDistribution`
 - `$vectorSearch`
@@ -208,6 +205,9 @@ Public upstream: 57. Supported: 36. Unsupported: 21.
 - `$_internalStreamingGroup`
 - `$_internalUnpackBucket`
 - `$_unpackBucket`
+- `$queue`
+- `$setMetadata`
+- `$setVariableFromSubPipeline`
 
 ## Aggregation Expression Operators
 

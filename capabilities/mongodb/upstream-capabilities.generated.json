@@ -1965,7 +1965,7 @@
     },
     {
       "name": "$queue",
-      "internal": false,
+      "internal": true,
       "source_kinds": [
         "stage_registration"
       ],
@@ -2154,7 +2154,7 @@
     },
     {
       "name": "$setMetadata",
-      "internal": false,
+      "internal": true,
       "source_kinds": [
         "stage_registration"
       ],
@@ -2170,7 +2170,7 @@
     },
     {
       "name": "$setVariableFromSubPipeline",
-      "internal": false,
+      "internal": true,
       "source_kinds": [
         "stage_registration"
       ],

@@ -434,14 +434,20 @@ fn finalize_items(items: BTreeMap<String, CapabilityAccumulator>) -> Vec<Capabil
     items
         .into_iter()
         .filter(|(name, _)| !DBREF_PSEUDO_OPERATORS.contains(&name.as_str()))
-        .map(|(name, entry)| CapabilityItem {
-            internal: name.starts_with("$_"),
-            name,
-            source_kinds: entry.source_kinds.into_iter().collect(),
-            source_files: entry.source_files.into_iter().collect(),
-            macro_kinds: entry.macro_kinds.into_iter().collect(),
-            feature_flagged: entry.feature_flagged,
-            conditional: entry.conditional,
+        .map(|(name, entry)| {
+            let macro_kinds = entry.macro_kinds.into_iter().collect::<Vec<_>>();
+            CapabilityItem {
+                internal: name.starts_with("$_")
+                    || macro_kinds
+                        .iter()
+                        .any(|macro_kind| macro_kind.contains("REGISTER_INTERNAL")),
+                name,
+                source_kinds: entry.source_kinds.into_iter().collect(),
+                source_files: entry.source_files.into_iter().collect(),
+                macro_kinds,
+                feature_flagged: entry.feature_flagged,
+                conditional: entry.conditional,
+            }
         })
         .collect()
 }
@@ -764,13 +770,16 @@ fn normalize_components(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bson::{Bson, Document, doc};
     use pretty_assertions::assert_eq;
 
     use super::{
-        GAP_MARKDOWN_PATH, SupportStatus, UPSTREAM_JSON_PATH, ValidationMode, build_gap_analysis,
-        current_support_catalog, extract_upstream_catalog, find_repo_root, load_gap_snapshot,
-        load_support_snapshot, load_upstream_snapshot, render_artifacts,
+        GAP_MARKDOWN_PATH, SupportStatus, UPSTREAM_JSON_PATH, ValidationMode, add_item,
+        build_gap_analysis, current_support_catalog, extract_upstream_catalog, finalize_items,
+        find_repo_root, load_gap_snapshot, load_support_snapshot, load_upstream_snapshot,
+        render_artifacts,
     };
     use mqlite_query::{
         QueryError, apply_projection, document_matches, parse_filter, run_pipeline,
@@ -856,6 +865,33 @@ mod tests {
                 .iter()
                 .all(|item| !matches!(item.name.as_str(), "$db" | "$id" | "$ref"))
         );
+    }
+
+    #[test]
+    fn internally_registered_stages_are_not_counted_as_public() {
+        let mut items = BTreeMap::new();
+        add_item(
+            &mut items,
+            "$setMetadata",
+            "stage_registration",
+            "../mongo/src/mongo/db/pipeline/document_source_set_metadata.cpp".to_string(),
+            "REGISTER_INTERNAL_LITE_PARSED_DOCUMENT_SOURCE".to_string(),
+            false,
+            false,
+        );
+        add_item(
+            &mut items,
+            "$setMetadata",
+            "stage_registration",
+            "../mongo/src/mongo/db/pipeline/document_source_set_metadata.cpp".to_string(),
+            "REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT".to_string(),
+            false,
+            false,
+        );
+
+        let finalized = finalize_items(items);
+        assert_eq!(finalized.len(), 1);
+        assert!(finalized[0].internal);
     }
 
     #[test]
