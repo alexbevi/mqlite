@@ -334,6 +334,7 @@ impl Broker {
             "listIndexes" => self.handle_list_indexes(body),
             "explain" => self.handle_explain(body),
             "create" => self.handle_create(body),
+            "dropDatabase" => self.handle_drop_database(body),
             "drop" => self.handle_drop(body),
             "createIndexes" => self.handle_create_indexes(body),
             "dropIndexes" => self.handle_drop_indexes(body),
@@ -751,6 +752,29 @@ impl Broker {
             })
             .map_err(internal_error)?;
         Ok(Document::new())
+    }
+
+    fn handle_drop_database(&self, body: &Document) -> Result<Document, CommandError> {
+        let database = database_name(body)?;
+        let collections = {
+            let storage = self.storage.read();
+            storage
+                .catalog()
+                .collection_names(&database)
+                .unwrap_or_default()
+        };
+
+        let mut storage = self.storage.write();
+        for collection in collections {
+            storage
+                .commit_mutation(WalMutation::DropCollection {
+                    database: database.clone(),
+                    collection,
+                })
+                .map_err(internal_error)?;
+        }
+
+        Ok(doc! { "dropped": database })
     }
 
     fn handle_drop(&self, body: &Document) -> Result<Document, CommandError> {
@@ -3942,6 +3966,50 @@ mod tests {
         .await;
         assert_eq!(delete.get_f64("ok").expect("ok"), 1.0);
         assert_eq!(delete.get_i32("n").expect("n"), 0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_database_removes_all_collections_and_hides_the_database() {
+        let (serve_task, _temp_dir, manifest) = start_broker("drop-database.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        for collection in ["widgets", "gadgets"] {
+            let insert = send_command(
+                &mut stream,
+                doc! {
+                    "insert": collection,
+                    "documents": [{ "_id": ObjectId::new(), "name": collection }],
+                    "$db": "app"
+                },
+            )
+            .await;
+            assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+        }
+
+        let drop_database =
+            send_command(&mut stream, doc! { "dropDatabase": 1, "$db": "app" }).await;
+        assert_eq!(drop_database.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(drop_database.get_str("dropped").expect("dropped"), "app");
+
+        let list_databases =
+            send_command(&mut stream, doc! { "listDatabases": 1, "nameOnly": true, "$db": "admin" })
+                .await;
+        let databases = list_databases.get_array("databases").expect("databases");
+        assert!(
+            !databases.iter().any(|entry| {
+                entry.as_document()
+                    .and_then(|document| document.get_str("name").ok())
+                    == Some("app")
+            })
+        );
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

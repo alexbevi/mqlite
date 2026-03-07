@@ -138,6 +138,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `explain` for wrapped CRUD commands that plan a single target query, including `delete`, `update`, `distinct`, and `findAndModify`
 - `explain` for collection-backed `aggregate` pipelines that do not end in `$out`, returning a `$cursor.queryPlanner` stage
 - `create`
+- `dropDatabase`
 - `drop`
 - `createIndexes`
 - `dropIndexes`

@@ -495,6 +495,10 @@ impl Catalog {
                 collection.to_string(),
             ));
         }
+        let remove_database = database_entry.collections.is_empty();
+        if remove_database {
+            self.databases.remove(database);
+        }
         Ok(())
     }
 
@@ -1230,6 +1234,21 @@ mod tests {
             .create_collection("app", "widgets", doc! {})
             .expect_err("duplicate should fail");
         assert!(matches!(error, CatalogError::NamespaceExists(_, _)));
+    }
+
+    #[test]
+    fn dropping_the_last_collection_removes_the_database_entry() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_collection("app", "widgets", doc! {})
+            .expect("create");
+
+        catalog
+            .drop_collection("app", "widgets")
+            .expect("drop collection");
+
+        assert!(!catalog.databases.contains_key("app"));
+        assert!(catalog.database_names().is_empty());
     }
 
     #[test]
