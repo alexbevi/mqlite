@@ -28,15 +28,15 @@ cargo run -p mqlite-capabilities -- sync --check
 
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
-| Query operators | 41 | 20 | 21 |
+| Query operators | 41 | 21 | 20 |
 | Aggregation stages | 57 | 12 | 45 |
-| Aggregation expression operators | 176 | 1 | 175 |
+| Aggregation expression operators | 176 | 11 | 165 |
 | Aggregation accumulators | 25 | 4 | 21 |
 | Aggregation window functions | 36 | 0 | 36 |
 
 ## Query Operators
 
-Public upstream: 41. Supported: 20. Unsupported: 21.
+Public upstream: 41. Supported: 21. Unsupported: 20.
 
 ### Supported Public
 
@@ -45,6 +45,7 @@ Public upstream: 41. Supported: 20. Unsupported: 21.
 - `$elemMatch`
 - `$eq`
 - `$exists`
+- `$expr`
 - `$gt`
 - `$gte`
 - `$in`
@@ -71,7 +72,6 @@ Public upstream: 41. Supported: 20. Unsupported: 21.
 - `$bitsAnySet`
 - `$comment`
 - `$db`
-- `$expr`
 - `$geoIntersects`
 - `$geoNear`
 - `$geoWithin`
@@ -214,11 +214,21 @@ Public upstream: 57. Supported: 12. Unsupported: 45.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 1. Unsupported: 175.
+Public upstream: 176. Supported: 11. Unsupported: 165.
 
 ### Supported Public
 
+- `$and`
+- `$eq`
+- `$gt`
+- `$gte`
+- `$in`
 - `$literal`
+- `$lt`
+- `$lte`
+- `$ne`
+- `$not`
+- `$or`
 
 ### Unsupported Public
 
@@ -227,7 +237,6 @@ Public upstream: 176. Supported: 1. Unsupported: 175.
 - `$acosh`
 - `$add`
 - `$allElementsTrue`
-- `$and`
 - `$anyElementTrue`
 - `$arrayElemAt`
 - `$arrayToObject`
@@ -275,7 +284,6 @@ Public upstream: 176. Supported: 1. Unsupported: 175.
 - `$encStrEndsWith` (feature-flagged)
 - `$encStrNormalizedEq` (feature-flagged)
 - `$encStrStartsWith` (feature-flagged)
-- `$eq`
 - `$exp`
 - `$expr`
 - `$filter`
@@ -284,13 +292,10 @@ Public upstream: 176. Supported: 1. Unsupported: 175.
 - `$floor`
 - `$function`
 - `$getField`
-- `$gt`
-- `$gte`
 - `$hash` (feature-flagged)
 - `$hexHash` (feature-flagged)
 - `$hour`
 - `$ifNull`
-- `$in`
 - `$indexOfArray`
 - `$indexOfBytes`
 - `$indexOfCP`
@@ -305,8 +310,6 @@ Public upstream: 176. Supported: 1. Unsupported: 175.
 - `$ln`
 - `$log`
 - `$log10`
-- `$lt`
-- `$lte`
 - `$ltrim`
 - `$map`
 - `$max`
@@ -321,10 +324,7 @@ Public upstream: 176. Supported: 1. Unsupported: 175.
 - `$mod`
 - `$month`
 - `$multiply`
-- `$ne`
-- `$not`
 - `$objectToArray`
-- `$or`
 - `$percentile`
 - `$pow`
 - `$radiansToDegrees`

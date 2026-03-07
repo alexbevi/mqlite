@@ -1047,6 +1047,10 @@ mod tests {
                 doc! { "values": [3, 5, 7] },
                 doc! { "values": { "$elemMatch": { "$lt": 6, "$gt": 4 } } },
             ),
+            "$expr" => (
+                doc! { "qty": 5, "limit": 4 },
+                doc! { "$expr": { "$gt": ["$qty", "$limit"] } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }
@@ -1122,6 +1126,16 @@ mod tests {
     fn supported_expression_projection(name: &str) -> Document {
         match name {
             "$literal" => doc! { "value": { "$literal": 5 } },
+            "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
+            "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
+            "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
+            "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
+            "$lt" => doc! { "value": { "$lt": ["$left", "$right"] } },
+            "$lte" => doc! { "value": { "$lte": ["$left", "$right"] } },
+            "$and" => doc! { "value": { "$and": [true, { "$eq": ["$left", "$left"] }] } },
+            "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
+            "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
             other => panic!("missing supported expression fixture for {other}"),
         }
     }

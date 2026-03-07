@@ -26,6 +26,7 @@ pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$regex",
     "$options",
     "$elemMatch",
+    "$expr",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -43,7 +44,9 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$replaceRoot",
 ];
 
-pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &["$literal"];
+pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
+    "$literal", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$and", "$or", "$not", "$in",
+];
 
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] = &["$sum", "$first", "$push", "$avg"];
 
@@ -61,6 +64,7 @@ pub enum MatchExpr {
     Or(Vec<MatchExpr>),
     Nor(Vec<MatchExpr>),
     Not(Box<MatchExpr>),
+    Expr(Bson),
     Eq {
         path: String,
         value: Bson,
@@ -160,6 +164,13 @@ pub enum QueryError {
 }
 
 pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
+    parse_filter_with_context(document, true)
+}
+
+fn parse_filter_with_context(
+    document: &Document,
+    allow_expr: bool,
+) -> Result<MatchExpr, QueryError> {
     let mut expressions = Vec::new();
 
     for (key, value) in document {
@@ -169,7 +180,10 @@ pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
                 let parsed = items
                     .iter()
                     .map(as_document)
-                    .map(|document| document.and_then(parse_filter))
+                    .map(|document| {
+                        document
+                            .and_then(|document| parse_filter_with_context(document, allow_expr))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 expressions.push(MatchExpr::And(parsed));
             }
@@ -178,7 +192,10 @@ pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
                 let parsed = items
                     .iter()
                     .map(as_document)
-                    .map(|document| document.and_then(parse_filter))
+                    .map(|document| {
+                        document
+                            .and_then(|document| parse_filter_with_context(document, allow_expr))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 expressions.push(MatchExpr::Or(parsed));
             }
@@ -187,9 +204,19 @@ pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
                 let parsed = items
                     .iter()
                     .map(as_document)
-                    .map(|document| document.and_then(parse_filter))
+                    .map(|document| {
+                        document
+                            .and_then(|document| parse_filter_with_context(document, allow_expr))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 expressions.push(MatchExpr::Nor(parsed));
+            }
+            "$expr" => {
+                if !allow_expr {
+                    return Err(QueryError::InvalidStructure);
+                }
+                validate_expression(value)?;
+                expressions.push(MatchExpr::Expr(value.clone()));
             }
             other if other.starts_with('$') => {
                 return Err(QueryError::UnsupportedOperator(other.to_string()));
@@ -472,6 +499,9 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
         MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
         MatchExpr::Not(expression) => !matches_expression(document, expression),
+        MatchExpr::Expr(expression) => eval_expression(document, expression)
+            .map(|value| expression_truthy(&value))
+            .unwrap_or(false),
         MatchExpr::Eq { path, value } => path_candidates(document, path)
             .into_iter()
             .any(|existing| matches_equality(existing, value)),
@@ -785,9 +815,9 @@ fn validate_elem_match_spec(spec: &Document, value_case: bool) -> Result<(), Que
     if value_case {
         let mut filter = Document::new();
         filter.insert("_elem", Bson::Document(spec.clone()));
-        parse_filter(&filter).map(|_| ())
+        parse_filter_with_context(&filter, false).map(|_| ())
     } else {
-        parse_filter(spec).map(|_| ())
+        parse_filter_with_context(spec, false).map(|_| ())
     }
 }
 
@@ -1112,16 +1142,14 @@ fn number_bson(value: f64) -> Bson {
 
 fn eval_expression(document: &Document, expression: &Bson) -> Result<Bson, QueryError> {
     match expression {
+        Bson::String(path) if path.starts_with("$$") => Err(QueryError::InvalidStructure),
         Bson::String(path) if path.starts_with('$') => {
             Ok(lookup_path_owned(document, &path[1..]).unwrap_or(Bson::Null))
         }
-        Bson::Document(spec) if spec.len() == 1 && spec.contains_key("$literal") => {
-            Ok(spec.get("$literal").cloned().unwrap_or(Bson::Null))
-        }
         Bson::Document(spec) if spec.len() == 1 => {
-            let (field, _) = spec.iter().next().expect("single field");
+            let (field, value) = spec.iter().next().expect("single field");
             if field.starts_with('$') {
-                return Err(QueryError::UnsupportedOperator(field.to_string()));
+                return eval_expression_operator(document, field, value);
             }
 
             let mut evaluated = Document::new();
@@ -1144,6 +1172,112 @@ fn eval_expression(document: &Document, expression: &Bson) -> Result<Bson, Query
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         _ => Ok(expression.clone()),
+    }
+}
+
+fn validate_expression(expression: &Bson) -> Result<(), QueryError> {
+    eval_expression(&Document::new(), expression).map(|_| ())
+}
+
+fn eval_expression_operator(
+    document: &Document,
+    operator: &str,
+    value: &Bson,
+) -> Result<Bson, QueryError> {
+    match operator {
+        "$literal" => Ok(value.clone()),
+        "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
+            let [left, right] = expression_arguments::<2>(value)?;
+            let left = eval_expression(document, left)?;
+            let right = eval_expression(document, right)?;
+            let ordering = compare_bson(&left, &right);
+            Ok(Bson::Boolean(match operator {
+                "$eq" => ordering.is_eq(),
+                "$ne" => !ordering.is_eq(),
+                "$gt" => ordering.is_gt(),
+                "$gte" => matches!(
+                    ordering,
+                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                ),
+                "$lt" => ordering.is_lt(),
+                "$lte" => matches!(
+                    ordering,
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                ),
+                _ => unreachable!("comparison operator"),
+            }))
+        }
+        "$and" => {
+            let arguments = expression_argument_slice(value)?;
+            Ok(Bson::Boolean(arguments.iter().try_fold(
+                true,
+                |result, argument| {
+                    Ok::<_, QueryError>(
+                        result && expression_truthy(&eval_expression(document, argument)?),
+                    )
+                },
+            )?))
+        }
+        "$or" => {
+            let arguments = expression_argument_slice(value)?;
+            Ok(Bson::Boolean(arguments.iter().try_fold(
+                false,
+                |result, argument| {
+                    Ok::<_, QueryError>(
+                        result || expression_truthy(&eval_expression(document, argument)?),
+                    )
+                },
+            )?))
+        }
+        "$not" => {
+            let [argument] = expression_arguments::<1>(value)?;
+            Ok(Bson::Boolean(!expression_truthy(&eval_expression(
+                document, argument,
+            )?)))
+        }
+        "$in" => {
+            let [needle, haystack] = expression_arguments::<2>(value)?;
+            let needle = eval_expression(document, needle)?;
+            let haystack = eval_expression(document, haystack)?;
+            let values = haystack.as_array().ok_or(QueryError::InvalidStructure)?;
+            Ok(Bson::Boolean(
+                values
+                    .iter()
+                    .any(|candidate| compare_bson(&needle, candidate).is_eq()),
+            ))
+        }
+        other => Err(QueryError::UnsupportedOperator(other.to_string())),
+    }
+}
+
+fn expression_argument_slice(value: &Bson) -> Result<&[Bson], QueryError> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or(QueryError::InvalidStructure)
+}
+
+fn expression_arguments<const N: usize>(value: &Bson) -> Result<[&Bson; N], QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if arguments.len() != N {
+        return Err(QueryError::InvalidStructure);
+    }
+    Ok(std::array::from_fn(|index| &arguments[index]))
+}
+
+fn expression_truthy(value: &Bson) -> bool {
+    match value {
+        Bson::Boolean(value) => *value,
+        Bson::Null | Bson::Undefined => false,
+        Bson::Int32(value) => *value != 0,
+        Bson::Int64(value) => *value != 0,
+        Bson::Double(value) => *value != 0.0 && !value.is_nan(),
+        Bson::Decimal128(value) => value
+            .to_string()
+            .parse::<f64>()
+            .map(|value| value != 0.0 && !value.is_nan())
+            .unwrap_or(true),
+        _ => true,
     }
 }
 
@@ -1717,6 +1851,48 @@ mod tests {
     }
 
     #[test]
+    fn supports_expr_filters() {
+        let document = doc! { "qty": 5, "limit": 4, "sku": "abc", "tags": ["red", "blue"] };
+
+        assert_filter(
+            &document,
+            doc! { "$expr": { "$gt": ["$qty", "$limit"] } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! {
+                "$or": [
+                    { "$expr": { "$eq": ["$sku", "missing"] } },
+                    { "$expr": { "$in": ["$sku", ["abc", "def"]] } }
+                ]
+            },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "$expr": { "$and": [{ "$eq": ["$qty", 5] }, { "$not": [{ "$lt": ["$limit", 4] }] }] } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "$expr": { "$lte": ["$qty", "$limit"] } },
+            false,
+        );
+    }
+
+    #[test]
+    fn rejects_expr_in_subdocuments() {
+        assert!(matches!(
+            document_matches(
+                &doc! { "a": [{ "qty": 1 }] },
+                &doc! { "a": { "$elemMatch": { "$expr": { "$eq": ["$qty", 1] } } } }
+            ),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
     fn supports_logical_and_or_query_filters() {
         let document = doc! { "sku": "abc", "qty": 5, "meta": { "enabled": true } };
 
@@ -1823,6 +1999,46 @@ mod tests {
     }
 
     #[test]
+    fn projection_supports_expression_operators() {
+        let document = doc! { "_id": 1, "left": 5, "right": 3, "sku": "abc" };
+        let projected = apply_projection(
+            &document,
+            Some(&doc! {
+                "eq": { "$eq": ["$left", 5] },
+                "ne": { "$ne": ["$left", "$right"] },
+                "gt": { "$gt": ["$left", "$right"] },
+                "gte": { "$gte": ["$left", 5] },
+                "lt": { "$lt": ["$right", "$left"] },
+                "lte": { "$lte": ["$right", 3] },
+                "and": { "$and": [true, { "$eq": ["$left", 5] }] },
+                "or": { "$or": [false, { "$eq": ["$sku", "abc"] }] },
+                "not": { "$not": [{ "$eq": ["$right", 5] }] },
+                "in": { "$in": ["$sku", ["def", "abc"]] },
+                "literal": { "$literal": { "nested": true } }
+            }),
+        )
+        .expect("apply projection");
+
+        assert_eq!(
+            projected,
+            doc! {
+                "_id": 1,
+                "eq": true,
+                "ne": true,
+                "gt": true,
+                "gte": true,
+                "lt": true,
+                "lte": true,
+                "and": true,
+                "or": true,
+                "not": true,
+                "in": true,
+                "literal": { "nested": true }
+            }
+        );
+    }
+
+    #[test]
     fn projection_supports_nested_exclusion_paths() {
         let document =
             doc! { "_id": 1, "sku": "abc", "qty": 5, "meta": { "enabled": true, "flag": "beta" } };
@@ -1881,6 +2097,19 @@ mod tests {
             results,
             vec![doc! { "_id": 1, "qty": 5, "sku": "abc", "meta": { "enabled": true } }]
         );
+    }
+
+    #[test]
+    fn match_stage_supports_expr_filters() {
+        let results = run_pipeline_ok(
+            vec![
+                doc! { "_id": 1, "qty": 5, "limit": 4 },
+                doc! { "_id": 2, "qty": 1, "limit": 4 },
+            ],
+            &[doc! { "$match": { "$expr": { "$gt": ["$qty", "$limit"] } } }],
+        );
+
+        assert_eq!(results, vec![doc! { "_id": 1, "qty": 5, "limit": 4 }]);
     }
 
     #[test]

@@ -116,6 +116,9 @@ file:///absolute/path/to/database.mongodb?db=app
 - Named pipe endpoint naming on Windows.
 - Ephemeral manifest discovery per database file.
 - `hello`, `ping`, and `buildInfo` bootstrap commands.
+- Compatibility-only admin helpers for driver test harnesses:
+  - `killAllSessions` as a no-op cleanup command
+  - `getParameter` with a minimal static reply for `authenticationMechanisms` and `requireApiVersion`
 
 ### Storage and catalog
 - One durable `.mongodb` file per broker.
@@ -153,7 +156,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `explain` reports `IXSCAN` vs `COLLSCAN`, `planCacheUsed`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, single-interval bounds or multi-interval arrays, and keys/docs examined.
 
 ### Query semantics currently implemented
-- Equality, comparison, membership, negated-membership, `$all`, `$not`, `$type`, regex matching, `$elemMatch`, array-size, and modulus matching on dotted field paths via `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, `$not`, `$exists`, `$type`, `$regex`/`$options`, `$elemMatch`, `$size`, and `$mod`.
+- Equality, comparison, membership, negated-membership, `$all`, `$not`, `$type`, regex matching, `$elemMatch`, top-level `$expr`, array-size, and modulus matching on dotted field paths via `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, `$not`, `$exists`, `$type`, `$regex`/`$options`, `$elemMatch`, `$expr`, `$size`, and `$mod`.
 - Boolean query composition with `$and`, `$or`, and `$nor`.
 - Basic projection.
 - Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.
@@ -161,6 +164,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available, including persisted cache reuse after broker restart.
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
+- Aggregation expression operators `$literal`, comparison operators `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, and membership via `$in`.
 - Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.
 - Aggregation stages:
@@ -188,6 +192,7 @@ These are already part of the tested failure surface:
 - `readConcern`
 - `writeConcern`
 - `$readPreference`
+- Session and transaction envelopes remain rejected even though `killAllSessions` exists as a no-op admin compatibility command.
 - Unsupported commands
 - Unsupported query operators
 - Unsupported aggregation stages

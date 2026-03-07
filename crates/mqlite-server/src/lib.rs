@@ -325,6 +325,8 @@ impl Broker {
                 "maxMessageSizeBytes": MAX_MESSAGE_SIZE_BYTES,
                 "maxWriteBatchSize": MAX_WRITE_BATCH_SIZE,
             }),
+            "getParameter" => Ok(self.handle_get_parameter(body)),
+            "killAllSessions" => Ok(Document::new()),
             "listDatabases" => self.handle_list_databases(body),
             "listCollections" => self.handle_list_collections(body),
             "listIndexes" => self.handle_list_indexes(body),
@@ -360,6 +362,33 @@ impl Broker {
             "maxMessageSizeBytes": MAX_MESSAGE_SIZE_BYTES,
             "maxWriteBatchSize": MAX_WRITE_BATCH_SIZE,
             "localTime": bson::DateTime::now(),
+        }
+    }
+
+    fn handle_get_parameter(&self, body: &Document) -> Document {
+        let supported = doc! {
+            "authenticationMechanisms": bson::Array::new(),
+            "requireApiVersion": false,
+        };
+
+        match body.get("getParameter") {
+            Some(Bson::String(value)) if value == "*" => supported,
+            Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {
+                let mut response = Document::new();
+                for (key, value) in body {
+                    if key == "getParameter" || key.starts_with('$') {
+                        continue;
+                    }
+
+                    if truthy_parameter_selector(value) {
+                        if let Some(parameter) = supported.get(key) {
+                            response.insert(key, parameter.clone());
+                        }
+                    }
+                }
+                response
+            }
+            _ => Document::new(),
         }
     }
 
@@ -1856,6 +1885,7 @@ fn collect_field_bounds(
             );
             Some(())
         }
+        MatchExpr::Expr(_) => None,
         MatchExpr::Nin { .. } => None,
         MatchExpr::All { .. } => None,
         MatchExpr::Type { .. } => None,
@@ -2025,6 +2055,7 @@ fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>
             }
         }
         MatchExpr::Not(expression) => collect_match_paths_into(expression, paths),
+        MatchExpr::Expr(_) => {}
         MatchExpr::Eq { path, .. }
         | MatchExpr::Ne { path, .. }
         | MatchExpr::Gt { path, .. }
@@ -2207,6 +2238,7 @@ fn filter_shape(expression: &MatchExpr) -> String {
             items.iter().map(filter_shape).collect::<Vec<_>>().join(",")
         ),
         MatchExpr::Not(expression) => format!("not({})", filter_shape(expression)),
+        MatchExpr::Expr(_) => "expr".to_string(),
         MatchExpr::Eq { path, .. } => format!("{path}:eq"),
         MatchExpr::Ne { path, .. } => format!("{path}:ne"),
         MatchExpr::Gt { path, .. } => format!("{path}:gt"),
@@ -2661,6 +2693,16 @@ fn body_batch_size(body: &Document, field: &str) -> Option<i64> {
         .ok()
         .and_then(|cursor| cursor.get_i64("batchSize").ok())
         .or_else(|| body.get_i64("batchSize").ok())
+}
+
+fn truthy_parameter_selector(value: &Bson) -> bool {
+    match value {
+        Bson::Boolean(value) => *value,
+        Bson::Int32(value) => *value != 0,
+        Bson::Int64(value) => *value != 0,
+        Bson::Double(value) => *value != 0.0,
+        _ => false,
+    }
 }
 
 fn cursor_document(batch: mqlite_exec::CursorBatch, batch_field: &str) -> Document {
@@ -4096,6 +4138,15 @@ mod tests {
             115,
         )
         .await;
+        assert_rejected(
+            doc! {
+                "killAllSessions": [],
+                "lsid": { "id": ObjectId::new() },
+                "$db": "admin"
+            },
+            115,
+        )
+        .await;
     }
 
     #[cfg(unix)]
@@ -4116,6 +4167,57 @@ mod tests {
             115,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serves_admin_compatibility_commands_for_driver_harnesses() {
+        let (serve_task, _temp_dir, manifest) = start_broker("admin-compat.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let kill_all_sessions =
+            send_command(&mut stream, doc! { "killAllSessions": [], "$db": "admin" }).await;
+        assert_eq!(kill_all_sessions.get_f64("ok").expect("ok"), 1.0);
+
+        let all_parameters =
+            send_command(&mut stream, doc! { "getParameter": "*", "$db": "admin" }).await;
+        assert_eq!(all_parameters.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(
+            all_parameters
+                .get_array("authenticationMechanisms")
+                .expect("authenticationMechanisms"),
+            &bson::Array::new()
+        );
+        assert!(
+            !all_parameters
+                .get_bool("requireApiVersion")
+                .expect("requireApiVersion")
+        );
+
+        let selected_parameters = send_command(
+            &mut stream,
+            doc! {
+                "getParameter": 1,
+                "authenticationMechanisms": 1,
+                "$db": "admin"
+            },
+        )
+        .await;
+        assert_eq!(selected_parameters.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(
+            selected_parameters
+                .get_array("authenticationMechanisms")
+                .expect("authenticationMechanisms"),
+            &bson::Array::new()
+        );
+        assert!(selected_parameters.get("requireApiVersion").is_none());
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
     }
 
     #[cfg(unix)]

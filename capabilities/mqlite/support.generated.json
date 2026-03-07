@@ -5,6 +5,7 @@
     "$elemMatch",
     "$eq",
     "$exists",
+    "$expr",
     "$gt",
     "$gte",
     "$in",
@@ -36,7 +37,17 @@
     "$unwind"
   ],
   "aggregation_expression_operators": [
-    "$literal"
+    "$and",
+    "$eq",
+    "$gt",
+    "$gte",
+    "$in",
+    "$literal",
+    "$lt",
+    "$lte",
+    "$ne",
+    "$not",
+    "$or"
   ],
   "aggregation_accumulator_operators": [
     "$avg",
