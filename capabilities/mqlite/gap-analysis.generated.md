@@ -29,7 +29,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | Category | Public upstream | Supported | Unsupported |
 | --- | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 |
-| Aggregation stages | 57 | 30 | 27 |
+| Aggregation stages | 57 | 31 | 26 |
 | Aggregation expression operators | 176 | 11 | 165 |
 | Aggregation accumulators | 25 | 5 | 20 |
 | Aggregation window functions | 36 | 0 | 36 |
@@ -114,7 +114,7 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 
 ## Aggregation Stages
 
-Public upstream: 57. Supported: 30. Unsupported: 27.
+Public upstream: 57. Supported: 31. Unsupported: 26.
 
 ### Supported Public
 
@@ -131,6 +131,7 @@ Public upstream: 57. Supported: 30. Unsupported: 27.
 - `$limit`
 - `$listCachedAndActiveUsers`
 - `$listCatalog`
+- `$listLocalSessions`
 - `$listMqlEntities`
 - `$lookup`
 - `$match`
@@ -159,7 +160,6 @@ Public upstream: 57. Supported: 30. Unsupported: 27.
 - `$graphLookup`
 - `$listClusterCatalog`
 - `$listExtensions` (feature-flagged)
-- `$listLocalSessions`
 - `$listSampledQueries`
 - `$listSearchIndexes`
 - `$listSessions`

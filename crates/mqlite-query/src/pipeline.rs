@@ -82,6 +82,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$listCachedAndActiveUsers" => {
                 list_cached_and_active_users_documents(stage_index, stage_spec)?
             }
+            "$listLocalSessions" => list_local_sessions_documents(stage_index, stage_spec)?,
             "$listMqlEntities" => list_mql_entities_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -1181,6 +1182,18 @@ fn list_cached_and_active_users_documents(
     Ok(Vec::new())
 }
 
+fn list_local_sessions_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    parse_list_sessions_spec(spec)?;
+    Ok(Vec::new())
+}
+
 fn list_mql_entities_documents(
     stage_index: usize,
     spec: &Bson,
@@ -1201,6 +1214,39 @@ fn list_mql_entities_documents(
         .into_iter()
         .map(|name| doc! { "name": name })
         .collect())
+}
+
+fn parse_list_sessions_spec(spec: &Bson) -> Result<(), QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut all_users = false;
+    let mut has_users = false;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "allUsers" => {
+                all_users = value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            "users" => {
+                let users = value.as_array().ok_or(QueryError::InvalidStage)?;
+                for user in users {
+                    let user = user.as_document().ok_or(QueryError::InvalidStage)?;
+                    match (user.get_str("user"), user.get_str("db"), user.len()) {
+                        (Ok(_), Ok(_), 2) => {}
+                        _ => return Err(QueryError::InvalidStage),
+                    }
+                }
+                has_users = !users.is_empty();
+            }
+            "$_internalPredicate" => return Err(QueryError::InvalidStage),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    if all_users && has_users {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

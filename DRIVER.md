@@ -73,6 +73,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.collection.aggregate([{ $indexStats: {} }])` returns local index metadata for the file-backed collection
 - `db.admin.aggregate([{ $listCatalog: {} }])` returns the local file-backed namespace catalog
 - `db.collection.aggregate([{ $listCachedAndActiveUsers: {} }])` returns an empty result because `mqlite` has no auth user cache
+- `db.aggregate([{ $listLocalSessions: { allUsers: true } }])` returns an empty result because `mqlite` does not implement logical sessions
 - `db.admin.aggregate([{ $listMqlEntities: { entityType: "aggregationStages" } }])` returns the sorted list of currently supported aggregation stages
 - `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
