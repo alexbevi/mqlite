@@ -1175,6 +1175,82 @@ fn documents_stage_rejects_non_array_specs_and_non_document_elements() {
 }
 
 #[test]
+fn facet_stage_runs_multiple_subpipelines_and_emits_one_document() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "team": "red", "qty": 1 },
+            doc! { "team": "blue", "qty": 3 },
+            doc! { "team": "blue", "qty": 2 },
+        ],
+        &[doc! {
+            "$facet": {
+                "totals": [
+                    { "$sortByCount": "$team" }
+                ],
+                "topQty": [
+                    { "$sort": { "qty": -1 } },
+                    { "$limit": 1 },
+                    { "$project": { "_id": 0, "qty": 1 } }
+                ]
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "totals": [
+                { "_id": "blue", "count": 2_i64 },
+                { "_id": "red", "count": 1_i64 }
+            ],
+            "topQty": [
+                { "qty": 3 }
+            ]
+        }]
+    );
+}
+
+#[test]
+fn facet_stage_runs_against_empty_input() {
+    let results = run_pipeline_ok(
+        Vec::new(),
+        &[doc! {
+            "$facet": {
+                "counted": [
+                    { "$count": "total" }
+                ]
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "counted": [
+                { "total": 0_i64 }
+            ]
+        }]
+    );
+}
+
+#[test]
+fn facet_stage_rejects_invalid_specs_and_disallowed_substages() {
+    for stage in [
+        doc! { "$facet": 1 },
+        doc! { "$facet": {} },
+        doc! { "$facet": { "$bad": [] } },
+        doc! { "$facet": { "bad.name": [] } },
+        doc! { "$facet": { "values": 1 } },
+        doc! { "$facet": { "values": [1] } },
+        doc! { "$facet": { "values": [{ "$documents": [{ "a": 1 }] }] } },
+        doc! { "$facet": { "values": [{ "$facet": { "nested": [] } }] } },
+    ] {
+        let error = run_pipeline(vec![doc! { "team": "red" }], &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

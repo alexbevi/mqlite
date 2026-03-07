@@ -18,6 +18,19 @@ pub fn run_pipeline(
     documents: Vec<Document>,
     pipeline: &[Document],
 ) -> Result<Vec<Document>, QueryError> {
+    run_pipeline_with_context(documents, pipeline, PipelineContext::default())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PipelineContext {
+    inside_facet: bool,
+}
+
+fn run_pipeline_with_context(
+    documents: Vec<Document>,
+    pipeline: &[Document],
+    context: PipelineContext,
+) -> Result<Vec<Document>, QueryError> {
     let mut current = documents;
 
     for (stage_index, stage) in pipeline.iter().enumerate() {
@@ -27,7 +40,10 @@ pub fn run_pipeline(
 
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
+            "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
+            "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
+            "$facet" => facet_documents(current, stage_spec)?,
             "$match" => {
                 let filter = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -110,6 +126,41 @@ pub fn run_pipeline(
     }
 
     Ok(current)
+}
+
+fn facet_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let mut output = Document::new();
+    for (facet_name, facet_pipeline) in spec {
+        validate_facet_name(facet_name)?;
+        let stages = facet_pipeline.as_array().ok_or(QueryError::InvalidStage)?;
+        let stages = stages
+            .iter()
+            .map(|value| value.as_document().cloned().ok_or(QueryError::InvalidStage))
+            .collect::<Result<Vec<_>, _>>()?;
+        let results = run_pipeline_with_context(
+            documents.clone(),
+            &stages,
+            PipelineContext { inside_facet: true },
+        )?;
+        output.insert(
+            facet_name.clone(),
+            Bson::Array(results.into_iter().map(Bson::Document).collect()),
+        );
+    }
+
+    Ok(vec![output])
+}
+
+fn validate_facet_name(name: &str) -> Result<(), QueryError> {
+    if name.is_empty() || name.starts_with('$') || name.contains('.') || name.contains('\0') {
+        return Err(QueryError::InvalidStage);
+    }
+    Ok(())
 }
 
 fn documents_stage(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {

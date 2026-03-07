@@ -262,6 +262,64 @@ fn command_aggregate_supports_sort_by_count_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_facet_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-facet.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"team":"red","qty":1},{"team":"blue","qty":3},{"team":"blue","qty":2}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$facet":{"totals":[{"$sortByCount":"$team"}],"topQty":[{"$sort":{"qty":-1}},{"$limit":1},{"$project":{"_id":0,"qty":1}}]}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "totals": [
+                { "_id": "blue", "count": 2 },
+                { "_id": "red", "count": 1 }
+            ],
+            "topQty": [
+                { "qty": 3 }
+            ]
+        })]
+    );
+}
+
+#[test]
 fn command_find_supports_size_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-size.mongodb");
