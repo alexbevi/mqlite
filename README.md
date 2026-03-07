@@ -174,6 +174,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$documents`
   - `$facet`
   - `$bucket`
+  - `$bucketAuto`
   - `$lookup`
   - `$sample`
   - `$sortByCount`

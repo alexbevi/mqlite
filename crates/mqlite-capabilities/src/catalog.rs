@@ -1094,6 +1094,10 @@ mod tests {
                 vec![doc! { "price": 10 }],
                 vec![doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 20] } }],
             ),
+            "$bucketAuto" => (
+                vec![doc! { "price": 10 }, doc! { "price": 20 }],
+                vec![doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }],
+            ),
             "$documents" => (
                 vec![doc! { "ignored": true }],
                 vec![doc! { "$documents": [{ "qty": 1 }] }],

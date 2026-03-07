@@ -73,6 +73,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
             "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
+            "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -658,6 +659,134 @@ fn bucket_documents(
     let sort_spec = doc! { "_id": 1 };
     results.sort_by(|left, right| compare_documents_by_sort(left, right, &sort_spec));
     Ok(results)
+}
+
+fn bucket_auto_documents(
+    documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut group_by = None;
+    let mut buckets = None;
+    let mut output_specs = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "groupBy" => {
+                let valid = match value {
+                    Bson::String(path) => path.starts_with('$') && path.len() > 1,
+                    Bson::Document(document) => document
+                        .iter()
+                        .next()
+                        .is_some_and(|(name, _)| name.starts_with('$')),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(QueryError::InvalidStage);
+                }
+                group_by = Some(value.clone());
+            }
+            "buckets" => {
+                let bucket_count = integer_value(value).ok_or(QueryError::InvalidStage)?;
+                if bucket_count <= 0 {
+                    return Err(QueryError::InvalidStage);
+                }
+                buckets = Some(bucket_count as usize);
+            }
+            "output" => {
+                let output = value.as_document().ok_or(QueryError::InvalidStage)?;
+                let accumulators = output
+                    .iter()
+                    .map(|(field, value)| Ok((field.clone(), parse_accumulator(value)?)))
+                    .collect::<Result<Vec<_>, QueryError>>()?;
+                output_specs = Some(accumulators);
+            }
+            "granularity" => return Err(QueryError::InvalidStage),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let group_by = group_by.ok_or(QueryError::InvalidStage)?;
+    let requested_bucket_count = buckets.ok_or(QueryError::InvalidStage)?;
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output_specs = output_specs.unwrap_or_else(|| {
+        vec![(
+            "count".to_string(),
+            GroupAccumulatorSpec::Sum(Bson::Int32(1)),
+        )]
+    });
+
+    let mut keyed = documents
+        .iter()
+        .enumerate()
+        .map(|(position, document)| {
+            eval_expression_with_variables(document, &group_by, variables)
+                .map(|value| (position, value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    keyed.sort_by(|left, right| compare_bson(&left.1, &right.1).then(left.0.cmp(&right.0)));
+
+    let bucket_count = requested_bucket_count.min(keyed.len());
+    let base_size = keyed.len() / bucket_count;
+    let remainder = keyed.len() % bucket_count;
+    let mut bucket_assignments = vec![0_usize; keyed.len()];
+    let mut bucket_bounds = Vec::with_capacity(bucket_count);
+    let mut offset = 0_usize;
+
+    for bucket_index in 0..bucket_count {
+        let bucket_size = base_size + usize::from(bucket_index < remainder);
+        let start = offset;
+        let end = start + bucket_size;
+        let min = keyed[start].1.clone();
+        let max = if bucket_index + 1 < bucket_count {
+            keyed[end].1.clone()
+        } else {
+            keyed[end - 1].1.clone()
+        };
+        for (position, _) in &keyed[start..end] {
+            bucket_assignments[*position] = bucket_index;
+        }
+        bucket_bounds.push((min, max));
+        offset = end;
+    }
+
+    let mut grouped_states = (0..bucket_count)
+        .map(|_| {
+            output_specs
+                .iter()
+                .map(|(field, spec)| (field.clone(), GroupAccumulatorState::from_spec(spec)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    for (position, document) in documents.iter().enumerate() {
+        let bucket_index = bucket_assignments[position];
+        for (field, accumulator) in &output_specs {
+            let state = grouped_states[bucket_index]
+                .iter_mut()
+                .find(|(existing_field, _)| existing_field == field)
+                .map(|(_, state)| state)
+                .expect("bucket state exists");
+            state.apply(document, accumulator, variables)?;
+        }
+    }
+
+    Ok(bucket_bounds
+        .into_iter()
+        .zip(grouped_states)
+        .map(|((min, max), states)| {
+            let mut output = Document::new();
+            output.insert("_id", doc! { "min": min, "max": max });
+            for (field, state) in states {
+                output.insert(field, state.finish());
+            }
+            output
+        })
+        .collect())
 }
 
 fn bucket_assignment(

@@ -33,6 +33,7 @@
   "aggregation_stages": [
     "$addFields",
     "$bucket",
+    "$bucketAuto",
     "$count",
     "$documents",
     "$facet",

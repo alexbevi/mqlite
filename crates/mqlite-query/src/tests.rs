@@ -1221,6 +1221,103 @@ fn bucket_stage_groups_documents_by_boundaries() {
 }
 
 #[test]
+fn bucket_auto_stage_groups_documents_and_preserves_incoming_order_with_push() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 0, "n": 9 },
+            doc! { "_id": 1, "n": 8 },
+            doc! { "_id": 2, "n": 7 },
+            doc! { "_id": 3, "n": 6 },
+            doc! { "_id": 4, "n": 5 },
+            doc! { "_id": 5, "n": 4 },
+            doc! { "_id": 6, "n": 3 },
+            doc! { "_id": 7, "n": 2 },
+            doc! { "_id": 8, "n": 1 },
+            doc! { "_id": 9, "n": 0 },
+        ],
+        &[doc! {
+            "$bucketAuto": {
+                "groupBy": "$n",
+                "buckets": 2,
+                "output": {
+                    "docs": { "$push": "$$ROOT" }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! {
+                "_id": { "min": 0, "max": 5 },
+                "docs": [
+                    { "_id": 5, "n": 4 },
+                    { "_id": 6, "n": 3 },
+                    { "_id": 7, "n": 2 },
+                    { "_id": 8, "n": 1 },
+                    { "_id": 9, "n": 0 },
+                ]
+            },
+            doc! {
+                "_id": { "min": 5, "max": 9 },
+                "docs": [
+                    { "_id": 0, "n": 9 },
+                    { "_id": 1, "n": 8 },
+                    { "_id": 2, "n": 7 },
+                    { "_id": 3, "n": 6 },
+                    { "_id": 4, "n": 5 },
+                ]
+            },
+        ]
+    );
+}
+
+#[test]
+fn bucket_auto_stage_defaults_to_count_output() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "price": 10 },
+            doc! { "price": 20 },
+            doc! { "price": 30 },
+            doc! { "price": 40 },
+        ],
+        &[doc! {
+            "$bucketAuto": {
+                "groupBy": "$price",
+                "buckets": 2
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": { "min": 10, "max": 30 }, "count": 2_i64 },
+            doc! { "_id": { "min": 30, "max": 40 }, "count": 2_i64 },
+        ]
+    );
+}
+
+#[test]
+fn bucket_auto_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$bucketAuto": 1 },
+        doc! { "$bucketAuto": {} },
+        doc! { "$bucketAuto": { "groupBy": "price", "buckets": 2 } },
+        doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 0 } },
+        doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2.5 } },
+        doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2, "output": 1 } },
+        doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2, "granularity": "R5" } },
+        doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2, "unknown": true } },
+    ] {
+        let error =
+            run_pipeline(vec![doc! { "price": 10 }], &[stage]).expect_err("invalid bucketAuto");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn union_with_stage_appends_documents_from_another_collection() {
     let resolver = StaticResolver::default().with_collection(
         "app",
