@@ -132,6 +132,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
+            "$querySettings" => query_settings_documents(stage_index, stage_spec)?,
             "$set" | "$addFields" => {
                 let spec = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -1217,6 +1218,15 @@ fn list_sampled_queries_documents(
     Ok(Vec::new())
 }
 
+fn query_settings_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    parse_query_settings_spec(spec)?;
+    Ok(Vec::new())
+}
+
 fn list_mql_entities_documents(
     stage_index: usize,
     spec: &Bson,
@@ -1298,6 +1308,21 @@ fn validate_namespace_string(namespace: &str) -> Result<(), QueryError> {
     if database.is_empty() || collection.is_empty() {
         return Err(QueryError::InvalidStage);
     }
+    Ok(())
+}
+
+fn parse_query_settings_spec(spec: &Bson) -> Result<(), QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "showDebugQueryShape" => {
+                value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
     Ok(())
 }
 

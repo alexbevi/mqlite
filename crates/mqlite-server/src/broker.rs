@@ -1567,6 +1567,8 @@ impl Broker {
                 execution_pipeline,
                 out_target,
                 merge_target,
+            );
+        }
         if starts_with_query_settings {
             return self.handle_query_settings_aggregate(
                 &database,
@@ -1574,8 +1576,6 @@ impl Broker {
                 execution_pipeline,
                 out_target,
                 merge_target,
-            );
-        }
             );
         }
         if starts_with_list_mql_entities {
@@ -1997,6 +1997,8 @@ impl Broker {
             .cursors
             .lock()
             .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
 
     fn handle_query_settings_aggregate(
         &self,
@@ -2037,8 +2039,6 @@ impl Broker {
             .cursors
             .lock()
             .open(namespace, results, batch_size, false);
-        Ok(cursor_document(cursor, "firstBatch"))
-    }
         Ok(cursor_document(cursor, "firstBatch"))
     }
 

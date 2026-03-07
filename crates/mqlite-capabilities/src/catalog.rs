@@ -1173,6 +1173,10 @@ mod tests {
                 vec![doc! { "_id": 1, "qty": 1 }],
                 vec![doc! { "$project": { "qty": 1 } }],
             ),
+            "$querySettings" => (
+                Vec::new(),
+                vec![doc! { "$querySettings": { "showDebugQueryShape": true } }],
+            ),
             "$set" => (
                 vec![doc! { "_id": 1, "qty": 1 }],
                 vec![doc! { "$set": { "copied": "$qty" } }],

@@ -54,6 +54,7 @@
     "$out",
     "$planCacheStats",
     "$project",
+    "$querySettings",
     "$replaceRoot",
     "$replaceWith",
     "$sample",

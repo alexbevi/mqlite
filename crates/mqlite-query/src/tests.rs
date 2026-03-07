@@ -2196,6 +2196,40 @@ fn list_sampled_queries_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn query_settings_stage_accepts_public_specs() {
+    for stage in [
+        doc! { "$querySettings": {} },
+        doc! { "$querySettings": { "showDebugQueryShape": false } },
+        doc! { "$querySettings": { "showDebugQueryShape": true } },
+    ] {
+        let results = run_pipeline_ok(Vec::new(), &[stage]);
+        assert!(results.is_empty());
+    }
+}
+
+#[test]
+fn query_settings_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$querySettings": 1 },
+        doc! { "$querySettings": { "showDebugQueryShape": 1 } },
+        doc! { "$querySettings": { "all": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$documents": [{ "_id": 1 }] },
+            doc! { "$querySettings": {} },
+        ],
+    )
+    .expect_err("$querySettings should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn list_mql_entities_stage_reports_supported_aggregation_stages() {
     let results = run_pipeline_ok(
         Vec::new(),

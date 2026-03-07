@@ -53,6 +53,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$merge",
     "$out",
     "$project",
+    "$querySettings",
     "$set",
     "$addFields",
     "$unset",
