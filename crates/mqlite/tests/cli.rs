@@ -600,6 +600,72 @@ fn command_explain_reports_plan_cache_usage_and_invalidation() {
 }
 
 #[test]
+fn command_explain_uses_persisted_plan_cache_after_restart() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-persisted-plan-cache.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut first_explain = Command::cargo_bin("mqlite").expect("binary");
+    let first_output = first_explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"explain":{"find":"widgets","filter":{"sku":"alpha"}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_response: Value = serde_json::from_slice(&first_output).expect("json response");
+    assert_eq!(first_response["queryPlanner"]["planCacheUsed"], false);
+
+    thread::sleep(Duration::from_secs(2));
+
+    let mut second_explain = Command::cargo_bin("mqlite").expect("binary");
+    let second_output = second_explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"explain":{"find":"widgets","filter":{"sku":"alpha"}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_response: Value = serde_json::from_slice(&second_output).expect("json response");
+    assert_eq!(second_response["queryPlanner"]["planCacheUsed"], true);
+}
+
+#[test]
 fn command_explain_reports_multi_interval_or_scan() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-multi-interval.mongodb");
@@ -739,6 +805,140 @@ fn command_explain_reports_multi_interval_or_scan() {
         .map(|document| document["sku"].as_str().expect("sku"))
         .collect::<Vec<_>>();
     assert_eq!(skus, vec!["a", "b"]);
+}
+
+#[test]
+fn command_explain_reports_branch_union_or_plan() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-branch-union-or.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true},{"key":{"qty":1},"name":"qty_1"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [
+            { "_id": 1, "sku": "alpha", "qty": 1 },
+            { "_id": 2, "sku": "beta", "qty": 10 },
+            { "_id": 3, "sku": "gamma", "qty": 7 },
+            { "_id": 4, "sku": "delta", "qty": 2 }
+        ]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let explain_command = json!({
+        "explain": {
+            "find": "widgets",
+            "filter": {
+                "$or": [
+                    { "sku": "alpha" },
+                    { "qty": { "$gt": 5 } }
+                ]
+            },
+            "sort": { "qty": 1 }
+        }
+    })
+    .to_string();
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let explain_output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&explain_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_response: Value = serde_json::from_slice(&explain_output).expect("json response");
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["stage"],
+        "OR"
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["inputStages"]
+            .as_array()
+            .expect("input stages")
+            .len(),
+        2
+    );
+    assert_eq!(
+        explain_response["queryPlanner"]["winningPlan"]["requiresSort"],
+        true
+    );
+
+    let find_command = json!({
+        "find": "widgets",
+        "filter": {
+            "$or": [
+                { "sku": "alpha" },
+                { "qty": { "$gt": 5 } }
+            ]
+        },
+        "sort": { "qty": 1 }
+    })
+    .to_string();
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let find_output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&find_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let find_response: Value = serde_json::from_slice(&find_output).expect("json response");
+    let skus = find_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .iter()
+        .map(|document| document["sku"].as_str().expect("sku"))
+        .collect::<Vec<_>>();
+    assert_eq!(skus, vec!["alpha", "gamma", "beta"]);
 }
 
 #[test]

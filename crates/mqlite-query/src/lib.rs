@@ -93,6 +93,10 @@ pub fn document_matches(document: &Document, filter: &Document) -> Result<bool, 
     Ok(matches_expression(document, &expression))
 }
 
+pub fn document_matches_expression(document: &Document, expression: &MatchExpr) -> bool {
+    matches_expression(document, expression)
+}
+
 pub fn apply_projection(
     document: &Document,
     projection: Option<&Document>,

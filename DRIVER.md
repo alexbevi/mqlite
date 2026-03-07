@@ -96,6 +96,6 @@ Any driver integration should include:
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
-- `explain` smoke tests so plan-cache usage, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
+- `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.

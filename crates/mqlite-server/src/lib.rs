@@ -22,10 +22,12 @@ use mqlite_ipc::{
     remove_manifest, write_manifest,
 };
 use mqlite_query::{
-    MatchExpr, QueryError, apply_projection, apply_update, document_matches, parse_filter,
-    parse_update, run_pipeline, upsert_seed_from_query,
+    MatchExpr, QueryError, apply_projection, apply_update, document_matches,
+    document_matches_expression, parse_filter, parse_update, run_pipeline, upsert_seed_from_query,
 };
-use mqlite_storage::{DatabaseFile, WalMutation};
+use mqlite_storage::{
+    DatabaseFile, PersistedPlanCacheChoice, PersistedPlanCacheEntry, WalMutation,
+};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
@@ -33,6 +35,7 @@ use thiserror::Error;
 const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
 const MAX_MESSAGE_SIZE_BYTES: i32 = 48 * 1024 * 1024;
 const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
+const MAX_OR_BRANCHES: usize = 32;
 const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 
@@ -143,12 +146,22 @@ impl Broker {
     pub fn new(config: BrokerConfig) -> Result<Self> {
         let paths = broker_paths(&config.database_path)?;
         let storage = DatabaseFile::open_or_create(&paths.database_path)?;
+        let plan_cache = storage
+            .persisted_plan_cache_entries()
+            .iter()
+            .map(|entry| {
+                (
+                    plan_cache_key_from_entry(entry),
+                    cached_plan_from_entry(entry),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         Ok(Self {
             config,
             paths,
             storage: Arc::new(RwLock::new(storage)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
-            plan_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            plan_cache: Arc::new(Mutex::new(plan_cache)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
@@ -197,8 +210,16 @@ impl Broker {
             }
         }
 
-        if self.storage.read().has_pending_wal() {
-            self.storage.write().checkpoint()?;
+        let persisted_cache = self.persisted_plan_cache_entries();
+        let should_checkpoint = {
+            let storage = self.storage.read();
+            storage.has_pending_wal()
+                || storage.persisted_plan_cache_entries() != persisted_cache.as_slice()
+        };
+        if should_checkpoint {
+            let mut storage = self.storage.write();
+            storage.set_persisted_plan_cache_entries(persisted_cache);
+            storage.checkpoint()?;
         }
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
@@ -215,30 +236,45 @@ impl Broker {
         projection: Option<&Document>,
     ) -> Result<CachedFindPlan, CommandError> {
         let cache_key = build_plan_cache_key(&namespace, filter, sort, projection)?;
-        let preferred_index = self
+        let preferred_choice = self
             .plan_cache
             .lock()
             .get(&cache_key)
             .filter(|cached| cached.sequence == sequence)
-            .and_then(|cached| cached.index_name.clone());
+            .map(|cached| cached.choice.clone());
         let plan = plan_find(
             collection,
             filter,
             sort,
             projection,
-            preferred_index.as_deref(),
+            preferred_choice.as_ref(),
         )?;
         self.plan_cache.lock().insert(
             cache_key,
             CachedPlan {
                 sequence,
-                index_name: planned_index_name(&plan),
+                choice: planned_choice(&plan),
             },
         );
         Ok(CachedFindPlan {
             plan,
-            cache_used: preferred_index.is_some(),
+            cache_used: preferred_choice.is_some(),
         })
+    }
+
+    fn persisted_plan_cache_entries(&self) -> Vec<PersistedPlanCacheEntry> {
+        self.plan_cache
+            .lock()
+            .iter()
+            .map(|(key, cached)| PersistedPlanCacheEntry {
+                namespace: key.namespace.clone(),
+                filter_shape: key.filter_shape.clone(),
+                sort_shape: key.sort_shape.clone(),
+                projection_shape: key.projection_shape.clone(),
+                sequence: cached.sequence,
+                choice: cached.choice.clone(),
+            })
+            .collect()
     }
 
     async fn handle_connection(&self, mut stream: BoxedStream) -> Result<()> {
@@ -452,8 +488,9 @@ impl Broker {
                 projection.as_ref(),
             )?,
             Err(CatalogError::NamespaceNotFound(_, _)) => CachedFindPlan {
-                plan: PlannedFind::CollectionScan {
+                plan: PlannedFind::Collection {
                     documents: Vec::new(),
+                    record_ids: Vec::new(),
                     docs_examined: 0,
                     sort_required: sort.is_some(),
                 },
@@ -1053,7 +1090,7 @@ struct PlanCacheKey {
 #[derive(Debug, Clone)]
 struct CachedPlan {
     sequence: u64,
-    index_name: Option<String>,
+    choice: PersistedPlanCacheChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -1069,7 +1106,7 @@ struct ProjectionRequirements {
 
 struct FindPlanContext<'a> {
     record_by_id: &'a BTreeMap<u64, &'a Document>,
-    filter: &'a Document,
+    expression: &'a MatchExpr,
     filter_paths: &'a BTreeSet<String>,
     field_bounds: &'a BTreeMap<String, FieldBounds>,
     sort: Option<&'a Document>,
@@ -1088,15 +1125,17 @@ struct PlanCost {
 
 #[derive(Debug, Clone)]
 enum PlannedFind {
-    CollectionScan {
+    Collection {
         documents: Vec<Document>,
+        record_ids: Vec<u64>,
         docs_examined: usize,
         sort_required: bool,
     },
-    IndexScan {
+    Index {
         index_name: String,
         bounds: Vec<IndexBounds>,
         documents: Vec<Document>,
+        record_ids: Vec<u64>,
         matched_fields: usize,
         filter_covered: bool,
         sort_required: bool,
@@ -1107,12 +1146,24 @@ enum PlannedFind {
         keys_examined: usize,
         docs_examined: usize,
     },
+    Or {
+        branches: Vec<PlannedFind>,
+        documents: Vec<Document>,
+        record_ids: Vec<u64>,
+        filter_covered: bool,
+        sort_required: bool,
+        sort_covered: bool,
+        projection_covered: bool,
+        projection_applied: bool,
+        keys_examined: usize,
+        docs_examined: usize,
+    },
 }
 
 impl PlannedFind {
     fn to_document(&self) -> Document {
         match self {
-            PlannedFind::CollectionScan {
+            PlannedFind::Collection {
                 docs_examined,
                 sort_required,
                 ..
@@ -1124,7 +1175,7 @@ impl PlannedFind {
                 "filterCovered": false,
                 "projectionCovered": false,
             },
-            PlannedFind::IndexScan {
+            PlannedFind::Index {
                 index_name, bounds, ..
             } => {
                 let mut document = doc! {
@@ -1161,7 +1212,7 @@ impl PlannedFind {
                     document.insert("intervalCount", bounds.len() as i32);
                     document.insert("intervals", Bson::Array(intervals));
                 }
-                if let PlannedFind::IndexScan {
+                if let PlannedFind::Index {
                     matched_fields,
                     filter_covered,
                     sort_required,
@@ -1190,12 +1241,31 @@ impl PlannedFind {
                 }
                 document
             }
+            PlannedFind::Or {
+                branches,
+                filter_covered,
+                sort_required,
+                sort_covered,
+                projection_covered,
+                keys_examined,
+                docs_examined,
+                ..
+            } => doc! {
+                "stage": "OR",
+                "inputStages": branches.iter().map(|branch| Bson::Document(branch.to_document())).collect::<Vec<_>>(),
+                "keysExamined": *keys_examined as i32,
+                "docsExamined": *docs_examined as i32,
+                "requiresSort": *sort_required,
+                "filterCovered": *filter_covered,
+                "sortCovered": *sort_covered,
+                "projectionCovered": *projection_covered,
+            },
         }
     }
 
     fn cost(&self) -> PlanCost {
         match self {
-            PlannedFind::CollectionScan {
+            PlannedFind::Collection {
                 docs_examined,
                 sort_required,
                 ..
@@ -1206,7 +1276,20 @@ impl PlannedFind {
                 projection_not_covered: true,
                 collection_scan: true,
             },
-            PlannedFind::IndexScan {
+            PlannedFind::Index {
+                sort_required,
+                projection_covered,
+                keys_examined,
+                docs_examined,
+                ..
+            } => PlanCost {
+                docs_examined: *docs_examined,
+                requires_sort: *sort_required,
+                keys_examined: *keys_examined,
+                projection_not_covered: !*projection_covered,
+                collection_scan: false,
+            },
+            PlannedFind::Or {
                 sort_required,
                 projection_covered,
                 keys_examined,
@@ -1224,12 +1307,22 @@ impl PlannedFind {
 
     fn into_execution(self) -> FindExecution {
         match self {
-            PlannedFind::CollectionScan { documents, .. } => FindExecution {
+            PlannedFind::Collection { documents, .. } => FindExecution {
                 documents,
                 sort_covered: false,
                 projection_applied: false,
             },
-            PlannedFind::IndexScan {
+            PlannedFind::Index {
+                documents,
+                sort_covered,
+                projection_applied,
+                ..
+            } => FindExecution {
+                documents,
+                sort_covered,
+                projection_applied,
+            },
+            PlannedFind::Or {
                 documents,
                 sort_covered,
                 projection_applied,
@@ -1241,6 +1334,55 @@ impl PlannedFind {
             },
         }
     }
+
+    fn record_ids(&self) -> &[u64] {
+        match self {
+            PlannedFind::Collection { record_ids, .. }
+            | PlannedFind::Index { record_ids, .. }
+            | PlannedFind::Or { record_ids, .. } => record_ids,
+        }
+    }
+
+    fn filter_covered(&self) -> bool {
+        match self {
+            PlannedFind::Collection { .. } => false,
+            PlannedFind::Index { filter_covered, .. } | PlannedFind::Or { filter_covered, .. } => {
+                *filter_covered
+            }
+        }
+    }
+
+    fn keys_examined(&self) -> usize {
+        match self {
+            PlannedFind::Collection { .. } => 0,
+            PlannedFind::Index { keys_examined, .. } | PlannedFind::Or { keys_examined, .. } => {
+                *keys_examined
+            }
+        }
+    }
+
+    fn docs_examined(&self) -> usize {
+        match self {
+            PlannedFind::Collection { docs_examined, .. }
+            | PlannedFind::Index { docs_examined, .. }
+            | PlannedFind::Or { docs_examined, .. } => *docs_examined,
+        }
+    }
+
+    fn branch_choices(&self) -> PersistedPlanCacheChoice {
+        match self {
+            PlannedFind::Collection { .. } => PersistedPlanCacheChoice::CollectionScan,
+            PlannedFind::Index { index_name, .. } => {
+                PersistedPlanCacheChoice::Index(index_name.clone())
+            }
+            PlannedFind::Or { branches, .. } => PersistedPlanCacheChoice::Union(
+                branches
+                    .iter()
+                    .map(PlannedFind::branch_choices)
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
 }
 
 fn plan_find(
@@ -1248,11 +1390,57 @@ fn plan_find(
     filter: &Document,
     sort: Option<&Document>,
     projection: Option<&Document>,
-    preferred_index: Option<&str>,
+    preferred_choice: Option<&PersistedPlanCacheChoice>,
 ) -> Result<PlannedFind, CommandError> {
     let expression = parse_filter(filter)?;
-    let field_bounds = extract_field_bounds(&expression).unwrap_or_default();
-    let filter_paths = collect_match_paths(&expression);
+    let simple_preferred_index = match preferred_choice {
+        Some(PersistedPlanCacheChoice::CollectionScan) => None,
+        Some(PersistedPlanCacheChoice::Index(name)) => Some(name.as_str()),
+        Some(PersistedPlanCacheChoice::Union(_)) | None => None,
+    };
+    let simple_plan = plan_find_simple(
+        collection,
+        &expression,
+        sort,
+        projection,
+        simple_preferred_index,
+    )?;
+
+    let Some(branches) = disjunctive_branches(&expression) else {
+        return Ok(simple_plan);
+    };
+    if matches!(
+        preferred_choice,
+        Some(PersistedPlanCacheChoice::CollectionScan)
+    ) {
+        return Ok(simple_plan);
+    }
+
+    let preferred_branch_choices = match preferred_choice {
+        Some(PersistedPlanCacheChoice::Union(choices)) if choices.len() == branches.len() => {
+            Some(choices.as_slice())
+        }
+        _ => None,
+    };
+    let Some(or_plan) = plan_or_find(collection, &branches, sort, preferred_branch_choices)? else {
+        return Ok(simple_plan);
+    };
+    Ok(if or_plan.cost() < simple_plan.cost() {
+        or_plan
+    } else {
+        simple_plan
+    })
+}
+
+fn plan_find_simple(
+    collection: &CollectionCatalog,
+    expression: &MatchExpr,
+    sort: Option<&Document>,
+    projection: Option<&Document>,
+    preferred_index: Option<&str>,
+) -> Result<PlannedFind, CommandError> {
+    let field_bounds = extract_field_bounds(expression).unwrap_or_default();
+    let filter_paths = collect_match_paths(expression);
     let projection_requirements = analyze_projection_requirements(projection)?;
     let record_by_id = collection
         .records
@@ -1261,7 +1449,7 @@ fn plan_find(
         .collect::<BTreeMap<_, _>>();
     let context = FindPlanContext {
         record_by_id: &record_by_id,
-        filter,
+        expression,
         filter_paths: &filter_paths,
         field_bounds: &field_bounds,
         sort,
@@ -1269,7 +1457,7 @@ fn plan_find(
         projection_requirements: projection_requirements.as_ref(),
     };
 
-    let mut best_plan = plan_collection_scan(collection, filter, sort)?;
+    let mut best_plan = plan_collection_scan(collection, expression, sort);
     if let Some(index_name) = preferred_index {
         if let Some(index) = collection.indexes.get(index_name) {
             if let Some(candidate) = evaluate_index_plan(&context, index)? {
@@ -1313,25 +1501,91 @@ fn plan_find(
 
 fn plan_collection_scan(
     collection: &CollectionCatalog,
-    filter: &Document,
+    expression: &MatchExpr,
     sort: Option<&Document>,
-) -> Result<PlannedFind, CommandError> {
-    let documents = collection
+) -> PlannedFind {
+    let (record_ids, documents) = collection
         .records
         .iter()
-        .map(|record| {
-            document_matches(&record.document, filter)
-                .map(|matches| (record.document.clone(), matches))
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter_map(|(document, matches)| matches.then_some(document))
-        .collect::<Vec<_>>();
-    Ok(PlannedFind::CollectionScan {
+        .filter(|record| document_matches_expression(&record.document, expression))
+        .map(|record| (record.record_id, record.document.clone()))
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    PlannedFind::Collection {
         documents,
+        record_ids,
         docs_examined: collection.records.len(),
         sort_required: sort.is_some(),
-    })
+    }
+}
+
+fn plan_or_find(
+    collection: &CollectionCatalog,
+    branches: &[MatchExpr],
+    sort: Option<&Document>,
+    preferred_choices: Option<&[PersistedPlanCacheChoice]>,
+) -> Result<Option<PlannedFind>, CommandError> {
+    if branches.is_empty() || branches.len() > MAX_OR_BRANCHES {
+        return Ok(None);
+    }
+
+    let record_by_id = collection
+        .records
+        .iter()
+        .map(|record| (record.record_id, &record.document))
+        .collect::<BTreeMap<_, _>>();
+    let mut planned_branches = Vec::with_capacity(branches.len());
+    for (index, branch) in branches.iter().enumerate() {
+        let preferred_index = preferred_choices
+            .and_then(|choices| choices.get(index))
+            .and_then(|choice| match choice {
+                PersistedPlanCacheChoice::Index(name) => Some(name.as_str()),
+                _ => None,
+            });
+        planned_branches.push(plan_find_simple(
+            collection,
+            branch,
+            None,
+            None,
+            preferred_index,
+        )?);
+    }
+
+    let mut seen_record_ids = BTreeSet::new();
+    let mut record_ids = Vec::new();
+    for branch in &planned_branches {
+        for record_id in branch.record_ids() {
+            if seen_record_ids.insert(*record_id) {
+                record_ids.push(*record_id);
+            }
+        }
+    }
+
+    let documents = record_ids
+        .iter()
+        .map(|record_id| fetch_record_document(&record_by_id, *record_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let filter_covered = planned_branches.iter().all(PlannedFind::filter_covered);
+    let keys_examined = planned_branches
+        .iter()
+        .map(PlannedFind::keys_examined)
+        .sum::<usize>();
+    let docs_examined = planned_branches
+        .iter()
+        .map(PlannedFind::docs_examined)
+        .sum::<usize>();
+
+    Ok(Some(PlannedFind::Or {
+        branches: planned_branches,
+        documents,
+        record_ids,
+        filter_covered,
+        sort_required: sort.is_some(),
+        sort_covered: false,
+        projection_covered: false,
+        projection_applied: false,
+        keys_examined,
+        docs_examined,
+    }))
 }
 
 fn evaluate_index_plan(
@@ -1340,7 +1594,8 @@ fn evaluate_index_plan(
 ) -> Result<Option<PlannedFind>, CommandError> {
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
-    let filter_supported = !context.filter.is_empty() && index.covers_paths(context.filter_paths);
+    let filter_supported =
+        !context.filter_paths.is_empty() && index.covers_paths(context.filter_paths);
     let projection_supported = projection_supported(index, context, sort_plan);
 
     if filter_plan.is_none()
@@ -1366,21 +1621,22 @@ fn evaluate_index_plan(
         .unwrap_or(0);
     let mut docs_examined = 0_usize;
     let mut documents = Vec::new();
+    let mut record_ids = Vec::new();
     let mut filter_covered = filter_supported;
     let mut projection_covered = projection_supported.is_some();
 
     for entry in entries {
         let index_document = materialize_index_document(&entry)?;
         let mut fetched = None;
-        let matches = if context.filter.is_empty() {
+        let matches = if context.filter_paths.is_empty() {
             true
         } else if filter_supported {
-            document_matches(&index_document, context.filter)?
+            document_matches_expression(&index_document, context.expression)
         } else {
             filter_covered = false;
             let document = fetch_record_document(context.record_by_id, entry.record_id)?;
             docs_examined += 1;
-            let is_match = document_matches(&document, context.filter)?;
+            let is_match = document_matches_expression(&document, context.expression);
             fetched = Some(document);
             is_match
         };
@@ -1404,13 +1660,15 @@ fn evaluate_index_plan(
                 }
             }
         };
+        record_ids.push(entry.record_id);
         documents.push(document);
     }
 
-    Ok(Some(PlannedFind::IndexScan {
+    Ok(Some(PlannedFind::Index {
         index_name: index.name.clone(),
         bounds,
         documents,
+        record_ids,
         matched_fields,
         filter_covered,
         sort_required: context.sort.is_some() && sort_plan.is_none(),
@@ -1429,7 +1687,8 @@ fn estimate_index_candidate(
 ) -> Option<PlanCost> {
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
-    let filter_supported = !context.filter.is_empty() && index.covers_paths(context.filter_paths);
+    let filter_supported =
+        !context.filter_paths.is_empty() && index.covers_paths(context.filter_paths);
     let projection_supported = projection_supported(index, context, sort_plan);
 
     if filter_plan.is_none()
@@ -1459,11 +1718,11 @@ fn estimate_index_candidate(
         filter_supported,
         estimated_keys_examined,
     );
-    let estimated_docs_examined = if !context.filter.is_empty() && !filter_supported {
+    let estimated_docs_examined = if !context.filter_paths.is_empty() && !filter_supported {
         estimated_keys_examined
     } else if projection_supported.is_some() {
         0
-    } else if context.filter.is_empty() || filter_supported {
+    } else if context.filter_paths.is_empty() || filter_supported {
         estimated_matches
     } else {
         estimated_keys_examined
@@ -1894,11 +2153,24 @@ fn build_plan_cache_key(
     })
 }
 
-fn planned_index_name(plan: &PlannedFind) -> Option<String> {
-    match plan {
-        PlannedFind::IndexScan { index_name, .. } => Some(index_name.clone()),
-        PlannedFind::CollectionScan { .. } => None,
+fn plan_cache_key_from_entry(entry: &PersistedPlanCacheEntry) -> PlanCacheKey {
+    PlanCacheKey {
+        namespace: entry.namespace.clone(),
+        filter_shape: entry.filter_shape.clone(),
+        sort_shape: entry.sort_shape.clone(),
+        projection_shape: entry.projection_shape.clone(),
     }
+}
+
+fn cached_plan_from_entry(entry: &PersistedPlanCacheEntry) -> CachedPlan {
+    CachedPlan {
+        sequence: entry.sequence,
+        choice: entry.choice.clone(),
+    }
+}
+
+fn planned_choice(plan: &PlannedFind) -> PersistedPlanCacheChoice {
+    plan.branch_choices()
 }
 
 fn filter_shape(expression: &MatchExpr) -> String {
@@ -1948,6 +2220,56 @@ fn projection_shape(projection: Option<&Document>) -> String {
                 .join(",")
         },
     )
+}
+
+fn disjunctive_branches(expression: &MatchExpr) -> Option<Vec<MatchExpr>> {
+    let branches = dnf_branches(expression)?;
+    (branches.len() > 1).then(|| {
+        branches
+            .into_iter()
+            .map(|terms| match terms.len() {
+                0 => MatchExpr::And(Vec::new()),
+                1 => terms.into_iter().next().expect("single term"),
+                _ => MatchExpr::And(terms),
+            })
+            .collect()
+    })
+}
+
+fn dnf_branches(expression: &MatchExpr) -> Option<Vec<Vec<MatchExpr>>> {
+    match expression {
+        MatchExpr::And(items) => {
+            let mut branches = vec![Vec::new()];
+            for item in items {
+                let item_branches = dnf_branches(item)?;
+                let mut next = Vec::new();
+                for branch in &branches {
+                    for item_branch in &item_branches {
+                        let mut combined = branch.clone();
+                        combined.extend(item_branch.clone());
+                        next.push(combined);
+                        if next.len() > MAX_OR_BRANCHES {
+                            return None;
+                        }
+                    }
+                }
+                branches = next;
+            }
+            Some(branches)
+        }
+        MatchExpr::Or(items) => {
+            let mut branches = Vec::new();
+            for item in items {
+                let item_branches = dnf_branches(item)?;
+                branches.extend(item_branches);
+                if branches.len() > MAX_OR_BRANCHES {
+                    return None;
+                }
+            }
+            Some(branches)
+        }
+        other => Some(vec![vec![other.clone()]]),
+    }
 }
 
 fn build_index_bounds(
@@ -3213,6 +3535,211 @@ mod tests {
             !third_planner
                 .get_bool("planCacheUsed")
                 .expect("plan cache used")
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_uses_persisted_plan_cache_after_restart() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("persisted-plan-cache.mongodb");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        assert!(
+            !explain
+                .get_document("queryPlanner")
+                .expect("query planner")
+                .get_bool("planCacheUsed")
+                .expect("plan cache used")
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "sku": "alpha" }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let planner = explain.get_document("queryPlanner").expect("query planner");
+        assert!(planner.get_bool("planCacheUsed").expect("plan cache used"));
+        assert_eq!(
+            planner
+                .get_document("winningPlan")
+                .expect("winning plan")
+                .get_str("indexName")
+                .expect("index"),
+            "sku_1"
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_uses_branch_union_or_plan_for_distinct_indexes() {
+        let (serve_task, _temp_dir, manifest) = start_broker("branch-union-or.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true },
+                    { "key": { "qty": 1 }, "name": "qty_1" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "alpha", "qty": 1 },
+                    { "_id": 2, "sku": "beta", "qty": 10 },
+                    { "_id": 3, "sku": "gamma", "qty": 7 },
+                    { "_id": 4, "sku": "delta", "qty": 2 }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": {
+                        "$or": [
+                            { "sku": "alpha" },
+                            { "qty": { "$gt": 5 } }
+                        ]
+                    },
+                    "sort": { "qty": 1 }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "OR");
+        let input_stages = winning_plan.get_array("inputStages").expect("input stages");
+        assert_eq!(input_stages.len(), 2);
+        assert_eq!(
+            input_stages[0]
+                .as_document()
+                .expect("stage")
+                .get_str("stage")
+                .expect("stage"),
+            "IXSCAN"
+        );
+        assert_eq!(
+            input_stages[1]
+                .as_document()
+                .expect("stage")
+                .get_str("stage")
+                .expect("stage"),
+            "IXSCAN"
+        );
+        assert!(
+            winning_plan
+                .get_bool("requiresSort")
+                .expect("requires sort")
+        );
+
+        let find = send_command(
+            &mut stream,
+            doc! {
+                "find": "widgets",
+                "filter": {
+                    "$or": [
+                        { "sku": "alpha" },
+                        { "qty": { "$gt": 5 } }
+                    ]
+                },
+                "sort": { "qty": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("first batch");
+        assert_eq!(
+            first_batch
+                .iter()
+                .map(|value| {
+                    value
+                        .as_document()
+                        .expect("document")
+                        .get_str("sku")
+                        .expect("sku")
+                })
+                .collect::<Vec<_>>(),
+            vec!["alpha", "gamma", "beta"]
         );
 
         drop(stream);

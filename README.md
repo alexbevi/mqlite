@@ -13,6 +13,8 @@ The repository now contains a working Rust workspace baseline with:
 - A direct CLI command path for broker validation without any patched driver.
 - Progressive tests, CI scaffolding, and living specs.
 
+See [ARCHITECTURE.md](/Users/alex/Workspace/mqlite/ARCHITECTURE.md) for the storage, index, broker, and command-execution design details.
+
 ## Build
 
 Build from the workspace root with Rust 1.87 or newer. The workspace uses Rust edition 2024 and CI runs on stable Rust across macOS, Linux, and Windows.
@@ -121,8 +123,9 @@ file:///absolute/path/to/database.mongodb?db=app
 - `distinct`
 - `aggregate`
 - Persistent `_id_` and secondary index durability across broker restarts.
-- Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache.
+- Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.
+- Branch-union `OR` planning for non-collapsible disjunctions, allowing separate branch plans over different indexes before result union and outer sort/projection handling.
 - Covered projection plans when the filter, sort, and projected fields can be satisfied from index keys alone, including explicit `null` versus missing-field distinctions recovered from persisted index-entry presence metadata.
 - `explain` reports `IXSCAN` vs `COLLSCAN`, `planCacheUsed`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, single-interval bounds or multi-interval arrays, and keys/docs examined.
 
@@ -132,7 +135,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Basic projection.
 - Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.
 - Sort-aware index planning for compatible `find` sorts, including reverse scans over descending key parts.
-- Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available.
+- Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available, including persisted cache reuse after broker restart.
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Aggregation stages:
@@ -205,7 +208,7 @@ Test coverage is a release gate:
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` metadata and work counters.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
 
 ## CLI
 
@@ -345,4 +348,4 @@ If the goal is to make `mqlite` feel closer to `sqlite3` without losing the Mong
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, stats-backed and plan-cached compound `find` planning, covered null-vs-missing index execution, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, persisted plan-cache snapshots, stats-backed and plan-cached compound `find` planning, branch-union `OR` planning, covered null-vs-missing index execution, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.

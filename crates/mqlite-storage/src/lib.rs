@@ -16,17 +16,17 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR5";
-pub const FILE_FORMAT_VERSION: u32 = 5;
+pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR6";
+pub const FILE_FORMAT_VERSION: u32 = 6;
 pub const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 4096;
 const SUPERBLOCK_LEN: usize = 512;
 const SUPERBLOCK_COUNT: usize = 2;
 const DATA_START_OFFSET: u64 = (HEADER_LEN + (SUPERBLOCK_LEN * SUPERBLOCK_COUNT)) as u64;
-const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB05";
+const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB06";
 const WAL_FRAME_MAGIC: &[u8; 4] = b"WAL1";
 const WAL_HEADER_LEN: usize = 40;
-const PAGE_MAGIC: &[u8; 8] = b"MQLTPG05";
+const PAGE_MAGIC: &[u8; 8] = b"MQLTPG06";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
 const PAGE_KIND_RECORD: u16 = 1;
@@ -39,6 +39,25 @@ pub struct PersistedState {
     pub last_applied_sequence: u64,
     pub last_checkpoint_unix_ms: u64,
     pub catalog: Catalog,
+    #[serde(default)]
+    pub plan_cache_entries: Vec<PersistedPlanCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PersistedPlanCacheEntry {
+    pub namespace: String,
+    pub filter_shape: String,
+    pub sort_shape: String,
+    pub projection_shape: String,
+    pub sequence: u64,
+    pub choice: PersistedPlanCacheChoice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PersistedPlanCacheChoice {
+    CollectionScan,
+    Index(String),
+    Union(Vec<PersistedPlanCacheChoice>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,6 +203,8 @@ struct SnapshotState {
     last_applied_sequence: u64,
     last_checkpoint_unix_ms: u64,
     catalog: SnapshotCatalog,
+    #[serde(default)]
+    plan_cache_entries: Vec<PersistedPlanCacheEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -303,6 +324,7 @@ impl DatabaseFile {
                 last_applied_sequence: 0,
                 last_checkpoint_unix_ms: current_unix_ms(),
                 catalog: Catalog::new(),
+                plan_cache_entries: Vec::new(),
             },
             active_slot: 0,
             active_superblock: Superblock::default(),
@@ -332,6 +354,16 @@ impl DatabaseFile {
 
     pub fn has_pending_wal(&self) -> bool {
         self.wal_records_since_checkpoint > 0
+    }
+
+    pub fn persisted_plan_cache_entries(&self) -> &[PersistedPlanCacheEntry] {
+        &self.state.plan_cache_entries
+    }
+
+    pub fn set_persisted_plan_cache_entries(&mut self, mut entries: Vec<PersistedPlanCacheEntry>) {
+        entries.sort();
+        entries.dedup();
+        self.state.plan_cache_entries = entries;
     }
 
     pub fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
@@ -472,6 +504,7 @@ impl DatabaseFile {
             last_applied_sequence: self.state.last_applied_sequence,
             last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
             catalog: snapshot_catalog,
+            plan_cache_entries: self.state.plan_cache_entries.clone(),
         };
         let snapshot = bson::to_vec(&snapshot_state)?;
         let snapshot_offset = page_offset;
@@ -761,6 +794,7 @@ fn read_snapshot(
             last_applied_sequence: snapshot_state.last_applied_sequence,
             last_checkpoint_unix_ms: snapshot_state.last_checkpoint_unix_ms,
             catalog,
+            plan_cache_entries: snapshot_state.plan_cache_entries,
         },
         checkpoint_counts,
     ))
@@ -1452,7 +1486,8 @@ mod tests {
 
     use super::{
         DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE,
-        SnapshotState, VerifyReport, WalMutation, decode_page, read_superblock,
+        PersistedPlanCacheChoice, PersistedPlanCacheEntry, SnapshotState, VerifyReport,
+        WalMutation, decode_page, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -1626,6 +1661,29 @@ mod tests {
                 .get("flag"),
             Some(&bson::Bson::Null)
         );
+    }
+
+    #[test]
+    fn reopens_persisted_plan_cache_entries() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("plan-cache-persist.mongodb");
+        let entries = vec![PersistedPlanCacheEntry {
+            namespace: "app.widgets".to_string(),
+            filter_shape: "sku:eq".to_string(),
+            sort_shape: "-".to_string(),
+            projection_shape: "-".to_string(),
+            sequence: 3,
+            choice: PersistedPlanCacheChoice::Index("sku_1".to_string()),
+        }];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database.set_persisted_plan_cache_entries(entries.clone());
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        assert_eq!(reopened.persisted_plan_cache_entries(), entries.as_slice());
     }
 
     #[test]

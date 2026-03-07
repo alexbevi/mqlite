@@ -2,6 +2,7 @@
 
 ## Repo Rules
 - Keep `README.md` and `DRIVER.md` in sync with code. Any supported or unsupported behavior change must update the docs in the same patch.
+- Keep `ARCHITECTURE.md` in sync with storage, indexing, planner, and command-execution changes in the same patch.
 - Keep tests in the same patch as code. A feature is not complete until parser, execution, recovery, and rejection behavior are covered where applicable.
 - Treat `mongo`, `node-mongodb-native`, and `specifications` in the workspace as reference material only. `mqlite` remains an independent Rust implementation.
 
@@ -18,6 +19,8 @@
 - Planner selection should use measurable work such as keys examined, docs examined, sort work, and coverage, not fixed heuristic scores alone.
 - `find` planning should prefer histogram-style index statistics, bounded interval estimates, and a sequence-keyed plan cache before falling back to exact execution work.
 - Covered index execution must preserve explicit `null` versus missing-field semantics using persisted index-entry presence metadata, not by silently fetching documents.
+- General disjunctions should prefer branch-union `OR` planning over collection scan when branch-local plans on distinct indexes are cheaper, even when the disjunction cannot collapse to one shared interval scan.
+- Plan-cache state should persist in checkpoint snapshots so compatible `find` shapes can reuse cached choices after broker restart.
 
 ## Upstream Reference Anchors
 - Server generic command fields and unsupported envelope behavior are keyed off `../mongo/src/mongo/idl/generic_argument.idl`.
@@ -47,5 +50,6 @@
 - Add planner tests and `explain` coverage whenever index scan selection changes.
 - Add storage-level regression tests whenever index ordering semantics change so descending or compound key behavior is validated after reopen, not only in memory.
 - Add planner regressions for cost-based ranking, plan-cache usage, covered projections, null-vs-missing covered execution, and point- or multi-interval prefix handling whenever `find` planning changes.
+- Add restart-time regressions whenever persisted plan-cache encoding or planner choice shapes change.
 - Add regression tests for every bug fix.
 - Preserve cross-platform behavior by keeping CI green on macOS, Linux, and Windows.
