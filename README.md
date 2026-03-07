@@ -155,6 +155,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `listCollections` on a missing database returns an empty cursor for driver setup and cleanup flows.
 - Collectionless `db.aggregate([{ $currentOp: { localOps: true } }])` compatibility on `admin`, returning the in-flight aggregate command for driver CRUD coverage.
 - Collection-backed aggregation with a trailing `$out` stage, replacing the target collection and returning an empty cursor.
+- Null-byte database or collection names are rejected with `InvalidNamespace`.
 - Persistent `_id_` and secondary index durability across broker restarts.
 - Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.

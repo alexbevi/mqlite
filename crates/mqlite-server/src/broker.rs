@@ -733,9 +733,9 @@ impl Broker {
 
     fn handle_create(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
-        let collection = body.get_str("create").map_err(|_| {
+        let collection = validated_collection_name(body.get_str("create").map_err(|_| {
             CommandError::new(9, "FailedToParse", "create requires a collection name")
-        })?;
+        })?)?;
 
         let mut options = body.clone();
         options.remove("create");
@@ -949,9 +949,9 @@ impl Broker {
 
     fn handle_insert(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
-        let collection_name = body.get_str("insert").map_err(|_| {
+        let collection_name = validated_collection_name(body.get_str("insert").map_err(|_| {
             CommandError::new(9, "FailedToParse", "insert requires a collection name")
-        })?;
+        })?)?;
         let documents = body
             .get_array("documents")
             .map_err(|_| CommandError::new(9, "FailedToParse", "insert requires documents"))?
@@ -4489,9 +4489,11 @@ fn command_name(body: &Document) -> Option<String> {
 }
 
 fn database_name(body: &Document) -> Result<String, CommandError> {
-    body.get_str("$db")
-        .map(str::to_string)
-        .map_err(|_| CommandError::new(9, "FailedToParse", "command is missing `$db`"))
+    let database = body
+        .get_str("$db")
+        .map_err(|_| CommandError::new(9, "FailedToParse", "command is missing `$db`"))?;
+    validate_database_name(database)?;
+    Ok(database.to_string())
 }
 
 fn parse_namespace(namespace: &str) -> Result<(&str, &str), CommandError> {
@@ -4509,7 +4511,36 @@ fn parse_namespace(namespace: &str) -> Result<(&str, &str), CommandError> {
             "namespace must be a `database.collection` string",
         ));
     }
+    validate_database_name(database)?;
+    validate_collection_name(collection)?;
     Ok((database, collection))
+}
+
+fn validated_collection_name(collection: &str) -> Result<&str, CommandError> {
+    validate_collection_name(collection)?;
+    Ok(collection)
+}
+
+fn validate_database_name(database: &str) -> Result<(), CommandError> {
+    if database.contains('\0') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "database names cannot contain null bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_collection_name(collection: &str) -> Result<(), CommandError> {
+    if collection.contains('\0') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "collection names cannot contain null bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn body_batch_size(body: &Document, field: &str) -> Option<i64> {
@@ -6454,6 +6485,25 @@ mod tests {
             .expect("shutdown timeout")
             .expect("join")
             .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_null_bytes_in_database_and_collection_names() {
+        assert_rejected(
+            doc! { "create": "widgets", "$db": "app\0invalid" },
+            73,
+        )
+        .await;
+        assert_rejected(
+            doc! {
+                "insert": "widgets\0invalid",
+                "documents": [{ "_id": 1 }],
+                "$db": "app"
+            },
+            73,
+        )
+        .await;
     }
 
     #[cfg(unix)]
