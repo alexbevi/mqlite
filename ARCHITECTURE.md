@@ -21,6 +21,28 @@ The current workspace is split into focused crates:
 - `mqlite-server`: command dispatch, planning, execution, and broker lifecycle.
 - `mqlite`: CLI entrypoints such as `serve`, `command`, `inspect`, `verify`, and `checkpoint`.
 
+## Source Layout
+
+The Rust workspace now follows a smaller-crate-root layout consistent with the Rust Book's
+guidance on packages, crates, and modules:
+
+- `src/lib.rs` is kept intentionally small and primarily declares modules plus the public re-exports
+  that define the crate surface.
+- Large implementation files were moved behind semantically named modules so a reader can discover
+  the crate API before reading implementation details.
+- Domain-heavy crates expose the concepts Rust developers would expect first:
+  - `mqlite-query` separates capabilities, error types, expression evaluation, filter parsing,
+    projection handling, updates, and pipeline execution.
+  - `mqlite-server` exposes the broker from a small crate root and keeps broker command handling in
+    `broker.rs`.
+  - `mqlite-storage`, `mqlite-catalog`, and `mqlite-capabilities` re-export from named module files
+    instead of placing their entire implementation directly in `lib.rs`.
+- Tests remain in-crate for internal behavior-heavy crates, but the public crate root is no longer
+  mixed with implementation and test code.
+
+This keeps the module tree readable for first-time contributors while preserving the existing
+behavior and test surface.
+
 ## Broker Model
 
 The broker is the only writer for a database file.
