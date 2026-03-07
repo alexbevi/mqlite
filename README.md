@@ -153,7 +153,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `explain` reports `IXSCAN` vs `COLLSCAN`, `planCacheUsed`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, single-interval bounds or multi-interval arrays, and keys/docs examined.
 
 ### Query semantics currently implemented
-- Equality and comparison matching on dotted field paths.
+- Equality, comparison, membership, and negated-membership matching on dotted field paths via `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, and `$exists`.
 - Boolean query composition with `$and` and `$or`.
 - Basic projection.
 - Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.

@@ -5,7 +5,7 @@ use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set
 use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
-    "$and", "$or", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$exists",
+    "$and", "$or", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -40,6 +40,7 @@ pub enum MatchExpr {
     Lt { path: String, value: Bson },
     Lte { path: String, value: Bson },
     In { path: String, values: Vec<Bson> },
+    Nin { path: String, values: Vec<Bson> },
     Exists { path: String, exists: bool },
 }
 
@@ -403,6 +404,11 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
                 .iter()
                 .any(|value| compare_bson(existing, value).is_eq())
         }),
+        MatchExpr::Nin { path, values } => lookup_path(document, path).is_none_or(|existing| {
+            values
+                .iter()
+                .all(|value| !compare_bson(existing, value).is_eq())
+        }),
         MatchExpr::Exists { path, exists } => lookup_path(document, path).is_some() == *exists,
     }
 }
@@ -438,6 +444,13 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                         value: operator_value.clone(),
                     },
                     "$in" => MatchExpr::In {
+                        path: path.to_string(),
+                        values: operator_value
+                            .as_array()
+                            .ok_or(QueryError::InvalidStructure)?
+                            .clone(),
+                    },
+                    "$nin" => MatchExpr::Nin {
                         path: path.to_string(),
                         values: operator_value
                             .as_array()
@@ -853,6 +866,15 @@ mod tests {
             doc! { "meta.missing": { "$exists": true } },
             false,
         );
+    }
+
+    #[test]
+    fn supports_nin_filters() {
+        let document = doc! { "sku": "abc", "qty": 5 };
+
+        assert_filter(&document, doc! { "sku": { "$nin": ["def", "ghi"] } }, true);
+        assert_filter(&document, doc! { "sku": { "$nin": ["abc", "ghi"] } }, false);
+        assert_filter(&document, doc! { "missing": { "$nin": ["abc"] } }, true);
     }
 
     #[test]

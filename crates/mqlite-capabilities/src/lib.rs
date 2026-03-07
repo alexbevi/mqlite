@@ -1012,6 +1012,10 @@ mod tests {
                 doc! { "sku": "abc" },
                 doc! { "sku": { "$in": ["def", "abc"] } },
             ),
+            "$nin" => (
+                doc! { "sku": "abc" },
+                doc! { "sku": { "$nin": ["def", "ghi"] } },
+            ),
             "$exists" => (
                 doc! { "meta": { "enabled": true } },
                 doc! { "meta.enabled": { "$exists": true } },
