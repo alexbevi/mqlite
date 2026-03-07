@@ -1859,6 +1859,7 @@ fn collect_field_bounds(
         MatchExpr::Nin { .. } => None,
         MatchExpr::All { .. } => None,
         MatchExpr::Type { .. } => None,
+        MatchExpr::ElemMatch { .. } => None,
         MatchExpr::Regex { .. } => None,
         MatchExpr::Size { .. } => None,
         MatchExpr::Mod { .. } => None,
@@ -2035,6 +2036,7 @@ fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>
         | MatchExpr::All { path, .. }
         | MatchExpr::Exists { path, .. }
         | MatchExpr::Type { path, .. }
+        | MatchExpr::ElemMatch { path, .. }
         | MatchExpr::Regex { path, .. }
         | MatchExpr::Size { path, .. }
         | MatchExpr::Mod { path, .. } => {
@@ -2222,6 +2224,11 @@ fn filter_shape(expression: &MatchExpr) -> String {
                 type_set.codes.len()
             )
         }
+        MatchExpr::ElemMatch {
+            path,
+            value_case,
+            spec,
+        } => format!("{path}:elem{}:{}", i32::from(*value_case), spec.len()),
         MatchExpr::Regex { path, options, .. } => format!("{path}:regex{options}"),
         MatchExpr::Size { path, size } => format!("{path}:size{size}"),
         MatchExpr::Mod {

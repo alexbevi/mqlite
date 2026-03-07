@@ -1043,6 +1043,10 @@ mod tests {
                 doc! { "name": "Ada" },
                 doc! { "name": { "$regex": "^a", "$options": "i" } },
             ),
+            "$elemMatch" => (
+                doc! { "values": [3, 5, 7] },
+                doc! { "values": { "$elemMatch": { "$lt": 6, "$gt": 4 } } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

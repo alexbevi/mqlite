@@ -6,8 +6,26 @@ use regex::{Regex as RustRegex, RegexBuilder};
 use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
-    "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size", "$mod", "$all", "$not", "$type", "$regex", "$options",
+    "$and",
+    "$or",
+    "$nor",
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$size",
+    "$mod",
+    "$all",
+    "$not",
+    "$type",
+    "$regex",
+    "$options",
+    "$elemMatch",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -86,6 +104,11 @@ pub enum MatchExpr {
     Type {
         path: String,
         type_set: TypeSet,
+    },
+    ElemMatch {
+        path: String,
+        spec: Document,
+        value_case: bool,
     },
     Regex {
         path: String,
@@ -449,59 +472,79 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
         MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
         MatchExpr::Not(expression) => !matches_expression(document, expression),
-        MatchExpr::Eq { path, value } => lookup_path(document, path)
-            .is_some_and(|existing| compare_bson(existing, value).is_eq()),
-        MatchExpr::Ne { path, value } => lookup_path(document, path)
-            .is_none_or(|existing| !compare_bson(existing, value).is_eq()),
-        MatchExpr::Gt { path, value } => lookup_path(document, path)
-            .is_some_and(|existing| compare_bson(existing, value).is_gt()),
-        MatchExpr::Gte { path, value } => lookup_path(document, path).is_some_and(|existing| {
-            matches!(
-                compare_bson(existing, value),
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater
-            )
-        }),
-        MatchExpr::Lt { path, value } => lookup_path(document, path)
-            .is_some_and(|existing| compare_bson(existing, value).is_lt()),
-        MatchExpr::Lte { path, value } => lookup_path(document, path).is_some_and(|existing| {
-            matches!(
-                compare_bson(existing, value),
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Less
-            )
-        }),
-        MatchExpr::In { path, values } => lookup_path(document, path).is_some_and(|existing| {
-            values
-                .iter()
-                .any(|value| compare_bson(existing, value).is_eq())
-        }),
-        MatchExpr::Nin { path, values } => lookup_path(document, path).is_none_or(|existing| {
-            values
-                .iter()
-                .all(|value| !compare_bson(existing, value).is_eq())
-        }),
-        MatchExpr::All { path, values } => {
-            lookup_path(document, path).is_some_and(|value| matches_all(value, values))
+        MatchExpr::Eq { path, value } => path_candidates(document, path)
+            .into_iter()
+            .any(|existing| matches_equality(existing, value)),
+        MatchExpr::Ne { path, value } => path_candidates(document, path)
+            .into_iter()
+            .all(|existing| !matches_equality(existing, value)),
+        MatchExpr::Gt { path, value } => path_candidates(document, path)
+            .into_iter()
+            .any(|existing| matches_comparison(existing, value, |ordering| ordering.is_gt())),
+        MatchExpr::Gte { path, value } => {
+            path_candidates(document, path).into_iter().any(|existing| {
+                matches_comparison(existing, value, |ordering| {
+                    matches!(
+                        ordering,
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater
+                    )
+                })
+            })
         }
-        MatchExpr::Exists { path, exists } => lookup_path(document, path).is_some() == *exists,
-        MatchExpr::Type { path, type_set } => {
-            lookup_path(document, path).is_some_and(|value| matches_type(value, type_set))
+        MatchExpr::Lt { path, value } => path_candidates(document, path)
+            .into_iter()
+            .any(|existing| matches_comparison(existing, value, |ordering| ordering.is_lt())),
+        MatchExpr::Lte { path, value } => {
+            path_candidates(document, path).into_iter().any(|existing| {
+                matches_comparison(existing, value, |ordering| {
+                    matches!(
+                        ordering,
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less
+                    )
+                })
+            })
         }
+        MatchExpr::In { path, values } => path_candidates(document, path)
+            .into_iter()
+            .any(|existing| values.iter().any(|value| matches_equality(existing, value))),
+        MatchExpr::Nin { path, values } => {
+            path_candidates(document, path).into_iter().all(|existing| {
+                values
+                    .iter()
+                    .all(|value| !matches_equality(existing, value))
+            })
+        }
+        MatchExpr::All { path, values } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_all(value, values)),
+        MatchExpr::Exists { path, exists } => path_candidates(document, path).is_empty() != *exists,
+        MatchExpr::Type { path, type_set } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_type(value, type_set)),
+        MatchExpr::ElemMatch {
+            path,
+            spec,
+            value_case,
+        } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_elem_match(value, spec, *value_case)),
         MatchExpr::Regex {
             path,
             pattern,
             options,
-        } => {
-            lookup_path(document, path).is_some_and(|value| matches_regex(value, pattern, options))
-        }
-        MatchExpr::Size { path, size } => lookup_path(document, path)
-            .and_then(Bson::as_array)
-            .is_some_and(|values| values.len() == *size),
+        } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_regex(value, pattern, options)),
+        MatchExpr::Size { path, size } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| value.as_array().is_some_and(|values| values.len() == *size)),
         MatchExpr::Mod {
             path,
             divisor,
             remainder,
-        } => lookup_path(document, path)
-            .is_some_and(|value| matches_mod(value, *divisor, *remainder)),
+        } => path_candidates(document, path)
+            .into_iter()
+            .any(|value| matches_mod(value, *divisor, *remainder)),
     }
 }
 
@@ -585,6 +628,19 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                         path: path.to_string(),
                         type_set: parse_type_set(operator_value)?,
                     },
+                    "$elemMatch" => {
+                        let spec = operator_value
+                            .as_document()
+                            .ok_or(QueryError::InvalidStructure)?
+                            .clone();
+                        let value_case = is_elem_match_value_case(&spec);
+                        validate_elem_match_spec(&spec, value_case)?;
+                        MatchExpr::ElemMatch {
+                            path: path.to_string(),
+                            spec,
+                            value_case,
+                        }
+                    }
                     "$size" => MatchExpr::Size {
                         path: path.to_string(),
                         size: usize::try_from(
@@ -631,6 +687,63 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
     }
 }
 
+fn path_candidates<'a>(document: &'a Document, path: &str) -> Vec<&'a Bson> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return Vec::new();
+    }
+    path_candidates_in_document(document, &segments)
+}
+
+fn path_candidates_in_document<'a>(document: &'a Document, segments: &[&str]) -> Vec<&'a Bson> {
+    let Some((first, rest)) = segments.split_first() else {
+        return Vec::new();
+    };
+    document
+        .get(*first)
+        .into_iter()
+        .flat_map(|value| path_candidates_in_value(value, rest))
+        .collect()
+}
+
+fn path_candidates_in_value<'a>(value: &'a Bson, segments: &[&str]) -> Vec<&'a Bson> {
+    if segments.is_empty() {
+        return vec![value];
+    }
+
+    match value {
+        Bson::Document(document) => path_candidates_in_document(document, segments),
+        Bson::Array(items) => items
+            .iter()
+            .flat_map(|item| path_candidates_in_value(item, segments))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn matches_equality(existing: &Bson, value: &Bson) -> bool {
+    match existing {
+        Bson::Array(items) => {
+            compare_bson(existing, value).is_eq()
+                || items.iter().any(|item| matches_equality(item, value))
+        }
+        _ => compare_bson(existing, value).is_eq(),
+    }
+}
+
+fn matches_comparison(
+    existing: &Bson,
+    value: &Bson,
+    predicate: impl Fn(std::cmp::Ordering) -> bool + Copy,
+) -> bool {
+    match existing {
+        Bson::Array(items) => items
+            .iter()
+            .any(|item| matches_comparison(item, value, predicate)),
+        _ => predicate(compare_bson(existing, value)),
+    }
+}
+
 fn projection_flag(value: &Bson) -> Option<bool> {
     match value {
         Bson::Boolean(value) => Some(*value),
@@ -657,6 +770,24 @@ fn parse_not_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryErro
             parse_field_expression(path, value)
         }
         _ => Err(QueryError::InvalidStructure),
+    }
+}
+
+fn is_elem_match_value_case(spec: &Document) -> bool {
+    let Some((first, _)) = spec.iter().next() else {
+        return false;
+    };
+    spec.keys().all(|key| key.starts_with('$'))
+        && !matches!(first.as_str(), "$and" | "$or" | "$nor" | "$expr")
+}
+
+fn validate_elem_match_spec(spec: &Document, value_case: bool) -> Result<(), QueryError> {
+    if value_case {
+        let mut filter = Document::new();
+        filter.insert("_elem", Bson::Document(spec.clone()));
+        parse_filter(&filter).map(|_| ())
+    } else {
+        parse_filter(spec).map(|_| ())
     }
 }
 
@@ -820,6 +951,43 @@ fn matches_type(value: &Bson, type_set: &TypeSet) -> bool {
             .codes
             .iter()
             .any(|code| bson_type_code(value) == *code)
+        || match value {
+            Bson::Array(items) => items.iter().any(|item| matches_type(item, type_set)),
+            _ => false,
+        }
+}
+
+fn matches_elem_match(value: &Bson, spec: &Document, value_case: bool) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+
+    items.iter().any(|item| {
+        if value_case {
+            let mut document = Document::new();
+            document.insert("_elem", item.clone());
+            let mut filter = Document::new();
+            filter.insert("_elem", Bson::Document(spec.clone()));
+            return document_matches(&document, &filter).unwrap_or(false);
+        }
+
+        match item {
+            Bson::Document(document) => document_matches(document, spec).unwrap_or(false),
+            Bson::Array(items) => {
+                let document = array_as_document(items);
+                document_matches(&document, spec).unwrap_or(false)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn array_as_document(items: &[Bson]) -> Document {
+    let mut document = Document::new();
+    for (index, item) in items.iter().enumerate() {
+        document.insert(index.to_string(), item.clone());
+    }
+    document
 }
 
 fn matches_regex(value: &Bson, pattern: &str, options: &str) -> bool {
@@ -1502,6 +1670,48 @@ mod tests {
         ));
         assert!(matches!(
             document_matches(&doc! { "name": "Ada" }, &doc! { "name": { "$not": {} } }),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn supports_elem_match_filters() {
+        assert_filter(
+            &doc! { "a": [3, 5, 7] },
+            doc! { "a": { "$elemMatch": { "$lt": 6, "$gt": 4 } } },
+            true,
+        );
+        assert_filter(
+            &doc! { "a": [3, 7] },
+            doc! { "a": { "$elemMatch": { "$lt": 6, "$gt": 4 } } },
+            false,
+        );
+        assert_filter(
+            &doc! { "a": [[5]] },
+            doc! { "a": { "$elemMatch": { "$elemMatch": { "$lt": 6, "$gt": 4 } } } },
+            true,
+        );
+        assert_filter(
+            &doc! { "a": [{ "b": 2, "c": 3 }, { "b": 1, "c": 4 }] },
+            doc! { "a": { "$elemMatch": { "b": 1, "c": 4 } } },
+            true,
+        );
+        assert_filter(
+            &doc! { "a": [{ "b": [12, 2], "c": [13, 3] }] },
+            doc! { "a": { "$elemMatch": { "b": 2 } } },
+            true,
+        );
+        assert_filter(
+            &doc! { "a": [{ "b": [5] }] },
+            doc! { "a.b": { "$elemMatch": { "$lt": 6, "$gt": 4 } } },
+            true,
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_elem_match_filters() {
+        assert!(matches!(
+            document_matches(&doc! { "a": [1, 2] }, &doc! { "a": { "$elemMatch": 1 } }),
             Err(QueryError::InvalidStructure)
         ));
     }

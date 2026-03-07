@@ -387,6 +387,54 @@ fn command_find_supports_regex_filter() {
 }
 
 #[test]
+fn command_find_supports_elem_match_filter() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-elemmatch.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"items":[{"qty":1},{"qty":4}]},{"items":[{"qty":2},{"qty":3}]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"items":{"$elemMatch":{"qty":4}}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["items"][1]["qty"], 4);
+}
+
+#[test]
 fn command_preserves_unique_indexes_across_restart() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-index.mongodb");

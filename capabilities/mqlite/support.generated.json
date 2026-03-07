@@ -2,6 +2,7 @@
   "query_operators": [
     "$all",
     "$and",
+    "$elemMatch",
     "$eq",
     "$exists",
     "$gt",
