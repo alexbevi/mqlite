@@ -10,6 +10,7 @@
     "$lte",
     "$ne",
     "$nin",
+    "$nor",
     "$or"
   ],
   "aggregation_stages": [

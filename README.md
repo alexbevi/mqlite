@@ -154,7 +154,7 @@ file:///absolute/path/to/database.mongodb?db=app
 
 ### Query semantics currently implemented
 - Equality, comparison, membership, and negated-membership matching on dotted field paths via `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, and `$exists`.
-- Boolean query composition with `$and` and `$or`.
+- Boolean query composition with `$and`, `$or`, and `$nor`.
 - Basic projection.
 - Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.
 - Sort-aware index planning for compatible `find` sorts, including reverse scans over descending key parts.

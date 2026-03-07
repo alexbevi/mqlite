@@ -5,7 +5,7 @@ use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set
 use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
-    "$and", "$or", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
+    "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -33,6 +33,7 @@ pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[];
 pub enum MatchExpr {
     And(Vec<MatchExpr>),
     Or(Vec<MatchExpr>),
+    Nor(Vec<MatchExpr>),
     Eq { path: String, value: Bson },
     Ne { path: String, value: Bson },
     Gt { path: String, value: Bson },
@@ -99,6 +100,15 @@ pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
                     .map(|document| document.and_then(parse_filter))
                     .collect::<Result<Vec<_>, _>>()?;
                 expressions.push(MatchExpr::Or(parsed));
+            }
+            "$nor" => {
+                let items = value.as_array().ok_or(QueryError::InvalidStructure)?;
+                let parsed = items
+                    .iter()
+                    .map(as_document)
+                    .map(|document| document.and_then(parse_filter))
+                    .collect::<Result<Vec<_>, _>>()?;
+                expressions.push(MatchExpr::Nor(parsed));
             }
             other if other.starts_with('$') => {
                 return Err(QueryError::UnsupportedOperator(other.to_string()));
@@ -379,6 +389,7 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
     match expression {
         MatchExpr::And(items) => items.iter().all(|item| matches_expression(document, item)),
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
+        MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
         MatchExpr::Eq { path, value } => lookup_path(document, path)
             .is_some_and(|existing| compare_bson(existing, value).is_eq()),
         MatchExpr::Ne { path, value } => lookup_path(document, path)
@@ -899,6 +910,22 @@ mod tests {
                     { "$or": [ { "sku": "abc" }, { "meta.enabled": true } ] }
                 ]
             },
+            false,
+        );
+    }
+
+    #[test]
+    fn supports_nor_query_filters() {
+        let document = doc! { "sku": "abc", "qty": 5, "meta": { "enabled": true } };
+
+        assert_filter(
+            &document,
+            doc! { "$nor": [{ "qty": { "$lt": 0 } }, { "sku": "missing" }] },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "$nor": [{ "qty": { "$gte": 5 } }, { "sku": "missing" }] },
             false,
         );
     }

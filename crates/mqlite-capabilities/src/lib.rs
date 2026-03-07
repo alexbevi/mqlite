@@ -1002,6 +1002,10 @@ mod tests {
                 doc! { "qty": 5, "sku": "abc" },
                 doc! { "$or": [{ "qty": { "$lt": 0 } }, { "sku": "abc" }] },
             ),
+            "$nor" => (
+                doc! { "qty": 5, "sku": "abc" },
+                doc! { "$nor": [{ "qty": { "$lt": 0 } }, { "sku": "missing" }] },
+            ),
             "$eq" => (doc! { "qty": 5 }, doc! { "qty": { "$eq": 5 } }),
             "$ne" => (doc! { "qty": 5 }, doc! { "qty": { "$ne": 4 } }),
             "$gt" => (doc! { "qty": 5 }, doc! { "qty": { "$gt": 4 } }),
