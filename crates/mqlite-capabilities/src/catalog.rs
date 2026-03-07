@@ -1119,6 +1119,10 @@ mod tests {
                     }
                 }],
             ),
+            "$out" => (
+                vec![doc! { "_id": 1 }],
+                vec![doc! { "$out": "archive" }],
+            ),
             "$sample" => (
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],

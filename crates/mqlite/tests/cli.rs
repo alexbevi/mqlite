@@ -398,6 +398,86 @@ fn command_aggregate_supports_lookup_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_out_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-out.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"label":"base"},{"label":"next"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"label":1}},{"$out":{"db":"analytics","coll":"archive"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert!(
+        response["cursor"]["firstBatch"]
+            .as_array()
+            .expect("firstBatch")
+            .is_empty()
+    );
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let find_output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"archive","filter":{},"sort":{"label":1}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let find_response: Value = serde_json::from_slice(&find_output).expect("json response");
+    let first_batch = find_response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "label": "base", "_id": first_batch[0]["_id"].clone() }),
+            json!({ "label": "next", "_id": first_batch[1]["_id"].clone() }),
+        ]
+    );
+}
+
+#[test]
 fn command_aggregate_supports_sample_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-sample.mongodb");

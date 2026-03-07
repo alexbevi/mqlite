@@ -40,6 +40,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$sortByCount",
     "$unionWith",
     "$match",
+    "$out",
     "$project",
     "$set",
     "$addFields",

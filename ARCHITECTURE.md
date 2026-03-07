@@ -151,6 +151,8 @@ Current cross-namespace aggregation behavior:
   - collectionless `$documents` subpipelines when `from` is omitted
 - Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
   continue to work in nested stages.
+- `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
+  returns an empty cursor result to the client.
 - The current implementation does not federate across files or processes.
 
 ## WAL And Recovery

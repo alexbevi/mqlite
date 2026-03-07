@@ -41,6 +41,7 @@
     "$limit",
     "$lookup",
     "$match",
+    "$out",
     "$project",
     "$replaceRoot",
     "$replaceWith",

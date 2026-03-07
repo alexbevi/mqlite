@@ -1318,6 +1318,44 @@ fn bucket_auto_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn out_stage_must_be_last_and_accepts_string_or_namespace_object_specs() {
+    let string_results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! { "$out": "archive" }],
+    );
+    assert!(string_results.is_empty());
+
+    let object_results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! { "$out": { "db": "analytics", "coll": "archive" } }],
+    );
+    assert!(object_results.is_empty());
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1, "value": 1 }],
+        &[doc! { "$out": "archive" }, doc! { "$match": { "value": 1 } }],
+    )
+    .expect_err("$out must be last");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
+fn out_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$out": 1 },
+        doc! { "$out": {} },
+        doc! { "$out": { "db": "analytics" } },
+        doc! { "$out": { "coll": 1 } },
+        doc! { "$out": { "db": 1, "coll": "archive" } },
+        doc! { "$out": { "db": "analytics", "coll": "archive", "timeseries": {} } },
+        doc! { "$out": { "db": "analytics", "coll": "archive", "unknown": true } },
+    ] {
+        let error = run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid $out");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn union_with_stage_appends_documents_from_another_collection() {
     let resolver = StaticResolver::default().with_collection(
         "app",

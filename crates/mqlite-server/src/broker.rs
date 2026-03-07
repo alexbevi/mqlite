@@ -1252,8 +1252,9 @@ impl Broker {
                 run_pipeline_with_resolver(input, execution_pipeline, &database, &resolver)?;
             (namespace, results)
         };
-        if let Some(target_collection) = out_target {
-            self.write_out_collection(&database, target_collection, results)?;
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(&database);
+            self.write_out_collection(target_database, &target.collection, results)?;
             let cursor = self
                 .cursors
                 .lock()
@@ -1352,14 +1353,83 @@ impl Broker {
     }
 }
 
-fn parse_out_target(value: &Bson) -> Result<&str, CommandError> {
-    value.as_str().ok_or_else(|| {
-        CommandError::new(
-            115,
-            "CommandNotSupported",
-            "aggregation stage `$out` only supports a string collection name",
-        )
-    })
+struct OutTarget {
+    database: Option<String>,
+    collection: String,
+}
+
+fn parse_out_target(value: &Bson) -> Result<OutTarget, CommandError> {
+    match value {
+        Bson::String(collection) => Ok(OutTarget {
+            database: None,
+            collection: collection.clone(),
+        }),
+        Bson::Document(document) => {
+            let mut database = None;
+            let mut collection = None;
+            for (field, value) in document {
+                match field.as_str() {
+                    "db" => {
+                        database = Some(
+                            value
+                                .as_str()
+                                .ok_or_else(|| {
+                                    CommandError::new(
+                                        9,
+                                        "FailedToParse",
+                                        "`$out.db` must be a string",
+                                    )
+                                })?
+                                .to_string(),
+                        );
+                    }
+                    "coll" => {
+                        collection = Some(
+                            value
+                                .as_str()
+                                .ok_or_else(|| {
+                                    CommandError::new(
+                                        9,
+                                        "FailedToParse",
+                                        "`$out.coll` must be a string",
+                                    )
+                                })?
+                                .to_string(),
+                        );
+                    }
+                    "timeseries" => {
+                        return Err(CommandError::new(
+                            115,
+                            "CommandNotSupported",
+                            "aggregation stage `$out` does not support time-series targets",
+                        ));
+                    }
+                    _ => {
+                        return Err(CommandError::new(
+                            9,
+                            "FailedToParse",
+                            "aggregation stage `$out` only supports string targets or `{ db, coll }` objects",
+                        ));
+                    }
+                }
+            }
+            Ok(OutTarget {
+                database,
+                collection: collection.ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "aggregation stage `$out` object targets require `coll`",
+                    )
+                })?,
+            })
+        }
+        _ => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "aggregation stage `$out` only supports string targets or `{ db, coll }` objects",
+        )),
+    }
 }
 
 struct BrokerCollectionResolver<'a> {

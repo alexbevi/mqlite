@@ -92,6 +92,13 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                     .filter_map(|(document, matches)| matches.then_some(document))
                     .collect()
             }
+            "$out" => {
+                if stage_index + 1 != pipeline.len() {
+                    return Err(QueryError::InvalidStage);
+                }
+                parse_out_stage(stage_spec)?;
+                Vec::new()
+            }
             "$project" => {
                 let projection = stage_spec.as_document().ok_or(QueryError::InvalidStage)?;
                 current
@@ -536,6 +543,33 @@ fn parse_union_with_spec(
                 collection,
                 pipeline,
             })
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn parse_out_stage(spec: &Bson) -> Result<(), QueryError> {
+    match spec {
+        Bson::String(_) => Ok(()),
+        Bson::Document(document) => {
+            let mut has_collection = false;
+            for (field, value) in document {
+                match field.as_str() {
+                    "db" => {
+                        value.as_str().ok_or(QueryError::InvalidStage)?;
+                    }
+                    "coll" => {
+                        value.as_str().ok_or(QueryError::InvalidStage)?;
+                        has_collection = true;
+                    }
+                    "timeseries" => return Err(QueryError::InvalidStage),
+                    _ => return Err(QueryError::InvalidStage),
+                }
+            }
+            if !has_collection {
+                return Err(QueryError::InvalidStage);
+            }
+            Ok(())
         }
         _ => Err(QueryError::InvalidStage),
     }
