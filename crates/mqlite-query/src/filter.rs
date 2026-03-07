@@ -20,6 +20,14 @@ fn parse_filter_with_context(
 
     for (key, value) in document {
         match key.as_str() {
+            "$alwaysFalse" => {
+                parse_always_boolean(value)?;
+                expressions.push(MatchExpr::AlwaysFalse);
+            }
+            "$alwaysTrue" => {
+                parse_always_boolean(value)?;
+                expressions.push(MatchExpr::AlwaysTrue);
+            }
             "$and" => {
                 let items = value.as_array().ok_or(QueryError::InvalidStructure)?;
                 let parsed = items
@@ -89,6 +97,8 @@ pub fn document_matches_expression(document: &Document, expression: &MatchExpr) 
 
 fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
     match expression {
+        MatchExpr::AlwaysFalse => false,
+        MatchExpr::AlwaysTrue => true,
         MatchExpr::And(items) => items.iter().all(|item| matches_expression(document, item)),
         MatchExpr::Or(items) => items.iter().any(|item| matches_expression(document, item)),
         MatchExpr::Nor(items) => items.iter().all(|item| !matches_expression(document, item)),
@@ -308,6 +318,13 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
             path: path.to_string(),
             value: value.clone(),
         }),
+    }
+}
+
+fn parse_always_boolean(value: &Bson) -> Result<(), QueryError> {
+    match integer_value(value) {
+        Some(1) => Ok(()),
+        _ => Err(QueryError::InvalidStructure),
     }
 }
 

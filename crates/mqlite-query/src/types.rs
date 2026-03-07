@@ -8,6 +8,8 @@ pub struct TypeSet {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchExpr {
+    AlwaysFalse,
+    AlwaysTrue,
     And(Vec<MatchExpr>),
     Or(Vec<MatchExpr>),
     Nor(Vec<MatchExpr>),

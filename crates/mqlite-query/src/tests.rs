@@ -41,6 +41,30 @@ fn matches_basic_filters() {
 }
 
 #[test]
+fn supports_always_true_and_always_false_filters() {
+    let document = doc! { "a": false, "b": 1 };
+
+    assert_filter(&document, doc! { "$alwaysTrue": 1 }, true);
+    assert_filter(&document, doc! { "$alwaysFalse": 1 }, false);
+    assert_filter(
+        &document,
+        doc! { "$and": [{ "a": false }, { "$alwaysTrue": 1 }, { "$alwaysTrue": 1 }] },
+        true,
+    );
+    assert_filter(
+        &document,
+        doc! { "$and": [{ "a": false }, { "$alwaysTrue": 1 }, { "$alwaysFalse": 1 }] },
+        false,
+    );
+    assert_filter(
+        &document,
+        doc! { "$or": [{ "b": 1 }, { "$alwaysFalse": 1 }] },
+        true,
+    );
+    assert_filter(&document, doc! { "$nor": [{ "$alwaysFalse": 1 }] }, true);
+}
+
+#[test]
 fn supports_all_comparison_query_operators() {
     let document = doc! { "sku": "abc", "qty": 5, "meta": { "score": 9 } };
 
@@ -189,6 +213,22 @@ fn rejects_expression_values_inside_all_filters() {
             &doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "red" } }] } }
         ),
         Err(QueryError::InvalidStructure)
+    ));
+}
+
+#[test]
+fn rejects_invalid_always_boolean_filters() {
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "$alwaysTrue": 0 }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "$alwaysFalse": 0 }),
+        Err(QueryError::InvalidStructure)
+    ));
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$alwaysFalse": 1 } }),
+        Err(QueryError::UnsupportedOperator(operator)) if operator == "$alwaysFalse"
     ));
 }
 

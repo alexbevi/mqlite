@@ -1002,6 +1002,8 @@ mod tests {
 
     fn supported_query_fixture(name: &str) -> (Document, Document) {
         match name {
+            "$alwaysFalse" => (doc! { "qty": 5 }, doc! { "$nor": [{ "$alwaysFalse": 1 }] }),
+            "$alwaysTrue" => (doc! { "qty": 5 }, doc! { "$alwaysTrue": 1 }),
             "$and" => (
                 doc! { "qty": 5, "sku": "abc" },
                 doc! { "$and": [{ "qty": { "$gte": 5 } }, { "sku": "abc" }] },

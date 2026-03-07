@@ -156,7 +156,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `explain` reports `IXSCAN` vs `COLLSCAN`, `planCacheUsed`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, single-interval bounds or multi-interval arrays, and keys/docs examined.
 
 ### Query semantics currently implemented
-- Equality, comparison, membership, negated-membership, `$all`, top-level `$comment`, `$not`, `$type`, regex matching, `$elemMatch`, top-level `$expr`, array-size, and modulus matching on dotted field paths via `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, `$comment`, `$not`, `$exists`, `$type`, `$regex`/`$options`, `$elemMatch`, `$expr`, `$size`, and `$mod`.
+- Top-level trivial boolean predicates, equality, comparison, membership, negated-membership, `$all`, top-level `$comment`, `$not`, `$type`, regex matching, `$elemMatch`, top-level `$expr`, array-size, and modulus matching on dotted field paths via `$alwaysTrue`, `$alwaysFalse`, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, `$comment`, `$not`, `$exists`, `$type`, `$regex`/`$options`, `$elemMatch`, `$expr`, `$size`, and `$mod`.
 - Boolean query composition with `$and`, `$or`, and `$nor`.
 - Basic projection.
 - Compound-prefix index selection for equality prefixes, point-interval prefixes, multi-interval `$in` and collapsed `$or` branches, and range bounds.

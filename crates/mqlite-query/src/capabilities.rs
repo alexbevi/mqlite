@@ -1,4 +1,6 @@
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
+    "$alwaysFalse",
+    "$alwaysTrue",
     "$and",
     "$or",
     "$nor",
