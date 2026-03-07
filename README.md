@@ -183,6 +183,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$currentOp`
   - `$lookup`
   - `$indexStats`
+  - `$listCatalog`
   - `$planCacheStats`
   - `$sample`
   - `$sortByCount`
@@ -209,6 +210,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.
 - Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
+- Collectionless `$listCatalog` aggregation on `admin` and collection-scoped `$listCatalog` aggregation on existing namespaces, returning the local file-backed namespace catalog.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
@@ -224,7 +226,7 @@ These are already part of the tested failure surface:
 - `writeConcern`
 - `$readPreference`
 - Session and transaction envelopes remain rejected even though `killAllSessions` exists as a no-op admin compatibility command.
-- Non-default `writeConcern` values remain rejected; only the default acknowledged write concern is accepted as a no-op compatibility case.
+- Non-default `writeConcern` values remain rejected except for standalone-compatible `w: "majority"`, which is accepted as a no-op alongside the default acknowledged write concern.
 - Unsupported commands
 - Unsupported query operators
 - Unsupported aggregation stages

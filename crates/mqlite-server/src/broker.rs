@@ -13,7 +13,7 @@ use anyhow::Result;
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
-    CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
+    Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
     IndexEntry, apply_index_specs, drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
@@ -1389,6 +1389,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$indexStats");
+        let starts_with_list_catalog = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$listCatalog");
         let starts_with_plan_cache_stats = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1406,6 +1410,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$indexStats must be run against a collection namespace",
+            ));
+        }
+        if starts_with_list_catalog && is_collectionless && database != "admin" {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "Collectionless $listCatalog must be run against the 'admin' database with {aggregate: 1}",
             ));
         }
         if starts_with_plan_cache_stats && is_collectionless {
@@ -1451,6 +1462,23 @@ impl Broker {
                 CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
             })?;
             return self.handle_index_stats_aggregate(
+                &database,
+                collection_name,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_list_catalog {
+            let collection_name = if is_collectionless {
+                None
+            } else {
+                Some(body.get_str("aggregate").map_err(|_| {
+                    CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
+                })?)
+            };
+            return self.handle_list_catalog_aggregate(
                 &database,
                 collection_name,
                 batch_size,
@@ -1651,6 +1679,73 @@ impl Broker {
                 )?
             } else {
                 index_stats_documents
+            }
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_list_catalog_aggregate(
+        &self,
+        database: &str,
+        collection_name: Option<&str>,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = collection_name
+            .map(|collection| format!("{database}.{collection}"))
+            .unwrap_or_else(|| format!("{database}.$cmd.aggregate"));
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let list_catalog = execution_pipeline
+                .first()
+                .and_then(|stage| stage.get("$listCatalog"))
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$listCatalog aggregation requires a $listCatalog stage document",
+                    )
+                })?;
+            parse_list_catalog_stage(list_catalog)?;
+            let list_catalog_documents =
+                build_list_catalog_results(storage.catalog(), database, collection_name);
+            if execution_pipeline.len() > 1 {
+                run_pipeline_with_resolver(
+                    list_catalog_documents,
+                    &execution_pipeline[1..],
+                    database,
+                    &resolver,
+                )?
+            } else {
+                list_catalog_documents
             }
         };
 
@@ -2042,7 +2137,11 @@ fn build_index_stats_results(collection: &CollectionCatalog) -> Vec<Document> {
 
 fn parse_plan_cache_stats_stage(spec: &Bson) -> Result<(), CommandError> {
     let spec = spec.as_document().ok_or_else(|| {
-        CommandError::new(9, "FailedToParse", "$planCacheStats must take a nested object")
+        CommandError::new(
+            9,
+            "FailedToParse",
+            "$planCacheStats must take a nested object",
+        )
     })?;
 
     match spec.get("allHosts") {
@@ -2108,6 +2207,59 @@ fn render_plan_cache_choice(choice: &PersistedPlanCacheChoice) -> Bson {
                 .map(render_plan_cache_choice)
                 .collect::<Vec<_>>(),
         }),
+        }
+}
+
+fn parse_list_catalog_stage(spec: &Bson) -> Result<(), CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(9, "FailedToParse", "$listCatalog must take a nested object")
+    })?;
+    if !spec.is_empty() {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "The $listCatalog stage specification must be an empty object",
+        ));
+    }
+    Ok(())
+}
+
+fn build_list_catalog_results(
+    catalog: &Catalog,
+    database: &str,
+    collection_name: Option<&str>,
+) -> Vec<Document> {
+    match collection_name {
+        Some(collection_name) => catalog
+            .databases
+            .get(database)
+            .and_then(|database_catalog| database_catalog.collections.get(collection_name))
+            .map(|collection| vec![list_catalog_document(database, collection_name, collection)])
+            .unwrap_or_default(),
+        None => catalog
+            .databases
+            .iter()
+            .flat_map(|(database_name, database_catalog)| {
+                database_catalog.collections.iter().map(|(collection_name, collection)| {
+                    list_catalog_document(database_name, collection_name, collection)
+                })
+            })
+            .collect(),
+    }
+}
+
+fn list_catalog_document(
+    database: &str,
+    collection_name: &str,
+    collection: &CollectionCatalog,
+) -> Document {
+    doc! {
+        "db": database,
+        "ns": format!("{database}.{collection_name}"),
+        "name": collection_name,
+        "type": "collection",
+        "options": collection.options.clone(),
+        "indexCount": collection.indexes.len() as i64,
     }
 }
 
@@ -4220,7 +4372,7 @@ fn reject_unsupported_envelope(body: &Document) -> Result<(), CommandError> {
 fn reject_unsupported_write_concern(write_concern: &Document) -> Result<(), CommandError> {
     for (key, value) in write_concern {
         let supported = match key.as_str() {
-            "w" => default_write_concern_w(value),
+            "w" => supported_write_concern_w(value),
             "j" | "journal" | "fsync" => falseish_write_concern_flag(value),
             "wtimeout" | "wtimeoutMS" => zero_write_concern_timeout(value),
             _ => false,
@@ -4238,11 +4390,12 @@ fn reject_unsupported_write_concern(write_concern: &Document) -> Result<(), Comm
     Ok(())
 }
 
-fn default_write_concern_w(value: &Bson) -> bool {
+fn supported_write_concern_w(value: &Bson) -> bool {
     match value {
         Bson::Int32(value) => *value == 1,
         Bson::Int64(value) => *value == 1,
         Bson::Double(value) => *value == 1.0,
+        Bson::String(value) => value == "majority",
         _ => false,
     }
 }
@@ -4660,7 +4813,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn list_collections_on_missing_database_returns_an_empty_cursor() {
-        let (serve_task, _temp_dir, manifest) = start_broker("missing-list-collections.mongodb").await;
+        let (serve_task, _temp_dir, manifest) =
+            start_broker("missing-list-collections.mongodb").await;
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
 
         let list_collections = send_command(
@@ -6072,14 +6226,35 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn accepts_majority_write_concern_as_a_standalone_compatibility_noop() {
+        let (serve_task, _temp_dir, manifest) = start_broker("majority-write-concern.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1, "sku": "alpha" }],
+                "writeConcern": { "w": "majority" },
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn rejects_read_concern_and_nondefault_write_concern_envelopes() {
         assert_rejected(
             doc! { "ping": 1, "readConcern": { "level": "majority" }, "$db": "admin" },
-            115,
-        )
-        .await;
-        assert_rejected(
-            doc! { "ping": 1, "writeConcern": { "w": "majority" }, "$db": "admin" },
             115,
         )
         .await;

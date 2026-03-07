@@ -253,6 +253,7 @@ The broker command path is:
    - synthesize collectionless metadata-stage input for supported first stages such as `$currentOp`
    - synthesize collection metadata-stage input for supported first stages such as `$collStats`
    - synthesize collection index metadata-stage input for supported first stages such as `$indexStats`
+   - synthesize collection catalog metadata-stage input for supported first stages such as `$listCatalog`
    - synthesize collection plan-cache metadata-stage input for supported first stages such as `$planCacheStats`
    - execute pure document stages in memory
    - resolve same-file foreign namespaces for `$unionWith` and `$lookup`

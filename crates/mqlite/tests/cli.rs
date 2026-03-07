@@ -480,7 +480,9 @@ fn command_aggregate_supports_plan_cache_stats_stage() {
 #[test]
 fn command_collectionless_aggregate_rejects_plan_cache_stats_stage() {
     let temp_dir = tempdir().expect("tempdir");
-    let database_path = temp_dir.path().join("command-plan-cache-stats-invalid.mongodb");
+    let database_path = temp_dir
+        .path()
+        .join("command-plan-cache-stats-invalid.mongodb");
 
     let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
     let output = aggregate
@@ -494,6 +496,104 @@ fn command_collectionless_aggregate_rejects_plan_cache_stats_stage() {
             "1",
             "--eval",
             r#"{"aggregate":1,"pipeline":[{"$planCacheStats":{}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
+fn command_collectionless_aggregate_supports_list_catalog_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-catalog.mongodb");
+
+    let mut insert_widgets = Command::cargo_bin("mqlite").expect("binary");
+    insert_widgets
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"sku":"alpha"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert_metrics = Command::cargo_bin("mqlite").expect("binary");
+    insert_metrics
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "analytics",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"metrics","documents":[{"kind":"daily"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listCatalog":{}},{"$project":{"_id":0,"ns":1,"indexCount":1}},{"$sort":{"ns":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "ns": "analytics.metrics", "indexCount": 1 }),
+            json!({ "ns": "app.widgets", "indexCount": 1 }),
+        ]
+    );
+}
+
+#[test]
+fn command_collectionless_aggregate_rejects_list_catalog_stage_outside_admin() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-list-catalog-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$listCatalog":{}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

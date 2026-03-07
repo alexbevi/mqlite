@@ -1985,6 +1985,41 @@ fn plan_cache_stats_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn list_catalog_stage_reports_synthetic_catalog_entries() {
+    let results = run_pipeline_ok(Vec::new(), &[doc! { "$listCatalog": {} }]);
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "db": "app",
+            "ns": "app.synthetic",
+            "name": "synthetic",
+            "type": "collection",
+            "options": {},
+            "indexCount": 1_i64,
+        }]
+    );
+}
+
+#[test]
+fn list_catalog_stage_rejects_invalid_specs() {
+    for stage in [doc! { "$listCatalog": 1 }, doc! { "$listCatalog": { "all": true } }] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$listCatalog": {} },
+        ],
+    )
+    .expect_err("$listCatalog should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

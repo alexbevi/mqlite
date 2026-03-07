@@ -77,6 +77,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
+            "$listCatalog" => list_catalog_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
@@ -1112,7 +1113,10 @@ fn index_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document
     }])
 }
 
-fn plan_cache_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+fn plan_cache_stats_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
     if stage_index != 0 {
         return Err(QueryError::InvalidStage);
     }
@@ -1133,6 +1137,26 @@ fn plan_cache_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Doc
         "sequence": 1_i64,
         "cachedPlan": { "type": "collectionScan" },
         "host": "mqlite",
+    }])
+}
+
+fn list_catalog_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if !spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(vec![doc! {
+        "db": "app",
+        "ns": "app.synthetic",
+        "name": "synthetic",
+        "type": "collection",
+        "options": {},
+        "indexCount": 1_i64,
     }])
 }
 
