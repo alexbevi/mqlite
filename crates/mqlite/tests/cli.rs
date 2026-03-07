@@ -201,6 +201,102 @@ fn command_collection_aggregate_rejects_current_op_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_coll_stats_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-coll-stats.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"sku":"alpha","qty":2},{"sku":"beta","qty":4}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"name":"sku_1","key":{"sku":1}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$collStats":{"count":{},"storageStats":{}}},{"$project":{"_id":0,"ns":1,"count":1,"storageStats.count":1,"storageStats.nindexes":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["ns"], "app.widgets");
+    assert_eq!(first_batch[0]["count"], 2);
+    assert_eq!(first_batch[0]["storageStats"]["count"], 2);
+    assert_eq!(first_batch[0]["storageStats"]["nindexes"], 2);
+}
+
+#[test]
+fn command_collectionless_aggregate_rejects_coll_stats_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-coll-stats-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$collStats":{"count":{}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
 fn command_aggregate_supports_bucket_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-bucket.mongodb");

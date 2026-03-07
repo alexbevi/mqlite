@@ -74,6 +74,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
         current = match stage_name.as_str() {
             "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
+            "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
@@ -1062,6 +1063,116 @@ fn current_op_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>
             "$db": "admin",
         },
     }])
+}
+
+fn coll_stats_documents(
+    documents: Vec<Document>,
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let coll_stats = parse_coll_stats_spec(spec)?;
+    Ok(vec![build_coll_stats_document(
+        "app.synthetic",
+        &documents,
+        1,
+        coll_stats.storage_stats_scale,
+        coll_stats.include_count,
+    )])
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CollStatsStage {
+    include_count: bool,
+    storage_stats_scale: Option<i64>,
+}
+
+fn parse_coll_stats_spec(spec: &Bson) -> Result<CollStatsStage, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut include_count = false;
+    let mut storage_stats_scale = None;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "count" => {
+                let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+                if !document.is_empty() {
+                    return Err(QueryError::InvalidStage);
+                }
+                include_count = true;
+            }
+            "storageStats" => {
+                storage_stats_scale = Some(parse_storage_stats_spec(value)?);
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(CollStatsStage {
+        include_count,
+        storage_stats_scale,
+    })
+}
+
+fn parse_storage_stats_spec(spec: &Bson) -> Result<i64, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut scale = 1_i64;
+    for (key, value) in spec {
+        match key.as_str() {
+            "scale" => {
+                scale = integer_value(value).ok_or(QueryError::InvalidStage)?;
+                if scale <= 0 {
+                    return Err(QueryError::InvalidStage);
+                }
+            }
+            "verbose" | "waitForLock" | "numericOnly" => {
+                value.as_bool().ok_or(QueryError::InvalidStage)?;
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+    Ok(scale)
+}
+
+fn build_coll_stats_document(
+    namespace: &str,
+    documents: &[Document],
+    index_count: usize,
+    storage_stats_scale: Option<i64>,
+    include_count: bool,
+) -> Document {
+    let count = documents.len() as i64;
+    let total_size = documents
+        .iter()
+        .map(|document| bson::to_vec(document).unwrap_or_default().len() as i64)
+        .sum::<i64>();
+    let average_size = if count == 0 { 0 } else { total_size / count };
+
+    let mut result = doc! {
+        "ns": namespace,
+    };
+    if include_count {
+        result.insert("count", count);
+    }
+    if let Some(scale) = storage_stats_scale {
+        let scale_size = |value: i64| value / scale.max(1);
+        result.insert(
+            "storageStats",
+            doc! {
+                "count": count,
+                "size": scale_size(total_size),
+                "avgObjSize": scale_size(average_size),
+                "storageSize": scale_size(total_size),
+                "nindexes": index_count as i64,
+                "totalIndexSize": 0_i64,
+                "indexSizes": {},
+            },
+        );
+    }
+    result
 }
 
 fn sample_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {

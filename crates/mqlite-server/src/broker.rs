@@ -1307,11 +1307,22 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$documents");
+        let starts_with_coll_stats = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$collStats");
         let starts_with_current_op = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$currentOp");
 
+        if starts_with_coll_stats && is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$collStats must be run against a collection namespace",
+            ));
+        }
         if starts_with_current_op && !is_collectionless {
             return Err(CommandError::new(
                 73,
@@ -1324,6 +1335,19 @@ impl Broker {
             return self.handle_current_op_aggregate(
                 body,
                 &database,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_coll_stats {
+            let collection_name = body.get_str("aggregate").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
+            })?;
+            return self.handle_coll_stats_aggregate(
+                &database,
+                collection_name,
                 batch_size,
                 execution_pipeline,
                 out_target,
@@ -1391,6 +1415,78 @@ impl Broker {
                 .open(namespace, Vec::new(), batch_size, false);
             return Ok(cursor_document(cursor, "firstBatch"));
         }
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_coll_stats_aggregate(
+        &self,
+        database: &str,
+        collection_name: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.{collection_name}");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let collection = storage
+                .catalog()
+                .get_collection(database, collection_name)?;
+            let coll_stats = execution_pipeline
+                .first()
+                .and_then(|stage| stage.get("$collStats"))
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$collStats aggregation requires a $collStats stage document",
+                    )
+                })?;
+            let coll_stats = parse_coll_stats_stage(coll_stats)?;
+            let stats_document = build_coll_stats_result(
+                &namespace,
+                collection,
+                coll_stats.storage_stats_scale,
+                coll_stats.include_count,
+            );
+            if execution_pipeline.len() > 1 {
+                run_pipeline_with_resolver(
+                    vec![stats_document],
+                    &execution_pipeline[1..],
+                    database,
+                    &resolver,
+                )?
+            } else {
+                vec![stats_document]
+            }
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
         let cursor = self
             .cursors
             .lock()
@@ -1492,7 +1588,172 @@ impl Broker {
             .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
     }
+}
 
+#[derive(Debug, Clone, Copy)]
+struct CollStatsStage {
+    include_count: bool,
+    storage_stats_scale: Option<i64>,
+}
+
+fn parse_coll_stats_stage(spec: &Bson) -> Result<CollStatsStage, CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(9, "FailedToParse", "$collStats must take a nested object")
+    })?;
+    let mut include_count = false;
+    let mut storage_stats_scale = None;
+
+    for (key, value) in spec {
+        match key.as_str() {
+            "count" => {
+                let document = value.as_document().ok_or_else(|| {
+                    CommandError::new(9, "FailedToParse", "$collStats count must be an object")
+                })?;
+                if !document.is_empty() {
+                    return Err(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$collStats count must be an empty object",
+                    ));
+                }
+                include_count = true;
+            }
+            "storageStats" => {
+                storage_stats_scale = Some(parse_coll_stats_storage_spec(value)?);
+            }
+            "latencyStats"
+            | "queryExecStats"
+            | "operationStats"
+            | "targetAllNodes"
+            | "$_requestOnTimeseriesView" => {
+                return Err(CommandError::new(
+                    115,
+                    "CommandNotSupported",
+                    format!("$collStats option `{key}` is not supported"),
+                ));
+            }
+            _ => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!("unsupported $collStats option `{key}`"),
+                ));
+            }
+        }
+    }
+
+    Ok(CollStatsStage {
+        include_count,
+        storage_stats_scale,
+    })
+}
+
+fn parse_coll_stats_storage_spec(spec: &Bson) -> Result<i64, CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            "$collStats storageStats must be an object",
+        )
+    })?;
+    let mut scale = 1_i64;
+    for (key, value) in spec {
+        match key.as_str() {
+            "scale" => {
+                scale = match value {
+                    Bson::Int32(value) => i64::from(*value),
+                    Bson::Int64(value) => *value,
+                    Bson::Double(value) if value.fract() == 0.0 => *value as i64,
+                    _ => {
+                        return Err(CommandError::new(
+                            9,
+                            "FailedToParse",
+                            "$collStats storageStats scale must be a positive integer",
+                        ));
+                    }
+                };
+                if scale <= 0 {
+                    return Err(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$collStats storageStats scale must be a positive integer",
+                    ));
+                }
+            }
+            "verbose" | "waitForLock" | "numericOnly" => {
+                value.as_bool().ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        format!("$collStats storageStats option `{key}` must be a boolean value"),
+                    )
+                })?;
+            }
+            _ => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!("unsupported $collStats storageStats option `{key}`"),
+                ));
+            }
+        }
+    }
+    Ok(scale)
+}
+
+fn build_coll_stats_result(
+    namespace: &str,
+    collection: &CollectionCatalog,
+    storage_stats_scale: Option<i64>,
+    include_count: bool,
+) -> Document {
+    let count = collection.records.len() as i64;
+    let total_size = collection
+        .records
+        .iter()
+        .map(|record| bson::to_vec(&record.document).unwrap_or_default().len() as i64)
+        .sum::<i64>();
+    let average_size = if count == 0 { 0 } else { total_size / count };
+
+    let mut result = doc! {
+        "ns": namespace,
+    };
+    if include_count {
+        result.insert("count", count);
+    }
+    if let Some(scale) = storage_stats_scale {
+        let mut total_index_size = 0_i64;
+        let mut index_sizes = Document::new();
+        for (name, index) in &collection.indexes {
+            let size = approximate_index_size(index);
+            total_index_size += size;
+            index_sizes.insert(name.clone(), size / scale.max(1));
+        }
+        result.insert(
+            "storageStats",
+            doc! {
+                "count": count,
+                "size": total_size / scale.max(1),
+                "avgObjSize": average_size / scale.max(1),
+                "storageSize": total_size / scale.max(1),
+                "nindexes": collection.indexes.len() as i64,
+                "totalIndexSize": total_index_size / scale.max(1),
+                "indexSizes": index_sizes,
+            },
+        );
+    }
+    result
+}
+
+fn approximate_index_size(index: &IndexCatalog) -> i64 {
+    index
+        .entries
+        .iter()
+        .map(|entry| bson::to_vec(&entry.key).unwrap_or_default().len() as i64 + 8)
+        .sum()
+}
+
+impl Broker {
     fn write_out_collection(
         &self,
         database: &str,
@@ -3999,17 +4260,18 @@ mod tests {
         assert_eq!(drop_database.get_f64("ok").expect("ok"), 1.0);
         assert_eq!(drop_database.get_str("dropped").expect("dropped"), "app");
 
-        let list_databases =
-            send_command(&mut stream, doc! { "listDatabases": 1, "nameOnly": true, "$db": "admin" })
-                .await;
+        let list_databases = send_command(
+            &mut stream,
+            doc! { "listDatabases": 1, "nameOnly": true, "$db": "admin" },
+        )
+        .await;
         let databases = list_databases.get_array("databases").expect("databases");
-        assert!(
-            !databases.iter().any(|entry| {
-                entry.as_document()
-                    .and_then(|document| document.get_str("name").ok())
-                    == Some("app")
-            })
-        );
+        assert!(!databases.iter().any(|entry| {
+            entry
+                .as_document()
+                .and_then(|document| document.get_str("name").ok())
+                == Some("app")
+        }));
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

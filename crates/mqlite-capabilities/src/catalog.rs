@@ -1098,6 +1098,10 @@ mod tests {
                 vec![doc! { "price": 10 }, doc! { "price": 20 }],
                 vec![doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }],
             ),
+            "$collStats" => (
+                vec![doc! { "_id": 1 }, doc! { "_id": 2 }],
+                vec![doc! { "$collStats": { "count": {}, "storageStats": {} } }],
+            ),
             "$currentOp" => (
                 Vec::new(),
                 vec![doc! { "$currentOp": { "localOps": true } }],

@@ -1863,6 +1863,54 @@ fn current_op_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn coll_stats_stage_reports_count_and_storage_stats() {
+    let results = run_pipeline_ok(
+        vec![doc! { "_id": 1, "qty": 12 }, doc! { "_id": 2, "qty": 34 }],
+        &[doc! {
+            "$collStats": {
+                "count": {},
+                "storageStats": { "scale": 1, "verbose": false }
+            }
+        }],
+    );
+
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result.get_str("ns").expect("ns"), "app.synthetic");
+    assert_eq!(result.get_i64("count").expect("count"), 2);
+    let storage_stats = result.get_document("storageStats").expect("storageStats");
+    assert_eq!(storage_stats.get_i64("count").expect("count"), 2);
+    assert_eq!(storage_stats.get_i64("nindexes").expect("nindexes"), 1);
+    assert!(storage_stats.get_i64("size").expect("size") > 0);
+}
+
+#[test]
+fn coll_stats_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$collStats": 1 },
+        doc! { "$collStats": { "count": 1 } },
+        doc! { "$collStats": { "count": { "bad": true } } },
+        doc! { "$collStats": { "storageStats": 1 } },
+        doc! { "$collStats": { "storageStats": { "scale": 0 } } },
+        doc! { "$collStats": { "latencyStats": {} } },
+        doc! { "$collStats": { "queryExecStats": {} } },
+    ] {
+        let error = run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$collStats": { "count": {} } },
+        ],
+    )
+    .expect_err("$collStats should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

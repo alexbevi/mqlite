@@ -34,6 +34,7 @@
     "$addFields",
     "$bucket",
     "$bucketAuto",
+    "$collStats",
     "$count",
     "$currentOp",
     "$documents",

@@ -251,6 +251,7 @@ The broker command path is:
 8. `aggregate` uses the pipeline runner:
    - parse each stage into the supported Rust-native semantics
    - synthesize collectionless metadata-stage input for supported first stages such as `$currentOp`
+   - synthesize collection metadata-stage input for supported first stages such as `$collStats`
    - execute pure document stages in memory
    - resolve same-file foreign namespaces for `$unionWith` and `$lookup`
    - thread `$lookup` `let` variables through correlated subpipelines
