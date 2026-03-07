@@ -229,6 +229,7 @@ struct SnapshotCollectionCatalog {
 struct SnapshotIndexCatalog {
     key: bson::Document,
     unique: bool,
+    expire_after_seconds: Option<i64>,
     root_page_id: Option<u64>,
     pages: Vec<PageRef>,
     entry_count: usize,
@@ -933,6 +934,7 @@ fn encode_snapshot_catalog(catalog: &Catalog) -> Result<EncodedSnapshotCatalog> 
                     SnapshotIndexCatalog {
                         key: index.key.clone(),
                         unique: index.unique,
+                        expire_after_seconds: index.expire_after_seconds,
                         root_page_id: encoded_index_tree.root_page_id,
                         pages: placeholder_page_refs(index_page_ids),
                         entry_count: index.entries.len(),
@@ -1227,6 +1229,7 @@ fn restore_index(
         snapshot_index.key.clone(),
         snapshot_index.unique,
     );
+    index.expire_after_seconds = snapshot_index.expire_after_seconds;
 
     if let Some(root_page_id) = snapshot_index.root_page_id {
         let page_ref_by_id = snapshot_index
@@ -1585,6 +1588,48 @@ mod tests {
         assert_eq!(
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
+        );
+    }
+
+    #[test]
+    fn reopens_persisted_index_expire_after_seconds_metadata() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("ttl-index-persist.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            apply_index_specs(
+                &mut collection,
+                &[doc! {
+                    "key": { "createdAt": 1 },
+                    "name": "createdAt_1",
+                    "expireAfterSeconds": 1
+                }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(
+            collection
+                .indexes
+                .get("createdAt_1")
+                .expect("index")
+                .expire_after_seconds,
+            Some(1)
         );
     }
 

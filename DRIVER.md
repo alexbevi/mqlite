@@ -76,10 +76,12 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.aggregate([{ $listLocalSessions: { allUsers: true } }])` returns an empty result because `mqlite` does not implement logical sessions
 - `db.admin.aggregate([{ $listSampledQueries: { namespace: "app.widgets" } }])` returns an empty result because `mqlite` does not implement query sampling
 - `db.getSiblingDB("config").system.sessions.aggregate([{ $listSessions: { allUsers: true } }])` returns an empty result because `mqlite` does not implement persisted logical sessions
+- `db.admin.aggregate([{ $querySettings: { showDebugQueryShape: true } }])` returns an empty result until `mqlite` has a local query-settings store
 - `db.admin.aggregate([{ $listMqlEntities: { entityType: "aggregationStages" } }])` returns the sorted list of currently supported aggregation stages
 - `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
 - Null-byte database or collection names are rejected with `InvalidNamespace`
+- TTL index metadata such as `expireAfterSeconds` is stored and returned by `listIndexes`
 - Update operations accept aggregation pipeline updates over the matched document stream
   - `dropDatabase` is supported for local test setup and teardown
   - `renameCollection` is supported for local collection management, including `dropTarget`

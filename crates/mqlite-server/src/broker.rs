@@ -1405,6 +1405,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$listSessions");
+        let starts_with_query_settings = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$querySettings");
         let starts_with_list_mql_entities = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1463,6 +1467,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$listSessions may only be run against config.system.sessions",
+            ));
+        }
+        if starts_with_query_settings && (!is_collectionless || database != "admin") {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$querySettings must be run against the 'admin' database with {aggregate: 1}",
             ));
         }
         if starts_with_list_mql_entities && (!is_collectionless || database != "admin") {
@@ -1556,6 +1567,15 @@ impl Broker {
                 execution_pipeline,
                 out_target,
                 merge_target,
+        if starts_with_query_settings {
+            return self.handle_query_settings_aggregate(
+                &database,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
             );
         }
         if starts_with_list_mql_entities {
@@ -1977,6 +1997,48 @@ impl Broker {
             .cursors
             .lock()
             .open(namespace, results, batch_size, false);
+
+    fn handle_query_settings_aggregate(
+        &self,
+        database: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.$cmd.aggregate");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            run_pipeline_with_resolver(Vec::new(), execution_pipeline, database, &resolver)?
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
         Ok(cursor_document(cursor, "firstBatch"))
     }
 
@@ -4580,6 +4642,9 @@ fn index_to_document(index: IndexCatalog) -> Document {
     if index.unique {
         document.insert("unique", true);
     }
+    if let Some(expire_after_seconds) = index.expire_after_seconds {
+        document.insert("expireAfterSeconds", expire_after_seconds);
+    }
     document
 }
 
@@ -6504,6 +6569,57 @@ mod tests {
             73,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_indexes_reports_expire_after_seconds_metadata() {
+        let (serve_task, _temp_dir, manifest) = start_broker("ttl-index-metadata.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    {
+                        "key": { "createdAt": 1 },
+                        "name": "createdAt_1",
+                        "expireAfterSeconds": 1
+                    }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let list_indexes =
+            send_command(&mut stream, doc! { "listIndexes": "widgets", "cursor": {}, "$db": "app" })
+                .await;
+        let first_batch = list_indexes
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        let ttl_index = first_batch
+            .iter()
+            .filter_map(Bson::as_document)
+            .find(|document| document.get_str("name").ok() == Some("createdAt_1"))
+            .expect("ttl index");
+        assert_eq!(
+            ttl_index
+                .get_i64("expireAfterSeconds")
+                .expect("expireAfterSeconds"),
+            1
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
     }
 
     #[cfg(unix)]

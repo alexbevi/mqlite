@@ -156,6 +156,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `db.aggregate([{ $currentOp: { localOps: true } }])` compatibility on `admin`, returning the in-flight aggregate command for driver CRUD coverage.
 - Collection-backed aggregation with a trailing `$out` stage, replacing the target collection and returning an empty cursor.
 - Null-byte database or collection names are rejected with `InvalidNamespace`.
+- TTL index metadata such as `expireAfterSeconds` is preserved in catalog state and returned by `listIndexes`, even though document expiration itself is not implemented.
 - Persistent `_id_` and secondary index durability across broker restarts.
 - Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.
@@ -197,6 +198,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$unionWith`
   - `$match`
   - `$merge`
+  - `$querySettings`
   - `$out`
   - `$project`
   - `$set`
@@ -222,6 +224,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$listLocalSessions` aggregation with the public `allUsers` and `users` filters, returning an empty result because `mqlite` does not implement logical sessions or a local session cache.
 - Collectionless `$listSampledQueries` aggregation on `admin`, accepting the public optional `namespace` filter and returning an empty result because `mqlite` does not implement query sampling.
 - `$listSessions` aggregation on `config.system.sessions`, accepting the public `allUsers` and `users` filters and returning an empty result because `mqlite` does not implement persisted logical sessions.
+- Collectionless `$querySettings` aggregation on `admin`, accepting the public `showDebugQueryShape` option and returning an empty result until `mqlite` grows a query-settings store.
 - Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.

@@ -180,6 +180,7 @@ pub struct IndexCatalog {
     pub name: String,
     pub key: Document,
     pub unique: bool,
+    pub expire_after_seconds: Option<i64>,
     pub entries: Vec<IndexEntry>,
     #[serde(skip, default)]
     pub tree: IndexTree,
@@ -193,6 +194,7 @@ impl IndexCatalog {
             name,
             key,
             unique,
+            expire_after_seconds: None,
             entries: Vec::new(),
             tree: IndexTree::default(),
             stats: IndexStats::default(),
@@ -593,7 +595,12 @@ pub fn apply_index_specs(
             return Err(CatalogError::IndexExists(name));
         }
         let unique = spec.get_bool("unique").unwrap_or(false);
+        let expire_after_seconds = spec
+            .get("expireAfterSeconds")
+            .map(parse_expire_after_seconds)
+            .transpose()?;
         let mut index = IndexCatalog::new(name.clone(), key.clone(), unique);
+        index.expire_after_seconds = expire_after_seconds;
         for record in &collection.records {
             validate_record_against_index(&index, &record.document, None)?;
             insert_index_entry(
@@ -608,6 +615,19 @@ pub fn apply_index_specs(
     }
 
     Ok(created)
+}
+
+fn parse_expire_after_seconds(value: &Bson) -> Result<i64, CatalogError> {
+    let value = match value {
+        Bson::Int32(value) => i64::from(*value),
+        Bson::Int64(value) => *value,
+        Bson::Double(value) if value.fract() == 0.0 => *value as i64,
+        _ => return Err(CatalogError::InvalidIndexSpec),
+    };
+    if value < 0 {
+        return Err(CatalogError::InvalidIndexSpec);
+    }
+    Ok(value)
 }
 
 pub fn drop_indexes_from_collection(
@@ -1031,6 +1051,31 @@ mod tests {
         assert_eq!(index.entries.len(), 2);
         assert_eq!(index.entries[0].record_id, 1);
         assert_eq!(index.entries[1].record_id, 2);
+    }
+
+    #[test]
+    fn stores_expire_after_seconds_in_index_metadata() {
+        let mut collection = CollectionCatalog::new(doc! {});
+
+        let created = super::apply_index_specs(
+            &mut collection,
+            &[doc! {
+                "key": { "createdAt": 1 },
+                "name": "createdAt_1",
+                "expireAfterSeconds": 1
+            }],
+        )
+        .expect("create index");
+
+        assert_eq!(created[0].expire_after_seconds, Some(1));
+        assert_eq!(
+            collection
+                .indexes
+                .get("createdAt_1")
+                .expect("index")
+                .expire_after_seconds,
+            Some(1)
+        );
     }
 
     #[test]
