@@ -41,6 +41,7 @@
     "$documents",
     "$facet",
     "$fill",
+    "$geoNear",
     "$graphLookup",
     "$group",
     "$indexStats",

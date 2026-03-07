@@ -1580,6 +1580,70 @@ fn graph_lookup_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn geo_near_stage_filters_and_sorts_by_distance() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "name": "zero", "kind": "keep", "loc": [0.0, 0.0] },
+            doc! { "name": "far", "kind": "skip", "loc": [5.0, 0.0] },
+            doc! { "name": "near", "kind": "keep", "loc": [1.0, 0.0] },
+        ],
+        &[doc! {
+            "$geoNear": {
+                "near": [0.0, 0.0],
+                "key": "loc",
+                "distanceField": "dist",
+                "includeLocs": "matchedLoc",
+                "maxDistance": 2.0,
+                "query": { "kind": "keep" }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "name": "zero", "kind": "keep", "loc": [0.0, 0.0], "dist": 0.0, "matchedLoc": [0.0, 0.0] },
+            doc! { "name": "near", "kind": "keep", "loc": [1.0, 0.0], "dist": 1.0, "matchedLoc": [1.0, 0.0] },
+        ]
+    );
+}
+
+#[test]
+fn geo_near_stage_supports_spherical_geojson_points() {
+    let results = run_pipeline_ok(
+        vec![doc! {
+            "name": "north",
+            "loc": { "type": "Point", "coordinates": [0.0, 1.0] }
+        }],
+        &[doc! {
+            "$geoNear": {
+                "near": { "type": "Point", "coordinates": [0.0, 0.0] },
+                "key": "loc",
+                "distanceField": "dist",
+                "spherical": true
+            }
+        }],
+    );
+
+    let distance = results[0].get_f64("dist").expect("distance");
+    assert!((distance - 111_319.49).abs() < 10.0);
+}
+
+#[test]
+fn geo_near_stage_rejects_invalid_specs() {
+    for pipeline in [
+        vec![doc! { "$geoNear": { "key": "loc", "distanceField": "dist" } }],
+        vec![doc! { "$project": { "loc": 1 } }, doc! { "$geoNear": { "near": [0.0, 0.0], "key": "loc", "distanceField": "dist" } }],
+        vec![doc! { "$geoNear": { "near": [0.0, 0.0], "key": 1, "distanceField": "dist" } }],
+        vec![doc! { "$geoNear": { "near": [0.0, 0.0], "key": "loc", "distanceMultiplier": -1.0 } }],
+    ] {
+        let error = run_pipeline(vec![doc! { "loc": [0.0, 0.0] }], &pipeline)
+            .expect_err("invalid geoNear");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn documents_stage_replaces_input_when_first() {
     let results = run_pipeline_ok(
         vec![doc! { "_id": 0, "ignored": true }],

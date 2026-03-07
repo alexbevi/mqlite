@@ -187,6 +187,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$currentOp`
   - `$densify`
   - `$fill`
+  - `$geoNear`
   - `$graphLookup`
   - `$lookup`
   - `$indexStats`
@@ -238,6 +239,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
 - `$densify` for numeric and date ranges, including `full`, `partition`, and explicit `[lower, upper]` bounds with partitioned local generation over the current document stream.
 - `$fill` for constant-value, `locf`, and `linear` fills over the local document stream, including `sortBy`, `partitionByFields`, and `partitionBy` expression partitioning.
+- `$geoNear` as a first-stage local geospatial scan over legacy coordinate pairs and GeoJSON points, including `query`, `minDistance`, `maxDistance`, `distanceMultiplier`, `distanceField`, `includeLocs`, `key`, and optional spherical distance calculation.
 - `$graphLookup` for same-file recursive foreign-collection traversal, including `startWith`, `connectFromField`, `connectToField`, `maxDepth`, `depthField`, `restrictSearchWithMatch`, and outer-scope variable resolution inside nested pipelines.
 - `$redact` aggregation with recursive `$$KEEP`, `$$PRUNE`, and `$$DESCEND` semantics over nested documents and arrays.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.

@@ -1564,6 +1564,88 @@ fn command_aggregate_rejects_invalid_graph_lookup_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_geo_near_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-geo-near.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"name":"zero","kind":"keep","loc":[0.0,0.0]},{"name":"far","kind":"skip","loc":[5.0,0.0]},{"name":"near","kind":"keep","loc":[1.0,0.0]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$geoNear":{"near":[0.0,0.0],"key":"loc","distanceField":"dist","includeLocs":"matchedLoc","maxDistance":2.0,"query":{"kind":"keep"}}},{"$project":{"_id":0,"name":1,"dist":1,"matchedLoc":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "name": "zero", "dist": 0.0, "matchedLoc": [0.0, 0.0] }),
+            json!({ "name": "near", "dist": 1.0, "matchedLoc": [1.0, 0.0] }),
+        ]
+    );
+}
+
+#[test]
+fn command_aggregate_rejects_non_initial_geo_near_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-geo-near-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$match":{}},{"$geoNear":{"near":[0.0,0.0],"key":"loc","distanceField":"dist"}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_query_settings_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-query-settings.mongodb");

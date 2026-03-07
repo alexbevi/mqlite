@@ -39,6 +39,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$documents",
     "$facet",
     "$fill",
+    "$geoNear",
     "$graphLookup",
     "$indexStats",
     "$lookup",

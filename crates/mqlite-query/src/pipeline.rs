@@ -97,6 +97,8 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$facet" => facet_documents(current, stage_spec, context)?,
+            "$geoNear" if stage_index != 0 => return Err(QueryError::InvalidStage),
+            "$geoNear" => geo_near_documents(current, stage_spec, &context.variables)?,
             "$graphLookup" => graph_lookup_documents(current, stage_spec, context)?,
             "$lookup" => lookup_documents(current, stage_spec, context)?,
             "$match" => {
@@ -523,6 +525,216 @@ fn graph_lookup_connect_from_values(document: &Document, field: &str) -> Vec<Bso
         Some(Bson::Null) | None => Vec::new(),
         Some(value) => vec![value],
     }
+}
+
+#[derive(Debug, Clone)]
+struct GeoNearStage {
+    near: GeoPoint,
+    distance_field: Option<String>,
+    max_distance: Option<f64>,
+    min_distance: Option<f64>,
+    query: Option<Document>,
+    spherical: bool,
+    distance_multiplier: f64,
+    include_locs: Option<String>,
+    key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GeoPoint {
+    x: f64,
+    y: f64,
+}
+
+fn geo_near_documents(
+    documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
+    let spec = parse_geo_near_spec(spec)?;
+    let mut results = Vec::new();
+
+    for mut document in documents {
+        if let Some(query) = &spec.query {
+            if !document_matches_with_variables(&document, query, variables)? {
+                continue;
+            }
+        }
+
+        let Some((location, location_bson)) = geo_point_for_document(&document, spec.key.as_deref())?
+        else {
+            continue;
+        };
+        let distance = if spec.spherical {
+            spherical_distance(spec.near, location)
+        } else {
+            planar_distance(spec.near, location)
+        };
+
+        if spec.min_distance.is_some_and(|minimum| distance < minimum) {
+            continue;
+        }
+        if spec.max_distance.is_some_and(|maximum| distance > maximum) {
+            continue;
+        }
+
+        if let Some(distance_field) = &spec.distance_field {
+            set_path(
+                &mut document,
+                distance_field,
+                Bson::Double(distance * spec.distance_multiplier),
+            )
+            .map_err(|_| QueryError::InvalidStructure)?;
+        }
+        if let Some(include_locs) = &spec.include_locs {
+            set_path(&mut document, include_locs, location_bson)
+                .map_err(|_| QueryError::InvalidStructure)?;
+        }
+
+        results.push((distance, document));
+    }
+
+    results.sort_by(|(left_distance, _), (right_distance, _)| {
+        left_distance
+            .partial_cmp(right_distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(results.into_iter().map(|(_, document)| document).collect())
+}
+
+fn parse_geo_near_spec(spec: &Bson) -> Result<GeoNearStage, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut near = None;
+    let mut distance_field = None;
+    let mut max_distance = None;
+    let mut min_distance = None;
+    let mut query = None;
+    let mut spherical = false;
+    let mut distance_multiplier = 1.0;
+    let mut include_locs = None;
+    let mut key = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "near" => near = Some(parse_geo_point(value)?),
+            "distanceField" => distance_field = Some(parse_field_name(value)?),
+            "maxDistance" => max_distance = Some(numeric_value(value)?),
+            "minDistance" => min_distance = Some(numeric_value(value)?),
+            "query" => {
+                let filter = value.as_document().ok_or(QueryError::InvalidStage)?.clone();
+                parse_filter(&filter)?;
+                query = Some(filter);
+            }
+            "spherical" => spherical = value.as_bool().ok_or(QueryError::InvalidStage)?,
+            "distanceMultiplier" => {
+                distance_multiplier = numeric_value(value)?;
+                if distance_multiplier < 0.0 {
+                    return Err(QueryError::InvalidStage);
+                }
+            }
+            "includeLocs" => include_locs = Some(parse_field_name(value)?),
+            "key" => {
+                let parsed = parse_field_name(value)?;
+                if parsed.is_empty() {
+                    return Err(QueryError::InvalidStage);
+                }
+                key = Some(parsed);
+            }
+            "limit" | "num" | "start" => return Err(QueryError::InvalidStage),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(GeoNearStage {
+        near: near.ok_or(QueryError::InvalidStage)?,
+        distance_field,
+        max_distance,
+        min_distance,
+        query,
+        spherical,
+        distance_multiplier,
+        include_locs,
+        key,
+    })
+}
+
+fn geo_point_for_document(
+    document: &Document,
+    key: Option<&str>,
+) -> Result<Option<(GeoPoint, Bson)>, QueryError> {
+    if let Some(key) = key {
+        return lookup_path(document, key)
+            .map(parse_geo_point_with_source)
+            .transpose();
+    }
+
+    for (field, value) in document {
+        if let Ok((point, source)) = parse_geo_point_with_source(value) {
+            if field != "_id" {
+                return Ok(Some((point, source)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_geo_point(value: &Bson) -> Result<GeoPoint, QueryError> {
+    parse_geo_point_with_source(value).map(|(point, _)| point)
+}
+
+fn parse_geo_point_with_source(value: &Bson) -> Result<(GeoPoint, Bson), QueryError> {
+    match value {
+        Bson::Array(values) if values.len() == 2 => Ok((
+            GeoPoint {
+                x: numeric_value(&values[0])?,
+                y: numeric_value(&values[1])?,
+            },
+            Bson::Array(values.clone()),
+        )),
+        Bson::Document(document) => {
+            if document.get_str("type").ok() != Some("Point") {
+                return Err(QueryError::InvalidStage);
+            }
+            let coordinates = document
+                .get_array("coordinates")
+                .map_err(|_| QueryError::InvalidStage)?;
+            if coordinates.len() != 2 {
+                return Err(QueryError::InvalidStage);
+            }
+            Ok((
+                GeoPoint {
+                    x: numeric_value(&coordinates[0])?,
+                    y: numeric_value(&coordinates[1])?,
+                },
+                Bson::Document(document.clone()),
+            ))
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn planar_distance(left: GeoPoint, right: GeoPoint) -> f64 {
+    let delta_x = left.x - right.x;
+    let delta_y = left.y - right.y;
+    (delta_x * delta_x + delta_y * delta_y).sqrt()
+}
+
+fn spherical_distance(left: GeoPoint, right: GeoPoint) -> f64 {
+    const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
+
+    let left_lat = left.y.to_radians();
+    let left_lon = left.x.to_radians();
+    let right_lat = right.y.to_radians();
+    let right_lon = right.x.to_radians();
+
+    let delta_lat = right_lat - left_lat;
+    let delta_lon = right_lon - left_lon;
+    let haversine = (delta_lat / 2.0).sin().powi(2)
+        + left_lat.cos() * right_lat.cos() * (delta_lon / 2.0).sin().powi(2);
+    let arc = 2.0 * haversine.sqrt().atan2((1.0 - haversine).sqrt());
+    EARTH_RADIUS_METERS * arc
 }
 
 #[derive(Debug, Clone)]

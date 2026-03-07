@@ -1250,6 +1250,16 @@ mod tests {
                     }
                 }],
             ),
+            "$geoNear" => (
+                vec![doc! { "loc": [0.0, 0.0] }, doc! { "loc": [1.0, 0.0] }],
+                vec![doc! {
+                    "$geoNear": {
+                        "near": [0.0, 0.0],
+                        "key": "loc",
+                        "distanceField": "dist"
+                    }
+                }],
+            ),
             "$lookup" => (
                 vec![doc! { "wanted": 2 }],
                 vec![doc! {
