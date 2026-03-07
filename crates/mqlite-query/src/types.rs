@@ -101,6 +101,7 @@ pub enum MatchExpr {
 pub enum UpdateSpec {
     Replacement(Document),
     Modifiers(Vec<UpdateModifier>),
+    Pipeline(Vec<Document>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

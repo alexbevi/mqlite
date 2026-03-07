@@ -171,6 +171,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Stats-backed index choice with a sequence-keyed plan cache when multiple candidate indexes are available, including persisted cache reuse after broker restart.
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
+- Pipeline-style updates using aggregation document transformation stages such as `$set`, `$addFields`, `$unset`, `$project`, `$replaceRoot`, and `$replaceWith` on the matched document stream.
 - Aggregation expression operators `$literal`, comparison operators `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, and membership via `$in`.
 - Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.

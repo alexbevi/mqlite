@@ -76,6 +76,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.admin.aggregate([{ $listMqlEntities: { entityType: "aggregationStages" } }])` returns the sorted list of currently supported aggregation stages
 - `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
+- Update operations accept aggregation pipeline updates over the matched document stream
   - `dropDatabase` is supported for local test setup and teardown
   - `renameCollection` is supported for local collection management, including `dropTarget`
   - `writeConcern: { w: "majority" }` is accepted as a standalone-style no-op compatibility case

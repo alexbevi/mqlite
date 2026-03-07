@@ -4,6 +4,7 @@ use mqlite_bson::{lookup_path_owned, remove_path, set_path};
 use crate::{
     QueryError,
     expression::{number_bson, numeric_value},
+    pipeline::run_pipeline,
     types::{UpdateModifier, UpdateSpec},
 };
 
@@ -42,6 +43,23 @@ pub fn parse_update(update: &Document) -> Result<UpdateSpec, QueryError> {
     Ok(UpdateSpec::Modifiers(modifiers))
 }
 
+pub fn parse_update_value(update: &Bson) -> Result<UpdateSpec, QueryError> {
+    match update {
+        Bson::Document(document) => parse_update(document),
+        Bson::Array(stages) => {
+            let pipeline = stages
+                .iter()
+                .map(|stage| stage.as_document().cloned().ok_or(QueryError::InvalidUpdate))
+                .collect::<Result<Vec<_>, _>>()?;
+            if pipeline.is_empty() {
+                return Err(QueryError::InvalidUpdate);
+            }
+            Ok(UpdateSpec::Pipeline(pipeline))
+        }
+        _ => Err(QueryError::InvalidUpdate),
+    }
+}
+
 pub fn apply_update(document: &mut Document, update: &UpdateSpec) -> Result<(), QueryError> {
     match update {
         UpdateSpec::Replacement(replacement) => {
@@ -68,6 +86,18 @@ pub fn apply_update(document: &mut Document, update: &UpdateSpec) -> Result<(), 
                         set_path(document, path, next).map_err(|_| QueryError::InvalidStructure)?;
                     }
                 }
+            }
+            Ok(())
+        }
+        UpdateSpec::Pipeline(pipeline) => {
+            let original_id = document.get("_id").cloned();
+            let mut updated = run_pipeline(vec![document.clone()], pipeline)?;
+            if updated.len() != 1 {
+                return Err(QueryError::InvalidUpdate);
+            }
+            *document = updated.pop().expect("single document");
+            if let Some(id) = original_id {
+                document.entry("_id".to_string()).or_insert(id);
             }
             Ok(())
         }
