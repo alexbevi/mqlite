@@ -6,6 +6,7 @@ use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
+    "$size",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -43,6 +44,7 @@ pub enum MatchExpr {
     In { path: String, values: Vec<Bson> },
     Nin { path: String, values: Vec<Bson> },
     Exists { path: String, exists: bool },
+    Size { path: String, size: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,6 +423,9 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
                 .all(|value| !compare_bson(existing, value).is_eq())
         }),
         MatchExpr::Exists { path, exists } => lookup_path(document, path).is_some() == *exists,
+        MatchExpr::Size { path, size } => lookup_path(document, path)
+            .and_then(Bson::as_array)
+            .is_some_and(|values| values.len() == *size),
     }
 }
 
@@ -473,6 +478,15 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                         exists: operator_value
                             .as_bool()
                             .ok_or(QueryError::InvalidStructure)?,
+                    },
+                    "$size" => MatchExpr::Size {
+                        path: path.to_string(),
+                        size: usize::try_from(
+                            integer_value(operator_value)
+                                .filter(|value| *value >= 0)
+                                .ok_or(QueryError::InvalidStructure)?,
+                        )
+                        .map_err(|_| QueryError::InvalidStructure)?,
                     },
                     other => return Err(QueryError::UnsupportedOperator(other.to_string())),
                 });
@@ -886,6 +900,16 @@ mod tests {
         assert_filter(&document, doc! { "sku": { "$nin": ["def", "ghi"] } }, true);
         assert_filter(&document, doc! { "sku": { "$nin": ["abc", "ghi"] } }, false);
         assert_filter(&document, doc! { "missing": { "$nin": ["abc"] } }, true);
+    }
+
+    #[test]
+    fn supports_size_filters() {
+        let document = doc! { "tags": ["red", "blue"], "meta": { "values": [1] } };
+
+        assert_filter(&document, doc! { "tags": { "$size": 2 } }, true);
+        assert_filter(&document, doc! { "tags": { "$size": 1 } }, false);
+        assert_filter(&document, doc! { "meta.values": { "$size": 1 } }, true);
+        assert_filter(&document, doc! { "missing": { "$size": 0 } }, false);
     }
 
     #[test]

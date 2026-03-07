@@ -1024,6 +1024,10 @@ mod tests {
                 doc! { "meta": { "enabled": true } },
                 doc! { "meta.enabled": { "$exists": true } },
             ),
+            "$size" => (
+                doc! { "tags": ["red", "blue"] },
+                doc! { "tags": { "$size": 2 } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

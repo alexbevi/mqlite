@@ -11,7 +11,8 @@
     "$ne",
     "$nin",
     "$nor",
-    "$or"
+    "$or",
+    "$size"
   ],
   "aggregation_stages": [
     "$addFields",

@@ -99,6 +99,54 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
 }
 
 #[test]
+fn command_find_supports_size_filter() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-size.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"tags":["red","blue"]},{"_id":2,"tags":["red"]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"tags":{"$size":2}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["tags"], json!(["red", "blue"]));
+}
+
+#[test]
 fn command_preserves_unique_indexes_across_restart() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-index.mongodb");
