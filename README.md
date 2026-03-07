@@ -224,10 +224,13 @@ These are already part of the tested failure surface:
 
 ### Language and server features
 - MapReduce
-- Server-side JavaScript
+- Server-side JavaScript, including `$where` and `$function`
 - Replication internals
 - Oplog mechanics
 - Cluster administration commands
+
+### Permanently out of scope
+- `mqlite` will not embed a JavaScript engine. Server-side JavaScript surfaces such as `$where` and `$function` are permanently unsupported and are expected to fail explicitly with an unsupported-operator `BadValue` error.
 
 ## Test Strategy
 

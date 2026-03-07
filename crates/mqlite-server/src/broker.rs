@@ -725,6 +725,13 @@ impl Broker {
         let batch_size = body.get_i64("batchSize").ok();
         let single_batch = body.get_bool("singleBatch").unwrap_or(false);
 
+        // Validate the query shape even when the collection does not exist so unsupported
+        // operators never degrade into an empty successful result.
+        parse_filter(&filter)?;
+        if let Some(projection) = projection.as_ref() {
+            let _ = apply_projection(&Document::new(), Some(projection))?;
+        }
+
         let storage = self.storage.read();
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection}");

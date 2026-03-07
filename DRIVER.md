@@ -97,6 +97,7 @@ The current supported and unsupported query and aggregation surface is tracked i
 - `capabilities/mqlite/gap-analysis.generated.md`
 
 Driver bring-up should use those reports as the source of truth for which command, query, and aggregation tests are expected to pass today versus fail explicitly.
+Server-side JavaScript is permanently out of scope for `mqlite`, so `$where` and `$function` should remain explicit unsupported-operator failures rather than compatibility gaps to close later.
 
 ## Driver Test Checklist
 
@@ -112,6 +113,7 @@ Any driver integration should include:
 - `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.
+- Explicit failure tests for permanently unsupported server-side JavaScript surfaces such as `$where` and `$function`.
 
 For `node-mongodb-native`, the current direct driver-validation commands are:
 

@@ -484,6 +484,94 @@ fn command_find_supports_sample_rate_extremes() {
 }
 
 #[test]
+fn command_find_rejects_where_filter() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-where.mongodb");
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"$where":"this.qty > 0"}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["code"], 2);
+    assert_eq!(response["codeName"], "BadValue");
+    assert!(
+        response["errmsg"]
+            .as_str()
+            .expect("errmsg")
+            .contains("unsupported query operator `$where`")
+    );
+}
+
+#[test]
+fn command_find_rejects_function_projection() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-function.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"qty":1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{},"projection":{"out":{"$function":{"body":"function() { return 1; }","args":[],"lang":"js"}}}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["code"], 2);
+    assert_eq!(response["codeName"], "BadValue");
+    assert!(
+        response["errmsg"]
+            .as_str()
+            .expect("errmsg")
+            .contains("unsupported query operator `$function`")
+    );
+}
+
+#[test]
 fn command_find_supports_not_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-not.mongodb");

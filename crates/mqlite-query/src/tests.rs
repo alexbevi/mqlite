@@ -1054,6 +1054,17 @@ fn match_stage_propagates_invalid_operator_errors() {
 }
 
 #[test]
+fn filter_rejects_where_operator() {
+    let error = document_matches(&doc! { "qty": 1 }, &doc! { "$where": "this.qty > 0" })
+        .expect_err("unsupported query operator");
+
+    assert!(matches!(
+        error,
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$where"
+    ));
+}
+
+#[test]
 fn pipeline_rejects_unsupported_stage() {
     let error = run_pipeline(
         vec![doc! { "qty": 1 }],
@@ -1064,6 +1075,22 @@ fn pipeline_rejects_unsupported_stage() {
     assert!(matches!(
         error,
         crate::QueryError::UnsupportedStage(stage) if stage == "$lookup"
+    ));
+}
+
+#[test]
+fn projection_rejects_function_expression_operator() {
+    let error = apply_projection(
+        &doc! { "_id": 1, "value": 2 },
+        Some(
+            &doc! { "out": { "$function": { "body": "function() { return 1; }", "args": [], "lang": "js" } } },
+        ),
+    )
+    .expect_err("unsupported expression");
+
+    assert!(matches!(
+        error,
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$function"
     ));
 }
 

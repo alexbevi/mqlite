@@ -13,6 +13,7 @@
 - The durable file uses a fixed header, two rotating superblocks, checkpoint snapshots, fixed-size slotted record pages with stable `RecordId`s, persisted B-tree index pages with internal and leaf nodes keyed by BSON plus `RecordId`, and an append-only WAL for typed collection mutations.
 - The compatibility target is a MongoDB Stable API v1 subset plus the minimum bootstrap/admin commands needed by drivers.
 - Unsupported distributed/server features must fail explicitly and must have regression coverage.
+- Server-side JavaScript is permanently out of scope. `$where` and `$function` must remain explicit unsupported-operator failures.
 - `mqlite command` is the default direct validation path before any driver patching work.
 - Reopen must validate persisted index pages against collection pages; do not silently rebuild index state from collection snapshots during load.
 - Indexed `find` planning should be directly observable through `explain`, not just inferred from behavior.
