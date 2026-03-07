@@ -13,6 +13,41 @@ The repository now contains a working Rust workspace baseline with:
 - A direct CLI command path for broker validation without any patched driver.
 - Progressive tests, CI scaffolding, and living specs.
 
+## Build
+
+Build from the workspace root with Rust 1.87 or newer. The workspace uses Rust edition 2024 and CI runs on stable Rust across macOS, Linux, and Windows.
+
+Install the toolchain with `rustup` if needed:
+
+```text
+rustup toolchain install stable
+rustup default stable
+```
+
+Build the CLI binary:
+
+```text
+cargo build -p mqlite
+```
+
+Build an optimized release binary:
+
+```text
+cargo build -p mqlite --release
+```
+
+Run the repo checks used by CI:
+
+```text
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+```
+
+The resulting binary is written to:
+- `target/debug/mqlite` for `cargo build -p mqlite`
+- `target/release/mqlite` for `cargo build -p mqlite --release`
+
 ## Upstream Reference Anchors
 
 This baseline was shaped against the checked-out MongoDB references in the parent workspace:
