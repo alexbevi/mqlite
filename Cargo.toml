@@ -25,6 +25,7 @@ assert_cmd = "=2.0.16"
 blake3 = "=1.8.2"
 bson = { version = "=2.13.0", features = ["uuid-1"] }
 bytes = "=1.10.1"
+chrono = { version = "=0.4.41", default-features = false, features = ["clock", "std"] }
 clap = { version = "=4.5.32", features = ["derive"] }
 fs4 = "=0.8.4"
 parking_lot = "=0.12.3"

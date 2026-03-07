@@ -37,6 +37,7 @@
     "$collStats",
     "$count",
     "$currentOp",
+    "$densify",
     "$documents",
     "$facet",
     "$group",

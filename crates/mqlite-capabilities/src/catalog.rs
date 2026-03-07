@@ -626,15 +626,17 @@ fn append_category_section(output: &mut String, title: &str, category: &GapCateg
     append_item_list(
         output,
         "### Unsupported Public\n\n",
-        category
-            .items
-            .iter()
-            .filter(|item| !item.internal && item.status == SupportStatus::Unsupported && !item.ignored),
+        category.items.iter().filter(|item| {
+            !item.internal && item.status == SupportStatus::Unsupported && !item.ignored
+        }),
     );
     append_item_list(
         output,
         "### Ignored Public\n\n",
-        category.items.iter().filter(|item| !item.internal && item.ignored),
+        category
+            .items
+            .iter()
+            .filter(|item| !item.internal && item.ignored),
     );
     append_item_list(
         output,
@@ -939,24 +941,27 @@ mod tests {
         let upstream = load_upstream_snapshot(&repo_root).expect("upstream snapshot");
         let gap = build_gap_analysis(&upstream);
 
-        assert!(gap
-            .aggregation_stages
-            .items
-            .iter()
-            .find(|item| item.name == "$search")
-            .is_some_and(|item| item.ignored));
-        assert!(gap
-            .aggregation_stages
-            .items
-            .iter()
-            .find(|item| item.name == "$vectorSearch")
-            .is_some_and(|item| item.ignored));
-        assert!(gap
-            .aggregation_stages
-            .items
-            .iter()
-            .find(|item| item.name == "$queryStats")
-            .is_some_and(|item| item.ignored));
+        assert!(
+            gap.aggregation_stages
+                .items
+                .iter()
+                .find(|item| item.name == "$search")
+                .is_some_and(|item| item.ignored)
+        );
+        assert!(
+            gap.aggregation_stages
+                .items
+                .iter()
+                .find(|item| item.name == "$vectorSearch")
+                .is_some_and(|item| item.ignored)
+        );
+        assert!(
+            gap.aggregation_stages
+                .items
+                .iter()
+                .find(|item| item.name == "$queryStats")
+                .is_some_and(|item| item.ignored)
+        );
         assert_eq!(gap.aggregation_stages.public_unsupported, 7);
     }
 
@@ -1207,6 +1212,12 @@ mod tests {
             "$currentOp" => (
                 Vec::new(),
                 vec![doc! { "$currentOp": { "localOps": true } }],
+            ),
+            "$densify" => (
+                vec![doc! { "val": 0 }, doc! { "val": 2 }],
+                vec![
+                    doc! { "$densify": { "field": "val", "range": { "step": 1, "bounds": "full" } } },
+                ],
             ),
             "$indexStats" => (Vec::new(), vec![doc! { "$indexStats": {} }]),
             "$documents" => (

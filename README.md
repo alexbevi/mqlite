@@ -185,6 +185,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$bucketAuto`
   - `$collStats`
   - `$currentOp`
+  - `$densify`
   - `$lookup`
   - `$indexStats`
   - `$listCatalog`
@@ -233,6 +234,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$querySettings` aggregation on `admin`, accepting the public `showDebugQueryShape` option and returning an empty result until `mqlite` grows a query-settings store.
 - Collectionless `$listMqlEntities` aggregation on `admin` for `entityType: "aggregationStages"`, returning the sorted list of currently supported aggregation stage names.
 - Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
+- `$densify` for numeric and date ranges, including `full`, `partition`, and explicit `[lower, upper]` bounds with partitioned local generation over the current document stream.
 - `$redact` aggregation with recursive `$$KEEP`, `$$PRUNE`, and `$$DESCEND` semantics over nested documents and arrays.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 

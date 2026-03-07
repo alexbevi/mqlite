@@ -1288,6 +1288,109 @@ fn redact_stage_rejects_invalid_decisions() {
 }
 
 #[test]
+fn densify_stage_supports_explicit_numeric_bounds() {
+    let results = run_pipeline_ok(
+        vec![doc! { "val": 0 }, doc! { "val": 4 }, doc! { "val": 9 }],
+        &[doc! {
+            "$densify": {
+                "field": "val",
+                "range": { "step": 2, "bounds": [0, 10] }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "val": 0 },
+            doc! { "val": 2_i64 },
+            doc! { "val": 4 },
+            doc! { "val": 6_i64 },
+            doc! { "val": 8_i64 },
+            doc! { "val": 9 },
+        ]
+    );
+}
+
+#[test]
+fn densify_stage_supports_partition_bounds() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "val": 0, "part": "a" },
+            doc! { "val": 2, "part": "a" },
+            doc! { "val": 0, "part": "b" },
+            doc! { "val": 2, "part": "b" },
+        ],
+        &[doc! {
+            "$densify": {
+                "field": "val",
+                "partitionByFields": ["part"],
+                "range": { "step": 1, "bounds": "partition" }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "val": 0, "part": "a" },
+            doc! { "val": 1_i64, "part": "a" },
+            doc! { "val": 2, "part": "a" },
+            doc! { "val": 0, "part": "b" },
+            doc! { "val": 1_i64, "part": "b" },
+            doc! { "val": 2, "part": "b" },
+        ]
+    );
+}
+
+#[test]
+fn densify_stage_supports_date_ranges() {
+    let day0 = DateTime::from_millis(0);
+    let day1 = DateTime::from_millis(86_400_000);
+    let day2 = DateTime::from_millis(172_800_000);
+    let day3 = DateTime::from_millis(259_200_000);
+
+    let results = run_pipeline_ok(
+        vec![doc! { "when": day0 }, doc! { "when": day3 }],
+        &[doc! {
+            "$densify": {
+                "field": "when",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [Bson::DateTime(day0), Bson::DateTime(day3)]
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "when": day0 },
+            doc! { "when": day1 },
+            doc! { "when": day2 },
+            doc! { "when": day3 },
+        ]
+    );
+}
+
+#[test]
+fn densify_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$densify": { "field": "val", "range": { "step": 1 } } },
+        doc! { "$densify": { "field": "$val", "range": { "step": 1, "bounds": "full" } } },
+        doc! { "$densify": { "field": "val", "range": { "step": 1, "bounds": "partition" } } },
+        doc! { "$densify": { "field": "val", "partitionByFields": ["val"], "range": { "step": 1, "bounds": "full" } } },
+        doc! { "$densify": { "field": "val", "range": { "step": 1, "unit": "day", "bounds": [0, 10] } } },
+        doc! { "$densify": { "field": "val", "range": { "step": 1.5, "unit": "day", "bounds": [Bson::DateTime(DateTime::from_millis(0)), Bson::DateTime(DateTime::from_millis(86_400_000))] } } },
+    ] {
+        let error = run_pipeline(vec![doc! { "val": 0 }], &[stage]).expect_err("invalid densify");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn documents_stage_replaces_input_when_first() {
     let results = run_pipeline_ok(
         vec![doc! { "_id": 0, "ignored": true }],

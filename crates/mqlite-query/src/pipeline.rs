@@ -5,6 +5,7 @@ use std::{
 };
 
 use bson::{Bson, Document, doc};
+use chrono::{DateTime, Datelike, Duration, Months, Utc};
 use mqlite_bson::{compare_bson, lookup_path, remove_path, set_path};
 
 use crate::{
@@ -77,6 +78,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
+            "$densify" => densify_documents(current, stage_spec)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
             "$listCatalog" => list_catalog_documents(stage_index, stage_spec)?,
             "$listClusterCatalog" => list_cluster_catalog_documents(stage_index, stage_spec)?,
@@ -732,6 +734,491 @@ fn parse_merge_stage(spec: &Bson) -> Result<(), QueryError> {
         when_not_matched,
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DensifyDateUnit {
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DensifyNumericKind {
+    Integer,
+    Double,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DensifyValue {
+    Number(f64),
+    DateTime(bson::DateTime),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DensifyBounds {
+    Full,
+    Partition,
+    Explicit(DensifyValue, DensifyValue),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DensifyRange {
+    step: f64,
+    bounds: DensifyBounds,
+    unit: Option<DensifyDateUnit>,
+    numeric_kind: Option<DensifyNumericKind>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DensifySpec {
+    field: String,
+    partition_by_fields: Vec<String>,
+    range: DensifyRange,
+}
+
+fn densify_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    let spec = parse_densify_spec(spec)?;
+    let sort_spec = densify_sort_spec(&spec);
+    let mut documents = documents;
+    documents.sort_by(|left, right| compare_documents_by_sort(left, right, &sort_spec));
+
+    if spec.partition_by_fields.is_empty() {
+        densify_partition(documents, &spec, &[])
+    } else {
+        let mut results = Vec::new();
+        let mut current_partition = Vec::new();
+        let mut current_key: Option<Vec<Bson>> = None;
+
+        for document in documents {
+            let key = partition_key(&document, &spec.partition_by_fields);
+            if current_key
+                .as_ref()
+                .is_some_and(|existing| existing != &key)
+            {
+                results.extend(densify_partition(
+                    std::mem::take(&mut current_partition),
+                    &spec,
+                    current_key.as_deref().unwrap_or(&[]),
+                )?);
+            }
+            current_key = Some(key);
+            current_partition.push(document);
+        }
+
+        if !current_partition.is_empty() {
+            results.extend(densify_partition(
+                current_partition,
+                &spec,
+                current_key.as_deref().unwrap_or(&[]),
+            )?);
+        }
+
+        Ok(results)
+    }
+}
+
+fn densify_partition(
+    documents: Vec<Document>,
+    spec: &DensifySpec,
+    partition_values: &[Bson],
+) -> Result<Vec<Document>, QueryError> {
+    let non_null_values = documents
+        .iter()
+        .filter_map(|document| densify_value_from_document(document, &spec.field).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let explicit_bounds = match spec.range.bounds {
+        DensifyBounds::Full => {
+            let Some(first) = non_null_values.first().copied() else {
+                return Ok(documents);
+            };
+            let Some(last) = non_null_values.last().copied() else {
+                return Ok(documents);
+            };
+            Some((first, last))
+        }
+        DensifyBounds::Partition => {
+            let Some(first) = non_null_values.first().copied() else {
+                return Ok(documents);
+            };
+            let Some(last) = non_null_values.last().copied() else {
+                return Ok(documents);
+            };
+            Some((first, last))
+        }
+        DensifyBounds::Explicit(lower, upper) => Some((lower, upper)),
+    };
+
+    let Some((lower, upper)) = explicit_bounds else {
+        return Ok(documents);
+    };
+
+    validate_densify_runtime_type(spec, &lower)?;
+    validate_densify_runtime_type(spec, &upper)?;
+
+    let mut results = Vec::new();
+    let mut current_value = densify_sub(lower, spec.range.step, spec.range.unit)?;
+
+    for document in documents {
+        let Some(next_value) = densify_value_from_document(&document, &spec.field)? else {
+            results.push(document);
+            continue;
+        };
+
+        validate_densify_runtime_type(spec, &next_value)?;
+
+        let next_step =
+            densify_next_step_from_base(current_value, lower, spec.range.step, spec.range.unit)?;
+        results.extend(generate_densified_documents(
+            spec,
+            partition_values,
+            next_step,
+            next_value,
+            lower,
+            upper,
+        )?);
+        results.push(document);
+        current_value = next_value;
+    }
+
+    results.extend(generate_densified_documents(
+        spec,
+        partition_values,
+        densify_next_step_from_base(current_value, lower, spec.range.step, spec.range.unit)?,
+        upper,
+        lower,
+        upper,
+    )?);
+
+    Ok(results)
+}
+
+fn parse_densify_spec(spec: &Bson) -> Result<DensifySpec, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut field = None;
+    let mut partition_by_fields = Vec::new();
+    let mut range = None;
+
+    for (name, value) in document {
+        match name.as_str() {
+            "field" => field = Some(parse_field_name(value)?),
+            "partitionByFields" => {
+                partition_by_fields = value
+                    .as_array()
+                    .ok_or(QueryError::InvalidStage)?
+                    .iter()
+                    .map(parse_field_name)
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "range" => range = Some(parse_densify_range(value)?),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let field = field.ok_or(QueryError::InvalidStage)?;
+    let range = range.ok_or(QueryError::InvalidStage)?;
+
+    for partition_field in &partition_by_fields {
+        if partition_field.starts_with(&field) {
+            return Err(QueryError::InvalidStage);
+        }
+        if field.starts_with(partition_field) {
+            return Err(QueryError::InvalidStage);
+        }
+    }
+
+    if matches!(range.bounds, DensifyBounds::Partition) && partition_by_fields.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(DensifySpec {
+        field,
+        partition_by_fields,
+        range,
+    })
+}
+
+fn parse_densify_range(spec: &Bson) -> Result<DensifyRange, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut step = None;
+    let mut unit = None;
+    let mut bounds = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "step" => step = Some(parse_densify_step(value)?),
+            "unit" => {
+                unit = Some(parse_densify_date_unit(
+                    value.as_str().ok_or(QueryError::InvalidStage)?,
+                )?)
+            }
+            "bounds" => bounds = Some(parse_densify_bounds(value)?),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let (step, numeric_kind) = step.ok_or(QueryError::InvalidStage)?;
+    if step <= 0.0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    if unit.is_some() && step.fract() != 0.0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let bounds = bounds.ok_or(QueryError::InvalidStage)?;
+    match bounds {
+        DensifyBounds::Explicit(DensifyValue::Number(lower), DensifyValue::Number(upper)) => {
+            if unit.is_some() || lower > upper {
+                return Err(QueryError::InvalidStage);
+            }
+        }
+        DensifyBounds::Explicit(DensifyValue::DateTime(lower), DensifyValue::DateTime(upper)) => {
+            if unit.is_none()
+                || compare_bson(&Bson::DateTime(lower), &Bson::DateTime(upper)).is_gt()
+            {
+                return Err(QueryError::InvalidStage);
+            }
+        }
+        DensifyBounds::Explicit(_, _) => return Err(QueryError::InvalidStage),
+        DensifyBounds::Full | DensifyBounds::Partition => {}
+    }
+
+    Ok(DensifyRange {
+        step,
+        bounds,
+        unit,
+        numeric_kind,
+    })
+}
+
+fn parse_densify_step(value: &Bson) -> Result<(f64, Option<DensifyNumericKind>), QueryError> {
+    match value {
+        Bson::Int32(step) => Ok((*step as f64, Some(DensifyNumericKind::Integer))),
+        Bson::Int64(step) => Ok((*step as f64, Some(DensifyNumericKind::Integer))),
+        Bson::Double(step) => Ok((*step, Some(DensifyNumericKind::Double))),
+        Bson::Decimal128(step) => step
+            .to_string()
+            .parse::<f64>()
+            .map(|value| (value, Some(DensifyNumericKind::Double)))
+            .map_err(|_| QueryError::InvalidStage),
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn parse_densify_bounds(value: &Bson) -> Result<DensifyBounds, QueryError> {
+    match value {
+        Bson::String(bounds) if bounds == "full" => Ok(DensifyBounds::Full),
+        Bson::String(bounds) if bounds == "partition" => Ok(DensifyBounds::Partition),
+        Bson::Array(bounds) if bounds.len() == 2 => {
+            let lower = densify_value_from_bson(&bounds[0]).ok_or(QueryError::InvalidStage)?;
+            let upper = densify_value_from_bson(&bounds[1]).ok_or(QueryError::InvalidStage)?;
+            Ok(DensifyBounds::Explicit(lower, upper))
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn parse_densify_date_unit(value: &str) -> Result<DensifyDateUnit, QueryError> {
+    match value {
+        "millisecond" => Ok(DensifyDateUnit::Millisecond),
+        "second" => Ok(DensifyDateUnit::Second),
+        "minute" => Ok(DensifyDateUnit::Minute),
+        "hour" => Ok(DensifyDateUnit::Hour),
+        "day" => Ok(DensifyDateUnit::Day),
+        "week" => Ok(DensifyDateUnit::Week),
+        "month" => Ok(DensifyDateUnit::Month),
+        "quarter" => Ok(DensifyDateUnit::Quarter),
+        "year" => Ok(DensifyDateUnit::Year),
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn parse_field_name(value: &Bson) -> Result<String, QueryError> {
+    let field = value.as_str().ok_or(QueryError::InvalidStage)?;
+    if field.is_empty() || field.starts_with('$') {
+        return Err(QueryError::InvalidStage);
+    }
+    Ok(field.to_string())
+}
+
+fn partition_key(document: &Document, fields: &[String]) -> Vec<Bson> {
+    fields
+        .iter()
+        .map(|field| lookup_path(document, field).cloned().unwrap_or(Bson::Null))
+        .collect()
+}
+
+fn densify_sort_spec(spec: &DensifySpec) -> Document {
+    let mut sort_spec = Document::new();
+    for field in &spec.partition_by_fields {
+        sort_spec.insert(field, 1);
+    }
+    if !sort_spec.contains_key(&spec.field) {
+        sort_spec.insert(&spec.field, 1);
+    }
+    sort_spec
+}
+
+fn densify_value_from_document(
+    document: &Document,
+    field: &str,
+) -> Result<Option<DensifyValue>, QueryError> {
+    match lookup_path(document, field) {
+        Some(Bson::Null) | None => Ok(None),
+        Some(value) => densify_value_from_bson(value)
+            .map(Some)
+            .ok_or(QueryError::InvalidStage),
+    }
+}
+
+fn densify_value_from_bson(value: &Bson) -> Option<DensifyValue> {
+    match value {
+        Bson::Int32(value) => Some(DensifyValue::Number(*value as f64)),
+        Bson::Int64(value) => Some(DensifyValue::Number(*value as f64)),
+        Bson::Double(value) => Some(DensifyValue::Number(*value)),
+        Bson::Decimal128(value) => value.to_string().parse().ok().map(DensifyValue::Number),
+        Bson::DateTime(value) => Some(DensifyValue::DateTime(*value)),
+        _ => None,
+    }
+}
+
+fn validate_densify_runtime_type(
+    spec: &DensifySpec,
+    value: &DensifyValue,
+) -> Result<(), QueryError> {
+    match (value, spec.range.unit) {
+        (DensifyValue::DateTime(_), Some(_)) => Ok(()),
+        (DensifyValue::Number(_), None) => Ok(()),
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn densify_next_step_from_base(
+    current: DensifyValue,
+    base: DensifyValue,
+    step: f64,
+    unit: Option<DensifyDateUnit>,
+) -> Result<DensifyValue, QueryError> {
+    let mut next = base;
+    while densify_compare(next, current).is_le() {
+        next = densify_add(next, step, unit)?;
+    }
+    Ok(next)
+}
+
+fn generate_densified_documents(
+    spec: &DensifySpec,
+    partition_values: &[Bson],
+    mut value: DensifyValue,
+    stop: DensifyValue,
+    lower: DensifyValue,
+    upper: DensifyValue,
+) -> Result<Vec<Document>, QueryError> {
+    let mut generated = Vec::new();
+    while densify_compare(value, stop).is_lt() {
+        if densify_compare(value, lower).is_ge() && densify_compare(value, upper).is_lt() {
+            let mut document = Document::new();
+            for (field, partition_value) in
+                spec.partition_by_fields.iter().zip(partition_values.iter())
+            {
+                set_path(&mut document, field, partition_value.clone())
+                    .map_err(|_| QueryError::InvalidStructure)?;
+            }
+            set_path(
+                &mut document,
+                &spec.field,
+                densify_value_to_bson(value, spec.range.numeric_kind),
+            )
+            .map_err(|_| QueryError::InvalidStructure)?;
+            generated.push(document);
+        }
+        value = densify_add(value, spec.range.step, spec.range.unit)?;
+    }
+    Ok(generated)
+}
+
+fn densify_compare(left: DensifyValue, right: DensifyValue) -> std::cmp::Ordering {
+    match (left, right) {
+        (DensifyValue::Number(left), DensifyValue::Number(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (DensifyValue::DateTime(left), DensifyValue::DateTime(right)) => {
+            compare_bson(&Bson::DateTime(left), &Bson::DateTime(right))
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn densify_add(
+    value: DensifyValue,
+    step: f64,
+    unit: Option<DensifyDateUnit>,
+) -> Result<DensifyValue, QueryError> {
+    match (value, unit) {
+        (DensifyValue::Number(value), None) => Ok(DensifyValue::Number(value + step)),
+        (DensifyValue::DateTime(value), Some(unit)) => {
+            let step = step as i64;
+            let chrono_value = DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
+                .ok_or(QueryError::InvalidStage)?;
+            let next = match unit {
+                DensifyDateUnit::Millisecond => chrono_value + Duration::milliseconds(step),
+                DensifyDateUnit::Second => chrono_value + Duration::seconds(step),
+                DensifyDateUnit::Minute => chrono_value + Duration::minutes(step),
+                DensifyDateUnit::Hour => chrono_value + Duration::hours(step),
+                DensifyDateUnit::Day => chrono_value + Duration::days(step),
+                DensifyDateUnit::Week => chrono_value + Duration::weeks(step),
+                DensifyDateUnit::Month => checked_add_months(chrono_value, step)?,
+                DensifyDateUnit::Quarter => checked_add_months(chrono_value, step * 3)?,
+                DensifyDateUnit::Year => chrono_value
+                    .with_year(chrono_value.year() + step as i32)
+                    .ok_or(QueryError::InvalidStage)?,
+            };
+            Ok(DensifyValue::DateTime(bson::DateTime::from_millis(
+                next.timestamp_millis(),
+            )))
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn densify_sub(
+    value: DensifyValue,
+    step: f64,
+    unit: Option<DensifyDateUnit>,
+) -> Result<DensifyValue, QueryError> {
+    densify_add(value, -step, unit)
+}
+
+fn checked_add_months(value: DateTime<Utc>, months: i64) -> Result<DateTime<Utc>, QueryError> {
+    if months >= 0 {
+        value
+            .checked_add_months(Months::new(months as u32))
+            .ok_or(QueryError::InvalidStage)
+    } else {
+        value
+            .checked_sub_months(Months::new((-months) as u32))
+            .ok_or(QueryError::InvalidStage)
+    }
+}
+
+fn densify_value_to_bson(value: DensifyValue, numeric_kind: Option<DensifyNumericKind>) -> Bson {
+    match value {
+        DensifyValue::Number(value) => match numeric_kind.unwrap_or(DensifyNumericKind::Double) {
+            DensifyNumericKind::Integer => Bson::Int64(value as i64),
+            DensifyNumericKind::Double => Bson::Double(value),
+        },
+        DensifyValue::DateTime(value) => Bson::DateTime(value),
+    }
 }
 
 fn bucket_documents(

@@ -1279,6 +1279,92 @@ fn command_aggregate_rejects_invalid_redact_decisions() {
 }
 
 #[test]
+fn command_aggregate_supports_densify_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-densify.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"val":0},{"_id":2,"val":4},{"_id":3,"val":9}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"val":1}},{"$densify":{"field":"val","range":{"step":2,"bounds":[0,10]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "val": 0 }),
+            json!({ "val": 2 }),
+            json!({ "val": 4 }),
+            json!({ "val": 6 }),
+            json!({ "val": 8 }),
+            json!({ "val": 9 }),
+        ]
+    );
+}
+
+#[test]
+fn command_aggregate_rejects_invalid_densify_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-densify-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$densify":{"field":"val","range":{"step":1,"bounds":"partition"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_query_settings_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-query-settings.mongodb");

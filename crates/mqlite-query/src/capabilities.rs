@@ -35,6 +35,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$bucketAuto",
     "$collStats",
     "$currentOp",
+    "$densify",
     "$documents",
     "$facet",
     "$indexStats",
