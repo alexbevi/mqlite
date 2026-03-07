@@ -12,12 +12,12 @@
     ]
   },
   "query_operators": {
-    "total_upstream": 68,
-    "public_upstream": 41,
+    "total_upstream": 65,
+    "public_upstream": 38,
     "total_supported": 21,
     "public_supported": 21,
-    "total_unsupported": 47,
-    "public_unsupported": 20,
+    "total_unsupported": 44,
+    "public_unsupported": 17,
     "items": [
       {
         "name": "$_internalBucketGeoWithin",
@@ -632,23 +632,6 @@
         "validation": "rejection"
       },
       {
-        "name": "$db",
-        "internal": false,
-        "source_kinds": [
-          "pathless"
-        ],
-        "source_files": [
-          "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-        ],
-        "macro_kinds": [
-          "initializer_map"
-        ],
-        "feature_flagged": false,
-        "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
-      },
-      {
         "name": "$elemMatch",
         "internal": false,
         "source_kinds": [
@@ -800,23 +783,6 @@
         "conditional": false,
         "status": "supported",
         "validation": "positive"
-      },
-      {
-        "name": "$id",
-        "internal": false,
-        "source_kinds": [
-          "pathless"
-        ],
-        "source_files": [
-          "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-        ],
-        "macro_kinds": [
-          "initializer_map"
-        ],
-        "feature_flagged": false,
-        "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
       },
       {
         "name": "$in",
@@ -1038,23 +1004,6 @@
         "conditional": false,
         "status": "supported",
         "validation": "positive"
-      },
-      {
-        "name": "$ref",
-        "internal": false,
-        "source_kinds": [
-          "pathless"
-        ],
-        "source_files": [
-          "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-        ],
-        "macro_kinds": [
-          "initializer_map"
-        ],
-        "feature_flagged": false,
-        "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
       },
       {
         "name": "$regex",

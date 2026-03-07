@@ -553,21 +553,6 @@
       "conditional": false
     },
     {
-      "name": "$db",
-      "internal": false,
-      "source_kinds": [
-        "pathless"
-      ],
-      "source_files": [
-        "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-      ],
-      "macro_kinds": [
-        "initializer_map"
-      ],
-      "feature_flagged": false,
-      "conditional": false
-    },
-    {
       "name": "$elemMatch",
       "internal": false,
       "source_kinds": [
@@ -692,21 +677,6 @@
       "internal": false,
       "source_kinds": [
         "path_accepting"
-      ],
-      "source_files": [
-        "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-      ],
-      "macro_kinds": [
-        "initializer_map"
-      ],
-      "feature_flagged": false,
-      "conditional": false
-    },
-    {
-      "name": "$id",
-      "internal": false,
-      "source_kinds": [
-        "pathless"
       ],
       "source_files": [
         "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
@@ -899,21 +869,6 @@
     },
     {
       "name": "$or",
-      "internal": false,
-      "source_kinds": [
-        "pathless"
-      ],
-      "source_files": [
-        "../mongo/src/mongo/db/query/compiler/parsers/matcher/expression_parser.cpp"
-      ],
-      "macro_kinds": [
-        "initializer_map"
-      ],
-      "feature_flagged": false,
-      "conditional": false
-    },
-    {
-      "name": "$ref",
       "internal": false,
       "source_kinds": [
         "pathless"

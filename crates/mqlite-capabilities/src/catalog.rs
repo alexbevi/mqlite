@@ -23,6 +23,7 @@ const QUERY_OPERATOR_SOURCE: &str =
 const FIND_COMMAND_IDL: &str = "../mongo/src/mongo/db/query/find_command.idl";
 const AGGREGATE_COMMAND_IDL: &str = "../mongo/src/mongo/db/pipeline/aggregate_command.idl";
 const WRITE_OPS_IDL: &str = "../mongo/src/mongo/db/query/write_ops/write_ops.idl";
+const DBREF_PSEUDO_OPERATORS: &[&str] = &["$db", "$id", "$ref"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReferenceAnchors {
@@ -432,6 +433,7 @@ fn add_item(
 fn finalize_items(items: BTreeMap<String, CapabilityAccumulator>) -> Vec<CapabilityItem> {
     items
         .into_iter()
+        .filter(|(name, _)| !DBREF_PSEUDO_OPERATORS.contains(&name.as_str()))
         .map(|(name, entry)| CapabilityItem {
             internal: name.starts_with("$_"),
             name,
@@ -847,6 +849,12 @@ mod tests {
                 .aggregation_window_operators
                 .iter()
                 .any(|item| item.name == "$rank")
+        );
+        assert!(
+            upstream
+                .query_operators
+                .iter()
+                .all(|item| !matches!(item.name.as_str(), "$db" | "$id" | "$ref"))
         );
     }
 
