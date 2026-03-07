@@ -4,7 +4,7 @@ use std::{
 };
 
 use bson::{Bson, Document, doc};
-use mqlite_bson::{compare_documents, lookup_path_owned};
+use mqlite_bson::{compare_bson, compare_documents, lookup_path_owned};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -119,7 +119,7 @@ impl CollectionCatalog {
         validate_record_against_indexes(&self.indexes, &record.document, None)?;
         for index in self.indexes.values_mut() {
             let entry = index_entry_for_document(record.record_id, &record.document, &index.key);
-            insert_index_entry(&mut index.entries, entry);
+            insert_index_entry(&mut index.entries, entry, &index.key);
             index.rebuild_tree();
         }
         self.records.push(record);
@@ -146,7 +146,7 @@ impl CollectionCatalog {
         for index in self.indexes.values_mut() {
             index.entries.retain(|entry| entry.record_id != record_id);
             let entry = index_entry_for_document(record_id, &document, &index.key);
-            insert_index_entry(&mut index.entries, entry);
+            insert_index_entry(&mut index.entries, entry, &index.key);
             index.rebuild_tree();
         }
         self.records[position].document = document;
@@ -201,7 +201,7 @@ impl IndexCatalog {
     }
 
     pub fn scan_bounds(&self, bounds: &IndexBounds) -> Vec<u64> {
-        self.tree.scan(bounds)
+        self.tree.scan(bounds, &self.key)
     }
 }
 
@@ -237,10 +237,10 @@ impl IndexTree {
         }
     }
 
-    pub fn scan(&self, bounds: &IndexBounds) -> Vec<u64> {
+    pub fn scan(&self, bounds: &IndexBounds, key_pattern: &Document) -> Vec<u64> {
         let mut record_ids = Vec::new();
         if let Some(root) = self.root.as_deref() {
-            scan_node(root, bounds, &mut record_ids);
+            scan_node(root, bounds, key_pattern, &mut record_ids);
         }
         record_ids
     }
@@ -460,6 +460,7 @@ pub fn apply_index_specs(
             insert_index_entry(
                 &mut index.entries,
                 index_entry_for_document(record.record_id, &record.document, &index.key),
+                &index.key,
             );
         }
         index.rebuild_tree();
@@ -571,7 +572,7 @@ pub fn validate_collection_indexes(collection: &CollectionCatalog) -> Result<(),
             }
 
             if let Some(previous_entry) = previous {
-                let ordering = compare_index_entries(previous_entry, entry);
+                let ordering = compare_index_entries(previous_entry, entry, &index.key);
                 if ordering != Ordering::Less {
                     return Err(CatalogError::InvalidIndexState(format!(
                         "index `{}` entries are not strictly ordered",
@@ -579,7 +580,8 @@ pub fn validate_collection_indexes(collection: &CollectionCatalog) -> Result<(),
                     )));
                 }
                 if index.unique
-                    && compare_documents(&previous_entry.key, &entry.key) == Ordering::Equal
+                    && compare_index_keys(&previous_entry.key, &entry.key, &index.key)
+                        == Ordering::Equal
                 {
                     return Err(CatalogError::DuplicateKey(index.name.clone()));
                 }
@@ -633,15 +635,63 @@ fn index_entry_for_document(
     }
 }
 
-fn insert_index_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry) {
+fn insert_index_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry, key_pattern: &Document) {
     let position = entries
-        .binary_search_by(|existing| compare_index_entries(existing, &entry))
+        .binary_search_by(|existing| compare_index_entries(existing, &entry, key_pattern))
         .unwrap_or_else(|position| position);
     entries.insert(position, entry);
 }
 
-fn compare_index_entries(left: &IndexEntry, right: &IndexEntry) -> Ordering {
-    compare_documents(&left.key, &right.key).then_with(|| left.record_id.cmp(&right.record_id))
+fn compare_index_entries(
+    left: &IndexEntry,
+    right: &IndexEntry,
+    key_pattern: &Document,
+) -> Ordering {
+    compare_index_keys(&left.key, &right.key, key_pattern)
+        .then_with(|| left.record_id.cmp(&right.record_id))
+}
+
+fn compare_index_keys(left: &Document, right: &Document, key_pattern: &Document) -> Ordering {
+    for (field, direction) in key_pattern {
+        let left_value = left.get(field).unwrap_or(&Bson::Null);
+        let right_value = right.get(field).unwrap_or(&Bson::Null);
+        let mut ordering = compare_bson(left_value, right_value);
+        if key_direction(direction) < 0 {
+            ordering = ordering.reverse();
+        }
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    Ordering::Equal
+}
+
+fn key_direction(value: &Bson) -> i32 {
+    match value {
+        Bson::Int32(direction) => {
+            if *direction < 0 {
+                -1
+            } else {
+                1
+            }
+        }
+        Bson::Int64(direction) => {
+            if *direction < 0 {
+                -1
+            } else {
+                1
+            }
+        }
+        Bson::Double(direction) => {
+            if *direction < 0.0 {
+                -1
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
 }
 
 fn build_internal_summary(children: &[NodeSummary]) -> NodeSummary {
@@ -663,11 +713,16 @@ fn build_internal_summary(children: &[NodeSummary]) -> NodeSummary {
     }
 }
 
-fn scan_node(node: &IndexNode, bounds: &IndexBounds, record_ids: &mut Vec<u64>) {
+fn scan_node(
+    node: &IndexNode,
+    bounds: &IndexBounds,
+    key_pattern: &Document,
+    record_ids: &mut Vec<u64>,
+) {
     match node {
         IndexNode::Leaf { entries } => {
             for entry in entries {
-                if key_within_bounds(&entry.key, bounds) {
+                if key_within_bounds(&entry.key, bounds, key_pattern) {
                     record_ids.push(entry.record_id);
                 }
             }
@@ -679,47 +734,47 @@ fn scan_node(node: &IndexNode, bounds: &IndexBounds, record_ids: &mut Vec<u64>) 
             let start = bounds
                 .lower
                 .as_ref()
-                .map_or(0, |bound| child_start_index(separators, bound));
+                .map_or(0, |bound| child_start_index(separators, bound, key_pattern));
             let end = bounds
                 .upper
                 .as_ref()
                 .map_or(children.len().saturating_sub(1), |bound| {
-                    child_end_index(separators, bound)
+                    child_end_index(separators, bound, key_pattern)
                 });
             if start > end {
                 return;
             }
 
             for child in &children[start..=end] {
-                scan_node(child, bounds, record_ids);
+                scan_node(child, bounds, key_pattern, record_ids);
             }
         }
     }
 }
 
-fn child_start_index(separators: &[Document], bound: &IndexBound) -> usize {
+fn child_start_index(separators: &[Document], bound: &IndexBound, key_pattern: &Document) -> usize {
     separators.partition_point(|separator| {
-        let ordering = compare_documents(separator, &bound.key);
+        let ordering = compare_index_keys(separator, &bound.key, key_pattern);
         ordering.is_lt() || (bound.inclusive && ordering.is_eq())
     })
 }
 
-fn child_end_index(separators: &[Document], bound: &IndexBound) -> usize {
+fn child_end_index(separators: &[Document], bound: &IndexBound, key_pattern: &Document) -> usize {
     separators.partition_point(|separator| {
-        let ordering = compare_documents(separator, &bound.key);
+        let ordering = compare_index_keys(separator, &bound.key, key_pattern);
         ordering.is_lt() || (bound.inclusive && ordering.is_eq())
     })
 }
 
-fn key_within_bounds(key: &Document, bounds: &IndexBounds) -> bool {
+fn key_within_bounds(key: &Document, bounds: &IndexBounds, key_pattern: &Document) -> bool {
     if let Some(lower) = bounds.lower.as_ref() {
-        let ordering = compare_documents(key, &lower.key);
+        let ordering = compare_index_keys(key, &lower.key, key_pattern);
         if ordering.is_lt() || (!lower.inclusive && ordering.is_eq()) {
             return false;
         }
     }
     if let Some(upper) = bounds.upper.as_ref() {
-        let ordering = compare_documents(key, &upper.key);
+        let ordering = compare_index_keys(key, &upper.key, key_pattern);
         if ordering.is_gt() || (!upper.inclusive && ordering.is_eq()) {
             return false;
         }
@@ -731,7 +786,7 @@ fn key_within_bounds(key: &Document, bounds: &IndexBounds) -> bool {
 mod tests {
     use std::collections::BTreeSet;
 
-    use bson::doc;
+    use bson::{Bson, doc};
     use pretty_assertions::assert_eq;
 
     use super::{
@@ -902,6 +957,99 @@ mod tests {
         assert_eq!(record_ids.first().copied(), Some(50));
         assert_eq!(record_ids.last().copied(), Some(99));
         assert_eq!(record_ids.len(), 50);
+    }
+
+    #[test]
+    fn orders_compound_descending_index_entries_by_key_pattern() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 1,
+                document: doc! { "_id": 1, "category": "tools", "qty": 9 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 2,
+                document: doc! { "_id": 2, "category": "tools", "qty": 3 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 3,
+                document: doc! { "_id": 3, "category": "tools", "qty": 5 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 4,
+                document: doc! { "_id": 4, "category": "garden", "qty": 1 },
+            })
+            .expect("insert");
+
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "category": 1, "qty": -1 }, "name": "category_1_qty_-1" }],
+        )
+        .expect("create index");
+
+        let entries = &collection
+            .indexes
+            .get("category_1_qty_-1")
+            .expect("index")
+            .entries;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.record_id)
+                .collect::<Vec<_>>(),
+            vec![4, 1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn scans_compound_descending_bounds_in_index_order() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 1,
+                document: doc! { "_id": 1, "category": "tools", "qty": 9 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 2,
+                document: doc! { "_id": 2, "category": "tools", "qty": 3 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 3,
+                document: doc! { "_id": 3, "category": "tools", "qty": 5 },
+            })
+            .expect("insert");
+
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "category": 1, "qty": -1 }, "name": "category_1_qty_-1" }],
+        )
+        .expect("create index");
+
+        let record_ids = collection
+            .indexes
+            .get("category_1_qty_-1")
+            .expect("index")
+            .scan_bounds(&IndexBounds {
+                lower: Some(IndexBound {
+                    key: doc! { "category": "tools", "qty": Bson::MaxKey },
+                    inclusive: true,
+                }),
+                upper: Some(IndexBound {
+                    key: doc! { "category": "tools", "qty": Bson::MinKey },
+                    inclusive: true,
+                }),
+            });
+        assert_eq!(record_ids, vec![1, 3, 2]);
     }
 
     #[test]

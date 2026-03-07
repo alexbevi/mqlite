@@ -208,3 +208,120 @@ fn command_explain_reports_ixscan_for_indexed_find() {
         "sku_1"
     );
 }
+
+#[test]
+fn command_explain_reports_compound_prefix_sort_plan() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-compound-explain.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"category":1,"qty":-1},"name":"category_1_qty_-1"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"explain":{"find":"widgets","filter":{"category":"tools"},"sort":{"qty":1}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["queryPlanner"]["winningPlan"]["stage"], "IXSCAN");
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["indexName"],
+        "category_1_qty_-1"
+    );
+    assert_eq!(response["queryPlanner"]["winningPlan"]["sortCovered"], true);
+    assert_eq!(response["queryPlanner"]["winningPlan"]["scanDirection"], -1);
+}
+
+#[test]
+fn command_explain_reports_descending_compound_range_bounds() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-compound-range.mongodb");
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"category":1,"qty":-1},"name":"category_1_qty_-1"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut explain = Command::cargo_bin("mqlite").expect("binary");
+    let output = explain
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"explain":{"find":"widgets","filter":{"category":"tools","qty":{"$gt":3,"$lte":9}},"sort":{"qty":-1}}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["queryPlanner"]["winningPlan"]["stage"], "IXSCAN");
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["indexName"],
+        "category_1_qty_-1"
+    );
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["lowerBound"],
+        serde_json::json!({ "category": "tools", "qty": 9 })
+    );
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["lowerInclusive"],
+        true
+    );
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["upperBound"],
+        serde_json::json!({ "category": "tools", "qty": 3 })
+    );
+    assert_eq!(
+        response["queryPlanner"]["winningPlan"]["upperInclusive"],
+        false
+    );
+    assert_eq!(response["queryPlanner"]["winningPlan"]["matchedFields"], 2);
+    assert_eq!(response["queryPlanner"]["winningPlan"]["sortCovered"], true);
+    assert_eq!(response["queryPlanner"]["winningPlan"]["scanDirection"], 1);
+}

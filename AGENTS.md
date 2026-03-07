@@ -14,6 +14,7 @@
 - `mqlite command` is the default direct validation path before any driver patching work.
 - Reopen must validate persisted index pages against collection pages; do not silently rebuild index state from collection snapshots during load.
 - Indexed `find` planning should be directly observable through `explain`, not just inferred from behavior.
+- Compound-prefix and sort-aware index plans must match persisted index key order, including descending key parts, after checkpoint and reopen.
 
 ## Upstream Reference Anchors
 - Server generic command fields and unsupported envelope behavior are keyed off `../mongo/src/mongo/idl/generic_argument.idl`.
@@ -41,5 +42,6 @@
 - Add integration tests for broker behavior over real IPC and `OP_MSG`.
 - Add storage recovery and page-format tests whenever the file format or mutation log changes, including persisted index-page checks.
 - Add planner tests and `explain` coverage whenever index scan selection changes.
+- Add storage-level regression tests whenever index ordering semantics change so descending or compound key behavior is validated after reopen, not only in memory.
 - Add regression tests for every bug fix.
 - Preserve cross-platform behavior by keeping CI green on macOS, Linux, and Windows.

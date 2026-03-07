@@ -121,12 +121,15 @@ file:///absolute/path/to/database.mongodb?db=app
 - `distinct`
 - `aggregate`
 - Persistent `_id_` and secondary index durability across broker restarts.
-- Planner-backed single-field index scans for `find`, with `explain` reporting `IXSCAN` vs `COLLSCAN`.
+- Planner-backed `find` index scans for single-field and compound-prefix predicates, including sort-aware plans that can reverse-scan compatible indexes.
+- `explain` reports `IXSCAN` vs `COLLSCAN`, matched prefix depth, sort coverage, scan direction, and concrete lower/upper index bounds.
 
 ### Query semantics currently implemented
 - Equality and comparison matching on dotted field paths.
 - Boolean query composition with `$and` and `$or`.
 - Basic projection.
+- Compound-prefix index selection for equality prefixes and range bounds.
+- Sort-aware index planning for compatible `find` sorts, including reverse scans over descending key parts.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Aggregation stages:
   - `$match`
@@ -194,11 +197,11 @@ These are already part of the tested failure surface:
 Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
-- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, and fallback to older checkpoints when newer record or index pages are corrupted.
+- Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records and B-tree indexes, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, and reopened compound descending index order checks.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify indexed `find` plans return `IXSCAN`.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify compound-prefix, range, and sort-aware indexed `find` plans return the expected `IXSCAN` metadata.
 
 ## CLI
 
@@ -338,4 +341,4 @@ If the goal is to make `mqlite` feel closer to `sqlite3` without losing the Mong
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, and replay on open. The next storage steps are page reuse/compaction, compound-prefix and sort-aware planning, and eventually page-splitting and reuse policies that operate incrementally instead of rebuilding runtime tree state from the persisted entry set.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, compound-prefix and sort-aware `find` planning, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.

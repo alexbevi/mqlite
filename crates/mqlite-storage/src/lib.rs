@@ -1432,7 +1432,9 @@ mod tests {
     };
 
     use bson::doc;
-    use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
+    use mqlite_catalog::{
+        CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, apply_index_specs,
+    };
     use tempfile::tempdir;
 
     use super::{
@@ -1536,6 +1538,79 @@ mod tests {
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
         );
+    }
+
+    #[test]
+    fn reopens_compound_descending_indexes_in_persisted_order() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("compound-descending.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(
+                &mut collection,
+                1,
+                doc! { "_id": 1, "category": "tools", "qty": 9 },
+            );
+            insert_record(
+                &mut collection,
+                2,
+                doc! { "_id": 2, "category": "tools", "qty": 3 },
+            );
+            insert_record(
+                &mut collection,
+                3,
+                doc! { "_id": 3, "category": "tools", "qty": 5 },
+            );
+            insert_record(
+                &mut collection,
+                4,
+                doc! { "_id": 4, "category": "garden", "qty": 1 },
+            );
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "category": 1, "qty": -1 }, "name": "category_1_qty_-1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let index = collection
+            .indexes
+            .get("category_1_qty_-1")
+            .expect("compound index");
+        assert_eq!(
+            index
+                .entries
+                .iter()
+                .map(|entry| entry.record_id)
+                .collect::<Vec<_>>(),
+            vec![4, 1, 3, 2]
+        );
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "category": "tools", "qty": bson::Bson::MaxKey },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "category": "tools", "qty": bson::Bson::MinKey },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids, vec![1, 3, 2]);
     }
 
     #[test]
