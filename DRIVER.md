@@ -86,6 +86,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.collection.aggregate([{ $geoNear: { near: [0, 0], key: "loc", distanceField: "dist" } }])` performs a first-stage local geospatial scan over legacy coordinate pairs or GeoJSON points, with optional `query`, `minDistance`, `maxDistance`, `distanceMultiplier`, `includeLocs`, and spherical distance calculation
 - `db.collection.aggregate([{ $graphLookup: { from: "foreign", startWith: "$seed", connectFromField: "neighbors", connectToField: "name", as: "results" } }])` performs same-file recursive graph traversal with optional `maxDepth`, `depthField`, `restrictSearchWithMatch`, and outer-variable resolution inside nested pipelines
 - `db.collection.aggregate([{ $redact: { $cond: [{ $lte: ["$level", 2] }, "$$DESCEND", "$$PRUNE"] } }])` applies recursive redaction with `$$KEEP`, `$$PRUNE`, and `$$DESCEND`
+- `db.collection.aggregate([{ $setWindowFields: { partitionBy: "$team", sortBy: { seq: 1 }, output: { runningQty: { $sum: "$qty", window: { documents: ["unbounded", "current"] } }, dense: { $denseRank: {} } } } }])` performs local window execution with document windows, single-sort-key range windows, supported accumulator window functions, ranking functions, `$shift`, `$locf`, and `$linearFill`
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
 - Null-byte database or collection names are rejected with `InvalidNamespace`
 - TTL index metadata such as `expireAfterSeconds` is stored and returned by `listIndexes`
@@ -144,6 +145,7 @@ Any driver integration should include:
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
 - Query and aggregation smoke coverage for every currently supported operator and stage listed in `capabilities/mqlite/gap-analysis.generated.md`, rather than only broad happy-path CRUD.
+- Dedicated aggregation smoke coverage for `$setWindowFields`, including at least one supported document window, one supported range window, one ranking function, and one explicit unsupported window-function rejection.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
 - `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.

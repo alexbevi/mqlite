@@ -270,6 +270,10 @@ pub fn extract_upstream_catalog(repo_root: &Path) -> Result<UpstreamCatalog> {
 
 pub fn build_gap_analysis(upstream: &UpstreamCatalog) -> GapAnalysis {
     let support = current_support_catalog();
+    let set_window_fields_supported = support
+        .aggregation_stages
+        .iter()
+        .any(|stage| stage == "$setWindowFields");
     GapAnalysis {
         reference_anchors: upstream.reference_anchors.clone(),
         query_operators: build_gap_category(
@@ -300,8 +304,14 @@ pub fn build_gap_analysis(upstream: &UpstreamCatalog) -> GapAnalysis {
             &upstream.aggregation_window_operators,
             &support.aggregation_window_operators,
             |_item| false,
-            |_item| ValidationMode::BlockedByStage {
-                stage: "$setWindowFields".to_string(),
+            |_item| {
+                if set_window_fields_supported {
+                    ValidationMode::Rejection
+                } else {
+                    ValidationMode::BlockedByStage {
+                        stage: "$setWindowFields".to_string(),
+                    }
+                }
             },
         ),
     }
@@ -962,7 +972,7 @@ mod tests {
                 .find(|item| item.name == "$queryStats")
                 .is_some_and(|item| item.ignored)
         );
-        assert_eq!(gap.aggregation_stages.public_unsupported, 7);
+        assert_eq!(gap.aggregation_stages.public_unsupported, 2);
     }
 
     #[test]
@@ -1078,18 +1088,26 @@ mod tests {
     }
 
     #[test]
-    fn window_functions_are_explicitly_blocked_by_stage_support() {
+    fn aggregation_window_function_contracts_match_support_snapshot() {
         let repo_root = repo_root();
         let gap = load_gap_snapshot(&repo_root).expect("gap snapshot");
 
         for item in &gap.aggregation_window_operators.items {
-            assert_eq!(item.status, SupportStatus::Unsupported);
-            assert_eq!(
-                item.validation,
-                ValidationMode::BlockedByStage {
-                    stage: "$setWindowFields".to_string()
+            match item.status {
+                SupportStatus::Supported => {
+                    let (documents, pipeline) = supported_window_fixture(&item.name);
+                    run_pipeline(documents, &pipeline).expect("supported window function");
                 }
-            );
+                SupportStatus::Unsupported => {
+                    assert_eq!(item.validation, ValidationMode::Rejection);
+                    let error = run_pipeline(
+                        vec![doc! { "_id": 1, "qty": 1 }],
+                        &[unsupported_window_stage(&item.name)],
+                    )
+                    .expect_err("unsupported window function");
+                    assert!(matches!(error, QueryError::InvalidStage));
+                }
+            }
         }
     }
 
@@ -1311,6 +1329,24 @@ mod tests {
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],
             ),
+            "$setWindowFields" => (
+                vec![
+                    doc! { "_id": 1, "team": "a", "seq": 0, "qty": 1 },
+                    doc! { "_id": 2, "team": "a", "seq": 1, "qty": 2 },
+                ],
+                vec![doc! {
+                    "$setWindowFields": {
+                        "partitionBy": "$team",
+                        "sortBy": { "seq": 1 },
+                        "output": {
+                            "runningQty": {
+                                "$sum": "$qty",
+                                "window": { "documents": ["unbounded", "current"] }
+                            }
+                        }
+                    }
+                }],
+            ),
             "$sortByCount" => (
                 vec![doc! { "team": "red" }],
                 vec![doc! { "$sortByCount": "$team" }],
@@ -1434,6 +1470,155 @@ mod tests {
                 vec![doc! { "$group": { "_id": Bson::Null, "value": { "$avg": "$qty" } } }],
             ),
             other => panic!("missing supported accumulator fixture for {other}"),
+        }
+    }
+
+    fn supported_window_fixture(name: &str) -> (Vec<Document>, Vec<Document>) {
+        match name {
+            "$sum" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 2 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$sum": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$avg" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$avg": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$first" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$first": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$last" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$last": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$push" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 2 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$push": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$addToSet" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 1 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$addToSet": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$min" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 3 },
+                    doc! { "_id": 2, "seq": 2, "qty": 1 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$min": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$max" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$max": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$count" => (
+                vec![doc! { "_id": 1, "seq": 1 }, doc! { "_id": 2, "seq": 2 }],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$count": {}, "window": { "documents": ["unbounded", "current"] } } } } },
+                ],
+            ),
+            "$documentNumber" => (
+                vec![doc! { "_id": 1, "seq": 1 }, doc! { "_id": 2, "seq": 2 }],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$documentNumber": {} } } } },
+                ],
+            ),
+            "$rank" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "score": 1 },
+                    doc! { "_id": 2, "seq": 2, "score": 1 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "score": 1 }, "output": { "value": { "$rank": {} } } } },
+                ],
+            ),
+            "$denseRank" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "score": 1 },
+                    doc! { "_id": 2, "seq": 2, "score": 2 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "score": 1 }, "output": { "value": { "$denseRank": {} } } } },
+                ],
+            ),
+            "$shift" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": 2 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$shift": { "output": "$qty", "by": -1, "default": 0 } } } } },
+                ],
+            ),
+            "$locf" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": Bson::Null },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$locf": "$qty" } } } },
+                ],
+            ),
+            "$linearFill" => (
+                vec![
+                    doc! { "_id": 1, "seq": 1, "qty": 1 },
+                    doc! { "_id": 2, "seq": 2, "qty": Bson::Null },
+                    doc! { "_id": 3, "seq": 3, "qty": 3 },
+                ],
+                vec![
+                    doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "value": { "$linearFill": "$qty" } } } },
+                ],
+            ),
+            other => panic!("missing supported window fixture for {other}"),
+        }
+    }
+
+    fn unsupported_window_stage(name: &str) -> Document {
+        let mut output_spec = Document::new();
+        output_spec.insert(name.to_string(), Bson::Document(Document::new()));
+        let mut output = Document::new();
+        output.insert("value", Bson::Document(output_spec));
+        doc! {
+            "$setWindowFields": {
+                "sortBy": { "_id": 1 },
+                "output": Bson::Document(output),
+            }
         }
     }
 }

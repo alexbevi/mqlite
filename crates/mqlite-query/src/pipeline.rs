@@ -6,12 +6,15 @@ use std::{
 
 use bson::{Bson, Document, doc};
 use chrono::{DateTime, Datelike, Duration, Months, Utc};
-use mqlite_bson::{compare_bson, lookup_path, remove_path, set_path};
+use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set_path};
 
 use crate::{
     QueryError,
     capabilities::SUPPORTED_AGGREGATION_STAGES,
-    expression::{eval_expression_with_variables, integer_value, number_bson, numeric_value},
+    expression::{
+        eval_expression_with_variables, integer_value, number_bson, numeric_value,
+        validate_expression,
+    },
     filter::document_matches_with_variables,
     parse_filter,
     projection::apply_projection_with_variables,
@@ -178,6 +181,9 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 current.into_iter().take(limit.max(0) as usize).collect()
             }
             "$sample" => sample_documents(current, stage_spec)?,
+            "$setWindowFields" => {
+                set_window_fields_documents(current, stage_spec, &context.variables)?
+            }
             "$skip" => {
                 let skip = integer_value(stage_spec).ok_or(QueryError::InvalidStage)?;
                 current.into_iter().skip(skip.max(0) as usize).collect()
@@ -561,7 +567,8 @@ fn geo_near_documents(
             }
         }
 
-        let Some((location, location_bson)) = geo_point_for_document(&document, spec.key.as_deref())?
+        let Some((location, location_bson)) =
+            geo_point_for_document(&document, spec.key.as_deref())?
         else {
             continue;
         };
@@ -1984,6 +1991,1020 @@ fn fill_partition_key(
 
 fn fill_needs_value(document: &Document, field: &str) -> bool {
     matches!(lookup_path(document, field), None | Some(Bson::Null))
+}
+
+#[derive(Debug, Clone)]
+struct SetWindowFieldsStage {
+    partition_by: Option<Bson>,
+    sort_by: Option<Document>,
+    output_fields: Vec<(String, WindowOutputSpec)>,
+}
+
+#[derive(Debug, Clone)]
+struct WindowOutputSpec {
+    function: WindowFunctionSpec,
+    window: Option<WindowBounds>,
+}
+
+#[derive(Debug, Clone)]
+enum WindowFunctionSpec {
+    Accumulator {
+        accumulator: WindowAccumulatorKind,
+        expression: Bson,
+    },
+    Count,
+    Rank(WindowRankKind),
+    Shift(WindowShiftSpec),
+    Locf(Bson),
+    LinearFill(Bson),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowAccumulatorKind {
+    Sum,
+    Avg,
+    First,
+    Last,
+    Push,
+    AddToSet,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowRankKind {
+    DocumentNumber,
+    Rank,
+    DenseRank,
+}
+
+#[derive(Debug, Clone)]
+struct WindowShiftSpec {
+    output: Bson,
+    by: i64,
+    default: Option<Bson>,
+}
+
+#[derive(Debug, Clone)]
+enum WindowBounds {
+    Documents(WindowDocumentBound, WindowDocumentBound),
+    Range(WindowRangeBound, WindowRangeBound, Option<DensifyDateUnit>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowDocumentBound {
+    Unbounded,
+    Current,
+    Offset(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowRangeBound {
+    Unbounded,
+    Current,
+    Offset(f64),
+}
+
+#[derive(Debug, Clone)]
+struct WindowRow {
+    document: Document,
+    partition_key: Bson,
+    original_position: usize,
+}
+
+fn set_window_fields_documents(
+    documents: Vec<Document>,
+    spec: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Document>, QueryError> {
+    let stage = parse_set_window_fields_spec(spec)?;
+    let mut rows = documents
+        .into_iter()
+        .enumerate()
+        .map(|(original_position, document)| {
+            let partition_key = match &stage.partition_by {
+                Some(expression) => {
+                    let value = eval_expression_with_variables(&document, expression, variables)?;
+                    if matches!(value, Bson::Array(_)) {
+                        return Err(QueryError::InvalidStage);
+                    }
+                    value
+                }
+                None => Bson::Null,
+            };
+            Ok(WindowRow {
+                document,
+                partition_key,
+                original_position,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if stage.partition_by.is_some() || stage.sort_by.is_some() {
+        rows.sort_by(|left, right| compare_window_rows(left, right, &stage.sort_by));
+    }
+
+    if stage.output_fields.is_empty() {
+        return Ok(rows.into_iter().map(|row| row.document).collect());
+    }
+
+    let mut start = 0_usize;
+    while start < rows.len() {
+        let end = if stage.partition_by.is_some() {
+            window_partition_end(&rows, start)
+        } else {
+            rows.len()
+        };
+        apply_window_partition(&mut rows[start..end], &stage, variables)?;
+        start = end;
+    }
+
+    Ok(rows.into_iter().map(|row| row.document).collect())
+}
+
+fn parse_set_window_fields_spec(spec: &Bson) -> Result<SetWindowFieldsStage, QueryError> {
+    let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut partition_by = None;
+    let mut sort_by = None;
+    let mut raw_output = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "partitionBy" => {
+                validate_expression(value)?;
+                partition_by = Some(value.clone());
+            }
+            "sortBy" => {
+                let sort = value.as_document().ok_or(QueryError::InvalidStage)?.clone();
+                validate_sort_spec(&sort)?;
+                sort_by = Some(sort);
+            }
+            "output" => raw_output = Some(value.as_document().ok_or(QueryError::InvalidStage)?),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let raw_output = raw_output.ok_or(QueryError::InvalidStage)?;
+    validate_window_output_paths(raw_output)?;
+    let output_fields = raw_output
+        .iter()
+        .map(|(field, value)| {
+            parse_window_output_spec(field, value, sort_by.as_ref())
+                .map(|spec| (field.clone(), spec))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(SetWindowFieldsStage {
+        partition_by,
+        sort_by,
+        output_fields,
+    })
+}
+
+fn validate_window_output_paths(output: &Document) -> Result<(), QueryError> {
+    let mut existing = Vec::new();
+    for field in output.keys() {
+        if field.is_empty()
+            || field.starts_with('$')
+            || field.contains('\0')
+            || field
+                .split('.')
+                .any(|segment| segment.is_empty() || segment.starts_with('$'))
+        {
+            return Err(QueryError::InvalidStage);
+        }
+
+        if existing.iter().any(|prior: &String| {
+            field == prior
+                || field.starts_with(&format!("{prior}."))
+                || prior.starts_with(&format!("{field}."))
+        }) {
+            return Err(QueryError::InvalidStage);
+        }
+        existing.push(field.clone());
+    }
+
+    Ok(())
+}
+
+fn parse_window_output_spec(
+    field: &str,
+    value: &Bson,
+    sort_by: Option<&Document>,
+) -> Result<WindowOutputSpec, QueryError> {
+    if field.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = value.as_document().ok_or(QueryError::InvalidStage)?;
+    if spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let mut function = None;
+    let mut window = None;
+    for (key, value) in spec {
+        if key == "window" {
+            window = Some(parse_window_bounds(value, sort_by)?);
+            continue;
+        }
+
+        if !key.starts_with('$') || function.is_some() {
+            return Err(QueryError::InvalidStage);
+        }
+        function = Some(parse_window_function_spec(key, value, sort_by)?);
+    }
+
+    let function = function.ok_or(QueryError::InvalidStage)?;
+    match &function {
+        WindowFunctionSpec::Rank(_) | WindowFunctionSpec::Shift(_) => {
+            if window.is_some() {
+                return Err(QueryError::InvalidStage);
+            }
+        }
+        WindowFunctionSpec::Locf(_) | WindowFunctionSpec::LinearFill(_) => {
+            if window.is_some() {
+                return Err(QueryError::InvalidStage);
+            }
+        }
+        WindowFunctionSpec::Count | WindowFunctionSpec::Accumulator { .. } => {}
+    }
+
+    Ok(WindowOutputSpec { function, window })
+}
+
+fn parse_window_function_spec(
+    name: &str,
+    value: &Bson,
+    sort_by: Option<&Document>,
+) -> Result<WindowFunctionSpec, QueryError> {
+    match name {
+        "$sum" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Sum,
+                expression: value.clone(),
+            })
+        }
+        "$avg" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Avg,
+                expression: value.clone(),
+            })
+        }
+        "$first" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::First,
+                expression: value.clone(),
+            })
+        }
+        "$last" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Last,
+                expression: value.clone(),
+            })
+        }
+        "$push" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Push,
+                expression: value.clone(),
+            })
+        }
+        "$addToSet" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::AddToSet,
+                expression: value.clone(),
+            })
+        }
+        "$min" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Min,
+                expression: value.clone(),
+            })
+        }
+        "$max" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Accumulator {
+                accumulator: WindowAccumulatorKind::Max,
+                expression: value.clone(),
+            })
+        }
+        "$count" => {
+            let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+            if !document.is_empty() {
+                return Err(QueryError::InvalidStage);
+            }
+            Ok(WindowFunctionSpec::Count)
+        }
+        "$documentNumber" => {
+            require_empty_window_function_args(value, sort_by)?;
+            Ok(WindowFunctionSpec::Rank(WindowRankKind::DocumentNumber))
+        }
+        "$rank" => {
+            require_empty_window_function_args(value, sort_by)?;
+            Ok(WindowFunctionSpec::Rank(WindowRankKind::Rank))
+        }
+        "$denseRank" => {
+            require_empty_window_function_args(value, sort_by)?;
+            Ok(WindowFunctionSpec::Rank(WindowRankKind::DenseRank))
+        }
+        "$shift" => Ok(WindowFunctionSpec::Shift(parse_shift_spec(value, sort_by)?)),
+        "$locf" => {
+            validate_expression(value)?;
+            Ok(WindowFunctionSpec::Locf(value.clone()))
+        }
+        "$linearFill" => {
+            validate_expression(value)?;
+            if single_sort_field(sort_by).is_none() {
+                return Err(QueryError::InvalidStage);
+            }
+            Ok(WindowFunctionSpec::LinearFill(value.clone()))
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn require_empty_window_function_args(
+    value: &Bson,
+    sort_by: Option<&Document>,
+) -> Result<(), QueryError> {
+    let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+    if !document.is_empty() || sort_by.is_none() {
+        return Err(QueryError::InvalidStage);
+    }
+    Ok(())
+}
+
+fn parse_shift_spec(
+    value: &Bson,
+    sort_by: Option<&Document>,
+) -> Result<WindowShiftSpec, QueryError> {
+    if sort_by.is_none() {
+        return Err(QueryError::InvalidStage);
+    }
+    let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut output = None;
+    let mut by = None;
+    let mut default = None;
+
+    for (field, value) in document {
+        match field.as_str() {
+            "output" => {
+                validate_expression(value)?;
+                output = Some(value.clone());
+            }
+            "by" => by = Some(integer_value(value).ok_or(QueryError::InvalidStage)?),
+            "default" => {
+                validate_expression(value)?;
+                default = Some(value.clone());
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    Ok(WindowShiftSpec {
+        output: output.ok_or(QueryError::InvalidStage)?,
+        by: by.ok_or(QueryError::InvalidStage)?,
+        default,
+    })
+}
+
+fn parse_window_bounds(
+    value: &Bson,
+    sort_by: Option<&Document>,
+) -> Result<WindowBounds, QueryError> {
+    let document = value.as_document().ok_or(QueryError::InvalidStage)?;
+    if document.is_empty() || document.len() > 2 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    match (document.get("documents"), document.get("range")) {
+        (Some(bounds), None) if document.len() == 1 => {
+            let (lower, upper) = parse_document_window_bounds(bounds)?;
+            Ok(WindowBounds::Documents(lower, upper))
+        }
+        (None, Some(bounds)) => parse_range_window_bounds(bounds, document.get("unit"), sort_by),
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn parse_document_window_bounds(
+    value: &Bson,
+) -> Result<(WindowDocumentBound, WindowDocumentBound), QueryError> {
+    let bounds = value.as_array().ok_or(QueryError::InvalidStage)?;
+    if bounds.len() != 2 {
+        return Err(QueryError::InvalidStage);
+    }
+    let lower = parse_document_window_bound(&bounds[0])?;
+    let upper = parse_document_window_bound(&bounds[1])?;
+    if document_bound_rank(lower, true) > document_bound_rank(upper, false) {
+        return Err(QueryError::InvalidStage);
+    }
+    Ok((lower, upper))
+}
+
+fn parse_document_window_bound(value: &Bson) -> Result<WindowDocumentBound, QueryError> {
+    match value {
+        Bson::String(keyword) if keyword == "unbounded" => Ok(WindowDocumentBound::Unbounded),
+        Bson::String(keyword) if keyword == "current" => Ok(WindowDocumentBound::Current),
+        _ => integer_value(value)
+            .map(WindowDocumentBound::Offset)
+            .ok_or(QueryError::InvalidStage),
+    }
+}
+
+fn parse_range_window_bounds(
+    value: &Bson,
+    unit: Option<&Bson>,
+    sort_by: Option<&Document>,
+) -> Result<WindowBounds, QueryError> {
+    if single_sort_field(sort_by).is_none() {
+        return Err(QueryError::InvalidStage);
+    }
+    let bounds = value.as_array().ok_or(QueryError::InvalidStage)?;
+    if bounds.len() != 2 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let unit = unit
+        .map(|value| parse_densify_date_unit(value.as_str().ok_or(QueryError::InvalidStage)?))
+        .transpose()?;
+
+    let lower = parse_range_window_bound(&bounds[0], unit.is_some())?;
+    let upper = parse_range_window_bound(&bounds[1], unit.is_some())?;
+    if range_bound_rank(lower, true) > range_bound_rank(upper, false) {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(WindowBounds::Range(lower, upper, unit))
+}
+
+fn parse_range_window_bound(
+    value: &Bson,
+    integral_only: bool,
+) -> Result<WindowRangeBound, QueryError> {
+    match value {
+        Bson::String(keyword) if keyword == "unbounded" => Ok(WindowRangeBound::Unbounded),
+        Bson::String(keyword) if keyword == "current" => Ok(WindowRangeBound::Current),
+        _ if integral_only => integer_value(value)
+            .map(|value| WindowRangeBound::Offset(value as f64))
+            .ok_or(QueryError::InvalidStage),
+        _ => Ok(WindowRangeBound::Offset(numeric_value(value)?)),
+    }
+}
+
+fn document_bound_rank(bound: WindowDocumentBound, lower: bool) -> f64 {
+    match bound {
+        WindowDocumentBound::Unbounded => {
+            if lower {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        }
+        WindowDocumentBound::Current => 0.0,
+        WindowDocumentBound::Offset(value) => value as f64,
+    }
+}
+
+fn range_bound_rank(bound: WindowRangeBound, lower: bool) -> f64 {
+    match bound {
+        WindowRangeBound::Unbounded => {
+            if lower {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        }
+        WindowRangeBound::Current => 0.0,
+        WindowRangeBound::Offset(value) => value,
+    }
+}
+
+fn compare_window_rows(
+    left: &WindowRow,
+    right: &WindowRow,
+    sort_by: &Option<Document>,
+) -> std::cmp::Ordering {
+    let partition = compare_bson(&left.partition_key, &right.partition_key);
+    if partition != std::cmp::Ordering::Equal {
+        return partition;
+    }
+
+    if let Some(sort_by) = sort_by {
+        let sort = compare_documents_by_sort(&left.document, &right.document, sort_by);
+        if sort != std::cmp::Ordering::Equal {
+            return sort;
+        }
+    }
+
+    left.original_position.cmp(&right.original_position)
+}
+
+fn window_partition_end(rows: &[WindowRow], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < rows.len()
+        && compare_bson(&rows[start].partition_key, &rows[end].partition_key).is_eq()
+    {
+        end += 1;
+    }
+    end
+}
+
+fn apply_window_partition(
+    rows: &mut [WindowRow],
+    stage: &SetWindowFieldsStage,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<(), QueryError> {
+    let originals = rows
+        .iter()
+        .map(|row| row.document.clone())
+        .collect::<Vec<_>>();
+
+    for (field, output) in &stage.output_fields {
+        let values = evaluate_window_output(&originals, output, stage.sort_by.as_ref(), variables)?;
+        for (row, value) in rows.iter_mut().zip(values) {
+            set_path(&mut row.document, field, value).map_err(|_| QueryError::InvalidStructure)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn evaluate_window_output(
+    documents: &[Document],
+    output: &WindowOutputSpec,
+    sort_by: Option<&Document>,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Bson>, QueryError> {
+    match &output.function {
+        WindowFunctionSpec::Accumulator {
+            accumulator,
+            expression,
+        } => (0..documents.len())
+            .map(|index| {
+                let indices = window_indices(documents, index, output.window.as_ref(), sort_by)?;
+                evaluate_window_accumulator(
+                    documents,
+                    &indices,
+                    *accumulator,
+                    expression,
+                    variables,
+                )
+            })
+            .collect(),
+        WindowFunctionSpec::Count => (0..documents.len())
+            .map(|index| {
+                let indices = window_indices(documents, index, output.window.as_ref(), sort_by)?;
+                Ok(Bson::Int64(indices.len() as i64))
+            })
+            .collect(),
+        WindowFunctionSpec::Rank(kind) => compute_rank_values(documents, sort_by, *kind),
+        WindowFunctionSpec::Shift(spec) => compute_shift_values(documents, spec, variables),
+        WindowFunctionSpec::Locf(expression) => {
+            compute_locf_values(documents, expression, variables)
+        }
+        WindowFunctionSpec::LinearFill(expression) => {
+            compute_linear_fill_values(documents, expression, sort_by, variables)
+        }
+    }
+}
+
+fn window_indices(
+    documents: &[Document],
+    index: usize,
+    explicit_window: Option<&WindowBounds>,
+    sort_by: Option<&Document>,
+) -> Result<Vec<usize>, QueryError> {
+    let bounds = match explicit_window {
+        Some(bounds) => bounds,
+        None => {
+            if sort_by.is_some() {
+                return document_window_indices(
+                    documents.len(),
+                    index,
+                    WindowDocumentBound::Unbounded,
+                    WindowDocumentBound::Current,
+                );
+            }
+            return Ok((0..documents.len()).collect());
+        }
+    };
+
+    match bounds {
+        WindowBounds::Documents(lower, upper) => {
+            if sort_by.is_none()
+                && !matches!(
+                    (lower, upper),
+                    (
+                        WindowDocumentBound::Unbounded,
+                        WindowDocumentBound::Unbounded
+                    )
+                )
+            {
+                return Err(QueryError::InvalidStage);
+            }
+            document_window_indices(documents.len(), index, *lower, *upper)
+        }
+        WindowBounds::Range(lower, upper, unit) => {
+            range_window_indices(documents, index, sort_by, *lower, *upper, *unit)
+        }
+    }
+}
+
+fn document_window_indices(
+    len: usize,
+    index: usize,
+    lower: WindowDocumentBound,
+    upper: WindowDocumentBound,
+) -> Result<Vec<usize>, QueryError> {
+    let lower = match lower {
+        WindowDocumentBound::Unbounded => 0_i64,
+        WindowDocumentBound::Current => index as i64,
+        WindowDocumentBound::Offset(offset) => index as i64 + offset,
+    };
+    let upper = match upper {
+        WindowDocumentBound::Unbounded => len as i64 - 1,
+        WindowDocumentBound::Current => index as i64,
+        WindowDocumentBound::Offset(offset) => index as i64 + offset,
+    };
+    if upper < 0 || lower >= len as i64 {
+        return Ok(Vec::new());
+    }
+
+    let start = lower.max(0) as usize;
+    let end = upper.min(len as i64 - 1);
+    if start as i64 > end {
+        return Ok(Vec::new());
+    }
+
+    Ok((start..=end as usize).collect())
+}
+
+fn range_window_indices(
+    documents: &[Document],
+    index: usize,
+    sort_by: Option<&Document>,
+    lower: WindowRangeBound,
+    upper: WindowRangeBound,
+    unit: Option<DensifyDateUnit>,
+) -> Result<Vec<usize>, QueryError> {
+    let (field, _) = single_sort_field(sort_by).ok_or(QueryError::InvalidStage)?;
+    let current_value = lookup_path(&documents[index], field).ok_or(QueryError::InvalidStage)?;
+    let current_value = densify_value_from_bson(current_value).ok_or(QueryError::InvalidStage)?;
+
+    match (current_value, unit) {
+        (DensifyValue::Number(current), None) => {
+            let lower_value = match lower {
+                WindowRangeBound::Unbounded => None,
+                WindowRangeBound::Current => Some(current),
+                WindowRangeBound::Offset(offset) => Some(current + offset),
+            };
+            let upper_value = match upper {
+                WindowRangeBound::Unbounded => None,
+                WindowRangeBound::Current => Some(current),
+                WindowRangeBound::Offset(offset) => Some(current + offset),
+            };
+            Ok(documents
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, document)| {
+                    let value = lookup_path(document, field)
+                        .and_then(densify_value_from_bson)
+                        .and_then(|value| match value {
+                            DensifyValue::Number(value) => Some(value),
+                            DensifyValue::DateTime(_) => None,
+                        })?;
+                    let within_lower = lower_value.is_none_or(|lower| value >= lower);
+                    let within_upper = upper_value.is_none_or(|upper| value <= upper);
+                    (within_lower && within_upper).then_some(candidate_index)
+                })
+                .collect::<Vec<_>>())
+        }
+        (DensifyValue::DateTime(current), Some(unit)) => {
+            let lower_value = match lower {
+                WindowRangeBound::Unbounded => None,
+                WindowRangeBound::Current => Some(current),
+                WindowRangeBound::Offset(offset) => {
+                    let value = densify_add(DensifyValue::DateTime(current), offset, Some(unit))?;
+                    match value {
+                        DensifyValue::DateTime(value) => Some(value),
+                        DensifyValue::Number(_) => return Err(QueryError::InvalidStage),
+                    }
+                }
+            };
+            let upper_value = match upper {
+                WindowRangeBound::Unbounded => None,
+                WindowRangeBound::Current => Some(current),
+                WindowRangeBound::Offset(offset) => {
+                    let value = densify_add(DensifyValue::DateTime(current), offset, Some(unit))?;
+                    match value {
+                        DensifyValue::DateTime(value) => Some(value),
+                        DensifyValue::Number(_) => return Err(QueryError::InvalidStage),
+                    }
+                }
+            };
+            Ok(documents
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, document)| {
+                    let value = lookup_path(document, field)
+                        .and_then(densify_value_from_bson)
+                        .and_then(|value| match value {
+                            DensifyValue::DateTime(value) => Some(value),
+                            DensifyValue::Number(_) => None,
+                        })?;
+                    let within_lower = lower_value.as_ref().is_none_or(|lower| {
+                        compare_bson(&Bson::DateTime(value), &Bson::DateTime(*lower)).is_ge()
+                    });
+                    let within_upper = upper_value.as_ref().is_none_or(|upper| {
+                        compare_bson(&Bson::DateTime(value), &Bson::DateTime(*upper)).is_le()
+                    });
+                    (within_lower && within_upper).then_some(candidate_index)
+                })
+                .collect::<Vec<_>>())
+        }
+        _ => Err(QueryError::InvalidStage),
+    }
+}
+
+fn evaluate_window_accumulator(
+    documents: &[Document],
+    indices: &[usize],
+    accumulator: WindowAccumulatorKind,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Bson, QueryError> {
+    match accumulator {
+        WindowAccumulatorKind::Sum => {
+            let mut total = 0.0;
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    if let Ok(number) = numeric_value(&value) {
+                        total += number;
+                    }
+                }
+            }
+            Ok(number_bson(total))
+        }
+        WindowAccumulatorKind::Avg => {
+            let mut total = 0.0;
+            let mut count = 0_u64;
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    if let Ok(number) = numeric_value(&value) {
+                        total += number;
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                Ok(Bson::Null)
+            } else {
+                Ok(Bson::Double(total / count as f64))
+            }
+        }
+        WindowAccumulatorKind::First => match indices.first() {
+            Some(&index) => {
+                Ok(
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                        .unwrap_or(Bson::Null),
+                )
+            }
+            None => Ok(Bson::Null),
+        },
+        WindowAccumulatorKind::Last => match indices.last() {
+            Some(&index) => {
+                Ok(
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                        .unwrap_or(Bson::Null),
+                )
+            }
+            None => Ok(Bson::Null),
+        },
+        WindowAccumulatorKind::Push => {
+            let mut values = Vec::new();
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    values.push(value);
+                }
+            }
+            Ok(Bson::Array(values))
+        }
+        WindowAccumulatorKind::AddToSet => {
+            let mut values = Vec::new();
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    if !values
+                        .iter()
+                        .any(|existing| compare_bson(existing, &value).is_eq())
+                    {
+                        values.push(value);
+                    }
+                }
+            }
+            Ok(Bson::Array(values))
+        }
+        WindowAccumulatorKind::Min => {
+            let mut current = None::<Bson>;
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    match &current {
+                        Some(existing) if compare_bson(existing, &value).is_le() => {}
+                        _ => current = Some(value),
+                    }
+                }
+            }
+            Ok(current.unwrap_or(Bson::Null))
+        }
+        WindowAccumulatorKind::Max => {
+            let mut current = None::<Bson>;
+            for &index in indices {
+                if let Some(value) =
+                    eval_expression_for_window(&documents[index], expression, variables)?
+                {
+                    match &current {
+                        Some(existing) if compare_bson(existing, &value).is_ge() => {}
+                        _ => current = Some(value),
+                    }
+                }
+            }
+            Ok(current.unwrap_or(Bson::Null))
+        }
+    }
+}
+
+fn eval_expression_for_window(
+    document: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<Bson>, QueryError> {
+    match expression {
+        Bson::String(path) if path.starts_with('$') && !path.starts_with("$$") => {
+            Ok(lookup_path_owned(document, &path[1..]))
+        }
+        _ => Ok(Some(eval_expression_with_variables(
+            document, expression, variables,
+        )?)),
+    }
+}
+
+fn compute_rank_values(
+    documents: &[Document],
+    sort_by: Option<&Document>,
+    kind: WindowRankKind,
+) -> Result<Vec<Bson>, QueryError> {
+    let sort_by = sort_by.ok_or(QueryError::InvalidStage)?;
+    let mut values = Vec::with_capacity(documents.len());
+    let mut dense_rank = 1_i64;
+    let mut current_rank = 1_i64;
+
+    for index in 0..documents.len() {
+        if index > 0
+            && compare_documents_by_sort(&documents[index - 1], &documents[index], sort_by)
+                != std::cmp::Ordering::Equal
+        {
+            current_rank = index as i64 + 1;
+            dense_rank += 1;
+        }
+
+        values.push(match kind {
+            WindowRankKind::DocumentNumber => Bson::Int64(index as i64 + 1),
+            WindowRankKind::Rank => Bson::Int64(current_rank),
+            WindowRankKind::DenseRank => Bson::Int64(dense_rank),
+        });
+    }
+
+    Ok(values)
+}
+
+fn compute_shift_values(
+    documents: &[Document],
+    spec: &WindowShiftSpec,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Bson>, QueryError> {
+    (0..documents.len())
+        .map(|index| {
+            let target = index as i64 + spec.by;
+            if (0..documents.len() as i64).contains(&target) {
+                eval_expression_with_variables(&documents[target as usize], &spec.output, variables)
+            } else {
+                match &spec.default {
+                    Some(default) => {
+                        eval_expression_with_variables(&documents[index], default, variables)
+                    }
+                    None => Ok(Bson::Null),
+                }
+            }
+        })
+        .collect()
+}
+
+fn compute_locf_values(
+    documents: &[Document],
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Bson>, QueryError> {
+    let mut last = None;
+    let mut values = Vec::with_capacity(documents.len());
+
+    for document in documents {
+        let current = eval_expression_for_window(document, expression, variables)?;
+        match current {
+            Some(Bson::Null) | None => values.push(last.clone().unwrap_or(Bson::Null)),
+            Some(value) => {
+                last = Some(value.clone());
+                values.push(value);
+            }
+        }
+    }
+
+    Ok(values)
+}
+
+fn compute_linear_fill_values(
+    documents: &[Document],
+    expression: &Bson,
+    sort_by: Option<&Document>,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<Bson>, QueryError> {
+    let (sort_field, _) = single_sort_field(sort_by).ok_or(QueryError::InvalidStage)?;
+    let sort_values = documents
+        .iter()
+        .map(|document| window_sort_scalar(document, sort_field))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = documents
+        .iter()
+        .map(
+            |document| match eval_expression_for_window(document, expression, variables)? {
+                Some(Bson::Null) | None => Ok(None),
+                Some(value) => Ok(Some(numeric_value(&value)?)),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut results = Vec::with_capacity(documents.len());
+    for index in 0..documents.len() {
+        match values[index] {
+            Some(value) => results.push(number_bson(value)),
+            None => {
+                let previous = (0..index)
+                    .rev()
+                    .find_map(|candidate| values[candidate].map(|value| (candidate, value)));
+                let next = ((index + 1)..documents.len())
+                    .find_map(|candidate| values[candidate].map(|value| (candidate, value)));
+                let filled = match (previous, next) {
+                    (Some((previous_index, previous_value)), Some((next_index, next_value))) => {
+                        let previous_sort = sort_values[previous_index];
+                        let next_sort = sort_values[next_index];
+                        if (next_sort - previous_sort).abs() < f64::EPSILON {
+                            return Err(QueryError::InvalidStage);
+                        }
+                        let ratio =
+                            (sort_values[index] - previous_sort) / (next_sort - previous_sort);
+                        Some(previous_value + ((next_value - previous_value) * ratio))
+                    }
+                    _ => None,
+                };
+                results.push(filled.map(number_bson).unwrap_or(Bson::Null));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn window_sort_scalar(document: &Document, field: &str) -> Result<f64, QueryError> {
+    let value = lookup_path(document, field).ok_or(QueryError::InvalidStage)?;
+    match value {
+        Bson::DateTime(value) => Ok(value.timestamp_millis() as f64),
+        _ => numeric_value(value),
+    }
+}
+
+fn single_sort_field(sort_by: Option<&Document>) -> Option<(&str, i64)> {
+    let sort_by = sort_by?;
+    if sort_by.len() != 1 {
+        return None;
+    }
+    let (field, direction) = sort_by.iter().next()?;
+    Some((field.as_str(), integer_value(direction)?))
 }
 
 fn validate_sort_spec(sort: &Document) -> Result<(), QueryError> {

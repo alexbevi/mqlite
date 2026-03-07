@@ -1195,10 +1195,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 54,
-    "total_supported": 41,
-    "public_supported": 41,
-    "total_unsupported": 43,
-    "public_unsupported": 3,
+    "total_supported": 42,
+    "public_supported": 42,
+    "total_unsupported": 42,
+    "public_unsupported": 2,
     "public_ignored": 10,
     "items": [
       {
@@ -2637,8 +2637,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$shardedDataDistribution",
@@ -6616,10 +6616,10 @@
   "aggregation_window_operators": {
     "total_upstream": 36,
     "public_upstream": 36,
-    "total_supported": 0,
-    "public_supported": 0,
-    "total_unsupported": 36,
-    "public_unsupported": 36,
+    "total_supported": 15,
+    "public_supported": 15,
+    "total_unsupported": 21,
+    "public_unsupported": 21,
     "public_ignored": 0,
     "items": [
       {
@@ -6637,12 +6637,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$avg",
@@ -6659,12 +6655,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bottom",
@@ -6682,11 +6674,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$bottomN",
@@ -6704,11 +6692,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$concatArrays",
@@ -6726,11 +6710,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$count",
@@ -6747,12 +6727,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$covariancePop",
@@ -6770,11 +6746,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$covarianceSamp",
@@ -6792,11 +6764,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$denseRank",
@@ -6813,12 +6781,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$derivative",
@@ -6836,11 +6800,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$documentNumber",
@@ -6857,12 +6817,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$expMovingAvg",
@@ -6880,11 +6836,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$first",
@@ -6901,12 +6853,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$firstN",
@@ -6924,11 +6872,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$integral",
@@ -6946,11 +6890,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$last",
@@ -6967,12 +6907,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$lastN",
@@ -6990,11 +6926,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$linearFill",
@@ -7011,12 +6943,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$locf",
@@ -7033,12 +6961,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$max",
@@ -7055,12 +6979,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$maxN",
@@ -7078,11 +6998,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$median",
@@ -7100,11 +7016,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$mergeObjects",
@@ -7122,11 +7034,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$min",
@@ -7143,12 +7051,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$minMaxScaler",
@@ -7166,11 +7070,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$minN",
@@ -7188,11 +7088,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$percentile",
@@ -7210,11 +7106,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$push",
@@ -7231,12 +7123,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$rank",
@@ -7253,12 +7141,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$setUnion",
@@ -7276,11 +7160,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$shift",
@@ -7297,12 +7177,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$stdDevPop",
@@ -7320,11 +7196,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$stdDevSamp",
@@ -7342,11 +7214,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$sum",
@@ -7363,12 +7231,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$top",
@@ -7386,11 +7250,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       },
       {
         "name": "$topN",
@@ -7408,11 +7268,7 @@
         "conditional": false,
         "ignored": false,
         "status": "unsupported",
-        "validation": {
-          "blocked_by_stage": {
-            "stage": "$setWindowFields"
-          }
-        }
+        "validation": "rejection"
       }
     ]
   }

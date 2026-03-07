@@ -1478,6 +1478,125 @@ fn fill_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn set_window_fields_stage_supports_partitioned_document_windows() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 3, "team": "a", "seq": 2, "qty": 3 },
+            doc! { "_id": 1, "team": "a", "seq": 0, "qty": 1 },
+            doc! { "_id": 5, "team": "b", "seq": 1, "qty": 5 },
+            doc! { "_id": 2, "team": "a", "seq": 1, "qty": 2 },
+            doc! { "_id": 4, "team": "b", "seq": 0, "qty": 4 },
+        ],
+        &[doc! {
+            "$setWindowFields": {
+                "partitionBy": "$team",
+                "sortBy": { "seq": 1 },
+                "output": {
+                    "runningQty": { "$sum": "$qty", "window": { "documents": ["unbounded", "current"] } },
+                    "trailingQty": { "$sum": "$qty", "window": { "documents": [-1, "current"] } },
+                    "docNo": { "$documentNumber": {} }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 1, "team": "a", "seq": 0, "qty": 1, "runningQty": 1_i64, "trailingQty": 1_i64, "docNo": 1_i64 },
+            doc! { "_id": 2, "team": "a", "seq": 1, "qty": 2, "runningQty": 3_i64, "trailingQty": 3_i64, "docNo": 2_i64 },
+            doc! { "_id": 3, "team": "a", "seq": 2, "qty": 3, "runningQty": 6_i64, "trailingQty": 5_i64, "docNo": 3_i64 },
+            doc! { "_id": 4, "team": "b", "seq": 0, "qty": 4, "runningQty": 4_i64, "trailingQty": 4_i64, "docNo": 1_i64 },
+            doc! { "_id": 5, "team": "b", "seq": 1, "qty": 5, "runningQty": 9_i64, "trailingQty": 9_i64, "docNo": 2_i64 },
+        ]
+    );
+}
+
+#[test]
+fn set_window_fields_stage_supports_range_shift_and_rank_functions() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 1, "score": 10, "label": "a" },
+            doc! { "_id": 2, "score": 10, "label": "b" },
+            doc! { "_id": 3, "score": 11, "label": "c" },
+            doc! { "_id": 4, "score": 13, "label": "d" },
+        ],
+        &[doc! {
+            "$setWindowFields": {
+                "sortBy": { "score": 1 },
+                "output": {
+                    "nearbyCount": { "$count": {}, "window": { "range": [-1, 0] } },
+                    "prevLabel": { "$shift": { "output": "$label", "by": -1, "default": "start" } },
+                    "rank": { "$rank": {} },
+                    "dense": { "$denseRank": {} }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 1, "score": 10, "label": "a", "nearbyCount": 2_i64, "prevLabel": "start", "rank": 1_i64, "dense": 1_i64 },
+            doc! { "_id": 2, "score": 10, "label": "b", "nearbyCount": 2_i64, "prevLabel": "a", "rank": 1_i64, "dense": 1_i64 },
+            doc! { "_id": 3, "score": 11, "label": "c", "nearbyCount": 3_i64, "prevLabel": "b", "rank": 3_i64, "dense": 2_i64 },
+            doc! { "_id": 4, "score": 13, "label": "d", "nearbyCount": 1_i64, "prevLabel": "c", "rank": 4_i64, "dense": 3_i64 },
+        ]
+    );
+}
+
+#[test]
+fn set_window_fields_stage_supports_locf_and_linear_fill() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "_id": 1, "seq": 1, "carry": 1, "interp": 1 },
+            doc! { "_id": 2, "seq": 2, "carry": Bson::Null, "interp": Bson::Null },
+            doc! { "_id": 3, "seq": 3, "carry": 2, "interp": 5 },
+            doc! { "_id": 4, "seq": 4, "carry": Bson::Null, "interp": Bson::Null },
+            doc! { "_id": 5, "seq": 5, "carry": 4, "interp": 9 },
+        ],
+        &[doc! {
+            "$setWindowFields": {
+                "sortBy": { "seq": 1 },
+                "output": {
+                    "carry": { "$locf": "$carry" },
+                    "interp": { "$linearFill": "$interp" }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 1, "seq": 1, "carry": 1, "interp": 1_i64 },
+            doc! { "_id": 2, "seq": 2, "carry": 1, "interp": 3_i64 },
+            doc! { "_id": 3, "seq": 3, "carry": 2, "interp": 5_i64 },
+            doc! { "_id": 4, "seq": 4, "carry": 2, "interp": 7_i64 },
+            doc! { "_id": 5, "seq": 5, "carry": 4, "interp": 9_i64 },
+        ]
+    );
+}
+
+#[test]
+fn set_window_fields_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$setWindowFields": 1 },
+        doc! { "$setWindowFields": { "output": { "total": {} } } },
+        doc! { "$setWindowFields": { "output": { "total": { "sum": "$qty" } } } },
+        doc! { "$setWindowFields": { "output": { "rank": { "$rank": {} } } } },
+        doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "shifted": { "$shift": { "output": "$qty" } } } } },
+        doc! { "$setWindowFields": { "output": { "total": { "$sum": "$qty", "window": { "documents": ["unbounded", "current"] } } } } },
+        doc! { "$setWindowFields": { "sortBy": { "seq": 1, "qty": 1 }, "output": { "counted": { "$count": {}, "window": { "range": [-1, 1] } } } } },
+        doc! { "$setWindowFields": { "sortBy": { "seq": 1 }, "output": { "a": { "$sum": "$qty" }, "a.b": { "$sum": "$qty" } } } },
+    ] {
+        let error = run_pipeline(vec![doc! { "seq": 1, "qty": 1 }], &[stage])
+            .expect_err("invalid setWindowFields");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+}
+
+#[test]
 fn graph_lookup_stage_traverses_foreign_documents_with_depth_and_filters() {
     let resolver = StaticResolver::default().with_collection(
         "app",
@@ -1633,12 +1752,15 @@ fn geo_near_stage_supports_spherical_geojson_points() {
 fn geo_near_stage_rejects_invalid_specs() {
     for pipeline in [
         vec![doc! { "$geoNear": { "key": "loc", "distanceField": "dist" } }],
-        vec![doc! { "$project": { "loc": 1 } }, doc! { "$geoNear": { "near": [0.0, 0.0], "key": "loc", "distanceField": "dist" } }],
+        vec![
+            doc! { "$project": { "loc": 1 } },
+            doc! { "$geoNear": { "near": [0.0, 0.0], "key": "loc", "distanceField": "dist" } },
+        ],
         vec![doc! { "$geoNear": { "near": [0.0, 0.0], "key": 1, "distanceField": "dist" } }],
         vec![doc! { "$geoNear": { "near": [0.0, 0.0], "key": "loc", "distanceMultiplier": -1.0 } }],
     ] {
-        let error = run_pipeline(vec![doc! { "loc": [0.0, 0.0] }], &pipeline)
-            .expect_err("invalid geoNear");
+        let error =
+            run_pipeline(vec![doc! { "loc": [0.0, 0.0] }], &pipeline).expect_err("invalid geoNear");
         assert!(matches!(error, QueryError::InvalidStage));
     }
 }

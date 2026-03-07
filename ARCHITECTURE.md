@@ -149,6 +149,14 @@ Current cross-namespace aggregation behavior:
   - optional `pipeline` filters or reshaping on the joined documents
   - `let` variables for correlated subpipelines
   - collectionless `$documents` subpipelines when `from` is omitted
+- `$setWindowFields` executes locally over the in-memory document stream after the stage-level
+  sort and partition step, with:
+  - `partitionBy` expression partitioning
+  - `sortBy`-driven document order
+  - document windows
+  - single-sort-key numeric or date range windows
+  - supported accumulator-style window functions, ranking functions, `$shift`, `$locf`, and `$linearFill`
+  - explicit parse-time rejection for unsupported window functions
 - Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
   continue to work in nested stages.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and

@@ -1451,6 +1451,93 @@ fn command_aggregate_rejects_invalid_fill_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_set_window_fields_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-set-window-fields.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"team":"a","seq":2,"qty":3},{"team":"a","seq":0,"qty":1},{"team":"b","seq":1,"qty":5},{"team":"a","seq":1,"qty":2},{"team":"b","seq":0,"qty":4}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$setWindowFields":{"partitionBy":"$team","sortBy":{"seq":1},"output":{"runningQty":{"$sum":"$qty","window":{"documents":["unbounded","current"]}},"rank":{"$documentNumber":{}}}}},{"$project":{"_id":0,"team":1,"seq":1,"qty":1,"runningQty":1,"rank":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "team": "a", "seq": 0, "qty": 1, "runningQty": 1, "rank": 1 }),
+            json!({ "team": "a", "seq": 1, "qty": 2, "runningQty": 3, "rank": 2 }),
+            json!({ "team": "a", "seq": 2, "qty": 3, "runningQty": 6, "rank": 3 }),
+            json!({ "team": "b", "seq": 0, "qty": 4, "runningQty": 4, "rank": 1 }),
+            json!({ "team": "b", "seq": 1, "qty": 5, "runningQty": 9, "rank": 2 }),
+        ]
+    );
+}
+
+#[test]
+fn command_aggregate_rejects_invalid_set_window_fields_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-set-window-fields-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$setWindowFields":{"output":{"rank":{"$rank":{}}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_aggregate_supports_graph_lookup_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-graph-lookup.mongodb");

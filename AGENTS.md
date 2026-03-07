@@ -24,6 +24,7 @@
 - General disjunctions should prefer branch-union `OR` planning over collection scan when branch-local plans on distinct indexes are cheaper, even when the disjunction cannot collapse to one shared interval scan.
 - Plan-cache state should persist in checkpoint snapshots so compatible `find` shapes can reuse cached choices after broker restart.
 - Cross-namespace aggregation stages such as `$unionWith` and `$lookup` must resolve foreign namespaces from the same broker-owned `.mongodb` file, including collectionless `$documents` subpipelines where supported.
+- `$setWindowFields` support is a local in-memory execution path and must keep its supported window-function list explicit; unsupported window functions should fail during stage parsing instead of silently degrading.
 
 ## Upstream Reference Anchors
 - Server generic command fields and unsupported envelope behavior are keyed off `../mongo/src/mongo/idl/generic_argument.idl`.

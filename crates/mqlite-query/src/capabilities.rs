@@ -54,6 +54,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$planCacheStats",
     "$sample",
     "$sortByCount",
+    "$setWindowFields",
     "$unionWith",
     "$match",
     "$merge",
@@ -81,4 +82,20 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =
     &["$sum", "$first", "$push", "$addToSet", "$avg"];
 
-pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[];
+pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[
+    "$addToSet",
+    "$avg",
+    "$count",
+    "$denseRank",
+    "$documentNumber",
+    "$first",
+    "$last",
+    "$linearFill",
+    "$locf",
+    "$max",
+    "$min",
+    "$push",
+    "$rank",
+    "$shift",
+    "$sum",
+];

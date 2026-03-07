@@ -66,6 +66,7 @@
     "$replaceWith",
     "$sample",
     "$set",
+    "$setWindowFields",
     "$skip",
     "$sort",
     "$sortByCount",
@@ -94,5 +95,21 @@
     "$push",
     "$sum"
   ],
-  "aggregation_window_operators": []
+  "aggregation_window_operators": [
+    "$addToSet",
+    "$avg",
+    "$count",
+    "$denseRank",
+    "$documentNumber",
+    "$first",
+    "$last",
+    "$linearFill",
+    "$locf",
+    "$max",
+    "$min",
+    "$push",
+    "$rank",
+    "$shift",
+    "$sum"
+  ]
 }
