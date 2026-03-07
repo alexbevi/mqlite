@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/mqlite",
+    "crates/mqlite-bson",
+    "crates/mqlite-wire",
+    "crates/mqlite-ipc",
+    "crates/mqlite-catalog",
+    "crates/mqlite-storage",
+    "crates/mqlite-query",
+    "crates/mqlite-exec",
+    "crates/mqlite-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.87"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "=1.0.98"
+assert_cmd = "=2.0.16"
+blake3 = "=1.8.2"
+bson = { version = "=2.13.0", features = ["uuid-1"] }
+bytes = "=1.10.1"
+clap = { version = "=4.5.32", features = ["derive"] }
+fs4 = "=0.8.4"
+parking_lot = "=0.12.3"
+pretty_assertions = "=1.4.1"
+proptest = "=1.6.0"
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
+tempfile = "=3.19.1"
+thiserror = "=2.0.12"
+tokio = { version = "=1.44.2", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "=0.1.17"
+uuid = { version = "=1.16.0", features = ["serde", "v4"] }

@@ -1,0 +1,14 @@
+[package]
+name = "mqlite-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bson.workspace = true
+mqlite-bson = { path = "../mqlite-bson" }
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "mqlite-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bson.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
