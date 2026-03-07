@@ -117,7 +117,14 @@ pub fn apply_projection(
         }
     }
 
-    if include_mode.unwrap_or(true) {
+    let include_mode = include_mode.unwrap_or_else(|| {
+        projection
+            .get("_id")
+            .and_then(projection_flag)
+            .unwrap_or(true)
+    });
+
+    if include_mode {
         let mut projected = Document::new();
         let include_id = projection
             .get("_id")
@@ -710,7 +717,7 @@ mod tests {
     use bson::{Bson, doc};
     use pretty_assertions::assert_eq;
 
-    use super::{apply_update, document_matches, parse_update, run_pipeline};
+    use super::{apply_projection, apply_update, document_matches, parse_update, run_pipeline};
 
     #[test]
     fn matches_basic_filters() {
@@ -753,6 +760,15 @@ mod tests {
                 .get("enabled")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn projection_only_excludes_id() {
+        let document = doc! { "_id": 1, "sku": "abc", "qty": 5 };
+        let projected =
+            apply_projection(&document, Some(&doc! { "_id": 0 })).expect("apply projection");
+
+        assert_eq!(projected, doc! { "sku": "abc", "qty": 5 });
     }
 
     #[test]

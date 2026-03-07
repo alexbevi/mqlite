@@ -92,6 +92,6 @@ Any driver integration should include:
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
-- `explain` smoke tests so compound-prefix, range, and sort-aware `IXSCAN` selection can be validated over the file-backed broker.
+- `explain` smoke tests so compound-prefix, point-prefix, range, cost-based, and covered-projection `IXSCAN` selection can be validated over the file-backed broker, including `keysExamined` and `docsExamined`.
 - Command monitoring verification.
 - Explicit failure tests for unsupported options.

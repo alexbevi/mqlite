@@ -200,8 +200,15 @@ impl IndexCatalog {
         self.tree = IndexTree::build(&self.entries);
     }
 
+    pub fn scan_entries(&self, bounds: &IndexBounds) -> Vec<IndexEntry> {
+        self.tree.scan_entries(bounds, &self.key)
+    }
+
     pub fn scan_bounds(&self, bounds: &IndexBounds) -> Vec<u64> {
-        self.tree.scan(bounds, &self.key)
+        self.scan_entries(bounds)
+            .into_iter()
+            .map(|entry| entry.record_id)
+            .collect()
     }
 }
 
@@ -237,12 +244,12 @@ impl IndexTree {
         }
     }
 
-    pub fn scan(&self, bounds: &IndexBounds, key_pattern: &Document) -> Vec<u64> {
-        let mut record_ids = Vec::new();
+    pub fn scan_entries(&self, bounds: &IndexBounds, key_pattern: &Document) -> Vec<IndexEntry> {
+        let mut entries = Vec::new();
         if let Some(root) = self.root.as_deref() {
-            scan_node(root, bounds, key_pattern, &mut record_ids);
+            scan_node(root, bounds, key_pattern, &mut entries);
         }
-        record_ids
+        entries
     }
 }
 
@@ -717,13 +724,13 @@ fn scan_node(
     node: &IndexNode,
     bounds: &IndexBounds,
     key_pattern: &Document,
-    record_ids: &mut Vec<u64>,
+    entries_out: &mut Vec<IndexEntry>,
 ) {
     match node {
         IndexNode::Leaf { entries } => {
             for entry in entries {
                 if key_within_bounds(&entry.key, bounds, key_pattern) {
-                    record_ids.push(entry.record_id);
+                    entries_out.push(entry.clone());
                 }
             }
         }
@@ -746,7 +753,7 @@ fn scan_node(
             }
 
             for child in &children[start..=end] {
-                scan_node(child, bounds, key_pattern, record_ids);
+                scan_node(child, bounds, key_pattern, entries_out);
             }
         }
     }

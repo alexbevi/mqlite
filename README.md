@@ -121,15 +121,19 @@ file:///absolute/path/to/database.mongodb?db=app
 - `distinct`
 - `aggregate`
 - Persistent `_id_` and secondary index durability across broker restarts.
-- Planner-backed `find` index scans for single-field and compound-prefix predicates, including sort-aware plans that can reverse-scan compatible indexes.
-- `explain` reports `IXSCAN` vs `COLLSCAN`, matched prefix depth, sort coverage, scan direction, and concrete lower/upper index bounds.
+- Cost-based `find` planning that ranks collection and index scans by actual keys examined, docs examined, sort work, and projection coverage on the current collection state.
+- Planner-backed `find` index scans for single-field and compound-prefix predicates, including point-interval prefixes, sort-aware plans, and reverse scans over compatible indexes.
+- Covered projection plans when the filter, sort, and projected fields can be satisfied from index keys alone.
+- `explain` reports `IXSCAN` vs `COLLSCAN`, matched prefix depth, filter coverage, sort coverage, projection coverage, scan direction, concrete lower/upper index bounds, and keys/docs examined.
 
 ### Query semantics currently implemented
 - Equality and comparison matching on dotted field paths.
 - Boolean query composition with `$and` and `$or`.
 - Basic projection.
-- Compound-prefix index selection for equality prefixes and range bounds.
+- Compound-prefix index selection for equality prefixes, point-interval prefixes, and range bounds.
 - Sort-aware index planning for compatible `find` sorts, including reverse scans over descending key parts.
+- Cost-based index choice when multiple candidate indexes are available.
+- Covered projection execution from index keys for compatible `find` projections.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Aggregation stages:
   - `$match`
@@ -201,7 +205,7 @@ Test coverage is a release gate:
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify compound-prefix, range, and sort-aware indexed `find` plans return the expected `IXSCAN` metadata.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, broker restart tests that prove unique indexes survive checkpoint and reopen, and `explain` tests that verify compound-prefix, point-prefix, range, cost-based, and covered-projection `find` plans return the expected `IXSCAN` metadata and work counters.
 
 ## CLI
 
@@ -341,4 +345,4 @@ If the goal is to make `mqlite` feel closer to `sqlite3` without losing the Mong
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, compound-prefix and sort-aware `find` planning, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability, slotted record pages, persisted B-tree index pages, stable `RecordId`s, cost-based compound-prefix and covered-projection `find` planning, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.

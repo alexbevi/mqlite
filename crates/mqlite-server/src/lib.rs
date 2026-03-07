@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -11,10 +11,10 @@ use std::{
 
 use anyhow::Result;
 use bson::{Bson, Document, doc};
-use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned};
+use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
     CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, IndexCatalog,
-    apply_index_specs, drop_indexes_from_collection,
+    IndexEntry, apply_index_specs, drop_indexes_from_collection,
 };
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
@@ -398,10 +398,15 @@ impl Broker {
             .cloned()
             .unwrap_or_default();
         let sort = command.get_document("sort").ok().cloned();
+        let projection = command.get_document("projection").ok().cloned();
         let storage = self.storage.read();
         let winning_plan = match storage.catalog().get_collection(&database, collection_name) {
-            Ok(collection) => plan_find(collection, &filter, sort.as_ref())?,
-            Err(CatalogError::NamespaceNotFound(_, _)) => PlannedFind::CollectionScan,
+            Ok(collection) => plan_find(collection, &filter, sort.as_ref(), projection.as_ref())?,
+            Err(CatalogError::NamespaceNotFound(_, _)) => PlannedFind::CollectionScan {
+                documents: Vec::new(),
+                docs_examined: 0,
+                sort_required: sort.is_some(),
+            },
             Err(error) => return Err(error.into()),
         };
 
@@ -602,16 +607,20 @@ impl Broker {
 
         let storage = self.storage.read();
         let execution = match storage.catalog().get_collection(&database, collection) {
-            Ok(collection) => execute_find(collection, &filter, sort.as_ref())?,
+            Ok(collection) => {
+                execute_find(collection, &filter, sort.as_ref(), projection.as_ref())?
+            }
             Err(CatalogError::NamespaceNotFound(_, _)) => FindExecution {
                 documents: Vec::new(),
                 sort_covered: false,
+                projection_applied: false,
             },
             Err(error) => return Err(error.into()),
         };
         let FindExecution {
             mut documents,
             sort_covered,
+            projection_applied,
         } = execution;
 
         if let Some(sort) = sort.as_ref().filter(|_| !sort_covered) {
@@ -621,10 +630,14 @@ impl Broker {
         if limit > 0 {
             documents.truncate(limit as usize);
         }
-        let documents = documents
-            .into_iter()
-            .map(|document| apply_projection(&document, projection.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let documents = if projection_applied {
+            documents
+        } else {
+            documents
+                .into_iter()
+                .map(|document| apply_projection(&document, projection.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
 
         let cursor = self.cursors.lock().open(
             format!("{database}.{collection}"),
@@ -944,13 +957,11 @@ struct FieldBounds {
 struct IndexBoundsPlan {
     bounds: IndexBounds,
     matched_fields: usize,
-    has_range: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SortPlan {
     direction: ScanDirection,
-    matched_fields: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,35 +974,71 @@ enum ScanDirection {
 struct FindExecution {
     documents: Vec<Document>,
     sort_covered: bool,
+    projection_applied: bool,
 }
 
-type CandidatePlan = (
-    usize,
-    String,
-    Box<IndexBounds>,
-    Vec<u64>,
-    usize,
-    bool,
-    ScanDirection,
-);
+#[derive(Debug, Clone)]
+struct ProjectionRequirements {
+    dependencies: BTreeSet<String>,
+}
+
+struct FindPlanContext<'a> {
+    record_by_id: &'a BTreeMap<u64, &'a Document>,
+    filter: &'a Document,
+    filter_paths: &'a BTreeSet<String>,
+    field_bounds: &'a BTreeMap<String, FieldBounds>,
+    sort: Option<&'a Document>,
+    projection: Option<&'a Document>,
+    projection_requirements: Option<&'a ProjectionRequirements>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanCost {
+    docs_examined: usize,
+    requires_sort: bool,
+    keys_examined: usize,
+    projection_not_covered: bool,
+    collection_scan: bool,
+}
 
 #[derive(Debug, Clone)]
 enum PlannedFind {
-    CollectionScan,
+    CollectionScan {
+        documents: Vec<Document>,
+        docs_examined: usize,
+        sort_required: bool,
+    },
     IndexScan {
         index_name: String,
         bounds: Box<IndexBounds>,
-        record_ids: Vec<u64>,
+        documents: Vec<Document>,
         matched_fields: usize,
+        filter_covered: bool,
+        sort_required: bool,
         sort_covered: bool,
+        projection_covered: bool,
+        projection_applied: bool,
         scan_direction: ScanDirection,
+        keys_examined: usize,
+        docs_examined: usize,
     },
 }
 
 impl PlannedFind {
     fn to_document(&self) -> Document {
         match self {
-            PlannedFind::CollectionScan => doc! { "stage": "COLLSCAN" },
+            PlannedFind::CollectionScan {
+                docs_examined,
+                sort_required,
+                ..
+            } => doc! {
+                "stage": "COLLSCAN",
+                "keysExamined": 0_i32,
+                "docsExamined": *docs_examined as i32,
+                "requiresSort": *sort_required,
+                "filterCovered": false,
+                "projectionCovered": false,
+            },
             PlannedFind::IndexScan {
                 index_name, bounds, ..
             } => {
@@ -1009,13 +1056,20 @@ impl PlannedFind {
                 }
                 if let PlannedFind::IndexScan {
                     matched_fields,
+                    filter_covered,
+                    sort_required,
                     sort_covered,
+                    projection_covered,
                     scan_direction,
+                    keys_examined,
+                    docs_examined,
                     ..
                 } = self
                 {
                     document.insert("matchedFields", *matched_fields as i32);
+                    document.insert("filterCovered", *filter_covered);
                     document.insert("sortCovered", *sort_covered);
+                    document.insert("projectionCovered", *projection_covered);
                     document.insert(
                         "scanDirection",
                         match scan_direction {
@@ -1023,9 +1077,61 @@ impl PlannedFind {
                             ScanDirection::Backward => -1,
                         },
                     );
+                    document.insert("keysExamined", *keys_examined as i32);
+                    document.insert("docsExamined", *docs_examined as i32);
+                    document.insert("requiresSort", *sort_required);
                 }
                 document
             }
+        }
+    }
+
+    fn cost(&self) -> PlanCost {
+        match self {
+            PlannedFind::CollectionScan {
+                docs_examined,
+                sort_required,
+                ..
+            } => PlanCost {
+                docs_examined: *docs_examined,
+                requires_sort: *sort_required,
+                keys_examined: 0,
+                projection_not_covered: true,
+                collection_scan: true,
+            },
+            PlannedFind::IndexScan {
+                sort_required,
+                projection_covered,
+                keys_examined,
+                docs_examined,
+                ..
+            } => PlanCost {
+                docs_examined: *docs_examined,
+                requires_sort: *sort_required,
+                keys_examined: *keys_examined,
+                projection_not_covered: !*projection_covered,
+                collection_scan: false,
+            },
+        }
+    }
+
+    fn into_execution(self) -> FindExecution {
+        match self {
+            PlannedFind::CollectionScan { documents, .. } => FindExecution {
+                documents,
+                sort_covered: false,
+                projection_applied: false,
+            },
+            PlannedFind::IndexScan {
+                documents,
+                sort_covered,
+                projection_applied,
+                ..
+            } => FindExecution {
+                documents,
+                sort_covered,
+                projection_applied,
+            },
         }
     }
 }
@@ -1034,151 +1140,191 @@ fn execute_find(
     collection: &CollectionCatalog,
     filter: &Document,
     sort: Option<&Document>,
+    projection: Option<&Document>,
 ) -> Result<FindExecution, CommandError> {
-    let record_by_id = collection
-        .records
-        .iter()
-        .map(|record| (record.record_id, &record.document))
-        .collect::<std::collections::BTreeMap<_, _>>();
-
-    let planned = plan_find(collection, filter, sort)?;
-    let sort_covered = matches!(
-        &planned,
-        PlannedFind::IndexScan {
-            sort_covered: true,
-            ..
-        }
-    );
-    let documents = match planned {
-        PlannedFind::CollectionScan => FindExecution {
-            documents: collection.documents(),
-            sort_covered: false,
-        },
-        PlannedFind::IndexScan {
-            record_ids,
-            sort_covered,
-            ..
-        } => FindExecution {
-            documents: record_ids
-                .into_iter()
-                .filter_map(|record_id| record_by_id.get(&record_id).cloned().cloned())
-                .collect(),
-            sort_covered,
-        },
-    };
-
-    let documents = documents
-        .documents
-        .into_iter()
-        .filter(|document| document_matches(document, filter).unwrap_or(false))
-        .collect::<Vec<_>>();
-
-    Ok(FindExecution {
-        documents,
-        sort_covered,
-    })
+    Ok(plan_find(collection, filter, sort, projection)?.into_execution())
 }
 
 fn plan_find(
     collection: &CollectionCatalog,
     filter: &Document,
     sort: Option<&Document>,
+    projection: Option<&Document>,
 ) -> Result<PlannedFind, CommandError> {
     let expression = parse_filter(filter)?;
-    let field_bounds = if filter.is_empty() {
-        Some(std::collections::BTreeMap::new())
-    } else {
-        extract_field_bounds(&expression)
-    };
-    let Some(field_bounds) = field_bounds else {
-        return Ok(PlannedFind::CollectionScan);
+    let field_bounds = extract_field_bounds(&expression).unwrap_or_default();
+    let filter_paths = collect_match_paths(&expression);
+    let projection_requirements = analyze_projection_requirements(projection)?;
+    let record_by_id = collection
+        .records
+        .iter()
+        .map(|record| (record.record_id, &record.document))
+        .collect::<BTreeMap<_, _>>();
+    let context = FindPlanContext {
+        record_by_id: &record_by_id,
+        filter,
+        filter_paths: &filter_paths,
+        field_bounds: &field_bounds,
+        sort,
+        projection,
+        projection_requirements: projection_requirements.as_ref(),
     };
 
-    let mut best_plan: Option<CandidatePlan> = None;
+    let mut best_plan = plan_collection_scan(collection, filter, sort)?;
     for index in collection.indexes.values() {
-        let filter_plan = build_index_bounds(index, &field_bounds);
-        let sort_plan = analyze_sort(index, &field_bounds, sort);
-        if filter_plan.is_none() && sort_plan.is_none() {
-            continue;
-        }
-
-        let bounds = filter_plan
-            .as_ref()
-            .map(|plan| plan.bounds.clone())
-            .unwrap_or(IndexBounds {
-                lower: None,
-                upper: None,
-            });
-        let mut record_ids = index.scan_bounds(&bounds);
-        let scan_direction = sort_plan
-            .map(|plan| plan.direction)
-            .unwrap_or(ScanDirection::Forward);
-        if scan_direction == ScanDirection::Backward {
-            record_ids.reverse();
-        }
-
-        let matched_fields = filter_plan
-            .as_ref()
-            .map(|plan| plan.matched_fields)
-            .unwrap_or(0);
-        let sort_matched = sort_plan.map(|plan| plan.matched_fields).unwrap_or(0);
-        let sort_covered = sort_plan.is_some();
-        let score = matched_fields * 100
-            + sort_matched * 10
-            + usize::from(sort_covered) * 5
-            + filter_plan
-                .as_ref()
-                .map(|plan| usize::from(!plan.has_range))
-                .unwrap_or(0);
-
-        let replace = match &best_plan {
-            Some((best_score, _, _, best_ids, best_matched_fields, best_sort_covered, _)) => {
-                score > *best_score
-                    || (score == *best_score && matched_fields > *best_matched_fields)
-                    || (score == *best_score && sort_covered && !*best_sort_covered)
-                    || (score == *best_score && record_ids.len() < best_ids.len())
+        if let Some(candidate) = evaluate_index_plan(&context, index)? {
+            if candidate.cost() < best_plan.cost() {
+                best_plan = candidate;
             }
-            None => true,
-        };
-        if replace {
-            best_plan = Some((
-                score,
-                index.name.clone(),
-                Box::new(bounds),
-                record_ids,
-                matched_fields,
-                sort_covered,
-                scan_direction,
-            ));
         }
     }
 
-    Ok(match best_plan {
-        Some((_, index_name, bounds, record_ids, matched_fields, sort_covered, scan_direction)) => {
-            PlannedFind::IndexScan {
-                index_name,
-                bounds,
-                record_ids,
-                matched_fields,
-                sort_covered,
-                scan_direction,
-            }
-        }
-        None => PlannedFind::CollectionScan,
+    Ok(best_plan)
+}
+
+fn plan_collection_scan(
+    collection: &CollectionCatalog,
+    filter: &Document,
+    sort: Option<&Document>,
+) -> Result<PlannedFind, CommandError> {
+    let documents = collection
+        .records
+        .iter()
+        .map(|record| {
+            document_matches(&record.document, filter)
+                .map(|matches| (record.document.clone(), matches))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(document, matches)| matches.then_some(document))
+        .collect::<Vec<_>>();
+    Ok(PlannedFind::CollectionScan {
+        documents,
+        docs_examined: collection.records.len(),
+        sort_required: sort.is_some(),
     })
 }
 
-fn extract_field_bounds(
-    expression: &MatchExpr,
-) -> Option<std::collections::BTreeMap<String, FieldBounds>> {
-    let mut field_bounds = std::collections::BTreeMap::new();
+fn evaluate_index_plan(
+    context: &FindPlanContext<'_>,
+    index: &IndexCatalog,
+) -> Result<Option<PlannedFind>, CommandError> {
+    let filter_plan = build_index_bounds(index, context.field_bounds);
+    let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
+    let index_fields = index.key.keys().cloned().collect::<BTreeSet<_>>();
+    let filter_supported = !context.filter.is_empty()
+        && context
+            .filter_paths
+            .iter()
+            .all(|path| index_fields.contains(path));
+    let projection_supported = context
+        .projection_requirements
+        .filter(|requirements| {
+            requirements
+                .dependencies
+                .iter()
+                .all(|path| index_fields.contains(path))
+        })
+        .filter(|_| context.sort.is_none() || sort_plan.is_some());
+
+    if filter_plan.is_none()
+        && sort_plan.is_none()
+        && !filter_supported
+        && projection_supported.is_none()
+    {
+        return Ok(None);
+    }
+
+    let bounds = filter_plan
+        .as_ref()
+        .map(|plan| plan.bounds.clone())
+        .unwrap_or(IndexBounds {
+            lower: None,
+            upper: None,
+        });
+    let mut entries = index.scan_entries(&bounds);
+    let scan_direction = sort_plan
+        .map(|plan| plan.direction)
+        .unwrap_or(ScanDirection::Forward);
+    if scan_direction == ScanDirection::Backward {
+        entries.reverse();
+    }
+
+    let matched_fields = filter_plan
+        .as_ref()
+        .map(|plan| plan.matched_fields)
+        .unwrap_or(0);
+    let keys_examined = entries.len();
+    let mut docs_examined = 0_usize;
+    let mut documents = Vec::new();
+    let mut filter_covered = filter_supported;
+    let mut projection_covered = projection_supported.is_some();
+
+    for entry in entries {
+        let index_document = materialize_index_document(&entry)?;
+        let index_can_filter = filter_supported && entry_covers_paths(&entry, context.filter_paths);
+        let mut fetched = None;
+        let matches = if context.filter.is_empty() {
+            true
+        } else if index_can_filter {
+            document_matches(&index_document, context.filter)?
+        } else {
+            filter_covered = false;
+            let document = fetch_record_document(context.record_by_id, entry.record_id)?;
+            docs_examined += 1;
+            let is_match = document_matches(&document, context.filter)?;
+            fetched = Some(document);
+            is_match
+        };
+        if !matches {
+            continue;
+        }
+
+        let can_project_from_index = projection_supported
+            .is_some_and(|requirements| entry_covers_paths(&entry, &requirements.dependencies));
+        if projection_supported.is_some() && !can_project_from_index {
+            projection_covered = false;
+        }
+
+        let document = if can_project_from_index {
+            apply_projection(&index_document, context.projection)?
+        } else {
+            match fetched {
+                Some(document) => document,
+                None => {
+                    docs_examined += 1;
+                    fetch_record_document(context.record_by_id, entry.record_id)?
+                }
+            }
+        };
+        documents.push(document);
+    }
+
+    Ok(Some(PlannedFind::IndexScan {
+        index_name: index.name.clone(),
+        bounds: Box::new(bounds),
+        documents,
+        matched_fields,
+        filter_covered,
+        sort_required: context.sort.is_some() && sort_plan.is_none(),
+        sort_covered: sort_plan.is_some(),
+        projection_covered,
+        projection_applied: projection_covered,
+        scan_direction,
+        keys_examined,
+        docs_examined,
+    }))
+}
+
+fn extract_field_bounds(expression: &MatchExpr) -> Option<BTreeMap<String, FieldBounds>> {
+    let mut field_bounds = BTreeMap::new();
     collect_field_bounds(expression, &mut field_bounds)?;
     (!field_bounds.is_empty()).then_some(field_bounds)
 }
 
 fn collect_field_bounds(
     expression: &MatchExpr,
-    field_bounds: &mut std::collections::BTreeMap<String, FieldBounds>,
+    field_bounds: &mut BTreeMap<String, FieldBounds>,
 ) -> Option<()> {
     match expression {
         MatchExpr::And(items) => {
@@ -1230,9 +1376,156 @@ fn collect_field_bounds(
     }
 }
 
+fn collect_match_paths(expression: &MatchExpr) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    collect_match_paths_into(expression, &mut paths);
+    paths
+}
+
+fn collect_match_paths_into(expression: &MatchExpr, paths: &mut BTreeSet<String>) {
+    match expression {
+        MatchExpr::And(items) | MatchExpr::Or(items) => {
+            for item in items {
+                collect_match_paths_into(item, paths);
+            }
+        }
+        MatchExpr::Eq { path, .. }
+        | MatchExpr::Ne { path, .. }
+        | MatchExpr::Gt { path, .. }
+        | MatchExpr::Gte { path, .. }
+        | MatchExpr::Lt { path, .. }
+        | MatchExpr::Lte { path, .. }
+        | MatchExpr::In { path, .. }
+        | MatchExpr::Exists { path, .. } => {
+            paths.insert(path.clone());
+        }
+    }
+}
+
+fn analyze_projection_requirements(
+    projection: Option<&Document>,
+) -> Result<Option<ProjectionRequirements>, QueryError> {
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+    if !projection_include_mode(projection)? {
+        return Ok(None);
+    }
+
+    let mut dependencies = BTreeSet::new();
+    let include_id = projection
+        .get("_id")
+        .and_then(projection_flag)
+        .unwrap_or(true);
+    if include_id {
+        dependencies.insert("_id".to_string());
+    }
+
+    for (field, value) in projection {
+        if field == "_id" {
+            continue;
+        }
+        match projection_flag(value) {
+            Some(true) => {
+                dependencies.insert(field.clone());
+            }
+            Some(false) => {}
+            None => collect_expression_dependencies(value, &mut dependencies),
+        }
+    }
+
+    Ok(Some(ProjectionRequirements { dependencies }))
+}
+
+fn projection_include_mode(projection: &Document) -> Result<bool, QueryError> {
+    let mut include_mode = None;
+    for (field, value) in projection {
+        if field == "_id" {
+            continue;
+        }
+        if let Some(flag) = projection_flag(value) {
+            include_mode = match include_mode {
+                None => Some(flag),
+                Some(existing) if existing == flag => Some(existing),
+                Some(_) => return Err(QueryError::MixedProjection),
+            };
+        } else {
+            include_mode = Some(true);
+        }
+    }
+
+    Ok(include_mode.unwrap_or_else(|| {
+        projection
+            .get("_id")
+            .and_then(projection_flag)
+            .unwrap_or(true)
+    }))
+}
+
+fn projection_flag(value: &Bson) -> Option<bool> {
+    match value {
+        Bson::Boolean(value) => Some(*value),
+        Bson::Int32(value) => Some(*value != 0),
+        Bson::Int64(value) => Some(*value != 0),
+        _ => None,
+    }
+}
+
+fn collect_expression_dependencies(expression: &Bson, dependencies: &mut BTreeSet<String>) {
+    match expression {
+        Bson::String(path) if path.starts_with('$') => {
+            dependencies.insert(path[1..].to_string());
+        }
+        Bson::Document(spec) if spec.len() == 1 && spec.contains_key("$literal") => {}
+        Bson::Document(spec) => {
+            for value in spec.values() {
+                collect_expression_dependencies(value, dependencies);
+            }
+        }
+        Bson::Array(items) => {
+            for item in items {
+                collect_expression_dependencies(item, dependencies);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn entry_covers_paths(entry: &IndexEntry, paths: &BTreeSet<String>) -> bool {
+    paths.iter().all(|path| {
+        entry
+            .key
+            .get(path)
+            .is_some_and(|value| !matches!(value, Bson::Null))
+    })
+}
+
+fn materialize_index_document(entry: &IndexEntry) -> Result<Document, CommandError> {
+    let mut document = Document::new();
+    for (field, value) in &entry.key {
+        if matches!(value, Bson::Null) {
+            continue;
+        }
+        set_path(&mut document, field, value.clone()).map_err(|_| {
+            CommandError::new(2, "BadValue", format!("invalid index key path `{field}`"))
+        })?;
+    }
+    Ok(document)
+}
+
+fn fetch_record_document(
+    record_by_id: &BTreeMap<u64, &Document>,
+    record_id: u64,
+) -> Result<Document, CommandError> {
+    record_by_id
+        .get(&record_id)
+        .map(|document| (*document).clone())
+        .ok_or_else(|| CommandError::new(8, "UnknownError", "missing record for index entry"))
+}
+
 fn build_index_bounds(
     index: &IndexCatalog,
-    field_bounds: &std::collections::BTreeMap<String, FieldBounds>,
+    field_bounds: &BTreeMap<String, FieldBounds>,
 ) -> Option<IndexBoundsPlan> {
     let key_fields = index
         .key
@@ -1246,8 +1539,8 @@ fn build_index_bounds(
             break;
         };
 
-        if let Some(value) = bounds.eq.as_ref() {
-            equality_prefix.push((field.clone(), value.clone()));
+        if let Some(value) = point_value(bounds) {
+            equality_prefix.push((field.clone(), value));
             continue;
         }
 
@@ -1277,7 +1570,6 @@ fn build_index_bounds(
             return Some(IndexBoundsPlan {
                 bounds: IndexBounds { lower, upper },
                 matched_fields: equality_prefix.len() + 1,
-                has_range: true,
             });
         }
 
@@ -1300,29 +1592,22 @@ fn build_index_bounds(
             }),
         },
         matched_fields: equality_prefix.len(),
-        has_range: false,
     })
 }
 
 fn analyze_sort(
     index: &IndexCatalog,
-    field_bounds: &std::collections::BTreeMap<String, FieldBounds>,
+    field_bounds: &BTreeMap<String, FieldBounds>,
     sort: Option<&Document>,
 ) -> Option<SortPlan> {
     let sort = sort.filter(|sort| !sort.is_empty())?;
     let effective_sort = sort
         .iter()
-        .filter(|(field, _)| {
-            field_bounds
-                .get(*field)
-                .and_then(|bounds| bounds.eq.as_ref())
-                .is_none()
-        })
+        .filter(|(field, _)| field_bounds.get(*field).and_then(point_value).is_none())
         .collect::<Vec<_>>();
     if effective_sort.is_empty() {
         return Some(SortPlan {
             direction: ScanDirection::Forward,
-            matched_fields: 0,
         });
     }
 
@@ -1333,12 +1618,7 @@ fn analyze_sort(
         .collect::<Option<Vec<_>>>()?;
     let start = index_fields
         .iter()
-        .take_while(|(field, _)| {
-            field_bounds
-                .get(field)
-                .and_then(|bounds| bounds.eq.as_ref())
-                .is_some()
-        })
+        .take_while(|(field, _)| field_bounds.get(field).and_then(point_value).is_some())
         .count();
 
     if index_fields.len() < start + effective_sort.len() {
@@ -1361,13 +1641,11 @@ fn analyze_sort(
     if direct {
         return Some(SortPlan {
             direction: ScanDirection::Forward,
-            matched_fields: effective_sort.len(),
         });
     }
     if reverse {
         return Some(SortPlan {
             direction: ScanDirection::Backward,
-            matched_fields: effective_sort.len(),
         });
     }
     None
@@ -1447,6 +1725,19 @@ fn trailing_fill_value(direction: i32, is_lower_bound: bool) -> Bson {
         (false, false) => Bson::MaxKey,
         (true, true) => Bson::MaxKey,
         (true, false) => Bson::MinKey,
+    }
+}
+
+fn point_value(bounds: &FieldBounds) -> Option<Bson> {
+    if let Some(value) = bounds.eq.as_ref() {
+        return Some(value.clone());
+    }
+
+    match (&bounds.lower, &bounds.upper) {
+        (Some((lower, true)), Some((upper, true))) if compare_bson(lower, upper).is_eq() => {
+            Some(lower.clone())
+        }
+        _ => None,
     }
 }
 
@@ -2042,6 +2333,279 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(quantities, vec![9, 5]);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_prefers_lower_cost_index_over_wider_compound_index() {
+        let (serve_task, _temp_dir, manifest) = start_broker("cost-based.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "category": 1, "status": 1 }, "name": "category_1_status_1" },
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let mut documents = Vec::new();
+        for value in 0..40_i32 {
+            documents.push(doc! {
+                "_id": value,
+                "category": "tools",
+                "status": "active",
+                "sku": format!("sku-{value:03}"),
+            });
+        }
+        documents.push(doc! {
+            "_id": 100,
+            "category": "tools",
+            "status": "active",
+            "sku": "target",
+        });
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": documents,
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": {
+                        "category": "tools",
+                        "status": "active",
+                        "sku": "target"
+                    }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert_eq!(winning_plan.get_str("indexName").expect("index"), "sku_1");
+        assert_eq!(winning_plan.get_i32("keysExamined").expect("keys"), 1);
+        assert_eq!(winning_plan.get_i32("docsExamined").expect("docs"), 1);
+        assert!(
+            !winning_plan
+                .get_bool("filterCovered")
+                .expect("filter covered")
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_uses_projection_covered_index_scan() {
+        let (serve_task, _temp_dir, manifest) = start_broker("projection-covered.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "category": 1, "qty": 1, "_id": 1 }, "name": "category_1_qty_1_id_1" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "category": "tools", "qty": 3, "secret": "alpha" },
+                    { "_id": 2, "category": "tools", "qty": 5, "secret": "beta" },
+                    { "_id": 3, "category": "garden", "qty": 1, "secret": "gamma" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": { "category": "tools" },
+                    "projection": { "category": 1, "qty": 1, "_id": 1 },
+                    "sort": { "qty": 1 }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert_eq!(
+            winning_plan.get_str("indexName").expect("index"),
+            "category_1_qty_1_id_1"
+        );
+        assert!(
+            winning_plan
+                .get_bool("filterCovered")
+                .expect("filter covered")
+        );
+        assert!(
+            winning_plan
+                .get_bool("projectionCovered")
+                .expect("projection covered")
+        );
+        assert!(winning_plan.get_bool("sortCovered").expect("sort covered"));
+        assert_eq!(winning_plan.get_i32("docsExamined").expect("docs"), 0);
+
+        let find = send_command(
+            &mut stream,
+            doc! {
+                "find": "widgets",
+                "filter": { "category": "tools" },
+                "projection": { "category": 1, "qty": 1, "_id": 1 },
+                "sort": { "qty": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("first batch");
+        assert_eq!(
+            first_batch
+                .iter()
+                .map(|value| {
+                    value
+                        .as_document()
+                        .expect("document")
+                        .get_i32("qty")
+                        .expect("qty")
+                })
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+        assert!(first_batch.iter().all(|value| {
+            value
+                .as_document()
+                .expect("document")
+                .get("secret")
+                .is_none()
+        }));
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_uses_point_interval_as_prefix_for_suffix_range_and_sort() {
+        let (serve_task, _temp_dir, manifest) = start_broker("point-prefix.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "category": 1, "qty": 1, "sku": 1 }, "name": "category_1_qty_1_sku_1" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "find": "widgets",
+                    "filter": {
+                        "category": "tools",
+                        "qty": { "$gte": 5, "$lte": 5 },
+                        "sku": { "$gt": "b" }
+                    },
+                    "sort": { "sku": 1 }
+                },
+                "$db": "app"
+            },
+        )
+        .await;
+        let winning_plan = explain
+            .get_document("queryPlanner")
+            .expect("query planner")
+            .get_document("winningPlan")
+            .expect("winning plan");
+        assert_eq!(winning_plan.get_str("stage").expect("stage"), "IXSCAN");
+        assert_eq!(
+            winning_plan.get_str("indexName").expect("index"),
+            "category_1_qty_1_sku_1"
+        );
+        assert_eq!(winning_plan.get_i32("matchedFields").expect("matched"), 3);
+        assert!(winning_plan.get_bool("sortCovered").expect("sort covered"));
+        assert_eq!(
+            winning_plan.get_document("lowerBound").expect("lower"),
+            &doc! { "category": "tools", "qty": 5, "sku": "b" }
+        );
+        assert!(
+            !winning_plan
+                .get_bool("lowerInclusive")
+                .expect("lower inclusive")
+        );
+        assert_eq!(
+            winning_plan.get_document("upperBound").expect("upper"),
+            &doc! { "category": "tools", "qty": 5, "sku": Bson::MaxKey }
+        );
+        assert!(
+            winning_plan
+                .get_bool("upperInclusive")
+                .expect("upper inclusive")
+        );
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
