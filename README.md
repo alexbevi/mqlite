@@ -152,6 +152,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `count`
 - `distinct`
 - `aggregate`
+- `listCollections` on a missing database returns an empty cursor for driver setup and cleanup flows.
 - Collectionless `db.aggregate([{ $currentOp: { localOps: true } }])` compatibility on `admin`, returning the in-flight aggregate command for driver CRUD coverage.
 - Collection-backed aggregation with a trailing `$out` stage, replacing the target collection and returning an empty cursor.
 - Persistent `_id_` and secondary index durability across broker restarts.
@@ -182,6 +183,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$currentOp`
   - `$lookup`
   - `$indexStats`
+  - `$planCacheStats`
   - `$sample`
   - `$sortByCount`
   - `$unionWith`
@@ -207,6 +209,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.
 - Collection-backed `$indexStats` metadata aggregation as a first stage, returning local index specs plus zeroed access counters for file-backed namespaces.
+- Collection-backed `$planCacheStats` metadata aggregation as a first stage, returning the local persisted per-namespace plan cache entries for `mqlite` query planning.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
 ## Unsupported Features

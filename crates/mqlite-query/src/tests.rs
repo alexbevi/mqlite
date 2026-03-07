@@ -1945,6 +1945,46 @@ fn index_stats_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn plan_cache_stats_stage_reports_synthetic_cache_entries() {
+    let results = run_pipeline_ok(Vec::new(), &[doc! { "$planCacheStats": {} }]);
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "namespace": "app.synthetic",
+            "filterShape": "{\"qty\":{\"$gte\":\"?\"}}",
+            "sortShape": "{}",
+            "projectionShape": "{}",
+            "sequence": 1_i64,
+            "cachedPlan": { "type": "collectionScan" },
+            "host": "mqlite",
+        }]
+    );
+}
+
+#[test]
+fn plan_cache_stats_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$planCacheStats": 1 },
+        doc! { "$planCacheStats": { "allHosts": true } },
+        doc! { "$planCacheStats": { "unknown": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$planCacheStats": {} },
+        ],
+    )
+    .expect_err("$planCacheStats should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn replace_root_errors_when_new_root_is_not_a_document() {
     let error = run_pipeline(
         vec![doc! { "value": 5 }],

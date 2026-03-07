@@ -39,6 +39,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$facet",
     "$indexStats",
     "$lookup",
+    "$planCacheStats",
     "$sample",
     "$sortByCount",
     "$unionWith",

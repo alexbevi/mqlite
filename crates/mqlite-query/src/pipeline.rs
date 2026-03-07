@@ -77,6 +77,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$collStats" => coll_stats_documents(current, stage_index, stage_spec)?,
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
+            "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -1107,6 +1108,30 @@ fn index_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document
             "ops": 0_i64,
             "since": bson::DateTime::from_millis(0),
         },
+        "host": "mqlite",
+    }])
+}
+
+fn plan_cache_stats_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    match spec.get("allHosts") {
+        None if spec.is_empty() => {}
+        Some(Bson::Boolean(false)) if spec.len() == 1 => {}
+        Some(Bson::Boolean(true)) if spec.len() == 1 => return Err(QueryError::InvalidStage),
+        _ => return Err(QueryError::InvalidStage),
+    }
+
+    Ok(vec![doc! {
+        "namespace": "app.synthetic",
+        "filterShape": "{\"qty\":{\"$gte\":\"?\"}}",
+        "sortShape": "{}",
+        "projectionShape": "{}",
+        "sequence": 1_i64,
+        "cachedPlan": { "type": "collectionScan" },
         "host": "mqlite",
     }])
 }

@@ -71,6 +71,8 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.aggregate([{ $currentOp: { localOps: true } }])` on `admin` returns the in-flight aggregate command and can be followed by normal pipeline stages such as `$project`
 - `db.collection.aggregate([{ $collStats: { count: {}, storageStats: {} } }])` returns local namespace metadata for the file-backed collection
 - `db.collection.aggregate([{ $indexStats: {} }])` returns local index metadata for the file-backed collection
+- `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
+- `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
   - `dropDatabase` is supported for local test setup and teardown
   - `renameCollection` is supported for local collection management, including `dropTarget`
   - wrapped CRUD `explain(...)` calls for `delete`, `update`, `distinct`, and `findAndModify` return a `queryPlanner` response

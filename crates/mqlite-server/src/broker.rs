@@ -431,7 +431,11 @@ impl Broker {
         let storage = self.storage.read();
         let collections = storage
             .catalog()
-            .collection_names(&database)?
+            .collection_names(&database)
+            .or_else(|error| match error {
+                CatalogError::DatabaseNotFound(_) => Ok(Vec::new()),
+                _ => Err(error),
+            })?
             .into_iter()
             .map(|name| {
                 let collection = storage
@@ -1385,6 +1389,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$indexStats");
+        let starts_with_plan_cache_stats = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$planCacheStats");
 
         if starts_with_coll_stats && is_collectionless {
             return Err(CommandError::new(
@@ -1398,6 +1406,13 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$indexStats must be run against a collection namespace",
+            ));
+        }
+        if starts_with_plan_cache_stats && is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$planCacheStats must be run against a collection namespace",
             ));
         }
         if starts_with_current_op && !is_collectionless {
@@ -1436,6 +1451,19 @@ impl Broker {
                 CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
             })?;
             return self.handle_index_stats_aggregate(
+                &database,
+                collection_name,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
+        if starts_with_plan_cache_stats {
+            let collection_name = body.get_str("aggregate").map_err(|_| {
+                CommandError::new(9, "FailedToParse", "aggregate requires a collection name")
+            })?;
+            return self.handle_plan_cache_stats_aggregate(
                 &database,
                 collection_name,
                 batch_size,
@@ -1623,6 +1651,70 @@ impl Broker {
                 )?
             } else {
                 index_stats_documents
+            }
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn handle_plan_cache_stats_aggregate(
+        &self,
+        database: &str,
+        collection_name: &str,
+        batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
+    ) -> Result<Document, CommandError> {
+        let namespace = format!("{database}.{collection_name}");
+        let results = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let plan_cache_stats = execution_pipeline
+                .first()
+                .and_then(|stage| stage.get("$planCacheStats"))
+                .ok_or_else(|| {
+                    CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "$planCacheStats aggregation requires a $planCacheStats stage document",
+                    )
+                })?;
+            parse_plan_cache_stats_stage(plan_cache_stats)?;
+            let plan_cache_documents = build_plan_cache_stats_results(&self.plan_cache, &namespace);
+            if execution_pipeline.len() > 1 {
+                run_pipeline_with_resolver(
+                    plan_cache_documents,
+                    &execution_pipeline[1..],
+                    database,
+                    &resolver,
+                )?
+            } else {
+                plan_cache_documents
             }
         };
 
@@ -1946,6 +2038,77 @@ fn build_index_stats_results(collection: &CollectionCatalog) -> Vec<Document> {
             }
         })
         .collect()
+}
+
+fn parse_plan_cache_stats_stage(spec: &Bson) -> Result<(), CommandError> {
+    let spec = spec.as_document().ok_or_else(|| {
+        CommandError::new(9, "FailedToParse", "$planCacheStats must take a nested object")
+    })?;
+
+    match spec.get("allHosts") {
+        None if spec.is_empty() => Ok(()),
+        Some(Bson::Boolean(false)) if spec.len() == 1 => Ok(()),
+        Some(Bson::Boolean(true)) if spec.len() == 1 => Err(CommandError::new(
+            115,
+            "CommandNotSupported",
+            "$planCacheStats allHosts is not supported",
+        )),
+        Some(Bson::Boolean(_)) => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "$planCacheStats parameters object may contain at most one field",
+        )),
+        Some(_) => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "$planCacheStats allHosts must be a boolean value",
+        )),
+        None => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "$planCacheStats parameters object may contain only `allHosts`",
+        )),
+    }
+}
+
+fn build_plan_cache_stats_results(
+    plan_cache: &Mutex<BTreeMap<PlanCacheKey, CachedPlan>>,
+    namespace: &str,
+) -> Vec<Document> {
+    plan_cache
+        .lock()
+        .iter()
+        .filter(|(key, _)| key.namespace == namespace)
+        .map(|(key, cached)| {
+            doc! {
+                "namespace": key.namespace.clone(),
+                "filterShape": key.filter_shape.clone(),
+                "sortShape": key.sort_shape.clone(),
+                "projectionShape": key.projection_shape.clone(),
+                "sequence": cached.sequence as i64,
+                "cachedPlan": render_plan_cache_choice(&cached.choice),
+                "host": "mqlite",
+            }
+        })
+        .collect()
+}
+
+fn render_plan_cache_choice(choice: &PersistedPlanCacheChoice) -> Bson {
+    match choice {
+        PersistedPlanCacheChoice::CollectionScan => {
+            Bson::Document(doc! { "type": "collectionScan" })
+        }
+        PersistedPlanCacheChoice::Index(name) => {
+            Bson::Document(doc! { "type": "index", "name": name.clone() })
+        }
+        PersistedPlanCacheChoice::Union(choices) => Bson::Document(doc! {
+            "type": "union",
+            "branches": choices
+                .iter()
+                .map(render_plan_cache_choice)
+                .collect::<Vec<_>>(),
+        }),
+    }
 }
 
 impl Broker {
@@ -4485,6 +4648,38 @@ mod tests {
                 .and_then(|document| document.get_str("name").ok())
                 == Some("app")
         }));
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_collections_on_missing_database_returns_an_empty_cursor() {
+        let (serve_task, _temp_dir, manifest) = start_broker("missing-list-collections.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let list_collections = send_command(
+            &mut stream,
+            doc! {
+                "listCollections": 1,
+                "filter": { "name": "widgets" },
+                "cursor": {},
+                "$db": "missing"
+            },
+        )
+        .await;
+        assert_eq!(list_collections.get_f64("ok").expect("ok"), 1.0);
+        let first_batch = list_collections
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert!(first_batch.is_empty());
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

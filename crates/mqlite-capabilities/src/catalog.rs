@@ -1130,6 +1130,7 @@ mod tests {
             ),
             "$merge" => (vec![doc! { "_id": 1 }], vec![doc! { "$merge": "archive" }]),
             "$out" => (vec![doc! { "_id": 1 }], vec![doc! { "$out": "archive" }]),
+            "$planCacheStats" => (Vec::new(), vec![doc! { "$planCacheStats": {} }]),
             "$sample" => (
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],

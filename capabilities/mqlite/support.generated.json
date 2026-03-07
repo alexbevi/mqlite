@@ -46,6 +46,7 @@
     "$match",
     "$merge",
     "$out",
+    "$planCacheStats",
     "$project",
     "$replaceRoot",
     "$replaceWith",
