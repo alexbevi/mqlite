@@ -1129,10 +1129,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 57,
-    "total_supported": 23,
-    "public_supported": 23,
-    "total_unsupported": 61,
-    "public_unsupported": 34,
+    "total_supported": 24,
+    "public_supported": 24,
+    "total_unsupported": 60,
+    "public_unsupported": 33,
     "items": [
       {
         "name": "$_internalAllCollectionStats",
@@ -1759,8 +1759,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$densify",

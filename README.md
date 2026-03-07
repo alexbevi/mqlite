@@ -176,6 +176,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$facet`
   - `$bucket`
   - `$bucketAuto`
+  - `$currentOp`
   - `$lookup`
   - `$sample`
   - `$sortByCount`
@@ -199,7 +200,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Same-file aggregation write stages via `$out`, including string targets and `{ db, coll }` targets within the same `.mongodb` file.
 - Same-file aggregation write stages via `$merge`, including string targets or `{ db, coll }` targets, `on` fields, and the currently supported string mode combinations for `whenMatched` and `whenNotMatched`.
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents`.
-- Collectionless `$currentOp` aggregation with `localOps: true` as a driver-compatibility helper.
+- Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 
 ## Unsupported Features
 

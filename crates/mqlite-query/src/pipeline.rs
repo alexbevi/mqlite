@@ -74,6 +74,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
         current = match stage_name.as_str() {
             "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
+            "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -678,7 +679,7 @@ fn parse_merge_stage(spec: &Bson) -> Result<(), QueryError> {
                         };
                     }
                     "let" | "targetCollectionVersion" | "allowMergeOnNullishValues" => {
-                        return Err(QueryError::InvalidStage)
+                        return Err(QueryError::InvalidStage);
                     }
                     _ => return Err(QueryError::InvalidStage),
                 }
@@ -1028,6 +1029,39 @@ fn documents_stage(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, Que
                 .ok_or(QueryError::ExpectedDocument)
         })
         .collect()
+}
+
+fn current_op_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    let mut local_ops = None;
+    for (key, value) in spec {
+        match key.as_str() {
+            "localOps" => {
+                local_ops = Some(value.as_bool().ok_or(QueryError::InvalidStage)?);
+            }
+            "allUsers" | "idleConnections" | "idleCursors" | "idleSessions" | "targetAllNodes"
+            | "truncateOps" => return Err(QueryError::InvalidStage),
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    if local_ops != Some(true) {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(vec![doc! {
+        "type": "op",
+        "ns": "admin.$cmd.aggregate",
+        "command": {
+            "aggregate": 1,
+            "pipeline": [{ "$currentOp": { "localOps": true } }],
+            "$db": "admin",
+        },
+    }])
 }
 
 fn sample_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {

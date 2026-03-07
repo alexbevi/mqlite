@@ -1333,7 +1333,10 @@ fn out_stage_must_be_last_and_accepts_string_or_namespace_object_specs() {
 
     let error = run_pipeline(
         vec![doc! { "_id": 1, "value": 1 }],
-        &[doc! { "$out": "archive" }, doc! { "$match": { "value": 1 } }],
+        &[
+            doc! { "$out": "archive" },
+            doc! { "$match": { "value": 1 } },
+        ],
     )
     .expect_err("$out must be last");
     assert!(matches!(error, QueryError::InvalidStage));
@@ -1378,7 +1381,10 @@ fn merge_stage_must_be_last_and_accepts_supported_mode_combinations() {
 
     let error = run_pipeline(
         vec![doc! { "_id": 1, "value": 1 }],
-        &[doc! { "$merge": "archive" }, doc! { "$match": { "value": 1 } }],
+        &[
+            doc! { "$merge": "archive" },
+            doc! { "$match": { "value": 1 } },
+        ],
     )
     .expect_err("$merge must be last");
     assert!(matches!(error, QueryError::InvalidStage));
@@ -1398,8 +1404,7 @@ fn merge_stage_rejects_invalid_specs() {
         doc! { "$merge": { "into": "archive", "let": { "x": 1 } } },
         doc! { "$merge": { "into": "archive", "unknown": true } },
     ] {
-        let error =
-            run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid $merge");
+        let error = run_pipeline(vec![doc! { "_id": 1 }], &[stage]).expect_err("invalid $merge");
         assert!(matches!(error, QueryError::InvalidStage));
     }
 }
@@ -1811,6 +1816,50 @@ fn facet_stage_rejects_invalid_specs_and_disallowed_substages() {
         let error = run_pipeline(vec![doc! { "team": "red" }], &[stage]).expect_err("invalid");
         assert!(matches!(error, QueryError::InvalidStage));
     }
+}
+
+#[test]
+fn current_op_stage_emits_a_synthetic_inflight_operation() {
+    let results = run_pipeline_ok(
+        Vec::new(),
+        &[
+            doc! { "$currentOp": { "localOps": true } },
+            doc! { "$project": { "_id": 0, "ns": 1, "type": 1 } },
+        ],
+    );
+
+    assert_eq!(
+        results,
+        vec![doc! {
+            "ns": "admin.$cmd.aggregate",
+            "type": "op",
+        }]
+    );
+}
+
+#[test]
+fn current_op_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$currentOp": 1 },
+        doc! { "$currentOp": {} },
+        doc! { "$currentOp": { "localOps": false } },
+        doc! { "$currentOp": { "localOps": "yes" } },
+        doc! { "$currentOp": { "localOps": true, "allUsers": false } },
+        doc! { "$currentOp": { "idleConnections": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid $currentOp");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        Vec::new(),
+        &[
+            doc! { "$documents": [{ "_id": 1 }] },
+            doc! { "$currentOp": { "localOps": true } },
+        ],
+    )
+    .expect_err("$currentOp should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
 }
 
 #[test]

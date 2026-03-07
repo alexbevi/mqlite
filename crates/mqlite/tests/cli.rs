@@ -130,6 +130,77 @@ fn command_collectionless_aggregate_supports_documents_stage() {
 }
 
 #[test]
+fn command_collectionless_aggregate_supports_current_op_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-current-op.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":1,"pipeline":[{"$currentOp":{"localOps":true}},{"$project":{"_id":0,"ns":1,"type":1,"command":1}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["ns"], "admin.$cmd.aggregate");
+    assert_eq!(first_batch[0]["type"], "op");
+    assert_eq!(first_batch[0]["command"]["aggregate"], 1);
+    assert_eq!(
+        first_batch[0]["command"]["pipeline"][0]["$currentOp"]["localOps"],
+        true
+    );
+    assert_eq!(
+        first_batch[0]["command"]["pipeline"][1]["$project"]["ns"],
+        1
+    );
+}
+
+#[test]
+fn command_collection_aggregate_rejects_current_op_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-current-op-invalid.mongodb");
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "admin",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$currentOp":{"localOps":true}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "InvalidNamespace");
+}
+
+#[test]
 fn command_aggregate_supports_bucket_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-bucket.mongodb");

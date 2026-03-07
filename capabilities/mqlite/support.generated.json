@@ -35,6 +35,7 @@
     "$bucket",
     "$bucketAuto",
     "$count",
+    "$currentOp",
     "$documents",
     "$facet",
     "$group",

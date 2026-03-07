@@ -33,6 +33,7 @@ pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$bucket",
     "$bucketAuto",
+    "$currentOp",
     "$documents",
     "$facet",
     "$lookup",

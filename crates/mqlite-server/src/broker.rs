@@ -662,7 +662,11 @@ impl Broker {
         command: &Document,
     ) -> Result<Document, CommandError> {
         let collection_name = command.get_str("findAndModify").map_err(|_| {
-            CommandError::new(9, "FailedToParse", "findAndModify requires a collection name")
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "findAndModify requires a collection name",
+            )
         })?;
         let filter = command
             .get_document("query")
@@ -1275,20 +1279,33 @@ impl Broker {
             &pipeline[..]
         };
 
-        if is_collectionless
-            && pipeline.len() == 1
-            && pipeline[0]
-                .keys()
-                .next()
-                .is_some_and(|stage_name| stage_name == "$currentOp")
-        {
-            return self.handle_current_op_aggregate(body, &database, batch_size);
-        }
-
         let starts_with_documents = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$documents");
+        let starts_with_current_op = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$currentOp");
+
+        if starts_with_current_op && !is_collectionless {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$currentOp must be run against the 'admin' database with {aggregate: 1}",
+            ));
+        }
+
+        if is_collectionless && starts_with_current_op {
+            return self.handle_current_op_aggregate(
+                body,
+                &database,
+                batch_size,
+                execution_pipeline,
+                out_target,
+                merge_target,
+            );
+        }
 
         let (namespace, results) = {
             let storage = self.storage.read();
@@ -1362,6 +1379,9 @@ impl Broker {
         body: &Document,
         database: &str,
         batch_size: Option<i64>,
+        execution_pipeline: &[Document],
+        out_target: Option<OutTarget>,
+        merge_target: Option<MergeTarget>,
     ) -> Result<Document, CommandError> {
         let current_op = body
             .get_array("pipeline")
@@ -1376,6 +1396,14 @@ impl Broker {
                 "collectionless $currentOp aggregation requires a $currentOp stage document",
             )
         })?;
+
+        if database != "admin" {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$currentOp must be run against the 'admin' database with {aggregate: 1}",
+            ));
+        }
 
         if !current_op.get_bool("localOps").unwrap_or(false) {
             return Err(CommandError::new(
@@ -1400,12 +1428,44 @@ impl Broker {
         operation.insert("ns", format!("{database}.$cmd.aggregate"));
         operation.insert("command", Bson::Document(body.clone()));
 
-        let cursor = self.cursors.lock().open(
-            format!("{database}.$cmd.aggregate"),
-            vec![operation],
-            batch_size,
-            false,
-        );
+        let namespace = format!("{database}.$cmd.aggregate");
+        let results = if execution_pipeline.len() > 1 {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            run_pipeline_with_resolver(
+                vec![operation],
+                &execution_pipeline[1..],
+                database,
+                &resolver,
+            )?
+        } else {
+            vec![operation]
+        };
+
+        if let Some(target) = out_target {
+            let target_database = target.database.as_deref().unwrap_or(database);
+            self.write_out_collection(target_database, &target.collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+        if let Some(target) = merge_target {
+            self.merge_into_collection(database, &target, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
+
+        let cursor = self
+            .cursors
+            .lock()
+            .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
     }
 
@@ -1465,7 +1525,9 @@ impl Broker {
                 .records
                 .iter()
                 .enumerate()
-                .filter(|(_, record)| merge_fields_match(&record.document, &document, &target.on_fields))
+                .filter(|(_, record)| {
+                    merge_fields_match(&record.document, &document, &target.on_fields)
+                })
                 .map(|(position, _)| position)
                 .collect::<Vec<_>>();
 
@@ -1491,7 +1553,9 @@ impl Broker {
                         for (field, value) in document {
                             merged.insert(field, value);
                         }
-                        collection_state.update_record_at(position, merged).map(|_| ())
+                        collection_state
+                            .update_record_at(position, merged)
+                            .map(|_| ())
                     }
                     MergeWhenMatched::KeepExisting => Ok(()),
                     MergeWhenMatched::Fail => Err(CatalogError::DuplicateKey(
@@ -1683,20 +1747,12 @@ fn parse_merge_target(value: &Bson) -> Result<MergeTarget, CommandError> {
                             for (field, value) in namespace {
                                 match field.as_str() {
                                     "db" => {
-                                        database = Some(
-                                            value
-                                                .as_str()
-                                                .ok_or_else(invalid)?
-                                                .to_string(),
-                                        );
+                                        database =
+                                            Some(value.as_str().ok_or_else(invalid)?.to_string());
                                     }
                                     "coll" => {
-                                        collection = Some(
-                                            value
-                                                .as_str()
-                                                .ok_or_else(invalid)?
-                                                .to_string(),
-                                        );
+                                        collection =
+                                            Some(value.as_str().ok_or_else(invalid)?.to_string());
                                     }
                                     _ => return Err(invalid()),
                                 }
@@ -1731,7 +1787,7 @@ fn parse_merge_target(value: &Bson) -> Result<MergeTarget, CommandError> {
                                     115,
                                     "CommandNotSupported",
                                     "aggregation stage `$merge` does not yet support pipeline-style `whenMatched`",
-                                ))
+                                ));
                             }
                             _ => return Err(invalid()),
                         };
@@ -1749,14 +1805,14 @@ fn parse_merge_target(value: &Bson) -> Result<MergeTarget, CommandError> {
                             115,
                             "CommandNotSupported",
                             "aggregation stage `$merge` does not yet support `let` variables",
-                        ))
+                        ));
                     }
                     "targetCollectionVersion" | "allowMergeOnNullishValues" => {
                         return Err(CommandError::new(
                             115,
                             "CommandNotSupported",
                             "aggregation stage `$merge` does not support router-only merge options",
-                        ))
+                        ));
                     }
                     _ => return Err(invalid()),
                 }
@@ -3748,7 +3804,8 @@ mod tests {
             doc! {
                 "aggregate": 1,
                 "pipeline": [
-                    { "$currentOp": { "localOps": true } }
+                    { "$currentOp": { "localOps": true } },
+                    { "$project": { "_id": 0, "ns": 1, "type": 1, "command": 1 } }
                 ],
                 "cursor": {},
                 "$db": "admin"
@@ -3763,6 +3820,7 @@ mod tests {
         assert_eq!(aggregate_batch.len(), 1);
         let operation = aggregate_batch[0].as_document().expect("operation");
         assert_eq!(operation.get_str("ns").expect("ns"), "admin.$cmd.aggregate");
+        assert_eq!(operation.get_str("type").expect("type"), "op");
         let command = operation.get_document("command").expect("command");
         assert_eq!(command.get_i32("aggregate").expect("aggregate"), 1);
         assert_eq!(
@@ -3774,6 +3832,16 @@ mod tests {
                 .and_then(|stage| stage.get_document("$currentOp").ok())
                 .and_then(|stage| stage.get_bool("localOps").ok()),
             Some(true)
+        );
+        assert_eq!(
+            command
+                .get_array("pipeline")
+                .expect("pipeline")
+                .get(1)
+                .and_then(Bson::as_document)
+                .and_then(|stage| stage.get_document("$project").ok())
+                .and_then(|stage| stage.get_i32("ns").ok()),
+            Some(1)
         );
         assert!(command.get_document("cursor").expect("cursor").is_empty());
         assert_eq!(command.get_str("$db").expect("$db"), "admin");
@@ -4035,7 +4103,10 @@ mod tests {
         ] {
             let explain = send_command(&mut stream, command).await;
             let planner = explain.get_document("queryPlanner").expect("queryPlanner");
-            assert_eq!(planner.get_str("namespace").expect("namespace"), "app.widgets");
+            assert_eq!(
+                planner.get_str("namespace").expect("namespace"),
+                "app.widgets"
+            );
             assert!(planner.get_document("winningPlan").is_ok());
         }
 

@@ -1098,6 +1098,10 @@ mod tests {
                 vec![doc! { "price": 10 }, doc! { "price": 20 }],
                 vec![doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }],
             ),
+            "$currentOp" => (
+                Vec::new(),
+                vec![doc! { "$currentOp": { "localOps": true } }],
+            ),
             "$documents" => (
                 vec![doc! { "ignored": true }],
                 vec![doc! { "$documents": [{ "qty": 1 }] }],
@@ -1119,14 +1123,8 @@ mod tests {
                     }
                 }],
             ),
-            "$merge" => (
-                vec![doc! { "_id": 1 }],
-                vec![doc! { "$merge": "archive" }],
-            ),
-            "$out" => (
-                vec![doc! { "_id": 1 }],
-                vec![doc! { "$out": "archive" }],
-            ),
+            "$merge" => (vec![doc! { "_id": 1 }], vec![doc! { "$merge": "archive" }]),
+            "$out" => (vec![doc! { "_id": 1 }], vec![doc! { "$out": "archive" }]),
             "$sample" => (
                 vec![doc! { "_id": 1 }],
                 vec![doc! { "$sample": { "size": 1 } }],
