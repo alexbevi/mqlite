@@ -14,10 +14,10 @@
   "query_operators": {
     "total_upstream": 68,
     "public_upstream": 41,
-    "total_supported": 17,
-    "public_supported": 17,
-    "total_unsupported": 51,
-    "public_unsupported": 24,
+    "total_supported": 19,
+    "public_supported": 19,
+    "total_unsupported": 49,
+    "public_unsupported": 22,
     "items": [
       {
         "name": "$_internalBucketGeoWithin",
@@ -1019,8 +1019,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$or",
@@ -1070,8 +1070,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$sampleRate",

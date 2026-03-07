@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set_path};
+use regex::{Regex as RustRegex, RegexBuilder};
 use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size", "$mod", "$all", "$not", "$type",
+    "$size", "$mod", "$all", "$not", "$type", "$regex", "$options",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -85,6 +86,11 @@ pub enum MatchExpr {
     Type {
         path: String,
         type_set: TypeSet,
+    },
+    Regex {
+        path: String,
+        pattern: String,
+        options: String,
     },
     Size {
         path: String,
@@ -480,6 +486,13 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
         MatchExpr::Type { path, type_set } => {
             lookup_path(document, path).is_some_and(|value| matches_type(value, type_set))
         }
+        MatchExpr::Regex {
+            path,
+            pattern,
+            options,
+        } => {
+            lookup_path(document, path).is_some_and(|value| matches_regex(value, pattern, options))
+        }
         MatchExpr::Size { path, size } => lookup_path(document, path)
             .and_then(Bson::as_array)
             .is_some_and(|values| values.len() == *size),
@@ -494,10 +507,22 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
 
 fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryError> {
     match value {
+        Bson::RegularExpression(regex) => {
+            let _ = compile_regex(&regex.pattern, &regex.options)?;
+            Ok(MatchExpr::Regex {
+                path: path.to_string(),
+                pattern: regex.pattern.clone(),
+                options: regex.options.clone(),
+            })
+        }
         Bson::Document(document) if document.keys().all(|key| key.starts_with('$')) => {
             let mut expressions = Vec::new();
+            if document.contains_key("$regex") || document.contains_key("$options") {
+                expressions.push(parse_regex_expression(path, document)?);
+            }
             for (operator, operator_value) in document {
                 expressions.push(match operator.as_str() {
+                    "$regex" | "$options" => continue,
                     "$eq" => MatchExpr::Eq {
                         path: path.to_string(),
                         value: operator_value.clone(),
@@ -617,11 +642,51 @@ fn projection_flag(value: &Bson) -> Option<bool> {
 
 fn parse_not_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryError> {
     match value {
+        Bson::RegularExpression(regex) => {
+            let _ = compile_regex(&regex.pattern, &regex.options)?;
+            Ok(MatchExpr::Regex {
+                path: path.to_string(),
+                pattern: regex.pattern.clone(),
+                options: regex.options.clone(),
+            })
+        }
         Bson::Document(document) if document.keys().all(|key| key.starts_with('$')) => {
+            if document.is_empty() {
+                return Err(QueryError::InvalidStructure);
+            }
             parse_field_expression(path, value)
         }
         _ => Err(QueryError::InvalidStructure),
     }
+}
+
+fn parse_regex_expression(path: &str, document: &Document) -> Result<MatchExpr, QueryError> {
+    let regex_value = document.get("$regex");
+    let options_value = document.get("$options");
+    let Some(regex_value) = regex_value else {
+        return Err(QueryError::InvalidStructure);
+    };
+
+    let (pattern, mut options) = match regex_value {
+        Bson::String(pattern) => (pattern.clone(), String::new()),
+        Bson::RegularExpression(regex) => (regex.pattern.clone(), regex.options.clone()),
+        _ => return Err(QueryError::InvalidStructure),
+    };
+
+    if let Some(options_value) = options_value {
+        let extra = options_value.as_str().ok_or(QueryError::InvalidStructure)?;
+        if !options.is_empty() {
+            return Err(QueryError::InvalidStructure);
+        }
+        options = extra.to_string();
+    }
+
+    let _ = compile_regex(&pattern, &options)?;
+    Ok(MatchExpr::Regex {
+        path: path.to_string(),
+        pattern,
+        options,
+    })
 }
 
 fn parse_type_set(value: &Bson) -> Result<TypeSet, QueryError> {
@@ -755,6 +820,44 @@ fn matches_type(value: &Bson, type_set: &TypeSet) -> bool {
             .codes
             .iter()
             .any(|code| bson_type_code(value) == *code)
+}
+
+fn matches_regex(value: &Bson, pattern: &str, options: &str) -> bool {
+    let Ok(regex) = compile_regex(pattern, options) else {
+        return false;
+    };
+    matches_regex_compiled(value, &regex)
+}
+
+fn matches_regex_compiled(value: &Bson, regex: &RustRegex) -> bool {
+    match value {
+        Bson::String(value) | Bson::Symbol(value) => regex.is_match(value),
+        Bson::Array(items) => items.iter().any(|item| matches_regex_compiled(item, regex)),
+        _ => false,
+    }
+}
+
+fn compile_regex(pattern: &str, options: &str) -> Result<RustRegex, QueryError> {
+    let mut builder = RegexBuilder::new(pattern);
+    for option in options.chars() {
+        match option {
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            'm' => {
+                builder.multi_line(true);
+            }
+            's' => {
+                builder.dot_matches_new_line(true);
+            }
+            'x' => {
+                builder.ignore_whitespace(true);
+            }
+            'u' => {}
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+    builder.build().map_err(|_| QueryError::InvalidStructure)
 }
 
 fn type_alias_code(alias: &str) -> Option<i32> {
@@ -1334,6 +1437,71 @@ mod tests {
         ));
         assert!(matches!(
             document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$type": 0 } }),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn supports_regex_filters() {
+        let document = doc! { "name": "Ada", "tags": ["beta", "Gamma"] };
+
+        assert_filter(&document, doc! { "name": { "$regex": "^A" } }, true);
+        assert_filter(
+            &document,
+            doc! { "name": { "$regex": "^a", "$options": "i" } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "tags": { "$regex": "^g", "$options": "i" } },
+            true,
+        );
+        assert!(
+            document_matches(
+                &document,
+                &doc! {
+                    "name": Bson::RegularExpression(bson::Regex {
+                        pattern: "^A".to_string(),
+                        options: "".to_string(),
+                    })
+                }
+            )
+            .expect("match")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_regex_filters() {
+        assert!(matches!(
+            document_matches(
+                &doc! { "name": "Ada" },
+                &doc! { "name": { "$options": "i" } }
+            ),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(
+                &doc! { "name": "Ada" },
+                &doc! { "name": { "$regex": "^A", "$options": 1 } }
+            ),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(
+                &doc! { "name": "Ada" },
+                &doc! { "name": { "$regex": "[", "$options": "i" } }
+            ),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(
+                &doc! { "name": "Ada" },
+                &doc! { "name": { "$regex": "^A", "$options": "q" } }
+            ),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(&doc! { "name": "Ada" }, &doc! { "name": { "$not": {} } }),
             Err(QueryError::InvalidStructure)
         ));
     }

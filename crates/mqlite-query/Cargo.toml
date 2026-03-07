@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bson.workspace = true
 mqlite-bson = { path = "../mqlite-bson" }
+regex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

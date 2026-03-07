@@ -1038,6 +1038,11 @@ mod tests {
                 doc! { "qty": { "$not": { "$mod": [5, 1] } } },
             ),
             "$type" => (doc! { "sku": "abc" }, doc! { "sku": { "$type": "string" } }),
+            "$regex" => (doc! { "name": "Ada" }, doc! { "name": { "$regex": "^A" } }),
+            "$options" => (
+                doc! { "name": "Ada" },
+                doc! { "name": { "$regex": "^a", "$options": "i" } },
+            ),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

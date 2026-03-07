@@ -14,7 +14,9 @@
     "$nin",
     "$nor",
     "$not",
+    "$options",
     "$or",
+    "$regex",
     "$size",
     "$type"
   ],
