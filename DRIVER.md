@@ -61,6 +61,10 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
   - no `logicalSessionTimeoutMinutes`
   - no replica set metadata
   - no auth or compression negotiation
+- Expect minimal admin compatibility helpers to exist for test harness setup:
+  - `killAllSessions` succeeds as a no-op cleanup command
+  - `getParameter` returns at least `authenticationMechanisms` and `requireApiVersion`
+  - session and transaction envelopes are still rejected explicitly
 
 ## Node Driver Adaptation Notes
 
@@ -120,3 +124,4 @@ MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite:operations
 - `check:mqlite` points the integration harness at a `file://` database and runs the explicit suite list from `test/tools/runner/mqlite_suite_registry.ts`.
 - `check:mqlite:crud` uses the same harness but restricts execution to the current curated CRUD bring-up profile in that same registry, which starts with `test/integration/crud/abstract_operation.test.ts` and can grow without modifying the underlying tests.
 - `check:mqlite:operations` runs the broader operation-focused registry in that same file, including CRUD, aggregation, indexing, run-command, read/write concern, command monitoring, BSON option, and operation-example suites so coverage against the upstream integration tree can be measured quickly.
+- Extra Mocha flags can be forwarded after `--` without disabling profile expansion, so high-level summaries like `MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite -- --reporter min` still use the registry instead of falling back to recursive test discovery.
