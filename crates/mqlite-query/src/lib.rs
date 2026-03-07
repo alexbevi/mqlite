@@ -833,10 +833,26 @@ mod tests {
             true,
         );
         assert_filter(&document, doc! { "sku": { "$in": ["def"] } }, false);
-        assert_filter(&document, doc! { "meta.enabled": { "$exists": true } }, true);
-        assert_filter(&document, doc! { "meta.enabled": { "$exists": false } }, false);
-        assert_filter(&document, doc! { "meta.missing": { "$exists": false } }, true);
-        assert_filter(&document, doc! { "meta.missing": { "$exists": true } }, false);
+        assert_filter(
+            &document,
+            doc! { "meta.enabled": { "$exists": true } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "meta.enabled": { "$exists": false } },
+            false,
+        );
+        assert_filter(
+            &document,
+            doc! { "meta.missing": { "$exists": false } },
+            true,
+        );
+        assert_filter(
+            &document,
+            doc! { "meta.missing": { "$exists": true } },
+            false,
+        );
     }
 
     #[test]
@@ -905,8 +921,7 @@ mod tests {
 
     #[test]
     fn projection_supports_nested_inclusion_and_computed_fields() {
-        let document =
-            doc! { "_id": 1, "sku": "abc", "meta": { "enabled": true, "flag": "beta" } };
+        let document = doc! { "_id": 1, "sku": "abc", "meta": { "enabled": true, "flag": "beta" } };
         let projected = apply_projection(
             &document,
             Some(&doc! {
@@ -1028,8 +1043,7 @@ mod tests {
             vec![doc! { "_id": 1, "sku": "abc", "meta": { "enabled": true, "flag": "beta" } }]
         );
 
-        let multiple =
-            run_pipeline_ok(input, &[doc! { "$unset": ["qty", "meta.enabled"] }]);
+        let multiple = run_pipeline_ok(input, &[doc! { "$unset": ["qty", "meta.enabled"] }]);
         assert_eq!(
             multiple,
             vec![doc! { "_id": 1, "sku": "abc", "meta": { "flag": "beta" } }]
@@ -1112,12 +1126,18 @@ mod tests {
         assert_eq!(missing, vec![doc! { "_id": 1 }, doc! { "_id": 0, "a": 1 }]);
 
         let null = run_pipeline_ok(
-            vec![doc! { "_id": 0, "a": 1 }, doc! { "_id": 1, "a": Bson::Null }],
+            vec![
+                doc! { "_id": 0, "a": 1 },
+                doc! { "_id": 1, "a": Bson::Null },
+            ],
             &[doc! { "$sort": { "a": 1 } }],
         );
         assert_eq!(
             null,
-            vec![doc! { "_id": 1, "a": Bson::Null }, doc! { "_id": 0, "a": 1 }]
+            vec![
+                doc! { "_id": 1, "a": Bson::Null },
+                doc! { "_id": 0, "a": 1 }
+            ]
         );
     }
 
@@ -1214,7 +1234,9 @@ mod tests {
 
         let expression_object = run_pipeline_ok(
             vec![doc! { "name": "alpha" }],
-            &[doc! { "$replaceRoot": { "newRoot": { "name": "$name", "wrapped": { "$literal": true } } } }],
+            &[
+                doc! { "$replaceRoot": { "newRoot": { "name": "$name", "wrapped": { "$literal": true } } } },
+            ],
         );
         assert_eq!(
             expression_object,

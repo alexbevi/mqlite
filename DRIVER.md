@@ -103,6 +103,7 @@ Any driver integration should include:
 - Idle shutdown and reconnect behavior.
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
+- Query and aggregation smoke coverage for every currently supported operator and stage listed in `capabilities/mqlite/gap-analysis.generated.md`, rather than only broad happy-path CRUD.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
 - `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.
 - Command monitoring verification.
@@ -113,7 +114,9 @@ For `node-mongodb-native`, the current direct driver-validation commands are:
 ```text
 MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite
 MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite:crud
+MQLITE_BINARY=../mqlite/target/debug/mqlite npm run check:mqlite:operations
 ```
 
 - `check:mqlite` points the integration harness at a `file://` database and runs the explicit suite list from `test/tools/runner/mqlite_suite_registry.ts`.
 - `check:mqlite:crud` uses the same harness but restricts execution to the current curated CRUD bring-up profile in that same registry, which starts with `test/integration/crud/abstract_operation.test.ts` and can grow without modifying the underlying tests.
+- `check:mqlite:operations` runs the broader operation-focused registry in that same file, including CRUD, aggregation, indexing, run-command, read/write concern, command monitoring, BSON option, and operation-example suites so coverage against the upstream integration tree can be measured quickly.
