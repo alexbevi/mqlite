@@ -1041,6 +1041,10 @@ mod tests {
                 doc! { "tags": ["red", "blue"] },
                 doc! { "tags": { "$all": ["red", "blue"] } },
             ),
+            "$comment" => (
+                doc! { "qty": 5, "sku": "abc" },
+                doc! { "qty": 5, "$comment": "metadata only" },
+            ),
             "$not" => (
                 doc! { "qty": 12 },
                 doc! { "qty": { "$not": { "$mod": [5, 1] } } },

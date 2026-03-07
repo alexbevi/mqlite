@@ -63,6 +63,7 @@ fn parse_filter_with_context(
                 validate_expression(value)?;
                 expressions.push(MatchExpr::Expr(value.clone()));
             }
+            "$comment" => continue,
             other if other.starts_with('$') => {
                 return Err(QueryError::UnsupportedOperator(other.to_string()));
             }

@@ -243,6 +243,54 @@ fn command_find_supports_all_filter() {
 }
 
 #[test]
+fn command_find_supports_top_level_comment_filter() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-comment.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"sku":"alpha"},{"sku":"beta"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut find = Command::cargo_bin("mqlite").expect("binary");
+    let output = find
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"find":"widgets","filter":{"sku":"alpha","$comment":"metadata only"}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["sku"], "alpha");
+}
+
+#[test]
 fn command_find_supports_not_filter() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-not.mongodb");

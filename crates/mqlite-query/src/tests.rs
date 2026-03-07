@@ -165,6 +165,23 @@ fn supports_all_filters() {
 }
 
 #[test]
+fn supports_top_level_comment_filters() {
+    let document = doc! { "sku": "abc", "qty": 5 };
+
+    assert_filter(
+        &document,
+        doc! { "sku": "abc", "$comment": "keep this for profiler parity" },
+        true,
+    );
+    assert_filter(&document, doc! { "$comment": { "trace": 1 } }, true);
+    assert_filter(
+        &document,
+        doc! { "qty": { "$gt": 7 }, "$comment": "ignored metadata" },
+        false,
+    );
+}
+
+#[test]
 fn rejects_expression_values_inside_all_filters() {
     assert!(matches!(
         document_matches(
@@ -197,6 +214,14 @@ fn rejects_malformed_not_filters() {
     assert!(matches!(
         document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$not": 5 } }),
         Err(QueryError::InvalidStructure)
+    ));
+}
+
+#[test]
+fn rejects_comment_as_field_operator() {
+    assert!(matches!(
+        document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$comment": "invalid" } }),
+        Err(QueryError::UnsupportedOperator(operator)) if operator == "$comment"
     ));
 }
 

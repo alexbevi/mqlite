@@ -14,6 +14,7 @@ pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$size",
     "$mod",
     "$all",
+    "$comment",
     "$not",
     "$type",
     "$regex",

@@ -2,6 +2,7 @@
   "query_operators": [
     "$all",
     "$and",
+    "$comment",
     "$elemMatch",
     "$eq",
     "$exists",
