@@ -1397,6 +1397,10 @@ impl Broker {
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$listLocalSessions");
+        let starts_with_list_sessions = pipeline
+            .first()
+            .and_then(|stage| stage.keys().next())
+            .is_some_and(|stage_name| stage_name == "$listSessions");
         let starts_with_list_mql_entities = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
@@ -1432,6 +1436,22 @@ impl Broker {
                 73,
                 "InvalidNamespace",
                 "$listLocalSessions must be run against the database with {aggregate: 1}, not a collection",
+            ));
+        }
+        if starts_with_list_sessions
+            && !matches!(body.get("aggregate"), Some(Bson::String(collection)) if collection == "system.sessions")
+        {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$listSessions may only be run against config.system.sessions",
+            ));
+        }
+        if starts_with_list_sessions && database != "config" {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                "$listSessions may only be run against config.system.sessions",
             ));
         }
         if starts_with_list_mql_entities && (!is_collectionless || database != "admin") {

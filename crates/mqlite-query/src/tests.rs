@@ -2112,6 +2112,54 @@ fn list_local_sessions_stage_rejects_invalid_specs() {
 }
 
 #[test]
+fn list_sessions_stage_accepts_public_specs() {
+    for stage in [
+        doc! { "$listSessions": {} },
+        doc! { "$listSessions": { "allUsers": false } },
+        doc! { "$listSessions": { "allUsers": true } },
+        doc! {
+            "$listSessions": {
+                "users": [{ "user": "alice", "db": "admin" }]
+            }
+        },
+    ] {
+        let results = run_pipeline_ok(Vec::new(), &[stage]);
+        assert!(results.is_empty());
+    }
+}
+
+#[test]
+fn list_sessions_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listSessions": 1 },
+        doc! { "$listSessions": { "allUsers": "yes" } },
+        doc! { "$listSessions": { "users": "alice" } },
+        doc! { "$listSessions": { "users": ["alice"] } },
+        doc! { "$listSessions": { "users": [{ "user": "alice" }] } },
+        doc! {
+            "$listSessions": {
+                "allUsers": true,
+                "users": [{ "user": "alice", "db": "admin" }]
+            }
+        },
+        doc! { "$listSessions": { "$_internalPredicate": {} } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$documents": [{ "_id": 1 }] },
+            doc! { "$listSessions": {} },
+        ],
+    )
+    .expect_err("$listSessions should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
 fn list_mql_entities_stage_reports_supported_aggregation_stages() {
     let results = run_pipeline_ok(
         Vec::new(),

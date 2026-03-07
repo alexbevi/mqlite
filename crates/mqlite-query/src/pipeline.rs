@@ -83,6 +83,7 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                 list_cached_and_active_users_documents(stage_index, stage_spec)?
             }
             "$listLocalSessions" => list_local_sessions_documents(stage_index, stage_spec)?,
+            "$listSessions" => list_sessions_documents(stage_index, stage_spec)?,
             "$listMqlEntities" => list_mql_entities_documents(stage_index, stage_spec)?,
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -1186,6 +1187,15 @@ fn list_local_sessions_documents(
     stage_index: usize,
     spec: &Bson,
 ) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    parse_list_sessions_spec(spec)?;
+    Ok(Vec::new())
+}
+
+fn list_sessions_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Document>, QueryError> {
     if stage_index != 0 {
         return Err(QueryError::InvalidStage);
     }

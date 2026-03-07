@@ -1136,6 +1136,10 @@ mod tests {
                 Vec::new(),
                 vec![doc! { "$listLocalSessions": { "allUsers": true } }],
             ),
+            "$listSessions" => (
+                Vec::new(),
+                vec![doc! { "$listSessions": { "allUsers": true } }],
+            ),
             "$listMqlEntities" => (
                 Vec::new(),
                 vec![doc! { "$listMqlEntities": { "entityType": "aggregationStages" } }],
