@@ -483,19 +483,39 @@ impl Broker {
 
     fn handle_explain(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
+        if let Ok(verbosity) = body.get_str("verbosity") {
+            if !matches!(
+                verbosity,
+                "queryPlanner" | "executionStats" | "allPlansExecution"
+            ) {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "explain verbosity must be queryPlanner, executionStats, or allPlansExecution",
+                ));
+            }
+        }
         let command = body
             .get_document("explain")
             .map_err(|_| CommandError::new(9, "FailedToParse", "explain requires a document"))?;
         let command_name = command_name(command)
             .ok_or_else(|| CommandError::new(9, "FailedToParse", "explain command is empty"))?;
-        if command_name != "find" {
-            return Err(CommandError::new(
+        match command_name.as_str() {
+            "find" => self.handle_find_explain(&database, command),
+            "aggregate" => self.handle_aggregate_explain(&database, command),
+            _ => Err(CommandError::new(
                 115,
                 "CommandNotSupported",
                 format!("explain for `{command_name}` is not supported"),
-            ));
+            )),
         }
+    }
 
+    fn handle_find_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
         let collection_name = command.get_str("find").map_err(|_| {
             CommandError::new(9, "FailedToParse", "find requires a collection name")
         })?;
@@ -509,7 +529,7 @@ impl Broker {
         let storage = self.storage.read();
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection_name}");
-        let cached_plan = match storage.catalog().get_collection(&database, collection_name) {
+        let cached_plan = match storage.catalog().get_collection(database, collection_name) {
             Ok(collection) => self.cached_find_plan(
                 namespace.clone(),
                 sequence,
@@ -538,6 +558,95 @@ impl Broker {
                 "winningPlan": winning_plan.to_document(),
             }
         })
+    }
+
+    fn handle_aggregate_explain(
+        &self,
+        database: &str,
+        command: &Document,
+    ) -> Result<Document, CommandError> {
+        let collection_name = command.get_str("aggregate").map_err(|_| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "aggregate explain requires a collection name",
+            )
+        })?;
+        let pipeline = command
+            .get_array("pipeline")
+            .map_err(|_| {
+                CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "aggregate explain requires a pipeline array",
+                )
+            })?
+            .iter()
+            .map(|value| {
+                value.as_document().cloned().ok_or_else(|| {
+                    CommandError::new(9, "FailedToParse", "pipeline stages must be documents")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if pipeline.iter().any(|stage| stage.contains_key("$out")) {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                "explain for aggregation pipelines with `$out` is not supported",
+            ));
+        }
+        let filter = pipeline
+            .first()
+            .and_then(|stage| stage.get_document("$match").ok())
+            .cloned()
+            .unwrap_or_default();
+        let sort = pipeline
+            .iter()
+            .find_map(|stage| stage.get_document("$sort").ok())
+            .cloned();
+        let cached_plan =
+            self.explain_find_plan(database, collection_name, &filter, sort.as_ref(), None)?;
+        let namespace = format!("{database}.{collection_name}");
+        let mut stages = bson::Array::new();
+        stages.push(Bson::Document(doc! {
+            "$cursor": {
+                "queryPlanner": {
+                    "namespace": namespace,
+                    "planCacheUsed": cached_plan.cache_used,
+                    "winningPlan": cached_plan.plan.to_document(),
+                }
+            }
+        }));
+        stages.extend(pipeline.into_iter().map(Bson::Document));
+        Ok(doc! { "stages": stages })
+    }
+
+    fn explain_find_plan(
+        &self,
+        database: &str,
+        collection_name: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        projection: Option<&Document>,
+    ) -> Result<CachedFindPlan, CommandError> {
+        let storage = self.storage.read();
+        let sequence = storage.last_applied_sequence();
+        let namespace = format!("{database}.{collection_name}");
+        match storage.catalog().get_collection(database, collection_name) {
+            Ok(collection) => {
+                self.cached_find_plan(namespace, sequence, collection, filter, sort, projection)
+            }
+            Err(CatalogError::NamespaceNotFound(_, _)) => Ok(CachedFindPlan {
+                plan: PlannedFind::Collection {
+                    documents: Vec::new(),
+                    record_ids: Vec::new(),
+                    docs_examined: 0,
+                    sort_required: sort.is_some(),
+                },
+                cache_used: false,
+            }),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn handle_create(&self, body: &Document) -> Result<Document, CommandError> {
@@ -955,21 +1064,30 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let validated_operations = operations
+            .into_iter()
+            .map(|operation| {
+                let query = operation.get_document("q").map_err(|_| {
+                    CommandError::new(9, "FailedToParse", "delete operations require `q`")
+                })?;
+                parse_filter(query)?;
+                Ok((query.clone(), operation.get_i32("limit").unwrap_or(0)))
+            })
+            .collect::<Result<Vec<_>, CommandError>>()?;
+
         let mut storage = self.storage.write();
-        let mut collection_state = storage
-            .catalog()
-            .get_collection(&database, collection_name)?
-            .clone();
+        let mut collection_state =
+            match storage.catalog().get_collection(&database, collection_name) {
+                Ok(collection) => collection.clone(),
+                Err(CatalogError::NamespaceNotFound(_, _)) => return Ok(doc! { "n": 0 }),
+                Err(error) => return Err(error.into()),
+            };
         let mut deleted = 0_i32;
 
-        for operation in operations {
-            let query = operation.get_document("q").map_err(|_| {
-                CommandError::new(9, "FailedToParse", "delete operations require `q`")
-            })?;
-            let limit = operation.get_i32("limit").unwrap_or(0);
+        for (query, limit) in validated_operations {
             let mut removed_record_ids = BTreeSet::new();
             for record in &collection_state.records {
-                if !document_matches(&record.document, query).unwrap_or(false) {
+                if !document_matches(&record.document, &query).unwrap_or(false) {
                     continue;
                 }
                 removed_record_ids.insert(record.record_id);
@@ -1061,56 +1179,187 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let batch_size = body_batch_size(body, "cursor");
+        let is_collectionless = matches!(
+            body.get("aggregate"),
+            Some(Bson::Int32(1)) | Some(Bson::Int64(1))
+        );
+        let out_target = pipeline
+            .last()
+            .and_then(|stage| stage.get("$out"))
+            .map(parse_out_target)
+            .transpose()?;
+        let execution_pipeline = if out_target.is_some() {
+            &pipeline[..pipeline.len().saturating_sub(1)]
+        } else {
+            &pipeline[..]
+        };
+
+        if is_collectionless
+            && pipeline.len() == 1
+            && pipeline[0]
+                .keys()
+                .next()
+                .is_some_and(|stage_name| stage_name == "$currentOp")
+        {
+            return self.handle_current_op_aggregate(body, &database, batch_size);
+        }
+
         let starts_with_documents = pipeline
             .first()
             .and_then(|stage| stage.keys().next())
             .is_some_and(|stage_name| stage_name == "$documents");
 
-        let storage = self.storage.read();
-        let resolver = BrokerCollectionResolver {
-            catalog: storage.catalog(),
-        };
-        let (namespace, input) = match body.get("aggregate") {
-            Some(Bson::String(collection_name)) => {
-                if starts_with_documents {
+        let (namespace, results) = {
+            let storage = self.storage.read();
+            let resolver = BrokerCollectionResolver {
+                catalog: storage.catalog(),
+            };
+            let (namespace, input) = match body.get("aggregate") {
+                Some(Bson::String(collection_name)) => {
+                    if starts_with_documents {
+                        return Err(CommandError::new(
+                            73,
+                            "InvalidNamespace",
+                            "$documents is only valid for collectionless aggregates and subpipelines",
+                        ));
+                    }
+                    let input = storage
+                        .catalog()
+                        .get_collection(&database, collection_name)
+                        .map(|collection| collection.documents())
+                        .unwrap_or_default();
+                    (format!("{database}.{collection_name}"), input)
+                }
+                Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {
+                    if !starts_with_documents {
+                        return Err(CommandError::new(
+                            73,
+                            "InvalidNamespace",
+                            "collectionless aggregate requires $documents as the first stage",
+                        ));
+                    }
+                    (format!("{database}.$cmd.aggregate"), Vec::new())
+                }
+                _ => {
                     return Err(CommandError::new(
-                        73,
-                        "InvalidNamespace",
-                        "$documents is only valid for collectionless aggregates and subpipelines",
+                        9,
+                        "FailedToParse",
+                        "aggregate requires a collection name or 1 for collectionless aggregate",
                     ));
                 }
-                let input = storage
-                    .catalog()
-                    .get_collection(&database, collection_name)
-                    .map(|collection| collection.documents())
-                    .unwrap_or_default();
-                (format!("{database}.{collection_name}"), input)
-            }
-            Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {
-                if !starts_with_documents {
-                    return Err(CommandError::new(
-                        73,
-                        "InvalidNamespace",
-                        "collectionless aggregate requires $documents as the first stage",
-                    ));
-                }
-                (format!("{database}.$cmd.aggregate"), Vec::new())
-            }
-            _ => {
-                return Err(CommandError::new(
-                    9,
-                    "FailedToParse",
-                    "aggregate requires a collection name or 1 for collectionless aggregate",
-                ));
-            }
+            };
+            let results =
+                run_pipeline_with_resolver(input, execution_pipeline, &database, &resolver)?;
+            (namespace, results)
         };
-        let results = run_pipeline_with_resolver(input, &pipeline, &database, &resolver)?;
+        if let Some(target_collection) = out_target {
+            self.write_out_collection(&database, target_collection, results)?;
+            let cursor = self
+                .cursors
+                .lock()
+                .open(namespace, Vec::new(), batch_size, false);
+            return Ok(cursor_document(cursor, "firstBatch"));
+        }
         let cursor = self
             .cursors
             .lock()
             .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
     }
+
+    fn handle_current_op_aggregate(
+        &self,
+        body: &Document,
+        database: &str,
+        batch_size: Option<i64>,
+    ) -> Result<Document, CommandError> {
+        let current_op = body
+            .get_array("pipeline")
+            .ok()
+            .and_then(|pipeline| pipeline.first())
+            .and_then(Bson::as_document)
+            .and_then(|stage| stage.get_document("$currentOp").ok());
+        let current_op = current_op.ok_or_else(|| {
+            CommandError::new(
+                9,
+                "FailedToParse",
+                "collectionless $currentOp aggregation requires a $currentOp stage document",
+            )
+        })?;
+
+        if !current_op.get_bool("localOps").unwrap_or(false) {
+            return Err(CommandError::new(
+                115,
+                "CommandNotSupported",
+                "collectionless $currentOp requires localOps: true",
+            ));
+        }
+
+        for key in current_op.keys() {
+            if key != "localOps" {
+                return Err(CommandError::new(
+                    115,
+                    "CommandNotSupported",
+                    "collectionless $currentOp only supports localOps",
+                ));
+            }
+        }
+
+        let mut operation = Document::new();
+        operation.insert("type", "op");
+        operation.insert("ns", format!("{database}.$cmd.aggregate"));
+        operation.insert("command", Bson::Document(body.clone()));
+
+        let cursor = self.cursors.lock().open(
+            format!("{database}.$cmd.aggregate"),
+            vec![operation],
+            batch_size,
+            false,
+        );
+        Ok(cursor_document(cursor, "firstBatch"))
+    }
+
+    fn write_out_collection(
+        &self,
+        database: &str,
+        collection: &str,
+        results: Vec<Document>,
+    ) -> Result<(), CommandError> {
+        let mut storage = self.storage.write();
+        let existing_options = storage
+            .catalog()
+            .get_collection(database, collection)
+            .ok()
+            .map(|catalog| catalog.options.clone())
+            .unwrap_or_default();
+        let mut collection_state = CollectionCatalog::new(existing_options);
+        for mut document in results {
+            ensure_object_id(&mut document);
+            let record_id = collection_state.next_record_id();
+            collection_state.insert_record(CollectionRecord {
+                record_id,
+                document,
+            })?;
+        }
+        storage
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: database.to_string(),
+                collection: collection.to_string(),
+                collection_state,
+            })
+            .map(|_| ())
+            .map_err(internal_error)
+    }
+}
+
+fn parse_out_target(value: &Bson) -> Result<&str, CommandError> {
+    value.as_str().ok_or_else(|| {
+        CommandError::new(
+            115,
+            "CommandNotSupported",
+            "aggregation stage `$out` only supports a string collection name",
+        )
+    })
 }
 
 struct BrokerCollectionResolver<'a> {
@@ -3052,6 +3301,152 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn collectionless_current_op_aggregate_reports_the_inflight_command() {
+        let (serve_task, _temp_dir, manifest) = start_broker("current-op.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let aggregate = send_command(
+            &mut stream,
+            doc! {
+                "aggregate": 1,
+                "pipeline": [
+                    { "$currentOp": { "localOps": true } }
+                ],
+                "cursor": {},
+                "$db": "admin"
+            },
+        )
+        .await;
+        let aggregate_batch = aggregate
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("batch");
+        assert_eq!(aggregate_batch.len(), 1);
+        let operation = aggregate_batch[0].as_document().expect("operation");
+        assert_eq!(operation.get_str("ns").expect("ns"), "admin.$cmd.aggregate");
+        let command = operation.get_document("command").expect("command");
+        assert_eq!(command.get_i32("aggregate").expect("aggregate"), 1);
+        assert_eq!(
+            command
+                .get_array("pipeline")
+                .expect("pipeline")
+                .first()
+                .and_then(Bson::as_document)
+                .and_then(|stage| stage.get_document("$currentOp").ok())
+                .and_then(|stage| stage.get_bool("localOps").ok()),
+            Some(true)
+        );
+        assert!(command.get_document("cursor").expect("cursor").is_empty());
+        assert_eq!(command.get_str("$db").expect("$db"), "admin");
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aggregate_out_replaces_the_target_collection_and_returns_an_empty_cursor() {
+        let (serve_task, _temp_dir, manifest) = start_broker("aggregate-out.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "a", "qty": 2 },
+                    { "_id": 2, "sku": "b", "qty": 1 }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let aggregate = send_command(
+            &mut stream,
+            doc! {
+                "aggregate": "widgets",
+                "pipeline": [
+                    { "$match": { "qty": { "$gte": 2 } } },
+                    { "$out": "report" }
+                ],
+                "cursor": {},
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = aggregate
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert!(first_batch.is_empty());
+
+        let report = send_command(
+            &mut stream,
+            doc! {
+                "find": "report",
+                "$db": "app"
+            },
+        )
+        .await;
+        let report_batch = report
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert_eq!(report_batch.len(), 1);
+        assert_eq!(
+            report_batch[0]
+                .as_document()
+                .expect("document")
+                .get_str("sku")
+                .expect("sku"),
+            "a"
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_on_a_missing_collection_is_a_noop() {
+        let (serve_task, _temp_dir, manifest) = start_broker("delete-noop.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let delete = send_command(
+            &mut stream,
+            doc! {
+                "delete": "widgets",
+                "deletes": [{ "q": {}, "limit": 0 }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(delete.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(delete.get_i32("n").expect("n"), 0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn explain_reports_ixscan_for_indexed_find() {
         let (serve_task, _temp_dir, manifest) = start_broker("explain.mongodb").await;
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
@@ -3094,6 +3489,78 @@ mod tests {
             .expect("shutdown timeout")
             .expect("join")
             .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_reports_cursor_planner_for_aggregate() {
+        let (serve_task, _temp_dir, manifest) = start_broker("aggregate-explain.mongodb").await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1, "sku": "a", "qty": 2 }],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let explain = send_command(
+            &mut stream,
+            doc! {
+                "explain": {
+                    "aggregate": "widgets",
+                    "pipeline": [
+                        { "$match": { "sku": "a" } },
+                        { "$group": { "_id": "$sku", "total": { "$sum": "$qty" } } }
+                    ],
+                    "cursor": {}
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+        )
+        .await;
+        let stages = explain.get_array("stages").expect("stages");
+        let cursor_stage = stages[0].as_document().expect("cursor stage");
+        let cursor = cursor_stage.get_document("$cursor").expect("$cursor");
+        let planner = cursor.get_document("queryPlanner").expect("queryPlanner");
+        assert_eq!(
+            planner.get_str("namespace").expect("namespace"),
+            "app.widgets"
+        );
+        assert!(planner.get_document("winningPlan").is_ok());
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_rejects_aggregate_pipelines_with_out() {
+        assert_rejected(
+            doc! {
+                "explain": {
+                    "aggregate": "widgets",
+                    "pipeline": [
+                        { "$project": { "_id": 0 } },
+                        { "$out": "report" }
+                    ],
+                    "cursor": {}
+                },
+                "verbosity": "queryPlanner",
+                "$db": "app"
+            },
+            115,
+        )
+        .await;
     }
 
     #[cfg(unix)]
@@ -4310,6 +4777,15 @@ mod tests {
         assert_rejected(
             doc! { "ping": 1, "$readPreference": { "mode": "secondary" }, "$db": "admin" },
             115,
+        )
+        .await;
+        assert_rejected(
+            doc! {
+                "explain": { "find": "widgets", "$db": "app" },
+                "verbosity": "unsupported",
+                "$db": "app"
+            },
+            9,
         )
         .await;
     }
