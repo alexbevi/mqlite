@@ -15,7 +15,8 @@
     "$nor",
     "$not",
     "$or",
-    "$size"
+    "$size",
+    "$type"
   ],
   "aggregation_stages": [
     "$addFields",

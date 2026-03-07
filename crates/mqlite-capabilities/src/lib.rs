@@ -1037,6 +1037,7 @@ mod tests {
                 doc! { "qty": 12 },
                 doc! { "qty": { "$not": { "$mod": [5, 1] } } },
             ),
+            "$type" => (doc! { "sku": "abc" }, doc! { "sku": { "$type": "string" } }),
             other => panic!("missing supported query fixture for {other}"),
         }
     }

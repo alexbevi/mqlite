@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub const SUPPORTED_QUERY_OPERATORS: &[&str] = &[
     "$and", "$or", "$nor", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists",
-    "$size", "$mod", "$all", "$not",
+    "$size", "$mod", "$all", "$not", "$type",
 ];
 
 pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
@@ -29,6 +29,12 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &["$literal"];
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] = &["$sum", "$first", "$push", "$avg"];
 
 pub const SUPPORTED_AGGREGATION_WINDOW_OPERATORS: &[&str] = &[];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeSet {
+    pub all_numbers: bool,
+    pub codes: Vec<i32>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchExpr {
@@ -75,6 +81,10 @@ pub enum MatchExpr {
     Exists {
         path: String,
         exists: bool,
+    },
+    Type {
+        path: String,
+        type_set: TypeSet,
     },
     Size {
         path: String,
@@ -467,6 +477,9 @@ fn matches_expression(document: &Document, expression: &MatchExpr) -> bool {
             lookup_path(document, path).is_some_and(|value| matches_all(value, values))
         }
         MatchExpr::Exists { path, exists } => lookup_path(document, path).is_some() == *exists,
+        MatchExpr::Type { path, type_set } => {
+            lookup_path(document, path).is_some_and(|value| matches_type(value, type_set))
+        }
         MatchExpr::Size { path, size } => lookup_path(document, path)
             .and_then(Bson::as_array)
             .is_some_and(|values| values.len() == *size),
@@ -543,6 +556,10 @@ fn parse_field_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryEr
                             .as_bool()
                             .ok_or(QueryError::InvalidStructure)?,
                     },
+                    "$type" => MatchExpr::Type {
+                        path: path.to_string(),
+                        type_set: parse_type_set(operator_value)?,
+                    },
                     "$size" => MatchExpr::Size {
                         path: path.to_string(),
                         size: usize::try_from(
@@ -605,6 +622,46 @@ fn parse_not_expression(path: &str, value: &Bson) -> Result<MatchExpr, QueryErro
         }
         _ => Err(QueryError::InvalidStructure),
     }
+}
+
+fn parse_type_set(value: &Bson) -> Result<TypeSet, QueryError> {
+    let mut type_set = TypeSet {
+        all_numbers: false,
+        codes: Vec::new(),
+    };
+
+    match value {
+        Bson::Array(values) => {
+            for item in values {
+                add_type_spec(&mut type_set, item)?;
+            }
+        }
+        _ => add_type_spec(&mut type_set, value)?,
+    }
+
+    type_set.codes.sort_unstable();
+    type_set.codes.dedup();
+    Ok(type_set)
+}
+
+fn add_type_spec(type_set: &mut TypeSet, value: &Bson) -> Result<(), QueryError> {
+    if let Some(alias) = value.as_str() {
+        if alias == "number" {
+            type_set.all_numbers = true;
+            return Ok(());
+        }
+
+        let code = type_alias_code(alias).ok_or(QueryError::InvalidStructure)?;
+        type_set.codes.push(code);
+        return Ok(());
+    }
+
+    let code = parse_type_code(value).ok_or(QueryError::InvalidStructure)?;
+    if code == 0 {
+        return Err(QueryError::InvalidStructure);
+    }
+    type_set.codes.push(code);
+    Ok(())
 }
 
 fn increment_value(current: &Bson, increment: &Bson) -> Result<Bson, QueryError> {
@@ -690,6 +747,88 @@ fn dedup_values(values: &[Bson]) -> Vec<Bson> {
     unique.sort_by(compare_bson);
     unique.dedup_by(|left, right| compare_bson(left, right).is_eq());
     unique
+}
+
+fn matches_type(value: &Bson, type_set: &TypeSet) -> bool {
+    (type_set.all_numbers && is_numeric_bson(value))
+        || type_set
+            .codes
+            .iter()
+            .any(|code| bson_type_code(value) == *code)
+}
+
+fn type_alias_code(alias: &str) -> Option<i32> {
+    match alias {
+        "double" => Some(1),
+        "string" => Some(2),
+        "object" => Some(3),
+        "array" => Some(4),
+        "binData" => Some(5),
+        "undefined" => Some(6),
+        "objectId" => Some(7),
+        "bool" | "boolean" => Some(8),
+        "date" => Some(9),
+        "null" => Some(10),
+        "regex" => Some(11),
+        "dbPointer" => Some(12),
+        "javascript" => Some(13),
+        "symbol" => Some(14),
+        "javascriptWithScope" => Some(15),
+        "int" => Some(16),
+        "timestamp" => Some(17),
+        "long" => Some(18),
+        "decimal" => Some(19),
+        "minKey" => Some(-1),
+        "maxKey" => Some(127),
+        _ => None,
+    }
+}
+
+fn parse_type_code(value: &Bson) -> Option<i32> {
+    let code = match value {
+        Bson::Int32(value) => Some(*value as i64),
+        Bson::Int64(value) => Some(*value),
+        Bson::Double(value) if value.is_finite() && value.fract() == 0.0 => Some(*value as i64),
+        Bson::Decimal128(value) => {
+            let parsed = value.to_string().parse::<f64>().ok()?;
+            (parsed.is_finite() && parsed.fract() == 0.0).then_some(parsed as i64)
+        }
+        _ => None,
+    }?;
+    i32::try_from(code).ok()
+}
+
+fn bson_type_code(value: &Bson) -> i32 {
+    match value {
+        Bson::Double(_) => 1,
+        Bson::String(_) => 2,
+        Bson::Document(_) => 3,
+        Bson::Array(_) => 4,
+        Bson::Binary(_) => 5,
+        Bson::Undefined => 6,
+        Bson::ObjectId(_) => 7,
+        Bson::Boolean(_) => 8,
+        Bson::DateTime(_) => 9,
+        Bson::Null => 10,
+        Bson::RegularExpression(_) => 11,
+        Bson::DbPointer(_) => 12,
+        Bson::JavaScriptCode(_) => 13,
+        Bson::Symbol(_) => 14,
+        Bson::JavaScriptCodeWithScope(_) => 15,
+        Bson::Int32(_) => 16,
+        Bson::Timestamp(_) => 17,
+        Bson::Int64(_) => 18,
+        Bson::Decimal128(_) => 19,
+        Bson::MinKey => -1,
+        Bson::MaxKey => 127,
+    }
+}
+
+fn is_numeric_bson(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
 }
 
 fn number_bson(value: f64) -> Bson {
@@ -951,7 +1090,9 @@ impl GroupAccumulatorState {
 
 #[cfg(test)]
 mod tests {
-    use bson::{Bson, Document, doc};
+    use std::str::FromStr;
+
+    use bson::{Bson, DateTime, Decimal128, Document, Timestamp, doc, oid::ObjectId};
     use pretty_assertions::assert_eq;
 
     use super::{
@@ -1147,6 +1288,52 @@ mod tests {
     fn rejects_malformed_not_filters() {
         assert!(matches!(
             document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$not": 5 } }),
+            Err(QueryError::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn supports_type_filters() {
+        let document = doc! {
+            "name": "Ada",
+            "count": 5_i32,
+            "big": Bson::Int64(7),
+            "price": 4.5,
+            "meta": { "enabled": true },
+            "tags": ["red", "blue"],
+            "when": DateTime::now(),
+            "id": ObjectId::new(),
+            "stamp": Timestamp { time: 1, increment: 2 },
+            "dec": Bson::Decimal128(Decimal128::from_str("1.5").expect("decimal")),
+        };
+
+        assert_filter(&document, doc! { "name": { "$type": "string" } }, true);
+        assert_filter(&document, doc! { "count": { "$type": "int" } }, true);
+        assert_filter(&document, doc! { "big": { "$type": "long" } }, true);
+        assert_filter(&document, doc! { "price": { "$type": "double" } }, true);
+        assert_filter(&document, doc! { "price": { "$type": "number" } }, true);
+        assert_filter(&document, doc! { "meta": { "$type": "object" } }, true);
+        assert_filter(&document, doc! { "tags": { "$type": "array" } }, true);
+        assert_filter(&document, doc! { "when": { "$type": "date" } }, true);
+        assert_filter(&document, doc! { "id": { "$type": "objectId" } }, true);
+        assert_filter(&document, doc! { "stamp": { "$type": "timestamp" } }, true);
+        assert_filter(&document, doc! { "dec": { "$type": "decimal" } }, true);
+        assert_filter(
+            &document,
+            doc! { "name": { "$type": ["int", "string"] } },
+            true,
+        );
+        assert_filter(&document, doc! { "missing": { "$type": "string" } }, false);
+    }
+
+    #[test]
+    fn rejects_malformed_type_filters() {
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$type": "missing" } }),
+            Err(QueryError::InvalidStructure)
+        ));
+        assert!(matches!(
+            document_matches(&doc! { "qty": 12 }, &doc! { "qty": { "$type": 0 } }),
             Err(QueryError::InvalidStructure)
         ));
     }
