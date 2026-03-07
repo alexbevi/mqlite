@@ -72,6 +72,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 - `db.collection.aggregate([{ $collStats: { count: {}, storageStats: {} } }])` returns local namespace metadata for the file-backed collection
 - `db.collection.aggregate([{ $indexStats: {} }])` returns local index metadata for the file-backed collection
 - `db.admin.aggregate([{ $listCatalog: {} }])` returns the local file-backed namespace catalog
+- `db.collection.aggregate([{ $listCachedAndActiveUsers: {} }])` returns an empty result because `mqlite` has no auth user cache
 - `db.collection.aggregate([{ $planCacheStats: {} }])` returns local persisted plan-cache metadata for the file-backed collection
 - `listCollections` on a missing database returns an empty cursor so driver cleanup/setup paths do not fail on fresh files
   - `dropDatabase` is supported for local test setup and teardown

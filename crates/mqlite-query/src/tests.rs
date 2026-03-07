@@ -11,7 +11,7 @@ use pretty_assertions::assert_eq;
 
 use crate::{
     CollectionResolver, QueryError, apply_projection, apply_update, document_matches,
-    document_matches_expression, parse_filter, parse_update, run_pipeline,
+    document_matches_expression, parse_filter, parse_update, parse_update_value, run_pipeline,
     run_pipeline_with_resolver,
 };
 
@@ -678,6 +678,19 @@ fn applies_modifier_updates() {
             .get("enabled")
             .is_none()
     );
+}
+
+#[test]
+fn applies_pipeline_updates() {
+    let mut document = doc! { "_id": 1, "qty": 2 };
+    let update = parse_update_value(&Bson::Array(vec![
+        Bson::Document(doc! { "$set": { "qty": 5 } }),
+        Bson::Document(doc! { "$set": { "flag": "beta" } }),
+    ]))
+    .expect("parse update");
+
+    apply_update(&mut document, &update).expect("apply");
+    assert_eq!(document, doc! { "_id": 1, "qty": 5, "flag": "beta" });
 }
 
 #[test]
@@ -2016,6 +2029,37 @@ fn list_catalog_stage_rejects_invalid_specs() {
         ],
     )
     .expect_err("$listCatalog should only be valid as the first stage");
+    assert!(matches!(error, QueryError::InvalidStage));
+}
+
+#[test]
+fn list_cached_and_active_users_stage_returns_no_results_without_auth() {
+    let results = run_pipeline_ok(
+        vec![doc! { "_id": 1 }],
+        &[doc! { "$listCachedAndActiveUsers": {} }],
+    );
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn list_cached_and_active_users_stage_rejects_invalid_specs() {
+    for stage in [
+        doc! { "$listCachedAndActiveUsers": 1 },
+        doc! { "$listCachedAndActiveUsers": { "all": true } },
+    ] {
+        let error = run_pipeline(Vec::new(), &[stage]).expect_err("invalid");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "_id": 1 }],
+        &[
+            doc! { "$match": { "_id": 1 } },
+            doc! { "$listCachedAndActiveUsers": {} },
+        ],
+    )
+    .expect_err("$listCachedAndActiveUsers should only be valid as the first stage");
     assert!(matches!(error, QueryError::InvalidStage));
 }
 

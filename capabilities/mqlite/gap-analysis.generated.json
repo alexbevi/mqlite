@@ -1129,10 +1129,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 57,
-    "total_supported": 28,
-    "public_supported": 28,
-    "total_unsupported": 56,
-    "public_unsupported": 29,
+    "total_supported": 29,
+    "public_supported": 29,
+    "total_unsupported": 55,
+    "public_unsupported": 28,
     "items": [
       {
         "name": "$_internalAllCollectionStats",
@@ -1939,8 +1939,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$listCatalog",

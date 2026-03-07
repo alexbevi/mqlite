@@ -23,7 +23,7 @@ use mqlite_ipc::{
 };
 use mqlite_query::{
     CollectionResolver, MatchExpr, QueryError, apply_projection, apply_update, document_matches,
-    document_matches_expression, parse_filter, parse_update, run_pipeline_with_resolver,
+    document_matches_expression, parse_filter, parse_update_value, run_pipeline_with_resolver,
     upsert_seed_from_query,
 };
 use mqlite_storage::{
@@ -1152,10 +1152,10 @@ impl Broker {
             let query = operation.get_document("q").map_err(|_| {
                 CommandError::new(9, "FailedToParse", "update operations require `q`")
             })?;
-            let update = operation.get_document("u").map_err(|_| {
+            let update = operation.get("u").ok_or_else(|| {
                 CommandError::new(9, "FailedToParse", "update operations require `u`")
             })?;
-            let update_spec = parse_update(update)?;
+            let update_spec = parse_update_value(update)?;
             let multi = operation.get_bool("multi").unwrap_or(false);
             let upsert = operation.get_bool("upsert").unwrap_or(false);
 

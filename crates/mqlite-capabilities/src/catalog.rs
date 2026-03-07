@@ -1129,6 +1129,9 @@ mod tests {
                 }],
             ),
             "$listCatalog" => (Vec::new(), vec![doc! { "$listCatalog": {} }]),
+            "$listCachedAndActiveUsers" => {
+                (vec![doc! { "_id": 1 }], vec![doc! { "$listCachedAndActiveUsers": {} }])
+            }
             "$merge" => (vec![doc! { "_id": 1 }], vec![doc! { "$merge": "archive" }]),
             "$out" => (vec![doc! { "_id": 1 }], vec![doc! { "$out": "archive" }]),
             "$planCacheStats" => (Vec::new(), vec![doc! { "$planCacheStats": {} }]),

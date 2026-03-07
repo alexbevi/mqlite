@@ -78,6 +78,9 @@ fn run_pipeline_with_context<R: CollectionResolver>(
             "$currentOp" => current_op_documents(stage_index, stage_spec)?,
             "$indexStats" => index_stats_documents(stage_index, stage_spec)?,
             "$listCatalog" => list_catalog_documents(stage_index, stage_spec)?,
+            "$listCachedAndActiveUsers" => {
+                list_cached_and_active_users_documents(stage_index, stage_spec)?
+            }
             "$planCacheStats" => plan_cache_stats_documents(stage_index, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
@@ -1158,6 +1161,22 @@ fn list_catalog_documents(stage_index: usize, spec: &Bson) -> Result<Vec<Documen
         "options": {},
         "indexCount": 1_i64,
     }])
+}
+
+fn list_cached_and_active_users_documents(
+    stage_index: usize,
+    spec: &Bson,
+) -> Result<Vec<Document>, QueryError> {
+    if stage_index != 0 {
+        return Err(QueryError::InvalidStage);
+    }
+
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if !spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+
+    Ok(Vec::new())
 }
 
 #[derive(Debug, Clone, Copy)]
