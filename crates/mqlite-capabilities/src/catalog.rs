@@ -24,6 +24,16 @@ const FIND_COMMAND_IDL: &str = "../mongo/src/mongo/db/query/find_command.idl";
 const AGGREGATE_COMMAND_IDL: &str = "../mongo/src/mongo/db/pipeline/aggregate_command.idl";
 const WRITE_OPS_IDL: &str = "../mongo/src/mongo/db/query/write_ops/write_ops.idl";
 const DBREF_PSEUDO_OPERATORS: &[&str] = &["$db", "$id", "$ref"];
+const IGNORED_AGGREGATION_STAGES: &[&str] = &[
+    "$rankFusion",
+    "$score",
+    "$scoreFusion",
+    "$search",
+    "$searchBeta",
+    "$searchMeta",
+    "$shardedDataDistribution",
+    "$vectorSearch",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReferenceAnchors {
@@ -85,6 +95,7 @@ pub struct GapItem {
     pub macro_kinds: Vec<String>,
     pub feature_flagged: bool,
     pub conditional: bool,
+    pub ignored: bool,
     pub status: SupportStatus,
     pub validation: ValidationMode,
 }
@@ -97,6 +108,7 @@ pub struct GapCategory {
     pub public_supported: usize,
     pub total_unsupported: usize,
     pub public_unsupported: usize,
+    pub public_ignored: usize,
     pub items: Vec<GapItem>,
 }
 
@@ -263,26 +275,31 @@ pub fn build_gap_analysis(upstream: &UpstreamCatalog) -> GapAnalysis {
         query_operators: build_gap_category(
             &upstream.query_operators,
             &support.query_operators,
+            |_item| false,
             |_item| ValidationMode::Rejection,
         ),
         aggregation_stages: build_gap_category(
             &upstream.aggregation_stages,
             &support.aggregation_stages,
+            |item| item.feature_flagged || IGNORED_AGGREGATION_STAGES.contains(&item.name.as_str()),
             |_item| ValidationMode::Rejection,
         ),
         aggregation_expression_operators: build_gap_category(
             &upstream.aggregation_expression_operators,
             &support.aggregation_expression_operators,
+            |_item| false,
             |_item| ValidationMode::Rejection,
         ),
         aggregation_accumulator_operators: build_gap_category(
             &upstream.aggregation_accumulator_operators,
             &support.aggregation_accumulator_operators,
+            |_item| false,
             |_item| ValidationMode::Rejection,
         ),
         aggregation_window_operators: build_gap_category(
             &upstream.aggregation_window_operators,
             &support.aggregation_window_operators,
+            |_item| false,
             |_item| ValidationMode::BlockedByStage {
                 stage: "$setWindowFields".to_string(),
             },
@@ -455,6 +472,7 @@ fn finalize_items(items: BTreeMap<String, CapabilityAccumulator>) -> Vec<Capabil
 fn build_gap_category(
     upstream: &[CapabilityItem],
     supported_names: &[String],
+    is_ignored: impl Fn(&CapabilityItem) -> bool,
     unsupported_validation: impl Fn(&CapabilityItem) -> ValidationMode,
 ) -> GapCategory {
     let supported_set = supported_names.iter().cloned().collect::<BTreeSet<_>>();
@@ -462,6 +480,7 @@ fn build_gap_category(
         .iter()
         .map(|item| {
             let supported = supported_set.contains(&item.name);
+            let ignored = !supported && !item.internal && is_ignored(item);
             GapItem {
                 name: item.name.clone(),
                 internal: item.internal,
@@ -470,6 +489,7 @@ fn build_gap_category(
                 macro_kinds: item.macro_kinds.clone(),
                 feature_flagged: item.feature_flagged,
                 conditional: item.conditional,
+                ignored,
                 status: if supported {
                     SupportStatus::Supported
                 } else {
@@ -486,6 +506,10 @@ fn build_gap_category(
 
     let total_upstream = items.len();
     let public_upstream = items.iter().filter(|item| !item.internal).count();
+    let public_ignored = items
+        .iter()
+        .filter(|item| !item.internal && item.ignored)
+        .count();
     let total_supported = items
         .iter()
         .filter(|item| item.status == SupportStatus::Supported)
@@ -501,7 +525,8 @@ fn build_gap_category(
         total_supported,
         public_supported,
         total_unsupported: total_upstream - total_supported,
-        public_unsupported: public_upstream - public_supported,
+        public_unsupported: public_upstream - public_supported - public_ignored,
+        public_ignored,
         items,
     }
 }
@@ -528,8 +553,8 @@ fn render_gap_markdown(gap: &GapAnalysis) -> String {
     }
     output.push('\n');
     output.push_str("## Summary\n\n");
-    output.push_str("| Category | Public upstream | Supported | Unsupported |\n");
-    output.push_str("| --- | ---: | ---: | ---: |\n");
+    output.push_str("| Category | Public upstream | Supported | Unsupported | Ignored |\n");
+    output.push_str("| --- | ---: | ---: | ---: | ---: |\n");
     append_summary_row(&mut output, "Query operators", &gap.query_operators);
     append_summary_row(&mut output, "Aggregation stages", &gap.aggregation_stages);
     append_summary_row(
@@ -572,16 +597,22 @@ fn render_gap_markdown(gap: &GapAnalysis) -> String {
 
 fn append_summary_row(output: &mut String, label: &str, category: &GapCategory) {
     output.push_str(&format!(
-        "| {label} | {} | {} | {} |\n",
-        category.public_upstream, category.public_supported, category.public_unsupported
+        "| {label} | {} | {} | {} | {} |\n",
+        category.public_upstream,
+        category.public_supported,
+        category.public_unsupported,
+        category.public_ignored
     ));
 }
 
 fn append_category_section(output: &mut String, title: &str, category: &GapCategory) {
     output.push_str(&format!("## {title}\n\n"));
     output.push_str(&format!(
-        "Public upstream: {}. Supported: {}. Unsupported: {}.\n\n",
-        category.public_upstream, category.public_supported, category.public_unsupported
+        "Public upstream: {}. Supported: {}. Unsupported: {}. Ignored: {}.\n\n",
+        category.public_upstream,
+        category.public_supported,
+        category.public_unsupported,
+        category.public_ignored
     ));
 
     append_item_list(
@@ -598,7 +629,12 @@ fn append_category_section(output: &mut String, title: &str, category: &GapCateg
         category
             .items
             .iter()
-            .filter(|item| !item.internal && item.status == SupportStatus::Unsupported),
+            .filter(|item| !item.internal && item.status == SupportStatus::Unsupported && !item.ignored),
+    );
+    append_item_list(
+        output,
+        "### Ignored Public\n\n",
+        category.items.iter().filter(|item| !item.internal && item.ignored),
     );
     append_item_list(
         output,
@@ -631,6 +667,9 @@ fn render_item_label(item: &GapItem) -> String {
     }
     if item.conditional {
         flags.push("conditional");
+    }
+    if item.ignored {
+        flags.push("ignored");
     }
     if flags.is_empty() {
         format!("`{}`", item.name)
@@ -892,6 +931,33 @@ mod tests {
         let finalized = finalize_items(items);
         assert_eq!(finalized.len(), 1);
         assert!(finalized[0].internal);
+    }
+
+    #[test]
+    fn ignored_aggregation_stages_are_not_counted_as_backlog() {
+        let repo_root = repo_root();
+        let upstream = load_upstream_snapshot(&repo_root).expect("upstream snapshot");
+        let gap = build_gap_analysis(&upstream);
+
+        assert!(gap
+            .aggregation_stages
+            .items
+            .iter()
+            .find(|item| item.name == "$search")
+            .is_some_and(|item| item.ignored));
+        assert!(gap
+            .aggregation_stages
+            .items
+            .iter()
+            .find(|item| item.name == "$vectorSearch")
+            .is_some_and(|item| item.ignored));
+        assert!(gap
+            .aggregation_stages
+            .items
+            .iter()
+            .find(|item| item.name == "$queryStats")
+            .is_some_and(|item| item.ignored));
+        assert_eq!(gap.aggregation_stages.public_unsupported, 7);
     }
 
     #[test]

@@ -26,17 +26,17 @@ cargo run -p mqlite-capabilities -- sync --check
 
 ## Summary
 
-| Category | Public upstream | Supported | Unsupported |
-| --- | ---: | ---: | ---: |
-| Query operators | 38 | 29 | 9 |
-| Aggregation stages | 54 | 37 | 17 |
-| Aggregation expression operators | 176 | 12 | 164 |
-| Aggregation accumulators | 25 | 5 | 20 |
-| Aggregation window functions | 36 | 0 | 36 |
+| Category | Public upstream | Supported | Unsupported | Ignored |
+| --- | ---: | ---: | ---: | ---: |
+| Query operators | 38 | 29 | 9 | 0 |
+| Aggregation stages | 54 | 37 | 7 | 10 |
+| Aggregation expression operators | 176 | 12 | 164 | 0 |
+| Aggregation accumulators | 25 | 5 | 20 | 0 |
+| Aggregation window functions | 36 | 0 | 36 | 0 |
 
 ## Query Operators
 
-Public upstream: 38. Supported: 29. Unsupported: 9.
+Public upstream: 38. Supported: 29. Unsupported: 9. Ignored: 0.
 
 ### Supported Public
 
@@ -82,6 +82,10 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 - `$where`
 - `$within`
 
+### Ignored Public
+
+- None
+
 ### Internal Or Server-Only Upstream
 
 - `$_internalBucketGeoWithin`
@@ -114,7 +118,7 @@ Public upstream: 38. Supported: 29. Unsupported: 9.
 
 ## Aggregation Stages
 
-Public upstream: 54. Supported: 37. Unsupported: 17.
+Public upstream: 54. Supported: 37. Unsupported: 7. Ignored: 10.
 
 ### Supported Public
 
@@ -164,17 +168,20 @@ Public upstream: 54. Supported: 37. Unsupported: 17.
 - `$fill`
 - `$geoNear`
 - `$graphLookup`
-- `$listExtensions` (feature-flagged)
-- `$queryStats` (feature-flagged)
-- `$rankFusion`
-- `$score`
-- `$scoreFusion` (feature-flagged)
-- `$search`
-- `$searchBeta`
-- `$searchMeta`
 - `$setWindowFields`
-- `$shardedDataDistribution`
-- `$vectorSearch`
+
+### Ignored Public
+
+- `$listExtensions` (feature-flagged, ignored)
+- `$queryStats` (feature-flagged, ignored)
+- `$rankFusion` (ignored)
+- `$score` (ignored)
+- `$scoreFusion` (feature-flagged, ignored)
+- `$search` (ignored)
+- `$searchBeta` (ignored)
+- `$searchMeta` (ignored)
+- `$shardedDataDistribution` (ignored)
+- `$vectorSearch` (ignored)
 
 ### Internal Or Server-Only Upstream
 
@@ -211,7 +218,7 @@ Public upstream: 54. Supported: 37. Unsupported: 17.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 12. Unsupported: 164.
+Public upstream: 176. Supported: 12. Unsupported: 164. Ignored: 0.
 
 ### Supported Public
 
@@ -395,6 +402,10 @@ Public upstream: 176. Supported: 12. Unsupported: 164.
 - `$year`
 - `$zip`
 
+### Ignored Public
+
+- None
+
 ### Internal Or Server-Only Upstream
 
 - `$_internalFindAllValuesAtPath`
@@ -408,7 +419,7 @@ Public upstream: 176. Supported: 12. Unsupported: 164.
 
 ## Aggregation Accumulators
 
-Public upstream: 25. Supported: 5. Unsupported: 20.
+Public upstream: 25. Supported: 5. Unsupported: 20. Ignored: 0.
 
 ### Supported Public
 
@@ -441,6 +452,10 @@ Public upstream: 25. Supported: 5. Unsupported: 20.
 - `$top`
 - `$topN`
 
+### Ignored Public
+
+- None
+
 ### Internal Or Server-Only Upstream
 
 - `$_internalConstructStats`
@@ -448,7 +463,7 @@ Public upstream: 25. Supported: 5. Unsupported: 20.
 
 ## Aggregation Window Functions
 
-Public upstream: 36. Supported: 0. Unsupported: 36.
+Public upstream: 36. Supported: 0. Unsupported: 36. Ignored: 0.
 
 ### Supported Public
 
@@ -492,6 +507,10 @@ Public upstream: 36. Supported: 0. Unsupported: 36.
 - `$sum`
 - `$top`
 - `$topN`
+
+### Ignored Public
+
+- None
 
 ### Internal Or Server-Only Upstream
 
