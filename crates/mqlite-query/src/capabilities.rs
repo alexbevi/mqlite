@@ -34,6 +34,7 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
     "$bucket",
     "$bucketAuto",
     "$changeStream",
+    "$changeStreamSplitLargeEvent",
     "$collStats",
     "$currentOp",
     "$densify",

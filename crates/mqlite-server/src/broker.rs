@@ -156,6 +156,12 @@ impl From<QueryError> for CommandError {
             QueryError::ExpectedDocument
             | QueryError::InvalidStage
             | QueryError::InvalidStructure => Self::new(9, "FailedToParse", error.to_string()),
+            QueryError::BsonObjectTooLarge(_) => {
+                Self::new(10334, "BSONObjectTooLarge", error.to_string())
+            }
+            QueryError::ChangeStreamFatalError(_) => {
+                Self::new(280, "ChangeStreamFatalError", error.to_string())
+            }
             QueryError::InvalidArgument(_) => Self::new(2, "BadValue", error.to_string()),
             QueryError::MixedProjection
             | QueryError::InvalidUpdate

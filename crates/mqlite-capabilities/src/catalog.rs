@@ -972,7 +972,7 @@ mod tests {
                 .find(|item| item.name == "$queryStats")
                 .is_some_and(|item| item.ignored)
         );
-        assert_eq!(gap.aggregation_stages.public_unsupported, 1);
+        assert_eq!(gap.aggregation_stages.public_unsupported, 0);
     }
 
     #[test]
@@ -1224,6 +1224,13 @@ mod tests {
                 vec![doc! { "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }],
             ),
             "$changeStream" => (Vec::new(), vec![doc! { "$changeStream": {} }]),
+            "$changeStreamSplitLargeEvent" => (
+                Vec::new(),
+                vec![
+                    doc! { "$changeStream": {} },
+                    doc! { "$changeStreamSplitLargeEvent": {} },
+                ],
+            ),
             "$collStats" => (
                 vec![doc! { "_id": 1 }, doc! { "_id": 2 }],
                 vec![doc! { "$collStats": { "count": {}, "storageStats": {} } }],

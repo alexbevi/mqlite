@@ -245,6 +245,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `$redact` aggregation with recursive `$$KEEP`, `$$PRUNE`, and `$$DESCEND` semantics over nested documents and arrays.
 - `$setWindowFields` for local partitioned window execution with `partitionBy`, `sortBy`, document windows, single-sort-key range windows, supported accumulator window functions (`$sum`, `$avg`, `$first`, `$last`, `$push`, `$addToSet`, `$min`, `$max`, `$count`), ranking functions (`$documentNumber`, `$rank`, `$denseRank`), `$shift`, `$locf`, and `$linearFill`.
 - `$changeStream` over a persisted local change-event log, including collection-scoped, database-scoped (`aggregate: 1`), and cluster-scoped (`admin` plus `allChangesForCluster: true`) streams, `resumeAfter`, `startAfter`, `startAtOperationTime`, `fullDocument`, `fullDocumentBeforeChange`, and `showExpandedEvents`. The current implementation returns the durable local history visible when the aggregate starts; it does not keep a live awaitData cursor open.
+- `$changeStreamSplitLargeEvent` as the final stage in a `$changeStream` pipeline, splitting oversized local change events into deterministic fragments with fragment resume tokens and explicit fatal errors when a resumed pipeline no longer reproduces the referenced split event.
 - Same-file `renameCollection` for local collection management, including cross-database renames within a single `.mongodb` file and optional `dropTarget` replacement.
 
 ## Unsupported Features
@@ -275,7 +276,6 @@ These are already part of the tested failure surface:
 
 ### Distributed consistency features
 - Retryable reads
-- `$changeStreamSplitLargeEvent`
 
 ### Storage features
 - Capped collections
@@ -310,7 +310,7 @@ Test coverage is a release gate:
 - Coverage reporting is wired into CI for the Linux job.
 - Capability snapshot tests keep the checked-in MongoDB operator and stage catalog in sync with the current `mqlite` support surface, and direct parser/executor contract tests validate that supported query operators, aggregation stages, expression operators, accumulators, and window functions are accepted while unsupported ones are rejected predictably.
 - Focused query and aggregation unit tests, inspired by MongoDB server matcher and pipeline tests, cover every currently supported query operator, aggregation stage, `$literal` expression operator, supported group accumulator, and supported `$setWindowFields` window operator.
-- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, direct CLI coverage for collection-scoped and collectionless `$changeStream`, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
+- The current baseline includes explicit rejection tests for session and transaction envelopes, regression tests for unsupported query operators and aggregation stages, CLI tests that validate broker auto-spawn and restart recovery without any patched driver, direct CLI coverage for collection-scoped and collectionless `$changeStream` plus `$changeStreamSplitLargeEvent`, broker restart tests that prove unique indexes and persisted plan-cache entries survive checkpoint and reopen, and `explain` tests that verify plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `find` plans return the expected `IXSCAN` or `OR` metadata and work counters.
 - The Node driver workspace now also carries a dedicated `file://` harness (`test/mocha_mqlite.js` and `test/tools/runner/run_mqlite.cjs`) so existing `node-mongodb-native` integration suites can be replayed against mqlite without editing the suites themselves. The default suite list lives in `test/tools/runner/mqlite_suite_registry.ts`, so unwanted suites can be removed by commenting out lines there. `npm run check:mqlite` runs that broad registry, `npm run check:mqlite:crud` keeps a small green bring-up subset, and `npm run check:mqlite:operations` runs the larger operation-focused set covering CRUD, aggregation, indexing, commands, BSON options, and example-style operation suites. Extra Mocha flags can be forwarded after `--`, so `npm run check:mqlite -- --reporter min` still expands the mqlite registry instead of falling back to recursive test discovery.
 
 ## CLI

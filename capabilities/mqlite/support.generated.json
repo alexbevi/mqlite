@@ -35,6 +35,7 @@
     "$bucket",
     "$bucketAuto",
     "$changeStream",
+    "$changeStreamSplitLargeEvent",
     "$collStats",
     "$count",
     "$currentOp",

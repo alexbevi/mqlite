@@ -16,6 +16,10 @@ pub enum QueryError {
     InvalidStage,
     #[error("{0}")]
     InvalidArgument(String),
+    #[error("{0}")]
+    BsonObjectTooLarge(String),
+    #[error("{0}")]
+    ChangeStreamFatalError(String),
     #[error("expected numeric value")]
     ExpectedNumeric,
     #[error("aggregation expression did not evaluate to a document")]

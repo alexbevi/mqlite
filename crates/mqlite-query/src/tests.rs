@@ -113,6 +113,33 @@ fn change_event(
     document
 }
 
+fn large_update_change_event(sequence: i64, payload: &str) -> Document {
+    change_event(
+        sequence,
+        "app",
+        Some("widgets"),
+        "update",
+        Some(doc! { "_id": sequence }),
+        Some(doc! { "_id": sequence, "payload": payload }),
+        Some(doc! { "_id": sequence, "payload": payload }),
+        Some(doc! { "updatedFields": { "payload": payload }, "removedFields": [] }),
+        false,
+        Document::new(),
+    )
+}
+
+fn merge_split_fragments(fragments: &[Document]) -> Document {
+    let mut merged = Document::new();
+    for fragment in fragments {
+        for (field, value) in fragment {
+            if field != "_id" && field != "splitEvent" {
+                merged.insert(field.clone(), value.clone());
+            }
+        }
+    }
+    merged
+}
+
 fn assert_filter(document: &Document, filter: Document, expected: bool) {
     assert_eq!(
         document_matches(document, &filter).expect("match"),
@@ -3215,6 +3242,260 @@ fn change_stream_stage_errors_when_required_images_or_resume_tokens_are_missing(
         missing_resume_token,
         QueryError::InvalidArgument(_)
     ));
+}
+
+#[test]
+fn change_stream_split_large_event_splits_oversized_events_and_enforces_size_limit() {
+    let payload = "x".repeat(8 * 1024 * 1024);
+    let resolver =
+        StaticResolver::default().with_change_events(vec![large_update_change_event(1, &payload)]);
+
+    let oversized = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! {
+            "$changeStream": {
+                "fullDocument": "updateLookup",
+                "fullDocumentBeforeChange": "required"
+            }
+        }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect_err("oversized change stream event without split stage");
+    assert!(matches!(oversized, QueryError::BsonObjectTooLarge(_)));
+
+    let results = run_pipeline_with_resolver(
+        Vec::new(),
+        &[
+            doc! {
+                "$changeStream": {
+                    "fullDocument": "updateLookup",
+                    "fullDocumentBeforeChange": "required"
+                }
+            },
+            doc! { "$changeStreamSplitLargeEvent": {} },
+        ],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("split large change stream event");
+
+    assert!(results.len() >= 2);
+    for (index, fragment) in results.iter().enumerate() {
+        let split_event = fragment.get_document("splitEvent").expect("split event");
+        assert_eq!(
+            split_event.get_i32("fragment").expect("fragment"),
+            (index + 1) as i32
+        );
+        assert_eq!(split_event.get_i32("of").expect("of"), results.len() as i32);
+        assert_eq!(
+            fragment
+                .get_document("_id")
+                .expect("token")
+                .get_i64("fragmentNum")
+                .expect("fragmentNum"),
+            index as i64
+        );
+    }
+
+    let merged = merge_split_fragments(&results);
+    assert_eq!(merged.get_str("operationType").expect("type"), "update");
+    assert_eq!(
+        merged
+            .get_document("documentKey")
+            .expect("documentKey")
+            .get_i64("_id")
+            .expect("_id"),
+        1
+    );
+    assert_eq!(
+        merged
+            .get_document("fullDocument")
+            .expect("fullDocument")
+            .get_str("payload")
+            .expect("payload")
+            .len(),
+        payload.len()
+    );
+    assert_eq!(
+        merged
+            .get_document("fullDocumentBeforeChange")
+            .expect("fullDocumentBeforeChange")
+            .get_str("payload")
+            .expect("payload")
+            .len(),
+        payload.len()
+    );
+}
+
+#[test]
+fn change_stream_split_large_event_supports_fragment_resume_and_fails_when_pipeline_changes() {
+    let payload = "x".repeat(8 * 1024 * 1024);
+    let resolver = StaticResolver::default().with_change_events(vec![
+        large_update_change_event(1, &payload),
+        change_event(
+            2,
+            "app",
+            Some("widgets"),
+            "insert",
+            Some(doc! { "_id": 2 }),
+            Some(doc! { "_id": 2, "payload": "small" }),
+            None,
+            None,
+            false,
+            Document::new(),
+        ),
+    ]);
+    let base_pipeline = vec![
+        doc! {
+            "$changeStream": {
+                "fullDocument": "updateLookup",
+                "fullDocumentBeforeChange": "whenAvailable"
+            }
+        },
+        doc! { "$changeStreamSplitLargeEvent": {} },
+    ];
+
+    let initial = run_pipeline_with_resolver(
+        Vec::new(),
+        &base_pipeline,
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("initial split stream");
+    let split_fragments = initial
+        .iter()
+        .take_while(|document| document.contains_key("splitEvent"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(split_fragments.len() >= 2);
+    let resume_token = split_fragments[split_fragments.len() - 2]
+        .get_document("_id")
+        .expect("resume token")
+        .clone();
+
+    let resumed = run_pipeline_with_resolver(
+        Vec::new(),
+        &[
+            doc! {
+                "$changeStream": {
+                    "fullDocument": "updateLookup",
+                    "fullDocumentBeforeChange": "whenAvailable",
+                    "resumeAfter": Bson::Document(resume_token.clone()),
+                }
+            },
+            doc! { "$changeStreamSplitLargeEvent": {} },
+        ],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect("resume after split fragment");
+    assert_eq!(
+        resumed[0]
+            .get_document("splitEvent")
+            .expect("splitEvent")
+            .get_i32("fragment")
+            .expect("fragment"),
+        split_fragments.len() as i32
+    );
+
+    let missing_split_stage = run_pipeline_with_resolver(
+        Vec::new(),
+        &[doc! {
+            "$changeStream": {
+                "fullDocument": "updateLookup",
+                "fullDocumentBeforeChange": "whenAvailable",
+                "resumeAfter": Bson::Document(resume_token.clone()),
+            }
+        }],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect_err("split resume token requires split stage");
+    assert!(matches!(
+        missing_split_stage,
+        QueryError::ChangeStreamFatalError(_)
+    ));
+
+    let incompatible_resume = run_pipeline_with_resolver(
+        Vec::new(),
+        &[
+            doc! {
+                "$changeStream": {
+                    "fullDocument": "updateLookup",
+                    "fullDocumentBeforeChange": "whenAvailable",
+                    "resumeAfter": Bson::Document(resume_token),
+                }
+            },
+            doc! { "$project": { "_id": 1, "operationType": 1, "documentKey": 1, "fullDocument": 1 } },
+            doc! { "$changeStreamSplitLargeEvent": {} },
+        ],
+        "app",
+        Some("widgets"),
+        &resolver,
+    )
+    .expect_err("resume token should fail when the resumed pipeline no longer splits");
+    assert!(matches!(
+        incompatible_resume,
+        QueryError::ChangeStreamFatalError(_)
+    ));
+}
+
+#[test]
+fn change_stream_split_large_event_validates_pipeline_position() {
+    let missing_change_stream =
+        run_pipeline(Vec::new(), &[doc! { "$changeStreamSplitLargeEvent": {} }])
+            .expect_err("split stage requires change stream");
+    assert!(matches!(
+        missing_change_stream,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let not_last = run_pipeline_with_resolver(
+        Vec::new(),
+        &[
+            doc! { "$changeStream": {} },
+            doc! { "$changeStreamSplitLargeEvent": {} },
+            doc! { "$project": { "_id": 1 } },
+        ],
+        "app",
+        Some("widgets"),
+        &StaticResolver::default(),
+    )
+    .expect_err("split stage must be last");
+    assert!(matches!(not_last, QueryError::InvalidStage));
+
+    let results = run_pipeline_with_resolver(
+        Vec::new(),
+        &[
+            doc! { "$changeStream": {} },
+            doc! { "$match": { "operationType": "insert" } },
+            doc! { "$redact": "$$DESCEND" },
+            doc! { "$changeStreamSplitLargeEvent": {} },
+        ],
+        "app",
+        Some("widgets"),
+        &StaticResolver::default().with_change_events(vec![change_event(
+            1,
+            "app",
+            Some("widgets"),
+            "insert",
+            Some(doc! { "_id": 1 }),
+            Some(doc! { "_id": 1, "qty": 1 }),
+            None,
+            None,
+            false,
+            Document::new(),
+        )]),
+    )
+    .expect("split stage should be valid after match and redact");
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].contains_key("splitEvent"));
 }
 
 #[test]

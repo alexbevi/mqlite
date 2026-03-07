@@ -1195,10 +1195,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 54,
-    "total_supported": 43,
-    "public_supported": 43,
-    "total_unsupported": 41,
-    "public_unsupported": 1,
+    "total_supported": 44,
+    "public_supported": 44,
+    "total_unsupported": 40,
+    "public_unsupported": 0,
     "public_ignored": 10,
     "items": [
       {
@@ -1804,8 +1804,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$collStats",

@@ -4376,3 +4376,107 @@ fn command_collectionless_aggregate_supports_change_stream_stage() {
             .all(|document| document["operationType"] == "insert")
     );
 }
+
+#[test]
+fn command_change_stream_split_large_event_accepts_change_stream_pipeline() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("change-stream-split.mongodb");
+
+    for command in [
+        json!({ "create": "widgets" }).to_string(),
+        json!({ "insert": "widgets", "documents": [{ "_id": 1, "sku": "alpha" }] }).to_string(),
+    ] {
+        let mut apply = Command::cargo_bin("mqlite").expect("binary");
+        apply
+            .args([
+                "command",
+                "--file",
+                database_path.to_str().expect("path"),
+                "--db",
+                "app",
+                "--idle-shutdown-secs",
+                "1",
+                "--eval",
+            ])
+            .arg(&command)
+            .assert()
+            .success();
+    }
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            { "$changeStream": {} },
+            { "$project": { "_id": 0, "operationType": 1, "documentKey": 1 } },
+            { "$changeStreamSplitLargeEvent": {} }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["operationType"], "insert");
+    assert!(first_batch[0].get("splitEvent").is_none());
+}
+
+#[test]
+fn command_change_stream_split_large_event_rejects_non_change_stream_pipeline() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("change-stream-split-invalid.mongodb");
+
+    let command = json!({
+        "aggregate": "widgets",
+        "pipeline": [{ "$changeStreamSplitLargeEvent": {} }],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&command)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json error");
+    assert_eq!(response["codeName"], "BadValue");
+    assert!(
+        response["errmsg"]
+            .as_str()
+            .expect("errmsg")
+            .contains("$changeStreamSplitLargeEvent can only be used in a $changeStream pipeline")
+    );
+}

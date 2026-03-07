@@ -37,6 +37,12 @@ impl CollectionResolver for NoopResolver {
     }
 }
 
+const MAX_BSON_OBJECT_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const CHANGE_STREAM_SPLIT_TOKEN_FIELD: &str = "fragmentNum";
+const CHANGE_STREAM_SPLIT_EVENT_FIELD: &str = "splitEvent";
+const CHANGE_STREAM_SPLIT_EVENT_FRAGMENT_FIELD: &str = "fragment";
+const CHANGE_STREAM_SPLIT_EVENT_TOTAL_FIELD: &str = "of";
+
 pub fn run_pipeline(
     documents: Vec<Document>,
     pipeline: &[Document],
@@ -77,7 +83,12 @@ fn run_pipeline_with_context<R: CollectionResolver>(
     context: &PipelineContext<'_, R>,
 ) -> Result<Vec<Document>, QueryError> {
     let mut current = documents;
+    let has_change_stream_split_large_event = pipeline
+        .iter()
+        .any(|stage| stage.len() == 1 && stage.contains_key("$changeStreamSplitLargeEvent"));
     let mut saw_change_stream = false;
+    let mut saw_change_stream_split_large_event = false;
+    let mut change_stream_split_resume = None;
 
     for (stage_index, stage) in pipeline.iter().enumerate() {
         if stage.len() != 1 {
@@ -94,7 +105,33 @@ fn run_pipeline_with_context<R: CollectionResolver>(
                     return Err(QueryError::InvalidStage);
                 }
                 saw_change_stream = true;
-                change_stream_documents(stage_spec, context)?
+                let output = change_stream_documents(
+                    stage_spec,
+                    context,
+                    has_change_stream_split_large_event,
+                )?;
+                change_stream_split_resume = output.resume_from_split;
+                output.documents
+            }
+            "$changeStreamSplitLargeEvent" if context.inside_facet => {
+                return Err(QueryError::InvalidStage);
+            }
+            "$changeStreamSplitLargeEvent" if !saw_change_stream => {
+                return Err(QueryError::InvalidArgument(
+                    "$changeStreamSplitLargeEvent can only be used in a $changeStream pipeline"
+                        .to_string(),
+                ));
+            }
+            "$changeStreamSplitLargeEvent" => {
+                if saw_change_stream_split_large_event || stage_index + 1 != pipeline.len() {
+                    return Err(QueryError::InvalidStage);
+                }
+                saw_change_stream_split_large_event = true;
+                split_change_stream_large_events(
+                    current,
+                    stage_spec,
+                    change_stream_split_resume.take(),
+                )?
             }
             "$bucket" => bucket_documents(current, stage_spec, &context.variables)?,
             "$bucketAuto" => bucket_auto_documents(current, stage_spec, &context.variables)?,
@@ -241,6 +278,10 @@ fn run_pipeline_with_context<R: CollectionResolver>(
         };
     }
 
+    if saw_change_stream && !saw_change_stream_split_large_event {
+        validate_change_stream_output_sizes(&current)?;
+    }
+
     Ok(current)
 }
 
@@ -303,6 +344,25 @@ struct ChangeStreamSpec {
     full_document_before_change: ChangeStreamFullDocumentBeforeChangeMode,
     all_changes_for_cluster: bool,
     show_expanded_events: bool,
+    resume_from_split: Option<ChangeStreamSplitResume>,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeStreamSplitResume {
+    token: Document,
+    skip_first_fragments: usize,
+}
+
+#[derive(Debug)]
+struct ChangeStreamStageOutput {
+    documents: Vec<Document>,
+    resume_from_split: Option<ChangeStreamSplitResume>,
+}
+
+#[derive(Debug)]
+struct SplitChangeStreamDocuments {
+    total_fragments: usize,
+    fragments: Vec<Document>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,8 +384,9 @@ struct InternalChangeEvent {
 fn change_stream_documents<R: CollectionResolver>(
     spec: &Bson,
     context: &PipelineContext<'_, R>,
-) -> Result<Vec<Document>, QueryError> {
-    let spec = parse_change_stream_spec(spec, context)?;
+    has_change_stream_split_large_event: bool,
+) -> Result<ChangeStreamStageOutput, QueryError> {
+    let spec = parse_change_stream_spec(spec, context, has_change_stream_split_large_event)?;
     let mut events = context
         .resolver
         .resolve_change_events()
@@ -349,10 +410,15 @@ fn change_stream_documents<R: CollectionResolver>(
     }
 
     if let Some(token) = spec.resume_after.as_ref().or(spec.start_after.as_ref()) {
+        let match_token = spec
+            .resume_from_split
+            .as_ref()
+            .map(|resume| &resume.token)
+            .unwrap_or(token);
         let Some(position) = events.iter().position(|event| {
             compare_bson(
                 &Bson::Document(event.token.clone()),
-                &Bson::Document(token.clone()),
+                &Bson::Document(match_token.clone()),
             )
             .is_eq()
         }) else {
@@ -360,18 +426,29 @@ fn change_stream_documents<R: CollectionResolver>(
                 "resume token does not exist in the local change-event log".to_string(),
             ));
         };
-        events = events.into_iter().skip(position + 1).collect();
+        let skip = if spec.resume_from_split.is_some() {
+            position
+        } else {
+            position + 1
+        };
+        events = events.into_iter().skip(skip).collect();
     }
 
-    events
+    let documents = events
         .into_iter()
         .map(|event| materialize_change_stream_event(event, &spec))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ChangeStreamStageOutput {
+        documents,
+        resume_from_split: spec.resume_from_split,
+    })
 }
 
 fn parse_change_stream_spec<R: CollectionResolver>(
     spec: &Bson,
     context: &PipelineContext<'_, R>,
+    has_change_stream_split_large_event: bool,
 ) -> Result<ChangeStreamSpec, QueryError> {
     let document = spec.as_document().ok_or(QueryError::InvalidStage)?;
     let mut resume_after = None;
@@ -434,6 +511,19 @@ fn parse_change_stream_spec<R: CollectionResolver>(
         return Err(QueryError::InvalidStage);
     }
 
+    let resume_from_split = resume_after
+        .as_ref()
+        .or(start_after.as_ref())
+        .map(parse_change_stream_split_resume)
+        .transpose()?
+        .flatten();
+    if resume_from_split.is_some() && !has_change_stream_split_large_event {
+        return Err(QueryError::ChangeStreamFatalError(
+            "To resume from a split event, the $changeStream pipeline must include a $changeStreamSplitLargeEvent stage"
+                .to_string(),
+        ));
+    }
+
     Ok(ChangeStreamSpec {
         resume_after,
         start_after,
@@ -442,7 +532,231 @@ fn parse_change_stream_spec<R: CollectionResolver>(
         full_document_before_change,
         all_changes_for_cluster,
         show_expanded_events,
+        resume_from_split,
     })
+}
+
+fn parse_change_stream_split_resume(
+    token: &Document,
+) -> Result<Option<ChangeStreamSplitResume>, QueryError> {
+    let Some(fragment_value) = token.get(CHANGE_STREAM_SPLIT_TOKEN_FIELD) else {
+        return Ok(None);
+    };
+    let Some(fragment_number) = non_negative_usize(fragment_value) else {
+        return Err(QueryError::InvalidStage);
+    };
+    let mut base_token = token.clone();
+    base_token.remove(CHANGE_STREAM_SPLIT_TOKEN_FIELD);
+    Ok(Some(ChangeStreamSplitResume {
+        token: base_token,
+        skip_first_fragments: fragment_number + 1,
+    }))
+}
+
+fn non_negative_usize(value: &Bson) -> Option<usize> {
+    match value {
+        Bson::Int32(value) if *value >= 0 => Some(*value as usize),
+        Bson::Int64(value) if *value >= 0 => usize::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn split_change_stream_large_events(
+    documents: Vec<Document>,
+    spec: &Bson,
+    resume_from_split: Option<ChangeStreamSplitResume>,
+) -> Result<Vec<Document>, QueryError> {
+    validate_change_stream_split_large_event_spec(spec)?;
+    let mut output = Vec::new();
+    let mut matched_resume_token = resume_from_split.is_none();
+
+    for document in documents {
+        let resume_target = resume_from_split
+            .as_ref()
+            .is_some_and(|resume| change_stream_document_has_token(&document, &resume.token));
+        let document_size = bson_document_size(&document)?;
+
+        if document_size <= MAX_BSON_OBJECT_SIZE_BYTES {
+            if resume_target {
+                return Err(incompatible_split_resume_error());
+            }
+            output.push(document);
+            continue;
+        }
+
+        let skip_first_fragments = if resume_target {
+            resume_from_split
+                .as_ref()
+                .expect("resume target has split resume state")
+                .skip_first_fragments
+        } else {
+            0
+        };
+        let split = split_change_stream_document(&document, skip_first_fragments)?;
+        if resume_target {
+            if split.total_fragments < skip_first_fragments {
+                return Err(incompatible_split_resume_error());
+            }
+            matched_resume_token = true;
+        }
+        output.extend(split.fragments);
+    }
+
+    if !matched_resume_token {
+        return Err(incompatible_split_resume_error());
+    }
+
+    Ok(output)
+}
+
+fn validate_change_stream_split_large_event_spec(spec: &Bson) -> Result<(), QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+    if !spec.is_empty() {
+        return Err(QueryError::InvalidStage);
+    }
+    Ok(())
+}
+
+fn change_stream_document_has_token(document: &Document, token: &Document) -> bool {
+    document
+        .get_document("_id")
+        .ok()
+        .is_some_and(|document_token| {
+            compare_bson(
+                &Bson::Document(document_token.clone()),
+                &Bson::Document(token.clone()),
+            )
+            .is_eq()
+        })
+}
+
+fn split_change_stream_document(
+    document: &Document,
+    skip_first_fragments: usize,
+) -> Result<SplitChangeStreamDocuments, QueryError> {
+    let base_token = document
+        .get_document("_id")
+        .map_err(|_| QueryError::InvalidStage)?
+        .clone();
+    let mut fields = document
+        .iter()
+        .filter(|(field, _)| field.as_str() != "_id")
+        .map(|(field, value)| {
+            Ok((
+                bson_element_size(field, value)?,
+                field.clone(),
+                value.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    if fields.is_empty() {
+        return Err(QueryError::ChangeStreamFatalError(
+            "cannot split a change stream event that contains only _id".to_string(),
+        ));
+    }
+    fields.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut fragments = Vec::new();
+    let mut field_index = 0;
+    while field_index < fields.len() {
+        let fragment_index = fragments.len();
+        let mut fragment_token = base_token.clone();
+        fragment_token.insert(
+            CHANGE_STREAM_SPLIT_TOKEN_FIELD,
+            Bson::Int64(fragment_index as i64),
+        );
+        let mut fragment = doc! {
+            "_id": Bson::Document(fragment_token),
+            CHANGE_STREAM_SPLIT_EVENT_FIELD: {
+                CHANGE_STREAM_SPLIT_EVENT_FRAGMENT_FIELD: (fragment_index + 1) as i32,
+                CHANGE_STREAM_SPLIT_EVENT_TOTAL_FIELD: 0_i32,
+            }
+        };
+        let mut added_any = false;
+
+        while field_index < fields.len() {
+            let (_, field_name, field_value) = &fields[field_index];
+            fragment.insert(field_name.clone(), field_value.clone());
+            if bson_document_size(&fragment)? <= MAX_BSON_OBJECT_SIZE_BYTES {
+                added_any = true;
+                field_index += 1;
+                continue;
+            }
+
+            fragment.remove(field_name);
+            if !added_any {
+                return Err(QueryError::BsonObjectTooLarge(
+                    "change stream event contains a top-level field that cannot fit in a split fragment"
+                        .to_string(),
+                ));
+            }
+            break;
+        }
+
+        fragments.push(fragment);
+    }
+
+    let total_fragments = fragments.len();
+    for fragment in &mut fragments {
+        if let Some(Bson::Document(split_event)) = fragment.get_mut(CHANGE_STREAM_SPLIT_EVENT_FIELD)
+        {
+            split_event.insert(
+                CHANGE_STREAM_SPLIT_EVENT_TOTAL_FIELD,
+                Bson::Int32(total_fragments as i32),
+            );
+        }
+    }
+
+    let fragments = if skip_first_fragments >= total_fragments {
+        Vec::new()
+    } else {
+        fragments
+            .into_iter()
+            .skip(skip_first_fragments)
+            .collect::<Vec<_>>()
+    };
+
+    Ok(SplitChangeStreamDocuments {
+        total_fragments,
+        fragments,
+    })
+}
+
+fn bson_document_size(document: &Document) -> Result<usize, QueryError> {
+    bson::to_vec(document)
+        .map(|bytes| bytes.len())
+        .map_err(|_| QueryError::InvalidStage)
+}
+
+fn bson_element_size(field: &str, value: &Bson) -> Result<usize, QueryError> {
+    let mut document = Document::new();
+    document.insert(field, value.clone());
+    bson_document_size(&document).map(|size| size.saturating_sub(5))
+}
+
+fn validate_change_stream_output_sizes(documents: &[Document]) -> Result<(), QueryError> {
+    if documents
+        .iter()
+        .try_fold(false, |found_oversized, document| {
+            if found_oversized {
+                return Ok(true);
+            }
+            Ok(bson_document_size(document)? > MAX_BSON_OBJECT_SIZE_BYTES)
+        })?
+    {
+        return Err(QueryError::BsonObjectTooLarge(
+            "change stream event exceeds maximum BSON size; add $changeStreamSplitLargeEvent to the pipeline"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn incompatible_split_resume_error() -> QueryError {
+    QueryError::ChangeStreamFatalError(
+        "resumed change stream pipeline no longer reproduces the split event referenced by the resume token"
+            .to_string(),
+    )
 }
 
 fn parse_internal_change_event(document: Document) -> Result<InternalChangeEvent, QueryError> {

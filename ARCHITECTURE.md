@@ -179,6 +179,11 @@ Current cross-namespace aggregation behavior:
   - `fullDocument` and `fullDocumentBeforeChange`
   - `showExpandedEvents`
   - finite historical reads over the durable local log at aggregate start time
+- `$changeStreamSplitLargeEvent` runs as the final stage in a `$changeStream` pipeline and:
+  - splits oversized change events into deterministic top-level-field fragments
+  - emits fragment `_id` tokens that extend the base change-event token with `fragmentNum`
+  - adds `splitEvent: { fragment, of }` metadata to each fragment
+  - enforces fatal resume errors when a resumed pipeline no longer reproduces the referenced split event
 - `$setWindowFields` executes locally over the in-memory document stream after the stage-level
   sort and partition step, with:
   - `partitionBy` expression partitioning
