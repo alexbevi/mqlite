@@ -14,6 +14,8 @@ pub enum QueryError {
     UnsupportedStage(String),
     #[error("invalid aggregation stage")]
     InvalidStage,
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error("expected numeric value")]
     ExpectedNumeric,
     #[error("aggregation expression did not evaluate to a document")]

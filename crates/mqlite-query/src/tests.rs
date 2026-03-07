@@ -1150,6 +1150,81 @@ fn documents_stage_replaces_input_when_first() {
 }
 
 #[test]
+fn bucket_stage_groups_documents_by_boundaries() {
+    let results = run_pipeline_ok(
+        vec![
+            doc! { "price": 10, "qty": 1 },
+            doc! { "price": 20, "qty": 2 },
+            doc! { "price": 40, "qty": 3 },
+        ],
+        &[doc! {
+            "$bucket": {
+                "groupBy": "$price",
+                "boundaries": [0, 20, 50],
+                "output": {
+                    "totalQty": { "$sum": "$qty" }
+                }
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 0, "totalQty": 1_i64 },
+            doc! { "_id": 20, "totalQty": 5_i64 },
+        ]
+    );
+}
+
+#[test]
+fn bucket_stage_supports_default_bucket_and_default_count_output() {
+    let results = run_pipeline_ok(
+        vec![doc! { "price": 10 }, doc! { "price": 120 }],
+        &[doc! {
+            "$bucket": {
+                "groupBy": "$price",
+                "boundaries": [0, 50, 100],
+                "default": "other"
+            }
+        }],
+    );
+
+    assert_eq!(
+        results,
+        vec![
+            doc! { "_id": 0, "count": 1_i64 },
+            doc! { "_id": "other", "count": 1_i64 },
+        ]
+    );
+}
+
+#[test]
+fn bucket_stage_rejects_invalid_specs_and_out_of_range_values_without_default() {
+    for stage in [
+        doc! { "$bucket": 1 },
+        doc! { "$bucket": {} },
+        doc! { "$bucket": { "groupBy": "price", "boundaries": [0, 10] } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [0] } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [10, 0] } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, "10"] } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 10], "default": 5 } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 10], "output": 1 } },
+        doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 10], "unknown": true } },
+    ] {
+        let error = run_pipeline(vec![doc! { "price": 5 }], &[stage]).expect_err("invalid bucket");
+        assert!(matches!(error, QueryError::InvalidStage));
+    }
+
+    let error = run_pipeline(
+        vec![doc! { "price": 20 }],
+        &[doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 10] } }],
+    )
+    .expect_err("out-of-range bucket value");
+    assert!(matches!(error, QueryError::InvalidArgument(_)));
+}
+
+#[test]
 fn documents_stage_must_be_first() {
     let error = run_pipeline(
         vec![doc! { "_id": 0 }],
@@ -1309,6 +1384,17 @@ fn pipeline_rejects_unsupported_stage() {
         error,
         crate::QueryError::UnsupportedStage(stage) if stage == "$lookup"
     ));
+}
+
+#[test]
+fn pipeline_surfaces_bucket_runtime_errors_as_bad_value_style_errors() {
+    let error = run_pipeline(
+        vec![doc! { "price": 20 }],
+        &[doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 10] } }],
+    )
+    .expect_err("bucket should reject unmatched values without a default");
+
+    assert!(matches!(error, QueryError::InvalidArgument(_)));
 }
 
 #[test]

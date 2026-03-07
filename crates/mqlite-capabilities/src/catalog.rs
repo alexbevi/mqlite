@@ -1090,6 +1090,10 @@ mod tests {
 
     fn supported_stage_fixture(name: &str) -> (Vec<Document>, Vec<Document>) {
         match name {
+            "$bucket" => (
+                vec![doc! { "price": 10 }],
+                vec![doc! { "$bucket": { "groupBy": "$price", "boundaries": [0, 20] } }],
+            ),
             "$documents" => (
                 vec![doc! { "ignored": true }],
                 vec![doc! { "$documents": [{ "qty": 1 }] }],

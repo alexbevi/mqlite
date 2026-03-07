@@ -170,6 +170,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Aggregation stages:
   - `$documents`
   - `$facet`
+  - `$bucket`
   - `$sample`
   - `$sortByCount`
   - `$match`

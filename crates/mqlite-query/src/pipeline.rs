@@ -40,6 +40,7 @@ fn run_pipeline_with_context(
 
         let (stage_name, stage_spec) = stage.iter().next().expect("single stage");
         current = match stage_name.as_str() {
+            "$bucket" => bucket_documents(current, stage_spec)?,
             "$documents" if context.inside_facet => return Err(QueryError::InvalidStage),
             "$documents" => documents_stage(stage_index, stage_spec)?,
             "$facet" if context.inside_facet => return Err(QueryError::InvalidStage),
@@ -154,6 +155,168 @@ fn facet_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document
     }
 
     Ok(vec![output])
+}
+
+fn bucket_documents(documents: Vec<Document>, spec: &Bson) -> Result<Vec<Document>, QueryError> {
+    let spec = spec.as_document().ok_or(QueryError::InvalidStage)?;
+
+    let mut group_by = None;
+    let mut boundaries = None;
+    let mut default = None;
+    let mut output_specs = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "groupBy" => {
+                let valid = match value {
+                    Bson::String(path) => path.starts_with('$') && path.len() > 1,
+                    Bson::Document(document) => document
+                        .iter()
+                        .next()
+                        .is_some_and(|(name, _)| name.starts_with('$')),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(QueryError::InvalidStage);
+                }
+                group_by = Some(value.clone());
+            }
+            "boundaries" => {
+                let values = value.as_array().ok_or(QueryError::InvalidStage)?.clone();
+                if values.len() < 2 {
+                    return Err(QueryError::InvalidStage);
+                }
+                for window in values.windows(2) {
+                    if bucket_value_type(&window[0]) != bucket_value_type(&window[1]) {
+                        return Err(QueryError::InvalidStage);
+                    }
+                    if compare_bson(&window[0], &window[1]) != std::cmp::Ordering::Less {
+                        return Err(QueryError::InvalidStage);
+                    }
+                }
+                boundaries = Some(values);
+            }
+            "default" => {
+                default = Some(value.clone());
+            }
+            "output" => {
+                let output = value.as_document().ok_or(QueryError::InvalidStage)?;
+                let accumulators = output
+                    .iter()
+                    .map(|(field, value)| Ok((field.clone(), parse_accumulator(value)?)))
+                    .collect::<Result<Vec<_>, QueryError>>()?;
+                output_specs = Some(accumulators);
+            }
+            _ => return Err(QueryError::InvalidStage),
+        }
+    }
+
+    let group_by = group_by.ok_or(QueryError::InvalidStage)?;
+    let boundaries = boundaries.ok_or(QueryError::InvalidStage)?;
+    if let Some(default_value) = default.as_ref() {
+        if bucket_value_type(default_value) == bucket_value_type(&boundaries[0]) {
+            let below_lower =
+                compare_bson(default_value, &boundaries[0]) == std::cmp::Ordering::Less;
+            let above_or_equal_upper =
+                compare_bson(default_value, boundaries.last().expect("boundaries"))
+                    != std::cmp::Ordering::Less;
+            if !below_lower && !above_or_equal_upper {
+                return Err(QueryError::InvalidStage);
+            }
+        }
+    }
+
+    let output_specs = output_specs.unwrap_or_else(|| {
+        vec![(
+            "count".to_string(),
+            GroupAccumulatorSpec::Sum(Bson::Int32(1)),
+        )]
+    });
+
+    let mut groups: BTreeMap<Vec<u8>, (Bson, BTreeMap<String, GroupAccumulatorState>)> =
+        BTreeMap::new();
+
+    for document in documents {
+        let value = eval_expression(&document, &group_by)?;
+        let bucket_id = match bucket_assignment(&value, &boundaries, default.as_ref())? {
+            Some(bucket_id) => bucket_id,
+            None => continue,
+        };
+        let bucket_key = bson::to_vec(&doc! { "_id": bucket_id.clone() })
+            .map_err(|_| QueryError::InvalidStage)?;
+        let entry = groups.entry(bucket_key).or_insert_with(|| {
+            let states = output_specs
+                .iter()
+                .map(|(field, spec)| (field.clone(), GroupAccumulatorState::from_spec(spec)))
+                .collect::<BTreeMap<_, _>>();
+            (bucket_id.clone(), states)
+        });
+        for (field, accumulator) in &output_specs {
+            let state = entry.1.get_mut(field).expect("bucket state exists");
+            state.apply(&document, accumulator)?;
+        }
+    }
+
+    let mut results = groups
+        .into_values()
+        .map(|(bucket_id, states)| {
+            let mut output = Document::new();
+            output.insert("_id", bucket_id);
+            for (field, state) in states {
+                output.insert(field, state.finish());
+            }
+            output
+        })
+        .collect::<Vec<_>>();
+    let sort_spec = doc! { "_id": 1 };
+    results.sort_by(|left, right| compare_documents_by_sort(left, right, &sort_spec));
+    Ok(results)
+}
+
+fn bucket_assignment(
+    value: &Bson,
+    boundaries: &[Bson],
+    default: Option<&Bson>,
+) -> Result<Option<Bson>, QueryError> {
+    for window in boundaries.windows(2) {
+        let lower = &window[0];
+        let upper = &window[1];
+        if compare_bson(value, lower) != std::cmp::Ordering::Less
+            && compare_bson(value, upper) == std::cmp::Ordering::Less
+        {
+            return Ok(Some(lower.clone()));
+        }
+    }
+
+    if let Some(default_value) = default {
+        return Ok(Some(default_value.clone()));
+    }
+
+    Err(QueryError::InvalidArgument(
+        "bucket groupBy value did not match any bucket and no default was specified".to_string(),
+    ))
+}
+
+fn bucket_value_type(value: &Bson) -> u8 {
+    match value {
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 1,
+        Bson::String(_) => 2,
+        Bson::Document(_) => 3,
+        Bson::Array(_) => 4,
+        Bson::Binary(_) => 5,
+        Bson::ObjectId(_) => 6,
+        Bson::Boolean(_) => 7,
+        Bson::DateTime(_) => 8,
+        Bson::Null => 9,
+        Bson::RegularExpression(_) => 10,
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 11,
+        Bson::Timestamp(_) => 12,
+        Bson::Symbol(_) => 13,
+        Bson::Undefined => 14,
+        Bson::MaxKey => 15,
+        Bson::MinKey => 16,
+        Bson::DbPointer(_) => 17,
+    }
 }
 
 fn validate_facet_name(name: &str) -> Result<(), QueryError> {

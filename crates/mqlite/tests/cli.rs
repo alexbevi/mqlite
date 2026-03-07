@@ -130,6 +130,59 @@ fn command_collectionless_aggregate_supports_documents_stage() {
 }
 
 #[test]
+fn command_aggregate_supports_bucket_stage() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-bucket.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"price":10,"qty":1},{"price":20,"qty":2},{"price":40,"qty":3}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$bucket":{"groupBy":"$price","boundaries":[0,20,50],"output":{"totalQty":{"$sum":"$qty"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    assert_eq!(
+        first_batch,
+        &vec![
+            json!({ "_id": 0, "totalQty": 1 }),
+            json!({ "_id": 20, "totalQty": 5 }),
+        ]
+    );
+}
+
+#[test]
 fn command_collection_aggregate_rejects_documents_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-documents-invalid.mongodb");

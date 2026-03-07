@@ -129,6 +129,7 @@ impl From<QueryError> for CommandError {
             QueryError::ExpectedDocument
             | QueryError::InvalidStage
             | QueryError::InvalidStructure => Self::new(9, "FailedToParse", error.to_string()),
+            QueryError::InvalidArgument(_) => Self::new(2, "BadValue", error.to_string()),
             QueryError::MixedProjection
             | QueryError::InvalidUpdate
             | QueryError::ExpectedNumeric => Self::new(2, "BadValue", error.to_string()),

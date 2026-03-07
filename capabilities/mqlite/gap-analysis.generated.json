@@ -1129,10 +1129,10 @@
   "aggregation_stages": {
     "total_upstream": 84,
     "public_upstream": 57,
-    "total_supported": 17,
-    "public_supported": 17,
-    "total_unsupported": 67,
-    "public_unsupported": 40,
+    "total_supported": 18,
+    "public_supported": 18,
+    "total_unsupported": 66,
+    "public_unsupported": 39,
     "items": [
       {
         "name": "$_internalAllCollectionStats",
@@ -1651,8 +1651,8 @@
         ],
         "feature_flagged": false,
         "conditional": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bucketAuto",
