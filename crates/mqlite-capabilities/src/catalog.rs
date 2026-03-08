@@ -34,6 +34,7 @@ const IGNORED_AGGREGATION_STAGES: &[&str] = &[
     "$shardedDataDistribution",
     "$vectorSearch",
 ];
+const IGNORED_AGGREGATION_EXPRESSIONS: &[&str] = &["$function"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReferenceAnchors {
@@ -291,7 +292,10 @@ pub fn build_gap_analysis(upstream: &UpstreamCatalog) -> GapAnalysis {
         aggregation_expression_operators: build_gap_category(
             &upstream.aggregation_expression_operators,
             &support.aggregation_expression_operators,
-            |item| item.feature_flagged,
+            |item| {
+                item.feature_flagged
+                    || IGNORED_AGGREGATION_EXPRESSIONS.contains(&item.name.as_str())
+            },
             |_item| ValidationMode::Rejection,
         ),
         aggregation_accumulator_operators: build_gap_category(
@@ -976,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_feature_flagged_aggregation_expressions_are_not_counted_as_backlog() {
+    fn ignored_aggregation_expressions_are_not_counted_as_backlog() {
         let repo_root = repo_root();
         let upstream = load_upstream_snapshot(&repo_root).expect("upstream snapshot");
         let gap = build_gap_analysis(&upstream);
@@ -1000,6 +1004,13 @@ mod tests {
                 .items
                 .iter()
                 .find(|item| item.name == "$toUUID")
+                .is_some_and(|item| item.ignored)
+        );
+        assert!(
+            gap.aggregation_expression_operators
+                .items
+                .iter()
+                .find(|item| item.name == "$function")
                 .is_some_and(|item| item.ignored)
         );
     }
