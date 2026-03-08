@@ -212,6 +212,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$toDate",
     "$toDecimal",
     "$toDouble",
+    "$toHashedIndexKey",
     "$toInt",
     "$toLower",
     "$toLong",

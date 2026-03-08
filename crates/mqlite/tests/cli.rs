@@ -1824,6 +1824,133 @@ fn command_aggregate_project_rejects_invalid_meta_expression() {
 }
 
 #[test]
+fn command_aggregate_project_supports_to_hashed_index_key_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-hashed-index-key-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":"hashThisStringLiteral","number":123,"ts":{"$timestamp":{"t":0,"i":0}},"oid":{"$oid":"47cc67093475061e3d95369d"},"date":{"$date":"1970-01-01T00:00:00.000Z"}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"stringHash":{"$toHashedIndexKey":"$value"},"numberHash":{"$toHashedIndexKey":"$number"},"timestampHash":{"$toHashedIndexKey":"$ts"},"objectIdHash":{"$toHashedIndexKey":"$oid"},"dateHash":{"$toHashedIndexKey":"$date"},"missingHash":{"$toHashedIndexKey":"$missingField"},"nullHash":{"$toHashedIndexKey":null},"expressionHash":{"$toHashedIndexKey":{"$pow":[2,4]}},"undefinedHash":{"$toHashedIndexKey":{"$literal":{"$undefined":true}}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("document");
+    assert_eq!(
+        first["stringHash"].as_i64(),
+        Some(-5_776_344_739_422_278_694)
+    );
+    assert_eq!(
+        first["numberHash"].as_i64(),
+        Some(-6_548_868_637_522_515_075)
+    );
+    assert_eq!(
+        first["timestampHash"].as_i64(),
+        Some(-7_867_208_682_377_458_672)
+    );
+    assert_eq!(
+        first["objectIdHash"].as_i64(),
+        Some(1_576_265_281_381_834_298)
+    );
+    assert_eq!(first["dateHash"].as_i64(), Some(-1_178_696_894_582_842_035));
+    assert_eq!(
+        first["missingHash"].as_i64(),
+        Some(2_338_878_944_348_059_895)
+    );
+    assert_eq!(first["nullHash"].as_i64(), Some(2_338_878_944_348_059_895));
+    assert_eq!(
+        first["expressionHash"].as_i64(),
+        Some(2_598_032_665_634_823_220)
+    );
+    assert_eq!(
+        first["undefinedHash"].as_i64(),
+        Some(40_158_834_000_849_533)
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_to_hashed_index_key_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-hashed-index-key-expression-invalid.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":"hashThisStringLiteral"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$toHashedIndexKey":["$value",1]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "FailedToParse");
+}
+
+#[test]
 fn command_aggregate_rejects_non_initial_geo_near_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-geo-near-invalid.mongodb");

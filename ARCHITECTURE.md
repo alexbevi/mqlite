@@ -206,7 +206,10 @@ Current cross-namespace aggregation behavior:
   percentile evaluators over per-document scalar or array inputs. Metadata expressions currently
   include `$meta` over broker-local `geoNearDistance`, `geoNearPoint`, `indexKey`, `recordId`,
   `sortKey`, `randVal`, and `textScore` slots when upstream stages or planners attach them to the
-  in-flight document stream. Array-selection `N`
+  in-flight document stream. Hashed-key expressions currently include `$toHashedIndexKey`, using
+  Mongo-compatible MD5 hashing over canonical BSON type tags, field-name recursion, and
+  `safeNumberLongForHash`-style numeric coercion so local hashed-key derivation matches server
+  results. Array-selection `N`
   expressions include `$firstN`, `$lastN`, `$minN`, and `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
   `$dayOfWeek`, `$dayOfYear`, `$hour`, `$minute`, `$second`, `$millisecond`, `$week`,
   `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction, parsing, formatting,

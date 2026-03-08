@@ -9,6 +9,7 @@ use chrono::{
     SecondsFormat, TimeZone, Timelike, Utc, Weekday,
 };
 use chrono_tz::Tz;
+use md5::{Digest, Md5};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 use regex::Regex as RustRegex;
 
@@ -406,6 +407,7 @@ fn eval_expression_operator(
             variables,
             ExpressionAccumulator::StdDevSamp,
         ),
+        "$toHashedIndexKey" => eval_to_hashed_index_key_expression(document, value, variables),
         "$toBool" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Bool),
         "$toDate" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Date),
         "$toDecimal" => {
@@ -637,6 +639,9 @@ fn validate_expression_operator(
             validate_expression_with_scope(unary_expression_operand(value), scope)
         }
         "$binarySize" | "$bsonSize" => {
+            validate_expression_with_scope(single_expression_operand(value)?, scope)
+        }
+        "$toHashedIndexKey" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
         "$add" | "$allElementsTrue" | "$and" | "$anyElementTrue" | "$arrayToObject" | "$concat"
@@ -2248,6 +2253,178 @@ fn parse_meta_expression_path(value: &Bson) -> Result<&str, QueryError> {
             "$meta field `{meta}` is not supported in mqlite"
         )))
     }
+}
+
+fn eval_to_hashed_index_key_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let input = eval_expression_result_with_variables(
+        document,
+        single_expression_operand(value)?,
+        variables,
+    )?;
+    let input = match input {
+        EvaluatedExpression::Missing => Bson::Null,
+        EvaluatedExpression::Value(value) => value,
+    };
+    Ok(EvaluatedExpression::Value(Bson::Int64(
+        hash_bson_value_for_index(&input),
+    )))
+}
+
+fn hash_bson_value_for_index(value: &Bson) -> i64 {
+    let mut hasher = MongoHasher::new(0);
+    hash_bson_value_recursive(&mut hasher, value, None);
+    hasher.finish()
+}
+
+struct MongoHasher {
+    state: Md5,
+}
+
+impl MongoHasher {
+    fn new(seed: i32) -> Self {
+        let mut state = Md5::new();
+        state.update(seed.to_le_bytes());
+        Self { state }
+    }
+
+    fn add_data(&mut self, bytes: &[u8]) {
+        self.state.update(bytes);
+    }
+
+    fn add_i64(&mut self, value: i64) {
+        self.add_data(&value.to_le_bytes());
+    }
+
+    fn finish(self) -> i64 {
+        let digest = self.state.finalize();
+        i64::from_le_bytes(digest[..8].try_into().expect("digest prefix"))
+    }
+}
+
+fn hash_bson_value_recursive(hasher: &mut MongoHasher, value: &Bson, field_name: Option<&str>) {
+    hasher.add_data(&(canonical_hash_type(value) as i32).to_le_bytes());
+    if let Some(field_name) = field_name {
+        hasher.add_data(field_name.as_bytes());
+        hasher.add_data(&[0]);
+    }
+
+    match value {
+        Bson::Document(document) => {
+            for (key, value) in document {
+                hash_bson_value_recursive(hasher, value, Some(key));
+            }
+            hash_bson_end_of_object(hasher);
+        }
+        Bson::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let key = index.to_string();
+                hash_bson_value_recursive(hasher, value, Some(&key));
+            }
+            hash_bson_end_of_object(hasher);
+        }
+        Bson::JavaScriptCodeWithScope(value) => {
+            hasher.add_data(&encode_bson_string_bytes(&value.code));
+            for (key, value) in &value.scope {
+                hash_bson_value_recursive(hasher, value, Some(key));
+            }
+            hash_bson_end_of_object(hasher);
+        }
+        _ if is_hash_numeric(value) => hasher.add_i64(safe_number_long_for_hash(value)),
+        _ => hasher.add_data(&raw_bson_value_bytes(value)),
+    }
+}
+
+fn hash_bson_end_of_object(hasher: &mut MongoHasher) {
+    hasher.add_data(&0_i32.to_le_bytes());
+    hasher.add_data(&[0]);
+}
+
+fn canonical_hash_type(value: &Bson) -> i8 {
+    match value {
+        Bson::MinKey => -1,
+        Bson::Undefined => 0,
+        Bson::Null => 5,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => 10,
+        Bson::String(_) | Bson::Symbol(_) => 15,
+        Bson::Document(_) => 20,
+        Bson::Array(_) => 25,
+        Bson::Binary(_) => 30,
+        Bson::ObjectId(_) => 35,
+        Bson::Boolean(_) => 40,
+        Bson::DateTime(_) => 45,
+        Bson::Timestamp(_) => 47,
+        Bson::RegularExpression(_) => 50,
+        Bson::DbPointer(_) => 55,
+        Bson::JavaScriptCode(_) => 60,
+        Bson::JavaScriptCodeWithScope(_) => 65,
+        Bson::MaxKey => 127,
+    }
+}
+
+fn is_hash_numeric(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
+}
+
+fn safe_number_long_for_hash(value: &Bson) -> i64 {
+    match value {
+        Bson::Int32(value) => *value as i64,
+        Bson::Int64(value) => *value,
+        Bson::Double(value) => safe_f64_long_for_hash(*value),
+        Bson::Decimal128(value) => safe_decimal_long_for_hash(value),
+        _ => 0,
+    }
+}
+
+fn safe_f64_long_for_hash(value: f64) -> i64 {
+    const LONG_LONG_MAX_PLUS_ONE_AS_DOUBLE: f64 = 9_223_372_036_854_775_808.0;
+
+    if value.is_nan() {
+        return 0;
+    }
+    if value == LONG_LONG_MAX_PLUS_ONE_AS_DOUBLE {
+        return i64::MIN;
+    }
+    if value.partial_cmp(&LONG_LONG_MAX_PLUS_ONE_AS_DOUBLE) != Some(std::cmp::Ordering::Less) {
+        return i64::MAX;
+    }
+    if value < i64::MIN as f64 {
+        return i64::MIN;
+    }
+    value as i64
+}
+
+fn safe_decimal_long_for_hash(value: &Decimal128) -> i64 {
+    let parsed = value.to_string().parse::<f64>().unwrap_or(f64::NAN);
+    if parsed.is_nan() {
+        return 0;
+    }
+    if parsed > i64::MAX as f64 {
+        return i64::MAX;
+    }
+    if parsed < i64::MIN as f64 {
+        return i64::MIN;
+    }
+    parsed as i64
+}
+
+fn raw_bson_value_bytes(value: &Bson) -> Vec<u8> {
+    let encoded = bson::to_vec(&doc! { "": value.clone() }).expect("bson encoding");
+    encoded[6..encoded.len() - 1].to_vec()
+}
+
+fn encode_bson_string_bytes(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + value.len() + 1);
+    bytes.extend_from_slice(&((value.len() + 1) as i32).to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(0);
+    bytes
 }
 
 fn eval_percentile_expression(

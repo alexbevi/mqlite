@@ -1681,6 +1681,9 @@ mod tests {
             "$toDate" => doc! { "value": { "$toDate": 1_i64 } },
             "$toDecimal" => doc! { "value": { "$toDecimal": "1.5" } },
             "$toDouble" => doc! { "value": { "$toDouble": "1.5" } },
+            "$toHashedIndexKey" => {
+                doc! { "value": { "$toHashedIndexKey": "hashThisStringLiteral" } }
+            }
             "$toInt" => doc! { "value": { "$toInt": "1" } },
             "$toLower" => doc! { "value": { "$toLower": "AbC" } },
             "$toLong" => doc! { "value": { "$toLong": "1" } },

@@ -213,6 +213,7 @@
     "$toDate",
     "$toDecimal",
     "$toDouble",
+    "$toHashedIndexKey",
     "$toInt",
     "$toLong",
     "$toLower",

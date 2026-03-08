@@ -2761,6 +2761,80 @@ fn meta_expression_rejects_invalid_inputs() {
 }
 
 #[test]
+fn projection_supports_to_hashed_index_key_expression() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "value": "hashThisStringLiteral",
+            "number": 123,
+            "ts": Bson::Timestamp(Timestamp { time: 0, increment: 0 }),
+            "oid": ObjectId::parse_str("47cc67093475061e3d95369d").expect("oid"),
+            "date": DateTime::from_millis(0)
+        },
+        Some(&doc! {
+            "stringHash": { "$toHashedIndexKey": "$value" },
+            "numberHash": { "$toHashedIndexKey": "$number" },
+            "timestampHash": { "$toHashedIndexKey": "$ts" },
+            "objectIdHash": { "$toHashedIndexKey": "$oid" },
+            "dateHash": { "$toHashedIndexKey": "$date" },
+            "missingHash": { "$toHashedIndexKey": "$missingField" },
+            "nullHash": { "$toHashedIndexKey": Bson::Null },
+            "expressionHash": { "$toHashedIndexKey": { "$pow": [2, 4] } },
+            "undefinedHash": { "$toHashedIndexKey": Bson::Undefined }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("stringHash"),
+        Some(&Bson::Int64(-5_776_344_739_422_278_694))
+    );
+    assert_eq!(
+        projected.get("numberHash"),
+        Some(&Bson::Int64(-6_548_868_637_522_515_075))
+    );
+    assert_eq!(
+        projected.get("timestampHash"),
+        Some(&Bson::Int64(-7_867_208_682_377_458_672))
+    );
+    assert_eq!(
+        projected.get("objectIdHash"),
+        Some(&Bson::Int64(1_576_265_281_381_834_298))
+    );
+    assert_eq!(
+        projected.get("dateHash"),
+        Some(&Bson::Int64(-1_178_696_894_582_842_035))
+    );
+    assert_eq!(
+        projected.get("missingHash"),
+        Some(&Bson::Int64(2_338_878_944_348_059_895))
+    );
+    assert_eq!(
+        projected.get("nullHash"),
+        Some(&Bson::Int64(2_338_878_944_348_059_895))
+    );
+    assert_eq!(
+        projected.get("expressionHash"),
+        Some(&Bson::Int64(2_598_032_665_634_823_220))
+    );
+    assert_eq!(
+        projected.get("undefinedHash"),
+        Some(&Bson::Int64(40_158_834_000_849_533))
+    );
+}
+
+#[test]
+fn to_hashed_index_key_expression_rejects_invalid_arity() {
+    let error = apply_projection(
+        &doc! { "_id": 1, "value": "hashThisStringLiteral" },
+        Some(&doc! { "out": { "$toHashedIndexKey": ["$value", 1] } }),
+    )
+    .expect_err("toHashedIndexKey requires a single operand");
+
+    assert!(matches!(error, QueryError::InvalidStructure));
+}
+
+#[test]
 fn projection_supports_n_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -6739,7 +6813,7 @@ fn projection_rejects_unsupported_expression_operator() {
         &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
         Some(&doc! {
             "out": {
-                "$toHashedIndexKey": {
+                "$createUUID": {
                     "input": [1, 2, 3]
                 }
             }
@@ -6749,6 +6823,6 @@ fn projection_rejects_unsupported_expression_operator() {
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$toHashedIndexKey"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$createUUID"
     ));
 }
