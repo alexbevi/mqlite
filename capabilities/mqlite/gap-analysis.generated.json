@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 12,
-    "public_supported": 12,
-    "total_unsupported": 172,
-    "public_unsupported": 141,
+    "total_supported": 26,
+    "public_supported": 26,
+    "total_unsupported": 158,
+    "public_unsupported": 127,
     "public_ignored": 23,
     "items": [
       {
@@ -2961,8 +2961,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$acos",
@@ -3015,8 +3015,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$allElementsTrue",
@@ -3375,8 +3375,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$cmp",
@@ -3393,8 +3393,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$concat",
@@ -3465,8 +3465,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$convert",
@@ -3825,8 +3825,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$encStrContains",
@@ -3951,8 +3951,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$filter",
@@ -4023,8 +4023,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$function",
@@ -4167,8 +4167,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$in",
@@ -4707,8 +4707,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$month",
@@ -4743,8 +4743,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$ne",
@@ -5049,8 +5049,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$rtrim",
@@ -5571,8 +5571,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$subtype",
@@ -5985,8 +5985,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$tsIncrement",

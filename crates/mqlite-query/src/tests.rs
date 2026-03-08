@@ -814,16 +814,30 @@ fn projection_supports_expression_operators() {
     let projected = apply_projection(
         &document,
         Some(&doc! {
+            "abs": { "$abs": -5 },
+            "add": { "$add": ["$left", "$right", 2] },
             "eq": { "$eq": ["$left", 5] },
             "ne": { "$ne": ["$left", "$right"] },
             "gt": { "$gt": ["$left", "$right"] },
             "gte": { "$gte": ["$left", 5] },
             "lt": { "$lt": ["$right", "$left"] },
             "lte": { "$lte": ["$right", 3] },
+            "cmp": { "$cmp": ["$left", "$right"] },
             "and": { "$and": [true, { "$eq": ["$left", 5] }] },
             "or": { "$or": [false, { "$eq": ["$sku", "abc"] }] },
             "not": { "$not": [{ "$eq": ["$right", 5] }] },
             "in": { "$in": ["$sku", ["def", "abc"]] },
+            "const": { "$const": "fixed" },
+            "divide": { "$divide": [7, 2] },
+            "expr": { "$expr": { "$eq": ["$left", 5] } },
+            "floor": { "$floor": 2.8 },
+            "ceil": { "$ceil": 2.2 },
+            "ifNull": { "$ifNull": [null, "$left"] },
+            "mod": { "$mod": [17, 5] },
+            "multiply": { "$multiply": ["$left", 2] },
+            "round": { "$round": [2.65, 1] },
+            "subtract": { "$subtract": ["$left", "$right"] },
+            "trunc": { "$trunc": [2.65, 1] },
             "literal": { "$literal": { "nested": true } }
         }),
     )
@@ -833,19 +847,73 @@ fn projection_supports_expression_operators() {
         projected,
         doc! {
             "_id": 1,
+            "abs": 5_i64,
+            "add": 10_i64,
             "eq": true,
             "ne": true,
             "gt": true,
             "gte": true,
             "lt": true,
             "lte": true,
+            "cmp": 1,
             "and": true,
             "or": true,
             "not": true,
             "in": true,
+            "const": "fixed",
+            "divide": 3.5,
+            "expr": true,
+            "floor": 2_i64,
+            "ceil": 3_i64,
+            "ifNull": 5,
+            "mod": 2_i64,
+            "multiply": 10_i64,
+            "round": 2.7,
+            "subtract": 2_i64,
+            "trunc": 2.6,
             "literal": { "nested": true }
         }
     );
+}
+
+#[test]
+fn expression_operators_reject_invalid_numeric_forms() {
+    let divide_by_zero = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! { "value": { "$divide": [1, 0] } }),
+    )
+    .expect_err("divide by zero");
+    assert!(matches!(divide_by_zero, QueryError::InvalidArgument(_)));
+
+    let if_null_requires_at_least_two_arguments = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! { "value": { "$ifNull": ["$missing"] } }),
+    )
+    .expect_err("ifNull arity");
+    assert!(matches!(
+        if_null_requires_at_least_two_arguments,
+        QueryError::InvalidStructure
+    ));
+
+    let round_requires_integral_place = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! { "value": { "$round": [2.7, 1.5] } }),
+    )
+    .expect_err("round place");
+    assert!(matches!(
+        round_requires_integral_place,
+        QueryError::InvalidStructure
+    ));
+
+    let add_requires_numeric_operands = apply_projection(
+        &doc! { "_id": 1, "text": "abc" },
+        Some(&doc! { "value": { "$add": ["$text", 1] } }),
+    )
+    .expect_err("numeric add");
+    assert!(matches!(
+        add_requires_numeric_operands,
+        QueryError::ExpectedNumeric
+    ));
 }
 
 #[test]
@@ -3565,12 +3633,12 @@ fn projection_rejects_function_expression_operator() {
 fn projection_rejects_unsupported_expression_operator() {
     let error = apply_projection(
         &doc! { "_id": 1, "value": 2 },
-        Some(&doc! { "out": { "$add": [1, 2] } }),
+        Some(&doc! { "out": { "$map": { "input": [1, 2], "as": "value", "in": "$$value" } } }),
     )
     .expect_err("unsupported expression");
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$add"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$map"
     ));
 }

@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 12 | 141 | 23 |
+| Aggregation expression operators | 176 | 26 | 127 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,29 +219,41 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
+Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 
 ### Supported Public
 
+- `$abs`
+- `$add`
 - `$and`
+- `$ceil`
+- `$cmp`
 - `$cond`
+- `$const`
+- `$divide`
 - `$eq`
+- `$expr`
+- `$floor`
 - `$gt`
 - `$gte`
+- `$ifNull`
 - `$in`
 - `$literal`
 - `$lt`
 - `$lte`
+- `$mod`
+- `$multiply`
 - `$ne`
 - `$not`
 - `$or`
+- `$round`
+- `$subtract`
+- `$trunc`
 
 ### Unsupported Public
 
-- `$abs`
 - `$acos`
 - `$acosh`
-- `$add`
 - `$allElementsTrue`
 - `$anyElementTrue`
 - `$arrayElemAt`
@@ -258,11 +270,8 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$bitOr`
 - `$bitXor`
 - `$bsonSize`
-- `$ceil`
-- `$cmp`
 - `$concat`
 - `$concatArrays`
-- `$const`
 - `$convert`
 - `$cos`
 - `$cosh`
@@ -278,17 +287,13 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$dayOfWeek`
 - `$dayOfYear`
 - `$degreesToRadians`
-- `$divide`
 - `$exp`
-- `$expr`
 - `$filter`
 - `$first`
 - `$firstN`
-- `$floor`
 - `$function`
 - `$getField`
 - `$hour`
-- `$ifNull`
 - `$indexOfArray`
 - `$indexOfBytes`
 - `$indexOfCP`
@@ -314,9 +319,7 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$min`
 - `$minN`
 - `$minute`
-- `$mod`
 - `$month`
-- `$multiply`
 - `$objectToArray`
 - `$percentile`
 - `$pow`
@@ -330,7 +333,6 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$replaceAll`
 - `$replaceOne`
 - `$reverseArray`
-- `$round`
 - `$rtrim`
 - `$second`
 - `$setDifference`
@@ -354,7 +356,6 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$substr`
 - `$substrBytes`
 - `$substrCP`
-- `$subtract`
 - `$sum`
 - `$switch`
 - `$tan`
@@ -371,7 +372,6 @@ Public upstream: 176. Supported: 12. Unsupported: 141. Ignored: 23.
 - `$toString`
 - `$toUpper`
 - `$trim`
-- `$trunc`
 - `$tsIncrement`
 - `$tsSecond`
 - `$type`

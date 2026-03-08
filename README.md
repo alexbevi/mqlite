@@ -175,7 +175,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Covered projection execution from index keys for compatible `find` projections, including covered `null` versus missing-field behavior from persisted index presence metadata.
 - Replacement updates and modifier updates via `$set`, `$unset`, `$inc`.
 - Pipeline-style updates using aggregation document transformation stages such as `$set`, `$addFields`, `$unset`, `$project`, `$replaceRoot`, and `$replaceWith` on the matched document stream.
-- Aggregation expression operators `$literal`, `$cond`, comparison operators `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, and membership via `$in`.
+- Aggregation expression operators `$literal`, `$const`, `$expr`, `$cond`, comparison operators `$cmp`/`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`, boolean composition via `$and`/`$or`/`$not`, membership via `$in`, arithmetic via `$add`/`$subtract`/`$multiply`/`$divide`/`$mod`, numeric transforms via `$abs`/`$ceil`/`$floor`/`$round`/`$trunc`, and null coalescing via `$ifNull`.
 - Explicit rejection of unsupported aggregation expression operators instead of silently treating single-key `$operator` documents as literal values.
 - Mongo-like `$unwind` preserve semantics for missing, `null`, and empty-array inputs when `preserveNullAndEmptyArrays` is set.
 - Aggregation stages:

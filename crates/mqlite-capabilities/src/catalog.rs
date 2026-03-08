@@ -1062,18 +1062,24 @@ mod tests {
     fn aggregation_expression_contracts_match_support_snapshot() {
         let repo_root = repo_root();
         let gap = load_gap_snapshot(&repo_root).expect("gap snapshot");
+        let document = doc! {
+            "_id": 1,
+            "left": 5,
+            "right": 3,
+            "text": "abc"
+        };
 
         for item in &gap.aggregation_expression_operators.items {
             match item.status {
                 SupportStatus::Supported => {
                     let projection = supported_expression_projection(&item.name);
-                    apply_projection(&doc! { "_id": 1 }, Some(&projection))
+                    apply_projection(&document, Some(&projection))
                         .expect("supported expression operator");
                 }
                 SupportStatus::Unsupported => {
                     assert_eq!(item.validation, ValidationMode::Rejection);
                     let projection = unsupported_expression_projection(&item.name);
-                    let error = apply_projection(&doc! { "_id": 1 }, Some(&projection))
+                    let error = apply_projection(&document, Some(&projection))
                         .expect_err("unsupported expression operator");
                     assert!(matches!(
                         error,
@@ -1460,18 +1466,32 @@ mod tests {
 
     fn supported_expression_projection(name: &str) -> Document {
         match name {
-            "$literal" => doc! { "value": { "$literal": 5 } },
+            "$abs" => doc! { "value": { "$abs": -5 } },
+            "$add" => doc! { "value": { "$add": ["$left", "$right", 2] } },
+            "$and" => doc! { "value": { "$and": [true, { "$eq": ["$left", "$left"] }] } },
+            "$ceil" => doc! { "value": { "$ceil": 2.2 } },
+            "$cmp" => doc! { "value": { "$cmp": ["$left", "$right"] } },
             "$cond" => doc! { "value": { "$cond": [{ "$eq": ["$left", "$left"] }, "yes", "no"] } },
+            "$const" => doc! { "value": { "$const": 5 } },
+            "$divide" => doc! { "value": { "$divide": [9, 3] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
-            "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
+            "$expr" => doc! { "value": { "$expr": { "$eq": ["$left", "$left"] } } },
+            "$floor" => doc! { "value": { "$floor": 2.8 } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
             "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
+            "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
+            "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
+            "$literal" => doc! { "value": { "$literal": 5 } },
             "$lt" => doc! { "value": { "$lt": ["$left", "$right"] } },
             "$lte" => doc! { "value": { "$lte": ["$left", "$right"] } },
-            "$and" => doc! { "value": { "$and": [true, { "$eq": ["$left", "$left"] }] } },
-            "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$mod" => doc! { "value": { "$mod": [17, 5] } },
+            "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },
+            "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
-            "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
+            "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$round" => doc! { "value": { "$round": [2.65, 1] } },
+            "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
+            "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
             other => panic!("missing supported expression fixture for {other}"),
         }
     }

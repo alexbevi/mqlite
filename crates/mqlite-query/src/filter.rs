@@ -11,7 +11,10 @@ use regex::{Regex as RustRegex, RegexBuilder};
 
 use crate::{
     QueryError,
-    expression::{eval_expression_with_variables, expression_truthy, validate_expression},
+    expression::{
+        coerce_to_i64, eval_expression_with_variables, expression_truthy, truncate_f64_to_i64,
+        validate_expression,
+    },
     types::{BitTestMode, MatchExpr, TypeSet},
 };
 
@@ -572,23 +575,6 @@ fn integer_value(value: &Bson) -> Option<i64> {
         Bson::Double(value) if value.fract() == 0.0 => Some(*value as i64),
         _ => None,
     }
-}
-
-fn coerce_to_i64(value: &Bson) -> Option<i64> {
-    match value {
-        Bson::Int32(value) => Some(*value as i64),
-        Bson::Int64(value) => Some(*value),
-        Bson::Double(value) if value.is_finite() => truncate_f64_to_i64(*value),
-        Bson::Decimal128(value) => truncate_f64_to_i64(value.to_string().parse::<f64>().ok()?),
-        _ => None,
-    }
-}
-
-fn truncate_f64_to_i64(value: f64) -> Option<i64> {
-    let truncated = value.trunc();
-    ((i64::MIN as f64)..=(i64::MAX as f64))
-        .contains(&truncated)
-        .then_some(truncated as i64)
 }
 
 fn matches_mod(value: &Bson, divisor: i64, remainder: i64) -> bool {

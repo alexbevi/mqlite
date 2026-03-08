@@ -2415,6 +2415,88 @@ fn command_aggregate_supports_sort_by_count_stage() {
 }
 
 #[test]
+fn command_aggregate_project_supports_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("expression-operators.mongodb");
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [{ "_id": 1, "left": 5, "right": 3, "text": "abc" }]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "sum": { "$add": ["$left", "$right"] },
+                    "difference": { "$subtract": ["$left", "$right"] },
+                    "quotient": { "$divide": [7, 2] },
+                    "remainder": { "$mod": [17, 5] },
+                    "rounded": { "$round": [2.65, 1] },
+                    "fallback": { "$ifNull": ["$missing", "$left"] },
+                    "cmp": { "$cmp": ["$left", "$right"] },
+                    "expr": { "$expr": { "$eq": ["$text", "abc"] } },
+                    "const": { "$const": "fixed" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0]["sum"], 8);
+    assert_eq!(first_batch[0]["difference"], 2);
+    assert_eq!(first_batch[0]["quotient"], 3.5);
+    assert_eq!(first_batch[0]["remainder"], 2);
+    assert_eq!(first_batch[0]["rounded"], 2.7);
+    assert_eq!(first_batch[0]["fallback"], 5);
+    assert_eq!(first_batch[0]["cmp"], 1);
+    assert_eq!(first_batch[0]["expr"], true);
+    assert_eq!(first_batch[0]["const"], "fixed");
+}
+
+#[test]
 fn command_aggregate_supports_facet_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-facet.mongodb");

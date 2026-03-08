@@ -77,18 +77,32 @@
     "$unwind"
   ],
   "aggregation_expression_operators": [
+    "$abs",
+    "$add",
     "$and",
+    "$ceil",
+    "$cmp",
     "$cond",
+    "$const",
+    "$divide",
     "$eq",
+    "$expr",
+    "$floor",
     "$gt",
     "$gte",
+    "$ifNull",
     "$in",
     "$literal",
     "$lt",
     "$lte",
+    "$mod",
+    "$multiply",
     "$ne",
     "$not",
-    "$or"
+    "$or",
+    "$round",
+    "$subtract",
+    "$trunc"
   ],
   "aggregation_accumulator_operators": [
     "$addToSet",

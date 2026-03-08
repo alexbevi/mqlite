@@ -78,7 +78,32 @@ pub const SUPPORTED_AGGREGATION_STAGES: &[&str] = &[
 ];
 
 pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
-    "$literal", "$cond", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$and", "$or", "$not", "$in",
+    "$abs",
+    "$add",
+    "$and",
+    "$ceil",
+    "$cmp",
+    "$cond",
+    "$const",
+    "$divide",
+    "$eq",
+    "$expr",
+    "$floor",
+    "$gt",
+    "$gte",
+    "$ifNull",
+    "$in",
+    "$literal",
+    "$lt",
+    "$lte",
+    "$mod",
+    "$multiply",
+    "$ne",
+    "$not",
+    "$or",
+    "$round",
+    "$subtract",
+    "$trunc",
 ];
 
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =
