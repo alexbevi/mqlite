@@ -85,6 +85,8 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$anyElementTrue",
     "$arrayElemAt",
     "$arrayToObject",
+    "$binarySize",
+    "$bsonSize",
     "$bitAnd",
     "$bitNot",
     "$bitOr",

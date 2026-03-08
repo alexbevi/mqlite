@@ -1482,6 +1482,8 @@ mod tests {
             "$anyElementTrue" => doc! { "value": { "$anyElementTrue": [0, false, "ok"] } },
             "$arrayElemAt" => doc! { "value": { "$arrayElemAt": ["$array", 1] } },
             "$arrayToObject" => doc! { "value": { "$arrayToObject": "$pairs" } },
+            "$binarySize" => doc! { "value": { "$binarySize": "abc" } },
+            "$bsonSize" => doc! { "value": { "$bsonSize": "$$CURRENT" } },
             "$bitAnd" => doc! { "value": { "$bitAnd": ["$left", 6] } },
             "$bitNot" => doc! { "value": { "$bitNot": "$left" } },
             "$bitOr" => doc! { "value": { "$bitOr": ["$left", 2] } },

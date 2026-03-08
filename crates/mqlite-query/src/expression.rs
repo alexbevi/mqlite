@@ -217,6 +217,8 @@ fn eval_expression_operator(
         "$switch" => eval_switch_expression(document, value, variables),
         "$arrayElemAt" => eval_array_elem_at_expression(document, value, variables),
         "$arrayToObject" => eval_array_to_object_expression(document, value, variables),
+        "$binarySize" => eval_binary_size_expression(document, value, variables),
+        "$bsonSize" => eval_bson_size_expression(document, value, variables),
         "$concatArrays" => eval_concat_arrays_expression(document, value, variables),
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
@@ -349,6 +351,9 @@ fn validate_expression_operator(
         "$expr" | "$abs" | "$ceil" | "$floor" | "$first" | "$isArray" | "$isNumber" | "$last"
         | "$objectToArray" | "$size" | "$type" => {
             validate_expression_with_scope(unary_expression_operand(value), scope)
+        }
+        "$binarySize" | "$bsonSize" => {
+            validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
         "$add" | "$allElementsTrue" | "$and" | "$anyElementTrue" | "$arrayToObject" | "$concat"
         | "$concatArrays" | "$eq" | "$gt" | "$gte" | "$in" | "$lt" | "$lte" | "$mergeObjects"
@@ -2206,6 +2211,58 @@ fn eval_array_elem_at_expression(
     }
 
     Ok(EvaluatedExpression::Value(items[index as usize].clone()))
+}
+
+fn eval_binary_size_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let evaluated = eval_expression_result_with_variables(
+        document,
+        single_expression_operand(value)?,
+        variables,
+    )?;
+    match evaluated {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::String(value)) => {
+            Ok(EvaluatedExpression::Value(Bson::Int64(value.len() as i64)))
+        }
+        EvaluatedExpression::Value(Bson::Binary(binary)) => Ok(EvaluatedExpression::Value(
+            Bson::Int64(binary.bytes.len() as i64),
+        )),
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(
+            "$binarySize requires a string or BinData input".to_string(),
+        )),
+    }
+}
+
+fn eval_bson_size_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let evaluated = eval_expression_result_with_variables(
+        document,
+        single_expression_operand(value)?,
+        variables,
+    )?;
+    match evaluated {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::Document(document)) => {
+            let size = bson::to_vec(&document).map_err(|error| {
+                QueryError::InvalidArgument(format!("$bsonSize failed to encode document: {error}"))
+            })?;
+            Ok(EvaluatedExpression::Value(Bson::Int64(size.len() as i64)))
+        }
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(
+            "$bsonSize requires a document input".to_string(),
+        )),
+    }
 }
 
 fn eval_first_last_expression(

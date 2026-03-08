@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 71,
-    "public_supported": 71,
-    "total_unsupported": 113,
-    "public_unsupported": 82,
+    "total_supported": 73,
+    "public_supported": 73,
+    "total_unsupported": 111,
+    "public_unsupported": 80,
     "public_ignored": 23,
     "items": [
       {
@@ -3231,8 +3231,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$bitAnd",
@@ -3357,8 +3357,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$ceil",

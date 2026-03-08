@@ -1640,6 +1640,44 @@ fn projection_supports_substring_expression_operators() {
 }
 
 #[test]
+fn projection_supports_size_introspection_expression_operators() {
+    let current = doc! {
+        "_id": 1,
+        "text": "éclair",
+        "bin": Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![1, 2, 3, 4]
+        })
+    };
+    let expected_bson_size = bson::to_vec(&current)
+        .expect("encode current document")
+        .len() as i64;
+    let projected = apply_projection(
+        &current,
+        Some(&doc! {
+            "textBytes": { "$binarySize": "$text" },
+            "binBytes": { "$binarySize": "$bin" },
+            "docBytes": { "$bsonSize": "$$CURRENT" },
+            "nullBytes": { "$binarySize": "$missing" },
+            "nullDoc": { "$bsonSize": Bson::Null }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "textBytes": 7_i64,
+            "binBytes": 4_i64,
+            "docBytes": expected_bson_size,
+            "nullBytes": Bson::Null,
+            "nullDoc": Bson::Null
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1849,6 +1887,36 @@ fn substring_expression_operators_reject_invalid_inputs() {
         }),
     )
     .expect_err("substrBytes requires exactly three arguments");
+    assert!(matches!(invalid_arity, QueryError::InvalidStructure));
+}
+
+#[test]
+fn size_introspection_expression_operators_reject_invalid_inputs() {
+    let invalid_binary = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$binarySize": "$value" }
+        }),
+    )
+    .expect_err("binarySize rejects non-string, non-binary values");
+    assert!(matches!(invalid_binary, QueryError::InvalidArgument(_)));
+
+    let invalid_bson = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$bsonSize": "$value" }
+        }),
+    )
+    .expect_err("bsonSize rejects non-document values");
+    assert!(matches!(invalid_bson, QueryError::InvalidArgument(_)));
+
+    let invalid_arity = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$binarySize": ["$value", "$value"] }
+        }),
+    )
+    .expect_err("binarySize requires exactly one argument");
     assert!(matches!(invalid_arity, QueryError::InvalidStructure));
 }
 

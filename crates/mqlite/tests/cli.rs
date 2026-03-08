@@ -1,6 +1,7 @@
 use std::{thread, time::Duration};
 
 use assert_cmd::Command;
+use bson::{Binary, Bson, doc, spec::BinarySubtype};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -3447,6 +3448,90 @@ fn command_aggregate_project_supports_substring_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_size_introspection_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("size-introspection-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"text":"éclair","bin":{"$binary":{"base64":"AQIDBA==","subType":"00"}}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let current = doc! {
+        "_id": 1_i64,
+        "text": "éclair",
+        "bin": Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![1, 2, 3, 4]
+        })
+    };
+    let expected_bson_size = bson::to_vec(&current)
+        .expect("encode current document")
+        .len() as i64;
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "textBytes": { "$binarySize": "$text" },
+                    "binBytes": { "$binarySize": "$bin" },
+                    "docBytes": { "$bsonSize": "$$CURRENT" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "textBytes": 7,
+            "binBytes": 4,
+            "docBytes": expected_bson_size
+        })]
+    );
+}
+
+#[test]
 fn command_aggregate_project_rejects_invalid_case_expression() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("invalid-case-expression.mongodb");
@@ -3618,6 +3703,53 @@ fn command_aggregate_project_rejects_invalid_substring_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$substrBytes":["$value",1,1]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_size_introspection_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-size-introspection-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":5}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$binarySize":"$value"}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()
