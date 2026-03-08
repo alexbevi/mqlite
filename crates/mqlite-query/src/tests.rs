@@ -2136,6 +2136,93 @@ fn projection_supports_date_arithmetic_expression_operators() {
 }
 
 #[test]
+fn projection_supports_date_parts_conversion_expression_operators() {
+    let date = bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date");
+    let projected = apply_projection(
+        &doc! { "_id": 1, "date": date, "timezone": "America/New_York" },
+        Some(&doc! {
+            "fromParts": {
+                "$dateFromParts": {
+                    "year": 2020,
+                    "month": 5,
+                    "day": 14,
+                    "hour": 12,
+                    "minute": 34,
+                    "second": 56,
+                    "millisecond": 789
+                }
+            },
+            "fromIsoParts": {
+                "$dateFromParts": {
+                    "isoWeekYear": 2020,
+                    "isoWeek": 20,
+                    "isoDayOfWeek": 4,
+                    "hour": 12,
+                    "minute": 34,
+                    "second": 56,
+                    "millisecond": 789
+                }
+            },
+            "toParts": { "$dateToParts": { "date": "$date" } },
+            "toIsoParts": { "$dateToParts": { "date": "$date", "iso8601": true } },
+            "toPartsTz": { "$dateToParts": { "date": "$date", "timezone": "$timezone" } },
+            "nullTimezone": { "$dateToParts": { "date": "$date", "timezone": "$missingTz" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("fromParts"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("fromIsoParts"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("toParts"),
+        Some(&Bson::Document(doc! {
+            "year": 2020,
+            "month": 5,
+            "day": 14,
+            "hour": 12,
+            "minute": 34,
+            "second": 56,
+            "millisecond": 789
+        }))
+    );
+    assert_eq!(
+        projected.get("toIsoParts"),
+        Some(&Bson::Document(doc! {
+            "isoWeekYear": 2020,
+            "isoWeek": 20,
+            "isoDayOfWeek": 4,
+            "hour": 12,
+            "minute": 34,
+            "second": 56,
+            "millisecond": 789
+        }))
+    );
+    assert_eq!(
+        projected.get("toPartsTz"),
+        Some(&Bson::Document(doc! {
+            "year": 2020,
+            "month": 5,
+            "day": 14,
+            "hour": 8,
+            "minute": 34,
+            "second": 56,
+            "millisecond": 789
+        }))
+    );
+    assert_eq!(projected.get("nullTimezone"), Some(&Bson::Null));
+}
+
+#[test]
 fn date_arithmetic_expression_operators_reject_invalid_inputs() {
     let invalid_unit = apply_projection(
         &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
@@ -2179,6 +2266,48 @@ fn date_arithmetic_expression_operators_reject_invalid_inputs() {
     )
     .expect_err("dateTrunc requires positive binSize");
     assert!(matches!(invalid_bin_size, QueryError::InvalidArgument(_)));
+}
+
+#[test]
+fn date_parts_conversion_expression_operators_reject_invalid_inputs() {
+    let mixed_parts = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": {
+                "$dateFromParts": {
+                    "year": 2020,
+                    "isoWeekYear": 2020
+                }
+            }
+        }),
+    )
+    .expect_err("dateFromParts rejects mixed calendar and iso fields");
+    assert!(matches!(mixed_parts, QueryError::InvalidStructure));
+
+    let invalid_hour = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": {
+                "$dateFromParts": {
+                    "year": 2020,
+                    "month": 5,
+                    "day": 14,
+                    "hour": 24
+                }
+            }
+        }),
+    )
+    .expect_err("dateFromParts validates numeric bounds");
+    assert!(matches!(invalid_hour, QueryError::InvalidArgument(_)));
+
+    let invalid_iso_flag = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": { "$dateToParts": { "date": "$date", "iso8601": "yes" } }
+        }),
+    )
+    .expect_err("dateToParts requires boolean iso flag");
+    assert!(matches!(invalid_iso_flag, QueryError::InvalidArgument(_)));
 }
 
 #[test]
@@ -6170,10 +6299,8 @@ fn projection_rejects_unsupported_expression_operator() {
         &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
         Some(&doc! {
             "out": {
-                "$dateFromParts": {
-                    "year": 2024,
-                    "month": 2,
-                    "day": 1
+                "$dateFromString": {
+                    "dateString": "2024-02-01T00:00:00.000Z"
                 }
             }
         }),
@@ -6182,6 +6309,6 @@ fn projection_rejects_unsupported_expression_operator() {
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateFromParts"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateFromString"
     ));
 }

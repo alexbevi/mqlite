@@ -122,12 +122,14 @@ fn eval_expression_operator(
             DateArithmeticExpressionMode::Add,
         ),
         "$dateDiff" => eval_date_diff_expression(document, value, variables),
+        "$dateFromParts" => eval_date_from_parts_expression(document, value, variables),
         "$dateSubtract" => eval_date_arithmetic_expression(
             document,
             value,
             variables,
             DateArithmeticExpressionMode::Subtract,
         ),
+        "$dateToParts" => eval_date_to_parts_expression(document, value, variables),
         "$dateTrunc" => eval_date_trunc_expression(document, value, variables),
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$cmp" => {
             let [left, right] = expression_arguments::<2>(value)?;
@@ -685,6 +687,8 @@ fn validate_expression_operator(
         | "$year" => validate_date_part_expression(value, scope),
         "$dateAdd" | "$dateSubtract" => validate_date_arithmetic_expression(value, scope, operator),
         "$dateDiff" => validate_date_diff_expression(value, scope),
+        "$dateFromParts" => validate_date_from_parts_expression(value, scope),
+        "$dateToParts" => validate_date_to_parts_expression(value, scope),
         "$dateTrunc" => validate_date_trunc_expression(value, scope),
         "$getField" => {
             let (field, input) = parse_get_field_spec(value)?;
@@ -4375,6 +4379,231 @@ fn eval_date_trunc_expression(
     )))
 }
 
+fn eval_date_from_parts_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = parse_date_from_parts_expression_spec(value)?;
+
+    let hour = match eval_date_from_parts_component(
+        document,
+        spec.hour,
+        variables,
+        "$dateFromParts",
+        "hour",
+        0,
+        Some((0, 23)),
+    )? {
+        Some(hour) => hour,
+        None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+    };
+    let minute = match eval_date_from_parts_component(
+        document,
+        spec.minute,
+        variables,
+        "$dateFromParts",
+        "minute",
+        0,
+        Some((0, 59)),
+    )? {
+        Some(minute) => minute,
+        None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+    };
+    let second = match eval_date_from_parts_component(
+        document,
+        spec.second,
+        variables,
+        "$dateFromParts",
+        "second",
+        0,
+        Some((0, 59)),
+    )? {
+        Some(second) => second,
+        None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+    };
+    let millisecond = match eval_date_from_parts_component(
+        document,
+        spec.millisecond,
+        variables,
+        "$dateFromParts",
+        "millisecond",
+        0,
+        Some((0, 999)),
+    )? {
+        Some(millisecond) => millisecond,
+        None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+    };
+
+    let timezone =
+        resolve_timezone_expression(document, spec.timezone, variables, "$dateFromParts")?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    let local = if let Some(year) = spec.year {
+        let year = match eval_date_from_parts_component(
+            document,
+            Some(year),
+            variables,
+            "$dateFromParts",
+            "year",
+            1970,
+            Some((1, 9999)),
+        )? {
+            Some(year) => year,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        let month = match eval_date_from_parts_component(
+            document,
+            spec.month,
+            variables,
+            "$dateFromParts",
+            "month",
+            1,
+            Some((1, 12)),
+        )? {
+            Some(month) => month,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        let day = match eval_date_from_parts_component(
+            document,
+            spec.day,
+            variables,
+            "$dateFromParts",
+            "day",
+            1,
+            Some((1, 31)),
+        )? {
+            Some(day) => day,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+            .and_then(|date| {
+                date.and_hms_milli_opt(
+                    hour as u32,
+                    minute as u32,
+                    second as u32,
+                    millisecond as u32,
+                )
+            })
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$dateFromParts produced an invalid calendar date".to_string(),
+                )
+            })?
+    } else {
+        let iso_week_year = match eval_date_from_parts_component(
+            document,
+            spec.iso_week_year,
+            variables,
+            "$dateFromParts",
+            "isoWeekYear",
+            1970,
+            Some((1, 9999)),
+        )? {
+            Some(year) => year,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        let iso_week = match eval_date_from_parts_component(
+            document,
+            spec.iso_week,
+            variables,
+            "$dateFromParts",
+            "isoWeek",
+            1,
+            Some((1, 53)),
+        )? {
+            Some(week) => week,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        let iso_day_of_week = match eval_date_from_parts_component(
+            document,
+            spec.iso_day_of_week,
+            variables,
+            "$dateFromParts",
+            "isoDayOfWeek",
+            1,
+            Some((1, 7)),
+        )? {
+            Some(day) => day,
+            None => return Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+        let weekday = iso_weekday(iso_day_of_week as u32)?;
+        NaiveDate::from_isoywd_opt(iso_week_year as i32, iso_week as u32, weekday)
+            .and_then(|date| {
+                date.and_hms_milli_opt(
+                    hour as u32,
+                    minute as u32,
+                    second as u32,
+                    millisecond as u32,
+                )
+            })
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$dateFromParts produced an invalid ISO-8601 date".to_string(),
+                )
+            })?
+    };
+
+    let result = resolve_local_datetime(&timezone, local, "$dateFromParts")?;
+    Ok(EvaluatedExpression::Value(Bson::DateTime(
+        bson::DateTime::from_millis(result.timestamp_millis()),
+    )))
+}
+
+fn eval_date_to_parts_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = parse_date_to_parts_expression_spec(value)?;
+    let timezone = resolve_timezone_expression(document, spec.timezone, variables, "$dateToParts")?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    let iso8601 = match spec.iso8601 {
+        Some(iso8601) => {
+            let iso8601 = eval_expression_result_with_variables(document, iso8601, variables)?;
+            if iso8601.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            match iso8601 {
+                EvaluatedExpression::Value(Bson::Boolean(value)) => value,
+                _ => {
+                    return Err(QueryError::InvalidArgument(
+                        "$dateToParts requires `iso8601` to evaluate to a boolean".to_string(),
+                    ));
+                }
+            }
+        }
+        None => false,
+    };
+
+    let date = eval_expression_result_with_variables(document, spec.date, variables)?;
+    if date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let date = coerce_date_expression_value(date, "$dateToParts", "date")?;
+    let parts = date_parts_in_timezone(date, &timezone);
+    let mut result = Document::new();
+    if iso8601 {
+        result.insert("isoWeekYear", parts.iso_week_year);
+        result.insert("isoWeek", parts.iso_week as i32);
+        result.insert("isoDayOfWeek", parts.iso_day_of_week as i32);
+    } else {
+        result.insert("year", parts.year);
+        result.insert("month", parts.month as i32);
+        result.insert("day", parts.day_of_month as i32);
+    }
+    result.insert("hour", parts.hour as i32);
+    result.insert("minute", parts.minute as i32);
+    result.insert("second", parts.second as i32);
+    result.insert("millisecond", parts.millisecond as i32);
+    Ok(EvaluatedExpression::Value(Bson::Document(result)))
+}
+
 fn eval_date_part_expression(
     document: &Document,
     value: &Bson,
@@ -4450,6 +4679,26 @@ type DateTruncExpressionSpec<'a> = (
     Option<&'a Bson>,
     Option<&'a Bson>,
 );
+
+struct DateFromPartsSpec<'a> {
+    year: Option<&'a Bson>,
+    month: Option<&'a Bson>,
+    day: Option<&'a Bson>,
+    hour: Option<&'a Bson>,
+    minute: Option<&'a Bson>,
+    second: Option<&'a Bson>,
+    millisecond: Option<&'a Bson>,
+    iso_week_year: Option<&'a Bson>,
+    iso_week: Option<&'a Bson>,
+    iso_day_of_week: Option<&'a Bson>,
+    timezone: Option<&'a Bson>,
+}
+
+struct DateToPartsSpec<'a> {
+    date: &'a Bson,
+    timezone: Option<&'a Bson>,
+    iso8601: Option<&'a Bson>,
+}
 
 fn resolve_timezone_expression(
     document: &Document,
@@ -4568,6 +4817,88 @@ fn parse_date_trunc_expression_spec(
     ))
 }
 
+fn parse_date_from_parts_expression_spec(
+    value: &Bson,
+) -> Result<DateFromPartsSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut parsed = DateFromPartsSpec {
+        year: None,
+        month: None,
+        day: None,
+        hour: None,
+        minute: None,
+        second: None,
+        millisecond: None,
+        iso_week_year: None,
+        iso_week: None,
+        iso_day_of_week: None,
+        timezone: None,
+    };
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "year" => parsed.year = Some(value),
+            "month" => parsed.month = Some(value),
+            "day" => parsed.day = Some(value),
+            "hour" => parsed.hour = Some(value),
+            "minute" => parsed.minute = Some(value),
+            "second" => parsed.second = Some(value),
+            "millisecond" => parsed.millisecond = Some(value),
+            "isoWeekYear" => parsed.iso_week_year = Some(value),
+            "isoWeek" => parsed.iso_week = Some(value),
+            "isoDayOfWeek" => parsed.iso_day_of_week = Some(value),
+            "timezone" => parsed.timezone = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateFromParts: {field}"
+                )));
+            }
+        }
+    }
+
+    if parsed.year.is_none() && parsed.iso_week_year.is_none() {
+        return Err(QueryError::InvalidStructure);
+    }
+    if parsed.year.is_some()
+        && (parsed.iso_week_year.is_some()
+            || parsed.iso_week.is_some()
+            || parsed.iso_day_of_week.is_some())
+    {
+        return Err(QueryError::InvalidStructure);
+    }
+    if parsed.iso_week_year.is_some() && (parsed.month.is_some() || parsed.day.is_some()) {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    Ok(parsed)
+}
+
+fn parse_date_to_parts_expression_spec(value: &Bson) -> Result<DateToPartsSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut date = None;
+    let mut timezone = None;
+    let mut iso8601 = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "date" => date = Some(value),
+            "timezone" => timezone = Some(value),
+            "iso8601" => iso8601 = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateToParts: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok(DateToPartsSpec {
+        date: date.ok_or(QueryError::InvalidStructure)?,
+        timezone,
+        iso8601,
+    })
+}
+
 fn validate_date_arithmetic_expression(
     value: &Bson,
     scope: &BTreeSet<String>,
@@ -4595,6 +4926,47 @@ fn validate_date_diff_expression(value: &Bson, scope: &BTreeSet<String>) -> Resu
     }
     if let Some(start_of_week) = start_of_week {
         validate_expression_with_scope(start_of_week, scope)?;
+    }
+    Ok(())
+}
+
+fn validate_date_from_parts_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let spec = parse_date_from_parts_expression_spec(value)?;
+    for value in [
+        spec.year,
+        spec.month,
+        spec.day,
+        spec.hour,
+        spec.minute,
+        spec.second,
+        spec.millisecond,
+        spec.iso_week_year,
+        spec.iso_week,
+        spec.iso_day_of_week,
+        spec.timezone,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_expression_with_scope(value, scope)?;
+    }
+    Ok(())
+}
+
+fn validate_date_to_parts_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let spec = parse_date_to_parts_expression_spec(value)?;
+    validate_expression_with_scope(spec.date, scope)?;
+    if let Some(timezone) = spec.timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    if let Some(iso8601) = spec.iso8601 {
+        validate_expression_with_scope(iso8601, scope)?;
     }
     Ok(())
 }
@@ -4725,6 +5097,49 @@ fn require_integral_i64_operand(
             "{operator} requires `{field}` to evaluate to an integral numeric value"
         ))
     })
+}
+
+fn eval_date_from_parts_component(
+    document: &Document,
+    expression: Option<&Bson>,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+    field: &str,
+    default: i64,
+    bounds: Option<(i64, i64)>,
+) -> Result<Option<i64>, QueryError> {
+    let Some(expression) = expression else {
+        return Ok(Some(default));
+    };
+    let value = eval_expression_result_with_variables(document, expression, variables)?;
+    if value.is_nullish() {
+        return Ok(None);
+    }
+    let value = require_integral_i64_operand(value, operator, field)?;
+    if let Some((lower, upper)) = bounds {
+        if value < lower || value > upper {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires `{field}` to evaluate to an integer in the range {lower} to {upper}"
+            )));
+        }
+    }
+    Ok(Some(value))
+}
+
+fn iso_weekday(value: u32) -> Result<Weekday, QueryError> {
+    match value {
+        1 => Ok(Weekday::Mon),
+        2 => Ok(Weekday::Tue),
+        3 => Ok(Weekday::Wed),
+        4 => Ok(Weekday::Thu),
+        5 => Ok(Weekday::Fri),
+        6 => Ok(Weekday::Sat),
+        7 => Ok(Weekday::Sun),
+        _ => Err(QueryError::InvalidArgument(
+            "$dateFromParts requires `isoDayOfWeek` to evaluate to an integer in the range 1 to 7"
+                .to_string(),
+        )),
+    }
 }
 
 fn coerce_date_part_value(
