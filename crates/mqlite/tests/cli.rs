@@ -4261,6 +4261,81 @@ fn command_aggregate_project_supports_date_part_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_date_arithmetic_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("date-arithmetic-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2020-05-14T12:34:56.789Z"},"monthEnd":{"$date":"2020-07-14T12:34:56.789Z"},"weekEnd":{"$date":"2020-05-28T08:00:00.000Z"}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "addedDaysMs": { "$toLong": { "$dateAdd": { "startDate": "$date", "unit": "day", "amount": 2 } } },
+                    "subtractedMonthsMs": { "$toLong": { "$dateSubtract": { "startDate": "$date", "unit": "month", "amount": 2 } } },
+                    "diffWeeks": { "$dateDiff": { "startDate": "$date", "endDate": "$weekEnd", "unit": "week", "startOfWeek": "thursday" } },
+                    "diffMonths": { "$dateDiff": { "startDate": "$date", "endDate": "$monthEnd", "unit": "month" } },
+                    "truncatedHourMs": { "$toLong": { "$dateTrunc": { "date": "$date", "unit": "hour" } } },
+                    "truncatedWeekMs": { "$toLong": { "$dateTrunc": { "date": "$date", "unit": "week", "startOfWeek": "monday" } } },
+                    "nullTimezone": { "$dateAdd": { "startDate": "$date", "unit": "day", "amount": 1, "timezone": "$missingTz" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["addedDaysMs"], 1_589_632_496_789_i64);
+    assert_eq!(first["subtractedMonthsMs"], 1_584_189_296_789_i64);
+    assert_eq!(first["diffWeeks"], 2);
+    assert_eq!(first["diffMonths"], 2);
+    assert_eq!(first["truncatedHourMs"], 1_589_457_600_000_i64);
+    assert_eq!(first["truncatedWeekMs"], 1_589_155_200_000_i64);
+    assert_eq!(first["nullTimezone"], Value::Null);
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -4459,6 +4534,53 @@ fn command_aggregate_project_rejects_invalid_date_part_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$hour":{"date":"$date","timezone":"DoesNot/Exist"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_date_arithmetic_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-date-arithmetic-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2020-05-14T12:34:56.789Z"}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$dateAdd":{"startDate":"$date","unit":"century","amount":1}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

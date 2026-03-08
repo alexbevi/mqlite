@@ -1079,6 +1079,7 @@ mod tests {
             "right": 3,
             "text": "abc",
             "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date"),
+            "otherDate": bson::DateTime::parse_rfc3339_str("2017-07-03T15:13:25.713Z").expect("date"),
             "timezone": "America/New_York",
             "array": [1, 2, 3],
             "emptyArray": [],
@@ -1520,6 +1521,18 @@ mod tests {
             }
             "$cos" => doc! { "value": { "$cos": 0 } },
             "$cosh" => doc! { "value": { "$cosh": 0 } },
+            "$dateAdd" => {
+                doc! { "value": { "$dateAdd": { "startDate": "$date", "unit": "day", "amount": 2 } } }
+            }
+            "$dateDiff" => {
+                doc! { "value": { "$dateDiff": { "startDate": "$date", "endDate": "$otherDate", "unit": "week", "startOfWeek": "monday" } } }
+            }
+            "$dateSubtract" => {
+                doc! { "value": { "$dateSubtract": { "startDate": "$date", "unit": "day", "amount": 2 } } }
+            }
+            "$dateTrunc" => {
+                doc! { "value": { "$dateTrunc": { "date": "$date", "unit": "hour" } } }
+            }
             "$dayOfMonth" => doc! { "value": { "$dayOfMonth": "$date" } },
             "$dayOfWeek" => {
                 doc! { "value": { "$dayOfWeek": { "date": "$date", "timezone": "$timezone" } } }

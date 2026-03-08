@@ -4,7 +4,10 @@ use std::{
 };
 
 use bson::{Bson, Decimal128, Document, doc, oid::ObjectId};
-use chrono::{DateTime, Datelike, FixedOffset, SecondsFormat, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, LocalResult, NaiveDate, NaiveDateTime,
+    SecondsFormat, TimeZone, Timelike, Utc, Weekday,
+};
 use chrono_tz::Tz;
 use mqlite_bson::{compare_bson, lookup_path_owned};
 use regex::Regex as RustRegex;
@@ -112,6 +115,20 @@ fn eval_expression_operator(
         "$const" | "$literal" => Ok(EvaluatedExpression::Value(value.clone())),
         "$expr" => eval_expression_result_with_variables(document, value, variables),
         "$cond" => eval_cond_expression(document, value, variables),
+        "$dateAdd" => eval_date_arithmetic_expression(
+            document,
+            value,
+            variables,
+            DateArithmeticExpressionMode::Add,
+        ),
+        "$dateDiff" => eval_date_diff_expression(document, value, variables),
+        "$dateSubtract" => eval_date_arithmetic_expression(
+            document,
+            value,
+            variables,
+            DateArithmeticExpressionMode::Subtract,
+        ),
+        "$dateTrunc" => eval_date_trunc_expression(document, value, variables),
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$cmp" => {
             let [left, right] = expression_arguments::<2>(value)?;
             let left = eval_expression_with_variables(document, left, variables)?;
@@ -666,6 +683,9 @@ fn validate_expression_operator(
         "$dayOfMonth" | "$dayOfWeek" | "$dayOfYear" | "$hour" | "$isoDayOfWeek" | "$isoWeek"
         | "$isoWeekYear" | "$millisecond" | "$minute" | "$month" | "$second" | "$week"
         | "$year" => validate_date_part_expression(value, scope),
+        "$dateAdd" | "$dateSubtract" => validate_date_arithmetic_expression(value, scope, operator),
+        "$dateDiff" => validate_date_diff_expression(value, scope),
+        "$dateTrunc" => validate_date_trunc_expression(value, scope),
         "$getField" => {
             let (field, input) = parse_get_field_spec(value)?;
             validate_expression_with_scope(field, scope)?;
@@ -1918,6 +1938,34 @@ impl DatePartExpressionMode {
             Self::Year => "$year",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum DateArithmeticExpressionMode {
+    Add,
+    Subtract,
+}
+
+impl DateArithmeticExpressionMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Add => "$dateAdd",
+            Self::Subtract => "$dateSubtract",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateUnit {
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
 }
 
 fn eval_expression_accumulator(
@@ -4166,6 +4214,167 @@ fn eval_n_expression(
     Ok(EvaluatedExpression::Value(Bson::Array(result)))
 }
 
+fn eval_date_arithmetic_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    mode: DateArithmeticExpressionMode,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = mode.name();
+    let (start_date, unit, amount, timezone) =
+        parse_date_arithmetic_expression_spec(value, operator)?;
+    let start_date = eval_expression_result_with_variables(document, start_date, variables)?;
+    if start_date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let unit = eval_expression_result_with_variables(document, unit, variables)?;
+    if unit.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let amount = eval_expression_result_with_variables(document, amount, variables)?;
+    if amount.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let timezone = resolve_timezone_expression(document, timezone, variables, operator)?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    let start_date = coerce_date_expression_value(start_date, operator, "startDate")?;
+    let unit = parse_date_unit_operand(unit, operator)?;
+    let amount = require_integral_i64_operand(amount, operator, "amount")?;
+
+    if matches!(mode, DateArithmeticExpressionMode::Subtract) && amount == i64::MIN {
+        return Err(QueryError::InvalidArgument(format!(
+            "invalid {operator} 'amount' parameter value: {amount}"
+        )));
+    }
+
+    let amount = match mode {
+        DateArithmeticExpressionMode::Add => amount,
+        DateArithmeticExpressionMode::Subtract => -amount,
+    };
+    let result = date_add_units(start_date, unit, amount, &timezone, operator)?;
+    Ok(EvaluatedExpression::Value(Bson::DateTime(
+        bson::DateTime::from_millis(result.timestamp_millis()),
+    )))
+}
+
+fn eval_date_diff_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (start_date, end_date, unit, timezone, start_of_week) =
+        parse_date_diff_expression_spec(value)?;
+    let start_date = eval_expression_result_with_variables(document, start_date, variables)?;
+    if start_date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let end_date = eval_expression_result_with_variables(document, end_date, variables)?;
+    if end_date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let unit = eval_expression_result_with_variables(document, unit, variables)?;
+    if unit.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let timezone = resolve_timezone_expression(document, timezone, variables, "$dateDiff")?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    let start_date = coerce_date_expression_value(start_date, "$dateDiff", "startDate")?;
+    let end_date = coerce_date_expression_value(end_date, "$dateDiff", "endDate")?;
+    let unit = parse_date_unit_operand(unit, "$dateDiff")?;
+    let start_of_week = if unit == DateUnit::Week {
+        match start_of_week {
+            Some(start_of_week) => {
+                let value =
+                    eval_expression_result_with_variables(document, start_of_week, variables)?;
+                if value.is_nullish() {
+                    return Ok(EvaluatedExpression::Value(Bson::Null));
+                }
+                parse_start_of_week_operand(value, "$dateDiff", "startOfWeek")?
+            }
+            None => Weekday::Sun,
+        }
+    } else {
+        Weekday::Sun
+    };
+
+    Ok(EvaluatedExpression::Value(Bson::Int64(date_diff_units(
+        start_date,
+        end_date,
+        unit,
+        &timezone,
+        start_of_week,
+    )?)))
+}
+
+fn eval_date_trunc_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (date, unit, bin_size, timezone, start_of_week) = parse_date_trunc_expression_spec(value)?;
+    let date = eval_expression_result_with_variables(document, date, variables)?;
+    if date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let unit = eval_expression_result_with_variables(document, unit, variables)?;
+    if unit.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let unit = parse_date_unit_operand(unit, "$dateTrunc")?;
+
+    let bin_size = match bin_size {
+        Some(bin_size) => {
+            let value = eval_expression_result_with_variables(document, bin_size, variables)?;
+            if value.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            let value = require_integral_i64_operand(value, "$dateTrunc", "binSize")?;
+            if value <= 0 {
+                return Err(QueryError::InvalidArgument(
+                    "$dateTrunc requires `binSize` to evaluate to a positive integral value"
+                        .to_string(),
+                ));
+            }
+            value
+        }
+        None => 1,
+    };
+
+    let timezone = resolve_timezone_expression(document, timezone, variables, "$dateTrunc")?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    let date = coerce_date_expression_value(date, "$dateTrunc", "date")?;
+
+    let start_of_week = if unit == DateUnit::Week {
+        match start_of_week {
+            Some(start_of_week) => {
+                let value =
+                    eval_expression_result_with_variables(document, start_of_week, variables)?;
+                if value.is_nullish() {
+                    return Ok(EvaluatedExpression::Value(Bson::Null));
+                }
+                parse_start_of_week_operand(value, "$dateTrunc", "startOfWeek")?
+            }
+            None => Weekday::Sun,
+        }
+    } else {
+        Weekday::Sun
+    };
+
+    let result = truncate_date_unit(date, unit, bin_size, &timezone, start_of_week, "$dateTrunc")?;
+    Ok(EvaluatedExpression::Value(Bson::DateTime(
+        bson::DateTime::from_millis(result.timestamp_millis()),
+    )))
+}
+
 fn eval_date_part_expression(
     document: &Document,
     value: &Bson,
@@ -4226,6 +4435,22 @@ struct DateParts {
     week: u32,
 }
 
+type DateArithmeticExpressionSpec<'a> = (&'a Bson, &'a Bson, &'a Bson, Option<&'a Bson>);
+type DateDiffExpressionSpec<'a> = (
+    &'a Bson,
+    &'a Bson,
+    &'a Bson,
+    Option<&'a Bson>,
+    Option<&'a Bson>,
+);
+type DateTruncExpressionSpec<'a> = (
+    &'a Bson,
+    &'a Bson,
+    Option<&'a Bson>,
+    Option<&'a Bson>,
+    Option<&'a Bson>,
+);
+
 fn resolve_timezone_expression(
     document: &Document,
     timezone: Option<&Bson>,
@@ -4243,6 +4468,154 @@ fn resolve_timezone_expression(
     parse_timezone(&timezone).map(Some).ok_or_else(|| {
         QueryError::InvalidArgument(format!("{operator} requires a valid timezone string"))
     })
+}
+
+fn parse_date_arithmetic_expression_spec<'a>(
+    value: &'a Bson,
+    operator: &str,
+) -> Result<DateArithmeticExpressionSpec<'a>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut start_date = None;
+    let mut unit = None;
+    let mut amount = None;
+    let mut timezone = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "startDate" => start_date = Some(value),
+            "unit" => unit = Some(value),
+            "amount" => amount = Some(value),
+            "timezone" => timezone = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to {operator}: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok((
+        start_date.ok_or(QueryError::InvalidStructure)?,
+        unit.ok_or(QueryError::InvalidStructure)?,
+        amount.ok_or(QueryError::InvalidStructure)?,
+        timezone,
+    ))
+}
+
+fn parse_date_diff_expression_spec(value: &Bson) -> Result<DateDiffExpressionSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut start_date = None;
+    let mut end_date = None;
+    let mut unit = None;
+    let mut timezone = None;
+    let mut start_of_week = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "startDate" => start_date = Some(value),
+            "endDate" => end_date = Some(value),
+            "unit" => unit = Some(value),
+            "timezone" => timezone = Some(value),
+            "startOfWeek" => start_of_week = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateDiff: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok((
+        start_date.ok_or(QueryError::InvalidStructure)?,
+        end_date.ok_or(QueryError::InvalidStructure)?,
+        unit.ok_or(QueryError::InvalidStructure)?,
+        timezone,
+        start_of_week,
+    ))
+}
+
+fn parse_date_trunc_expression_spec(
+    value: &Bson,
+) -> Result<DateTruncExpressionSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut date = None;
+    let mut unit = None;
+    let mut bin_size = None;
+    let mut timezone = None;
+    let mut start_of_week = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "date" => date = Some(value),
+            "unit" => unit = Some(value),
+            "binSize" => bin_size = Some(value),
+            "timezone" => timezone = Some(value),
+            "startOfWeek" => start_of_week = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateTrunc: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok((
+        date.ok_or(QueryError::InvalidStructure)?,
+        unit.ok_or(QueryError::InvalidStructure)?,
+        bin_size,
+        timezone,
+        start_of_week,
+    ))
+}
+
+fn validate_date_arithmetic_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+    operator: &str,
+) -> Result<(), QueryError> {
+    let (start_date, unit, amount, timezone) =
+        parse_date_arithmetic_expression_spec(value, operator)?;
+    validate_expression_with_scope(start_date, scope)?;
+    validate_expression_with_scope(unit, scope)?;
+    validate_expression_with_scope(amount, scope)?;
+    if let Some(timezone) = timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    Ok(())
+}
+
+fn validate_date_diff_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (start_date, end_date, unit, timezone, start_of_week) =
+        parse_date_diff_expression_spec(value)?;
+    validate_expression_with_scope(start_date, scope)?;
+    validate_expression_with_scope(end_date, scope)?;
+    validate_expression_with_scope(unit, scope)?;
+    if let Some(timezone) = timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    if let Some(start_of_week) = start_of_week {
+        validate_expression_with_scope(start_of_week, scope)?;
+    }
+    Ok(())
+}
+
+fn validate_date_trunc_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let (date, unit, bin_size, timezone, start_of_week) = parse_date_trunc_expression_spec(value)?;
+    validate_expression_with_scope(date, scope)?;
+    validate_expression_with_scope(unit, scope)?;
+    if let Some(bin_size) = bin_size {
+        validate_expression_with_scope(bin_size, scope)?;
+    }
+    if let Some(timezone) = timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    if let Some(start_of_week) = start_of_week {
+        validate_expression_with_scope(start_of_week, scope)?;
+    }
+    Ok(())
 }
 
 fn parse_timezone(value: &str) -> Option<ResolvedTimeZone> {
@@ -4282,9 +4655,89 @@ fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(total_seconds)
 }
 
+fn parse_date_unit_operand(
+    value: EvaluatedExpression,
+    operator: &str,
+) -> Result<DateUnit, QueryError> {
+    let value = require_named_string_operand(value, operator, "unit")?;
+    parse_date_unit(&value).ok_or_else(|| {
+        QueryError::InvalidArgument(format!("{operator} requires a valid time unit string"))
+    })
+}
+
+fn parse_date_unit(value: &str) -> Option<DateUnit> {
+    match value {
+        "millisecond" => Some(DateUnit::Millisecond),
+        "second" => Some(DateUnit::Second),
+        "minute" => Some(DateUnit::Minute),
+        "hour" => Some(DateUnit::Hour),
+        "day" => Some(DateUnit::Day),
+        "week" => Some(DateUnit::Week),
+        "month" => Some(DateUnit::Month),
+        "quarter" => Some(DateUnit::Quarter),
+        "year" => Some(DateUnit::Year),
+        _ => None,
+    }
+}
+
+fn parse_start_of_week_operand(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
+) -> Result<Weekday, QueryError> {
+    let value = require_named_string_operand(value, operator, field)?;
+    parse_start_of_week(&value).ok_or_else(|| {
+        QueryError::InvalidArgument(format!(
+            "{operator} requires `{field}` to evaluate to a valid day of week string"
+        ))
+    })
+}
+
+fn parse_start_of_week(value: &str) -> Option<Weekday> {
+    match value.to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => Some(Weekday::Sun),
+        "mon" | "monday" => Some(Weekday::Mon),
+        "tue" | "tuesday" => Some(Weekday::Tue),
+        "wed" | "wednesday" => Some(Weekday::Wed),
+        "thu" | "thursday" => Some(Weekday::Thu),
+        "fri" | "friday" => Some(Weekday::Fri),
+        "sat" | "saturday" => Some(Weekday::Sat),
+        _ => None,
+    }
+}
+
+fn require_integral_i64_operand(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
+) -> Result<i64, QueryError> {
+    let value = match value {
+        EvaluatedExpression::Value(value) => value,
+        EvaluatedExpression::Missing => {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires `{field}` to evaluate to an integral numeric value"
+            )));
+        }
+    };
+
+    integral_numeric_i64(&value).ok_or_else(|| {
+        QueryError::InvalidArgument(format!(
+            "{operator} requires `{field}` to evaluate to an integral numeric value"
+        ))
+    })
+}
+
 fn coerce_date_part_value(
     value: EvaluatedExpression,
     operator: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    coerce_date_expression_value_with_field(value, operator, "date")
+}
+
+fn coerce_date_expression_value_with_field(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
 ) -> Result<DateTime<Utc>, QueryError> {
     let value = match value {
         EvaluatedExpression::Value(value) => value,
@@ -4295,13 +4748,13 @@ fn coerce_date_part_value(
         Bson::DateTime(value) => DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
             .ok_or_else(|| {
                 QueryError::InvalidArgument(format!(
-                    "{operator} requires a date, timestamp, or objectId input"
+                    "{operator} requires `{field}` to evaluate to a date, timestamp, or objectId input"
                 ))
             }),
         Bson::Timestamp(value) => {
             DateTime::<Utc>::from_timestamp(value.time as i64, 0).ok_or_else(|| {
                 QueryError::InvalidArgument(format!(
-                    "{operator} requires a date, timestamp, or objectId input"
+                    "{operator} requires `{field}` to evaluate to a date, timestamp, or objectId input"
                 ))
             })
         }
@@ -4310,13 +4763,21 @@ fn coerce_date_part_value(
         )
         .ok_or_else(|| {
             QueryError::InvalidArgument(format!(
-                "{operator} requires a date, timestamp, or objectId input"
+                "{operator} requires `{field}` to evaluate to a date, timestamp, or objectId input"
             ))
         }),
         _ => Err(QueryError::InvalidArgument(format!(
-            "{operator} requires a date, timestamp, or objectId input"
+            "{operator} requires `{field}` to evaluate to a date, timestamp, or objectId input"
         ))),
     }
+}
+
+fn coerce_date_expression_value(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    coerce_date_expression_value_with_field(value, operator, field)
 }
 
 fn date_parts_in_timezone(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> DateParts {
@@ -4325,6 +4786,256 @@ fn date_parts_in_timezone(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> D
         ResolvedTimeZone::Fixed(offset) => extract_date_parts(date.with_timezone(offset)),
         ResolvedTimeZone::Named(timezone) => extract_date_parts(date.with_timezone(timezone)),
     }
+}
+
+fn naive_in_timezone(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> NaiveDateTime {
+    match timezone {
+        ResolvedTimeZone::Utc => date.naive_utc(),
+        ResolvedTimeZone::Fixed(offset) => date.with_timezone(offset).naive_local(),
+        ResolvedTimeZone::Named(timezone) => date.with_timezone(timezone).naive_local(),
+    }
+}
+
+fn resolve_local_datetime(
+    timezone: &ResolvedTimeZone,
+    naive: NaiveDateTime,
+    operator: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    let resolved = match timezone {
+        ResolvedTimeZone::Utc => DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc),
+        ResolvedTimeZone::Fixed(offset) => match offset.from_local_datetime(&naive) {
+            LocalResult::Single(date) => return Ok(date.with_timezone(&Utc)),
+            LocalResult::Ambiguous(date, _) => return Ok(date.with_timezone(&Utc)),
+            LocalResult::None => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "{operator} produced an invalid local datetime"
+                )));
+            }
+        },
+        ResolvedTimeZone::Named(timezone) => match timezone.from_local_datetime(&naive) {
+            LocalResult::Single(date) => return Ok(date.with_timezone(&Utc)),
+            LocalResult::Ambiguous(date, _) => return Ok(date.with_timezone(&Utc)),
+            LocalResult::None => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "{operator} produced an invalid local datetime"
+                )));
+            }
+        },
+    };
+    Ok(resolved)
+}
+
+fn date_add_units(
+    date: DateTime<Utc>,
+    unit: DateUnit,
+    amount: i64,
+    timezone: &ResolvedTimeZone,
+    operator: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    let local = naive_in_timezone(date, timezone);
+    let shifted = match unit {
+        DateUnit::Millisecond => local + Duration::milliseconds(amount),
+        DateUnit::Second => local + Duration::seconds(amount),
+        DateUnit::Minute => local + Duration::minutes(amount),
+        DateUnit::Hour => local + Duration::hours(amount),
+        DateUnit::Day => local + Duration::days(amount),
+        DateUnit::Week => local + Duration::weeks(amount),
+        DateUnit::Month => add_months_to_local_datetime(local, amount, operator)?,
+        DateUnit::Quarter => add_months_to_local_datetime(
+            local,
+            amount.checked_mul(3).ok_or_else(|| {
+                QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+            })?,
+            operator,
+        )?,
+        DateUnit::Year => add_months_to_local_datetime(
+            local,
+            amount.checked_mul(12).ok_or_else(|| {
+                QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+            })?,
+            operator,
+        )?,
+    };
+    resolve_local_datetime(timezone, shifted, operator)
+}
+
+fn add_months_to_local_datetime(
+    local: NaiveDateTime,
+    months: i64,
+    operator: &str,
+) -> Result<NaiveDateTime, QueryError> {
+    let year_month = local.year().saturating_mul(12) + local.month0() as i32;
+    let target_month_index = (year_month as i64).checked_add(months).ok_or_else(|| {
+        QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+    })?;
+    let target_year = target_month_index.div_euclid(12);
+    let target_month0 = target_month_index.rem_euclid(12);
+    let target_year = i32::try_from(target_year).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+    })?;
+    let target_month = u32::try_from(target_month0 + 1).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+    })?;
+    let day = local
+        .day()
+        .min(last_day_of_month(target_year, target_month));
+    let date = NaiveDate::from_ymd_opt(target_year, target_month, day).ok_or_else(|| {
+        QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+    })?;
+    date.and_hms_milli_opt(
+        local.hour(),
+        local.minute(),
+        local.second(),
+        local.and_utc().timestamp_subsec_millis(),
+    )
+    .ok_or_else(|| {
+        QueryError::InvalidArgument(format!("{operator} overflowed during date arithmetic"))
+    })
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    for day in (28..=31).rev() {
+        if NaiveDate::from_ymd_opt(year, month, day).is_some() {
+            return day;
+        }
+    }
+    28
+}
+
+fn date_diff_units(
+    start_date: DateTime<Utc>,
+    end_date: DateTime<Utc>,
+    unit: DateUnit,
+    timezone: &ResolvedTimeZone,
+    start_of_week: Weekday,
+) -> Result<i64, QueryError> {
+    let start = naive_in_timezone(start_date, timezone);
+    let end = naive_in_timezone(end_date, timezone);
+    Ok(match unit {
+        DateUnit::Millisecond => (end - start).num_milliseconds(),
+        DateUnit::Second => (end - start).num_seconds(),
+        DateUnit::Minute => (end - start).num_minutes(),
+        DateUnit::Hour => (end - start).num_hours(),
+        DateUnit::Day => end.date().signed_duration_since(start.date()).num_days(),
+        DateUnit::Week => {
+            let start = start_of_week_date(start.date(), start_of_week);
+            let end = start_of_week_date(end.date(), start_of_week);
+            end.signed_duration_since(start).num_days() / 7
+        }
+        DateUnit::Month => calendar_month_difference(start, end)?,
+        DateUnit::Quarter => calendar_month_difference(start, end)? / 3,
+        DateUnit::Year => calendar_month_difference(start, end)? / 12,
+    })
+}
+
+fn calendar_month_difference(start: NaiveDateTime, end: NaiveDateTime) -> Result<i64, QueryError> {
+    let mut months =
+        ((end.year() - start.year()) as i64) * 12 + end.month0() as i64 - start.month0() as i64;
+    if months > 0 && add_months_to_local_datetime(start, months, "$dateDiff")? > end {
+        months -= 1;
+    } else if months < 0 && add_months_to_local_datetime(start, months, "$dateDiff")? < end {
+        months += 1;
+    }
+    Ok(months)
+}
+
+fn truncate_date_unit(
+    date: DateTime<Utc>,
+    unit: DateUnit,
+    bin_size: i64,
+    timezone: &ResolvedTimeZone,
+    start_of_week: Weekday,
+    operator: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    let local = naive_in_timezone(date, timezone);
+    let truncated = match unit {
+        DateUnit::Millisecond => {
+            let millisecond =
+                (local.and_utc().timestamp_subsec_millis() as i64 / bin_size) * bin_size;
+            local
+                .with_nanosecond((millisecond as u32) * 1_000_000)
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+                })?
+        }
+        DateUnit::Second => local
+            .with_second(((local.second() as i64 / bin_size) * bin_size) as u32)
+            .and_then(|value| value.with_nanosecond(0))
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+            })?,
+        DateUnit::Minute => local
+            .with_minute(((local.minute() as i64 / bin_size) * bin_size) as u32)
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0))
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+            })?,
+        DateUnit::Hour => local
+            .with_hour(((local.hour() as i64 / bin_size) * bin_size) as u32)
+            .and_then(|value| value.with_minute(0))
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0))
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+            })?,
+        DateUnit::Day => {
+            let day = (((local.day() as i64) - 1) / bin_size) * bin_size + 1;
+            NaiveDate::from_ymd_opt(local.year(), local.month(), day as u32)
+                .and_then(|date| date.and_hms_milli_opt(0, 0, 0, 0))
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+                })?
+        }
+        DateUnit::Week => {
+            let current_week = start_of_week_date(local.date(), start_of_week);
+            let anchor = start_of_week_date(
+                NaiveDate::from_ymd_opt(1970, 1, 4).expect("anchor"),
+                start_of_week,
+            );
+            let weeks_since = current_week.signed_duration_since(anchor).num_days() / 7;
+            let floored_weeks = weeks_since.div_euclid(bin_size) * bin_size;
+            anchor
+                .and_hms_milli_opt(0, 0, 0, 0)
+                .expect("anchor datetime")
+                + Duration::weeks(floored_weeks)
+        }
+        DateUnit::Month => truncate_month_like(local, bin_size, 1, operator)?,
+        DateUnit::Quarter => truncate_month_like(local, bin_size * 3, 1, operator)?,
+        DateUnit::Year => {
+            let year = (i64::from(local.year() - 1)).div_euclid(bin_size) * bin_size + 1;
+            NaiveDate::from_ymd_opt(year as i32, 1, 1)
+                .and_then(|date| date.and_hms_milli_opt(0, 0, 0, 0))
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(format!("{operator} failed to truncate date"))
+                })?
+        }
+    };
+    resolve_local_datetime(timezone, truncated, operator)
+}
+
+fn truncate_month_like(
+    local: NaiveDateTime,
+    bin_size_months: i64,
+    anchor_month: u32,
+    operator: &str,
+) -> Result<NaiveDateTime, QueryError> {
+    let total_months = i64::from(local.year() - 1) * 12 + i64::from(local.month() - anchor_month);
+    let floored_months = total_months.div_euclid(bin_size_months) * bin_size_months;
+    let year = floored_months.div_euclid(12) + 1;
+    let month = floored_months.rem_euclid(12) + i64::from(anchor_month);
+    let carry = (month - 1).div_euclid(12);
+    let month = (month - 1).rem_euclid(12) + 1;
+    NaiveDate::from_ymd_opt((year + carry) as i32, month as u32, 1)
+        .and_then(|date| date.and_hms_milli_opt(0, 0, 0, 0))
+        .ok_or_else(|| QueryError::InvalidArgument(format!("{operator} failed to truncate date")))
+}
+
+fn start_of_week_date(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
+    let weekday = date.weekday().num_days_from_sunday() as i64;
+    let start = start_of_week.num_days_from_sunday() as i64;
+    let delta = (7 + weekday - start) % 7;
+    date - Duration::days(delta)
 }
 
 fn extract_date_parts<Tz: chrono::TimeZone>(date: DateTime<Tz>) -> DateParts {

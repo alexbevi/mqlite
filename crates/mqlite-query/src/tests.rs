@@ -2080,6 +2080,108 @@ fn projection_supports_date_part_expression_operators() {
 }
 
 #[test]
+fn projection_supports_date_arithmetic_expression_operators() {
+    let base = bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date");
+    let month_end = bson::DateTime::parse_rfc3339_str("2020-07-14T12:34:56.789Z").expect("date");
+    let week_end = bson::DateTime::parse_rfc3339_str("2020-05-28T08:00:00.000Z").expect("date");
+
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "date": base,
+            "monthEnd": month_end,
+            "weekEnd": week_end
+        },
+        Some(&doc! {
+            "addedDays": { "$dateAdd": { "startDate": "$date", "unit": "day", "amount": 2 } },
+            "subtractedMonths": { "$dateSubtract": { "startDate": "$date", "unit": "month", "amount": 2 } },
+            "diffWeeks": { "$dateDiff": { "startDate": "$date", "endDate": "$weekEnd", "unit": "week", "startOfWeek": "thursday" } },
+            "diffMonths": { "$dateDiff": { "startDate": "$date", "endDate": "$monthEnd", "unit": "month" } },
+            "truncatedHour": { "$dateTrunc": { "date": "$date", "unit": "hour" } },
+            "truncatedWeek": { "$dateTrunc": { "date": "$date", "unit": "week", "startOfWeek": "monday" } },
+            "nullTimezone": { "$dateAdd": { "startDate": "$date", "unit": "day", "amount": 1, "timezone": "$missingTz" } },
+            "nullDate": { "$dateTrunc": { "date": "$missingDate", "unit": "hour" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("addedDays"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-16T12:34:56.789Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("subtractedMonths"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-03-14T12:34:56.789Z").expect("date")
+        ))
+    );
+    assert_eq!(projected.get("diffWeeks"), Some(&Bson::Int64(2)));
+    assert_eq!(projected.get("diffMonths"), Some(&Bson::Int64(2)));
+    assert_eq!(
+        projected.get("truncatedHour"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-14T12:00:00.000Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("truncatedWeek"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-11T00:00:00.000Z").expect("date")
+        ))
+    );
+    assert_eq!(projected.get("nullTimezone"), Some(&Bson::Null));
+    assert_eq!(projected.get("nullDate"), Some(&Bson::Null));
+}
+
+#[test]
+fn date_arithmetic_expression_operators_reject_invalid_inputs() {
+    let invalid_unit = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": { "$dateAdd": { "startDate": "$date", "unit": "century", "amount": 1 } }
+        }),
+    )
+    .expect_err("date arithmetic expressions require a valid unit");
+    assert!(matches!(invalid_unit, QueryError::InvalidArgument(_)));
+
+    let invalid_amount = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": { "$dateSubtract": { "startDate": "$date", "unit": "day", "amount": 1.5 } }
+        }),
+    )
+    .expect_err("date arithmetic expressions require integral amount");
+    assert!(matches!(invalid_amount, QueryError::InvalidArgument(_)));
+
+    let invalid_start_of_week = apply_projection(
+        &doc! {
+            "_id": 1,
+            "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date"),
+            "other": bson::DateTime::parse_rfc3339_str("2020-05-15T12:34:56.789Z").expect("date")
+        },
+        Some(&doc! {
+            "out": { "$dateDiff": { "startDate": "$date", "endDate": "$other", "unit": "week", "startOfWeek": "funday" } }
+        }),
+    )
+    .expect_err("dateDiff requires a valid startOfWeek");
+    assert!(matches!(
+        invalid_start_of_week,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_bin_size = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": { "$dateTrunc": { "date": "$date", "unit": "hour", "binSize": 0 } }
+        }),
+    )
+    .expect_err("dateTrunc requires positive binSize");
+    assert!(matches!(invalid_bin_size, QueryError::InvalidArgument(_)));
+}
+
+#[test]
 fn projection_supports_accumulator_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -6068,10 +6170,10 @@ fn projection_rejects_unsupported_expression_operator() {
         &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
         Some(&doc! {
             "out": {
-                "$dateAdd": {
-                    "startDate": "$value",
-                    "unit": "day",
-                    "amount": 1
+                "$dateFromParts": {
+                    "year": 2024,
+                    "month": 2,
+                    "day": 1
                 }
             }
         }),
@@ -6080,6 +6182,6 @@ fn projection_rejects_unsupported_expression_operator() {
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateAdd"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateFromParts"
     ));
 }
