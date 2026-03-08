@@ -2812,6 +2812,133 @@ fn command_aggregate_project_rejects_invalid_field_mutation_expression() {
 }
 
 #[test]
+fn command_aggregate_project_supports_array_sequence_expressions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("array-sequence-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"array":[1,2,3,2,1],"seq":[1,2,3]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "indexOfArray": { "$indexOfArray": ["$array", 2] },
+                    "indexOfArrayFrom": { "$indexOfArray": ["$array", 2, 2] },
+                    "range": { "$range": [0, 5, 2] },
+                    "reverseArray": { "$reverseArray": "$seq" },
+                    "sliceCount": { "$slice": ["$array", 2] },
+                    "sliceWindow": { "$slice": ["$array", 1, 2] },
+                    "nullIndex": { "$indexOfArray": [null, 2] },
+                    "nullReverse": { "$reverseArray": "$missing" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "indexOfArray": 1,
+            "indexOfArrayFrom": 3,
+            "range": [0, 2, 4],
+            "reverseArray": [3, 2, 1],
+            "sliceCount": [1, 2],
+            "sliceWindow": [2, 3],
+            "nullIndex": null,
+            "nullReverse": null
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_array_sequence_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-array-sequence-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$range":[1,3,0]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_supports_facet_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-facet.mongodb");

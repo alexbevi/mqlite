@@ -208,6 +208,7 @@ fn eval_expression_operator(
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$getField" => eval_get_field_expression(document, value, variables),
+        "$indexOfArray" => eval_index_of_array_expression(document, value, variables),
         "$isArray" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(document, value, variables)?,
             EvaluatedExpression::Value(Bson::Array(_))
@@ -216,6 +217,9 @@ fn eval_expression_operator(
         "$map" => eval_map_expression(document, value, variables),
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
+        "$range" => eval_range_expression(document, value, variables),
+        "$reverseArray" => eval_reverse_array_expression(document, value, variables),
+        "$slice" => eval_slice_expression(document, value, variables),
         "$setField" => eval_set_field_expression(document, value, variables, false),
         "$size" => eval_size_expression(document, value, variables),
         "$and" => {
@@ -350,6 +354,16 @@ fn validate_expression_operator(
             }
             Ok(())
         }
+        "$indexOfArray" => {
+            let arguments = expression_argument_slice(value)?;
+            if !(2..=4).contains(&arguments.len()) {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
         "$ifNull" => {
             let arguments = expression_argument_slice(value)?;
             if arguments.len() < 2 {
@@ -362,7 +376,28 @@ fn validate_expression_operator(
         }
         "$let" => validate_let_expression(value, scope),
         "$map" => validate_map_expression(value, scope),
+        "$range" => {
+            let arguments = expression_argument_slice(value)?;
+            if !(2..=3).contains(&arguments.len()) {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
         "$setField" => validate_set_field_expression(value, scope, false),
+        "$slice" => {
+            let arguments = expression_argument_slice(value)?;
+            if !(2..=3).contains(&arguments.len()) {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
         "$unsetField" => validate_set_field_expression(value, scope, true),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
@@ -801,6 +836,176 @@ fn eval_set_field_expression(
     }
 }
 
+fn eval_index_of_array_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if !(2..=4).contains(&arguments.len()) {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    let array = eval_expression_result_with_variables(document, &arguments[0], variables)?;
+    if array.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let EvaluatedExpression::Value(Bson::Array(items)) = array else {
+        return Err(QueryError::InvalidArgument(
+            "$indexOfArray requires an array input".to_string(),
+        ));
+    };
+
+    let needle = eval_expression_with_variables(document, &arguments[1], variables)?;
+    let start = match arguments.get(2) {
+        Some(start) => parse_non_negative_index(document, start, variables, "$indexOfArray")?,
+        None => 0,
+    };
+    let end = match arguments.get(3) {
+        Some(end) => parse_non_negative_index(document, end, variables, "$indexOfArray")?,
+        None => items.len(),
+    };
+
+    if start >= items.len() || start >= end {
+        return Ok(EvaluatedExpression::Value(Bson::Int64(-1)));
+    }
+
+    let end = end.min(items.len());
+    for (index, item) in items[start..end].iter().enumerate() {
+        if compare_bson(item, &needle).is_eq() {
+            return Ok(EvaluatedExpression::Value(Bson::Int64(
+                (start + index) as i64,
+            )));
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Int64(-1)))
+}
+
+fn eval_range_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if !(2..=3).contains(&arguments.len()) {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    let start = parse_i32_bound(document, &arguments[0], variables, "$range")?;
+    let end = parse_i32_bound(document, &arguments[1], variables, "$range")?;
+    let step = match arguments.get(2) {
+        Some(step) => parse_i32_bound(document, step, variables, "$range")?,
+        None => 1,
+    };
+    if step == 0 {
+        return Err(QueryError::InvalidArgument(
+            "$range requires a non-zero step".to_string(),
+        ));
+    }
+
+    let mut values = Vec::new();
+    let mut current = start;
+    if step > 0 {
+        while current < end {
+            values.push(Bson::Int32(current));
+            current = current.checked_add(step).ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$range overflowed while materializing output".to_string(),
+                )
+            })?;
+        }
+    } else {
+        while current > end {
+            values.push(Bson::Int32(current));
+            current = current.checked_add(step).ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$range overflowed while materializing output".to_string(),
+                )
+            })?;
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(values)))
+}
+
+fn eval_reverse_array_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    match eval_expression_result_with_variables(
+        document,
+        unary_expression_operand(value),
+        variables,
+    )? {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::Array(mut items)) => {
+            items.reverse();
+            Ok(EvaluatedExpression::Value(Bson::Array(items)))
+        }
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(
+            "$reverseArray requires an array input".to_string(),
+        )),
+    }
+}
+
+fn eval_slice_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if !(2..=3).contains(&arguments.len()) {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    let array = eval_expression_result_with_variables(document, &arguments[0], variables)?;
+    if array.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let EvaluatedExpression::Value(Bson::Array(items)) = array else {
+        return Err(QueryError::InvalidArgument(
+            "$slice requires an array input".to_string(),
+        ));
+    };
+
+    if arguments.len() == 2 {
+        let count = parse_i32_bound(document, &arguments[1], variables, "$slice")?;
+        let len = items.len() as i32;
+        let (start, end) = if count >= 0 {
+            (0, count.min(len))
+        } else {
+            let count = count.unsigned_abs() as i32;
+            ((len - count).max(0), len)
+        };
+        return Ok(EvaluatedExpression::Value(Bson::Array(
+            items[start as usize..end as usize].to_vec(),
+        )));
+    }
+
+    let position = parse_i32_bound(document, &arguments[1], variables, "$slice")?;
+    let count = parse_i32_bound(document, &arguments[2], variables, "$slice")?;
+    if count <= 0 {
+        return Err(QueryError::InvalidArgument(
+            "$slice requires a positive count in the three-argument form".to_string(),
+        ));
+    }
+
+    let len = items.len() as i32;
+    let start = if position >= 0 {
+        position.min(len)
+    } else {
+        (len + position).max(0)
+    };
+    let end = (start + count).min(len);
+    Ok(EvaluatedExpression::Value(Bson::Array(
+        items[start as usize..end as usize].to_vec(),
+    )))
+}
+
 fn eval_cond_expression(
     document: &Document,
     value: &Bson,
@@ -1076,6 +1281,50 @@ fn parse_filter_limit(
 
     usize::try_from(limit).map_err(|_| {
         QueryError::InvalidArgument("$filter limit must evaluate to a positive integer".to_string())
+    })
+}
+
+fn parse_i32_bound(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<i32, QueryError> {
+    let value = eval_expression_with_variables(document, value, variables)?;
+    let numeric = numeric_value(&value).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} requires numeric integral arguments"))
+    })?;
+    if numeric.fract() != 0.0 {
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} requires numeric integral arguments"
+        )));
+    }
+
+    i32::try_from(numeric as i64).map_err(|_| {
+        QueryError::InvalidArgument(format!(
+            "{operator} requires arguments representable as 32-bit integers"
+        ))
+    })
+}
+
+fn parse_non_negative_index(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<usize, QueryError> {
+    let value = eval_expression_with_variables(document, value, variables)?;
+    let numeric = numeric_value(&value).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} requires non-negative integral bounds"))
+    })?;
+    if numeric.fract() != 0.0 || numeric < 0.0 {
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} requires non-negative integral bounds"
+        )));
+    }
+
+    usize::try_from(numeric as u64).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} requires non-negative integral bounds"))
     })
 }
 

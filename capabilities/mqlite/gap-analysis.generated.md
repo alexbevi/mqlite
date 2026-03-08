@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 46 | 107 | 23 |
+| Aggregation expression operators | 176 | 50 | 103 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
+Public upstream: 176. Supported: 50. Unsupported: 103. Ignored: 23.
 
 ### Supported Public
 
@@ -247,6 +247,7 @@ Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 - `$gte`
 - `$ifNull`
 - `$in`
+- `$indexOfArray`
 - `$isArray`
 - `$isNumber`
 - `$last`
@@ -262,9 +263,12 @@ Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 - `$not`
 - `$objectToArray`
 - `$or`
+- `$range`
+- `$reverseArray`
 - `$round`
 - `$setField`
 - `$size`
+- `$slice`
 - `$subtract`
 - `$trunc`
 - `$type`
@@ -305,7 +309,6 @@ Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 - `$firstN`
 - `$function`
 - `$hour`
-- `$indexOfArray`
 - `$indexOfBytes`
 - `$indexOfCP`
 - `$isoDayOfWeek`
@@ -329,14 +332,12 @@ Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 - `$pow`
 - `$radiansToDegrees`
 - `$rand`
-- `$range`
 - `$reduce`
 - `$regexFind`
 - `$regexFindAll`
 - `$regexMatch`
 - `$replaceAll`
 - `$replaceOne`
-- `$reverseArray`
 - `$rtrim`
 - `$second`
 - `$setDifference`
@@ -346,7 +347,6 @@ Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 - `$setUnion`
 - `$sin`
 - `$sinh`
-- `$slice`
 - `$sortArray`
 - `$split`
 - `$sqrt`

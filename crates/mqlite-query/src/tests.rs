@@ -1034,6 +1034,39 @@ fn projection_supports_field_mutation_expressions() {
 }
 
 #[test]
+fn projection_supports_array_sequence_expressions() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3, 2, 1], "seq": [1, 2, 3], "nullish": Bson::Null },
+        Some(&doc! {
+            "indexOfArray": { "$indexOfArray": ["$array", 2] },
+            "indexOfArrayFrom": { "$indexOfArray": ["$array", 2, 2] },
+            "range": { "$range": [0, 5, 2] },
+            "reverseArray": { "$reverseArray": "$seq" },
+            "sliceCount": { "$slice": ["$array", 2] },
+            "sliceWindow": { "$slice": ["$array", 1, 2] },
+            "nullIndex": { "$indexOfArray": [Bson::Null, 2] },
+            "nullReverse": { "$reverseArray": "$missing" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "indexOfArray": 1_i64,
+            "indexOfArrayFrom": 3_i64,
+            "range": [0, 2, 4],
+            "reverseArray": [3, 2, 1],
+            "sliceCount": [1, 2],
+            "sliceWindow": [2, 3],
+            "nullIndex": Bson::Null,
+            "nullReverse": Bson::Null
+        }
+    );
+}
+
+#[test]
 fn projection_preserves_missing_expression_results() {
     let projected = apply_projection(
         &doc! { "_id": 1, "array": [1, 2, 3], "object": { "a": 1 } },
@@ -1155,6 +1188,45 @@ fn field_mutation_expressions_reject_invalid_arguments() {
         unexpected_unset_value,
         QueryError::InvalidStructure
     ));
+}
+
+#[test]
+fn array_sequence_expressions_reject_invalid_arguments() {
+    let invalid_index = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$indexOfArray": ["string", "s"] }
+        }),
+    )
+    .expect_err("non-array input");
+    assert!(matches!(invalid_index, QueryError::InvalidArgument(_)));
+
+    let invalid_range = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$range": [1, 3, 0] }
+        }),
+    )
+    .expect_err("zero step");
+    assert!(matches!(invalid_range, QueryError::InvalidArgument(_)));
+
+    let invalid_reverse = apply_projection(
+        &doc! { "_id": 1, "value": 1 },
+        Some(&doc! {
+            "out": { "$reverseArray": "$value" }
+        }),
+    )
+    .expect_err("scalar reverse");
+    assert!(matches!(invalid_reverse, QueryError::InvalidArgument(_)));
+
+    let invalid_slice = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$slice": [[1, 2], 0, 0] }
+        }),
+    )
+    .expect_err("non-positive count");
+    assert!(matches!(invalid_slice, QueryError::InvalidArgument(_)));
 }
 
 #[test]

@@ -1501,6 +1501,7 @@ mod tests {
             "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
             "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
             "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
+            "$indexOfArray" => doc! { "value": { "$indexOfArray": ["$array", 2] } },
             "$isArray" => doc! { "value": { "$isArray": "$array" } },
             "$isNumber" => doc! { "value": { "$isNumber": "$left" } },
             "$last" => doc! { "value": { "$last": "$array" } },
@@ -1520,11 +1521,14 @@ mod tests {
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$range" => doc! { "value": { "$range": [0, 5, 2] } },
+            "$reverseArray" => doc! { "value": { "$reverseArray": "$array" } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
             "$setField" => {
                 doc! { "value": { "$setField": { "field": "a", "input": "$object", "value": 9 } } }
             }
             "$size" => doc! { "value": { "$size": "$array" } },
+            "$slice" => doc! { "value": { "$slice": ["$array", 2] } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$type" => doc! { "value": { "$type": "$left" } },
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
