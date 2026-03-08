@@ -201,8 +201,9 @@ Current cross-namespace aggregation behavior:
   include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
   `$setUnion`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
-  `$strcasecmp`. String-length and string-position expressions currently include `$strLenBytes`,
-  `$strLenCP`, `$indexOfBytes`, and `$indexOfCP`,
+  `$strcasecmp`. String-length, string-position, and substring expressions currently include
+  `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`, `$substr`, `$substrBytes`, and
+  `$substrCP`,
   while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
   alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
   all executed in-process without a separate expression VM.

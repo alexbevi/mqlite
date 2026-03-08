@@ -245,6 +245,8 @@ fn eval_expression_operator(
         "$size" => eval_size_expression(document, value, variables),
         "$strLenBytes" => eval_string_length_expression(document, value, variables, false),
         "$strLenCP" => eval_string_length_expression(document, value, variables, true),
+        "$substr" | "$substrBytes" => eval_substring_expression(document, value, variables, false),
+        "$substrCP" => eval_substring_expression(document, value, variables, true),
         "$and" => {
             let arguments = expression_argument_slice(value)?;
             Ok(EvaluatedExpression::Value(Bson::Boolean(
@@ -382,6 +384,12 @@ fn validate_expression_operator(
         }
         "$strLenBytes" | "$strLenCP" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
+        }
+        "$substr" | "$substrBytes" | "$substrCP" => {
+            for argument in expression_arguments::<3>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
         }
         "$strcasecmp" => {
             for argument in expression_arguments::<2>(value)? {
@@ -1427,6 +1435,54 @@ fn eval_case_fold_expression(
     Ok(EvaluatedExpression::Value(Bson::String(value)))
 }
 
+fn eval_substring_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    code_points: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if code_points {
+        "$substrCP"
+    } else {
+        "$substrBytes"
+    };
+    let [input, start, length] = expression_arguments::<3>(value)?;
+
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let input = coerce_substring_input(input)?;
+
+    if code_points {
+        let start = parse_non_negative_i32_bound(document, start, variables, operator)?;
+        let length = parse_non_negative_i32_bound(document, length, variables, operator)?;
+        let boundaries = code_point_boundaries(&input);
+        let code_point_len = boundaries.len() - 1;
+        if start as usize >= code_point_len {
+            return Ok(EvaluatedExpression::Value(Bson::String(String::new())));
+        }
+
+        let start = start as usize;
+        let end = (start + length as usize).min(code_point_len);
+        let substring = input[boundaries[start]..boundaries[end]].to_string();
+        return Ok(EvaluatedExpression::Value(Bson::String(substring)));
+    }
+
+    let start = parse_non_negative_truncating_index(document, start, variables, operator)?;
+    let length = parse_truncating_length(document, length, variables, operator)?;
+    if start >= input.len() {
+        return Ok(EvaluatedExpression::Value(Bson::String(String::new())));
+    }
+    validate_utf8_byte_boundary(&input, start, operator, true)?;
+
+    let end = match length {
+        Some(length) => start.saturating_add(length).min(input.len()),
+        None => input.len(),
+    };
+    validate_utf8_byte_boundary(&input, end, operator, false)?;
+    Ok(EvaluatedExpression::Value(Bson::String(
+        input[start..end].to_string(),
+    )))
+}
+
 fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
     let haystack = input.as_bytes();
     let needle = token.as_bytes();
@@ -1865,6 +1921,35 @@ fn coerce_case_string(value: EvaluatedExpression, operator: &str) -> Result<Stri
     }
 }
 
+fn coerce_substring_input(value: EvaluatedExpression) -> Result<String, QueryError> {
+    match value {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(String::new())
+        }
+        EvaluatedExpression::Value(Bson::String(value))
+        | EvaluatedExpression::Value(Bson::Symbol(value))
+        | EvaluatedExpression::Value(Bson::JavaScriptCode(value)) => Ok(value),
+        EvaluatedExpression::Value(Bson::JavaScriptCodeWithScope(value)) => Ok(value.code),
+        EvaluatedExpression::Value(Bson::Int32(value)) => Ok(value.to_string()),
+        EvaluatedExpression::Value(Bson::Int64(value)) => Ok(value.to_string()),
+        EvaluatedExpression::Value(Bson::Double(value)) => Ok(value.to_string()),
+        EvaluatedExpression::Value(Bson::Decimal128(value)) => Ok(value.to_string()),
+        EvaluatedExpression::Value(Bson::Timestamp(value)) => Ok(value.to_string()),
+        EvaluatedExpression::Value(Bson::DateTime(value)) => {
+            let value = DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(
+                        "substring expressions require a string-compatible input".to_string(),
+                    )
+                })?;
+            Ok(value.to_rfc3339_opts(SecondsFormat::Millis, true))
+        }
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(
+            "substring expressions require a string-compatible input".to_string(),
+        )),
+    }
+}
+
 fn require_string_operand(
     value: EvaluatedExpression,
     operator: &str,
@@ -1981,6 +2066,82 @@ fn parse_non_negative_index(
     usize::try_from(numeric as u64).map_err(|_| {
         QueryError::InvalidArgument(format!("{operator} requires non-negative integral bounds"))
     })
+}
+
+fn parse_non_negative_i32_bound(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<i32, QueryError> {
+    let value = parse_i32_bound(document, value, variables, operator)?;
+    if value < 0 {
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} requires non-negative integral arguments"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_non_negative_truncating_index(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<usize, QueryError> {
+    let value = eval_expression_with_variables(document, value, variables)?;
+    let numeric = numeric_value(&value).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} requires numeric arguments"))
+    })?;
+    let truncated = numeric.trunc();
+    if truncated < 0.0 {
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} requires a non-negative starting index"
+        )));
+    }
+    usize::try_from(truncated as u128)
+        .map_err(|_| QueryError::InvalidArgument(format!("{operator} requires numeric arguments")))
+}
+
+fn parse_truncating_length(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<Option<usize>, QueryError> {
+    let value = eval_expression_with_variables(document, value, variables)?;
+    let numeric = numeric_value(&value).map_err(|_| {
+        QueryError::InvalidArgument(format!("{operator} requires numeric arguments"))
+    })?;
+    let truncated = numeric.trunc();
+    if truncated < 0.0 {
+        return Ok(None);
+    }
+    usize::try_from(truncated as u128)
+        .map(Some)
+        .map_err(|_| QueryError::InvalidArgument(format!("{operator} requires numeric arguments")))
+}
+
+fn validate_utf8_byte_boundary(
+    input: &str,
+    index: usize,
+    operator: &str,
+    starting: bool,
+) -> Result<(), QueryError> {
+    if index >= input.len() {
+        return Ok(());
+    }
+    if is_utf8_continuation_byte(input.as_bytes()[index]) {
+        let part = if starting { "starting" } else { "ending" };
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} has an invalid UTF-8 {part} boundary"
+        )));
+    }
+    Ok(())
+}
+
+fn is_utf8_continuation_byte(byte: u8) -> bool {
+    (byte & 0b1100_0000) == 0b1000_0000
 }
 
 fn materialize_variable_value(value: EvaluatedExpression) -> Bson {

@@ -1604,6 +1604,42 @@ fn projection_supports_string_position_expression_operators() {
 }
 
 #[test]
+fn projection_supports_substring_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "ascii": "abcd",
+            "utf8": "éclair",
+            "wide": "寿司sushi"
+        },
+        Some(&doc! {
+            "asciiBytes": { "$substrBytes": ["$ascii", 1, 2] },
+            "utf8Bytes": { "$substrBytes": ["$utf8", 0, 4] },
+            "utf8Cp": { "$substrCP": ["$utf8", 0, 4] },
+            "wideCp": { "$substrCP": ["$wide", 0, 6] },
+            "aliasRest": { "$substr": ["$ascii", 2, -1] },
+            "nullInput": { "$substrBytes": [Bson::Null, 0, 4] },
+            "outOfRangeCp": { "$substrCP": ["$ascii", 999, 1] }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "asciiBytes": "bc",
+            "utf8Bytes": "écl",
+            "utf8Cp": "écla",
+            "wideCp": "寿司sush",
+            "aliasRest": "cd",
+            "nullInput": "",
+            "outOfRangeCp": ""
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1747,6 +1783,72 @@ fn string_position_expression_operators_reject_invalid_inputs() {
         }),
     )
     .expect_err("indexOfBytes requires at least two arguments");
+    assert!(matches!(invalid_arity, QueryError::InvalidStructure));
+}
+
+#[test]
+fn substring_expression_operators_reject_invalid_inputs() {
+    let invalid_start = apply_projection(
+        &doc! { "_id": 1, "value": "abcd" },
+        Some(&doc! {
+            "out": { "$substrBytes": ["$value", -1, 2] }
+        }),
+    )
+    .expect_err("substrBytes rejects negative starting offsets");
+    assert!(matches!(invalid_start, QueryError::InvalidArgument(_)));
+
+    let invalid_length = apply_projection(
+        &doc! { "_id": 1, "value": "abcd" },
+        Some(&doc! {
+            "out": { "$substrCP": ["$value", 1, -1] }
+        }),
+    )
+    .expect_err("substrCP rejects negative lengths");
+    assert!(matches!(invalid_length, QueryError::InvalidArgument(_)));
+
+    let invalid_integral = apply_projection(
+        &doc! { "_id": 1, "value": "abcd" },
+        Some(&doc! {
+            "out": { "$substrCP": ["$value", 1.2, 2] }
+        }),
+    )
+    .expect_err("substrCP rejects non-integral bounds");
+    assert!(matches!(invalid_integral, QueryError::InvalidArgument(_)));
+
+    let invalid_utf8_start = apply_projection(
+        &doc! { "_id": 1, "value": "é" },
+        Some(&doc! {
+            "out": { "$substrBytes": ["$value", 1, 1] }
+        }),
+    )
+    .expect_err("substrBytes rejects continuation-byte starts");
+    assert!(matches!(invalid_utf8_start, QueryError::InvalidArgument(_)));
+
+    let invalid_utf8_end = apply_projection(
+        &doc! { "_id": 1, "value": "é" },
+        Some(&doc! {
+            "out": { "$substrBytes": ["$value", 0, 1] }
+        }),
+    )
+    .expect_err("substrBytes rejects continuation-byte ends");
+    assert!(matches!(invalid_utf8_end, QueryError::InvalidArgument(_)));
+
+    let invalid_input = apply_projection(
+        &doc! { "_id": 1, "value": doc! { "a": 1 } },
+        Some(&doc! {
+            "out": { "$substr": ["$value", 0, 1] }
+        }),
+    )
+    .expect_err("substr rejects non-string-compatible input");
+    assert!(matches!(invalid_input, QueryError::InvalidArgument(_)));
+
+    let invalid_arity = apply_projection(
+        &doc! { "_id": 1, "value": "abcd" },
+        Some(&doc! {
+            "out": { "$substrBytes": ["$value", 1] }
+        }),
+    )
+    .expect_err("substrBytes requires exactly three arguments");
     assert!(matches!(invalid_arity, QueryError::InvalidStructure));
 }
 

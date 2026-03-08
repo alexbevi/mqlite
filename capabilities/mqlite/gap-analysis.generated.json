@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 68,
-    "public_supported": 68,
-    "total_unsupported": 116,
-    "public_unsupported": 85,
+    "total_supported": 71,
+    "public_supported": 71,
+    "total_unsupported": 113,
+    "public_unsupported": 82,
     "public_ignored": 23,
     "items": [
       {
@@ -5517,8 +5517,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$substrBytes",
@@ -5535,8 +5535,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$substrCP",
@@ -5553,8 +5553,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$subtract",

@@ -3373,6 +3373,80 @@ fn command_aggregate_project_supports_string_position_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_substring_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("substring-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"ascii":"abcd","utf8":"éclair","wide":"寿司sushi"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "asciiBytes": { "$substrBytes": ["$ascii", 1, 2] },
+                    "utf8Bytes": { "$substrBytes": ["$utf8", 0, 4] },
+                    "utf8Cp": { "$substrCP": ["$utf8", 0, 4] },
+                    "wideCp": { "$substrCP": ["$wide", 0, 6] },
+                    "aliasRest": { "$substr": ["$ascii", 2, -1] }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "asciiBytes": "bc",
+            "utf8Bytes": "écl",
+            "utf8Cp": "écla",
+            "wideCp": "寿司sush",
+            "aliasRest": "cd"
+        })]
+    );
+}
+
+#[test]
 fn command_aggregate_project_rejects_invalid_case_expression() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("invalid-case-expression.mongodb");
@@ -3499,6 +3573,51 @@ fn command_aggregate_project_rejects_invalid_string_position_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$indexOfCP":["$value","$token"]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_substring_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-substring-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":"é"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$substrBytes":["$value",1,1]}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

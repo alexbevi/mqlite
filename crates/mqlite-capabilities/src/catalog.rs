@@ -1556,6 +1556,9 @@ mod tests {
             "$strcasecmp" => doc! { "value": { "$strcasecmp": ["Ab", "aB"] } },
             "$strLenBytes" => doc! { "value": { "$strLenBytes": "é" } },
             "$strLenCP" => doc! { "value": { "$strLenCP": "é" } },
+            "$substr" => doc! { "value": { "$substr": ["éclair", 0, 4] } },
+            "$substrBytes" => doc! { "value": { "$substrBytes": ["éclair", 0, 4] } },
+            "$substrCP" => doc! { "value": { "$substrCP": ["éclair", 0, 4] } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$switch" => {
                 doc! { "value": { "$switch": { "branches": [{ "case": { "$eq": ["$left", "$left"] }, "then": "yes" }], "default": "no" } } }
