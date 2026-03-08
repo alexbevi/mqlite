@@ -10,6 +10,7 @@ bson.workspace = true
 chrono.workspace = true
 mqlite-bson = { path = "../mqlite-bson" }
 regex.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

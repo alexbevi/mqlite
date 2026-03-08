@@ -3795,6 +3795,83 @@ fn command_aggregate_project_supports_utility_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_conversion_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("convert-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"intText":"1","decimalText":"1.5","dateText":"1970-01-01T00:00:00.001Z","oidText":"0123456789abcdef01234567"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "convertInt": { "$convert": { "input": "$intText", "to": "int", "onError": 0, "onNull": -1 } },
+                    "convertFallback": { "$convert": { "input": "bad", "to": "int", "onError": "fallback" } },
+                    "convertNull": { "$convert": { "input": "$missing", "to": "int", "onNull": "nullish" } },
+                    "toBool": { "$toBool": 0 },
+                    "toDouble": { "$toDouble": "$decimalText" },
+                    "toDecimalString": { "$toString": { "$toDecimal": "$decimalText" } },
+                    "toDateString": { "$toString": { "$toDate": "$dateText" } },
+                    "toObjectIdString": { "$toString": { "$toObjectId": "$oidText" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["convertInt"], 1);
+    assert_eq!(first["convertFallback"], "fallback");
+    assert_eq!(first["convertNull"], "nullish");
+    assert_eq!(first["toBool"], false);
+    assert_json_number_close(&first["toDouble"], 1.5);
+    assert_eq!(first["toDecimalString"], "1.5");
+    assert_eq!(first["toDateString"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(first["toObjectIdString"], "0123456789abcdef01234567");
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -3903,6 +3980,51 @@ fn command_aggregate_project_rejects_invalid_utility_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$tsSecond":"$value"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_conversion_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-convert-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":"abc"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$convert":{"input":"$value","to":"int","base":16}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

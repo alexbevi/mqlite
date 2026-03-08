@@ -209,6 +209,8 @@ Current cross-namespace aggregation behavior:
   and `$radiansToDegrees`. String-length, string-position, substring, split, and replacement
   expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`,
   `$substr`, `$substrBytes`, `$substrCP`, `$split`, `$replaceOne`, and `$replaceAll`,
+  conversion expressions currently include `$convert`, `$toBool`, `$toDate`, `$toDecimal`,
+  `$toDouble`, `$toInt`, `$toLong`, `$toObjectId`, and `$toString`,
   utility expressions currently include `$rand`, `$sortArray`, `$tsSecond`, `$tsIncrement`, and
   `$zip`,
   while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
@@ -217,6 +219,9 @@ Current cross-namespace aggregation behavior:
   common evaluator path so nullish inputs return `null` consistently while domain violations fail
   explicitly. String replacement and split currently support string operands only; regex-backed
   variants remain out of scope until the feature-flagged upstream behavior is intentionally adopted.
+  `$convert` currently supports the core scalar target families plus `onError` and `onNull`;
+  feature-flagged or BinData-oriented variants such as `base`, `format`, `byteOrder`, and subtype
+  conversions are still rejected explicitly.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file

@@ -670,6 +670,7 @@ dependencies = [
  "mqlite-bson",
  "pretty_assertions",
  "regex",
+ "serde_json",
  "thiserror",
 ]
 

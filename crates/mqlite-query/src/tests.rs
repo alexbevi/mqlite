@@ -1882,6 +1882,98 @@ fn projection_supports_utility_expression_operators() {
 }
 
 #[test]
+fn projection_supports_conversion_expression_operators() {
+    let object_id = ObjectId::parse_str("0123456789abcdef01234567").expect("object id");
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "intText": "1",
+            "decimalText": "1.5",
+            "dateText": "1970-01-01T00:00:00.001Z",
+            "oidText": "0123456789abcdef01234567",
+            "doc": { "a": 1, "id": object_id },
+            "arr": [1, true, object_id],
+            "timestamp": Timestamp { time: 2, increment: 9 },
+            "falseValue": false
+        },
+        Some(&doc! {
+            "convertInt": { "$convert": { "input": "$intText", "to": "int", "onError": 0, "onNull": -1 } },
+            "convertCode": { "$convert": { "input": "$intText", "to": 18 } },
+            "convertFallback": { "$convert": { "input": "bad", "to": "int", "onError": "fallback" } },
+            "convertNull": { "$convert": { "input": "$missing", "to": "int", "onNull": "nullish" } },
+            "toBool": { "$toBool": "$falseValue" },
+            "toBoolNan": { "$toBool": Bson::Double(f64::NAN) },
+            "toDate": { "$toDate": "$dateText" },
+            "toDateFromObjectId": { "$toDate": { "$toObjectId": "$oidText" } },
+            "toDateFromTimestamp": { "$toDate": "$timestamp" },
+            "toDecimal": { "$toDecimal": "$decimalText" },
+            "toDouble": { "$toDouble": "$decimalText" },
+            "toInt": { "$toInt": "$intText" },
+            "toLong": { "$toLong": "$intText" },
+            "toObjectId": { "$toObjectId": "$oidText" },
+            "toStringDoc": { "$toString": "$doc" },
+            "toStringArray": { "$toString": "$arr" },
+            "toStringDecimal": { "$toString": { "$toDecimal": "$decimalText" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected.get("convertInt"), Some(&Bson::Int32(1)));
+    assert_eq!(projected.get("convertCode"), Some(&Bson::Int64(1)));
+    assert_eq!(
+        projected.get("convertFallback"),
+        Some(&Bson::String("fallback".to_string()))
+    );
+    assert_eq!(
+        projected.get("convertNull"),
+        Some(&Bson::String("nullish".to_string()))
+    );
+    assert_eq!(projected.get("toBool"), Some(&Bson::Boolean(false)));
+    assert_eq!(projected.get("toBoolNan"), Some(&Bson::Boolean(true)));
+    assert_eq!(
+        projected.get("toDate"),
+        Some(&Bson::DateTime(DateTime::from_millis(1)))
+    );
+    assert_eq!(
+        projected.get("toDateFromObjectId"),
+        Some(&Bson::DateTime(object_id.timestamp()))
+    );
+    assert_eq!(
+        projected.get("toDateFromTimestamp"),
+        Some(&Bson::DateTime(DateTime::from_millis(2_000)))
+    );
+    assert_eq!(
+        projected.get("toDecimal"),
+        Some(&Bson::Decimal128(
+            Decimal128::from_str("1.5").expect("decimal")
+        ))
+    );
+    assert_eq!(projected.get("toDouble"), Some(&Bson::Double(1.5)));
+    assert_eq!(projected.get("toInt"), Some(&Bson::Int32(1)));
+    assert_eq!(projected.get("toLong"), Some(&Bson::Int64(1)));
+    assert_eq!(
+        projected.get("toObjectId"),
+        Some(&Bson::ObjectId(object_id))
+    );
+    assert_eq!(
+        projected.get("toStringDoc"),
+        Some(&Bson::String(
+            "{\"a\":1,\"id\":\"0123456789abcdef01234567\"}".to_string()
+        ))
+    );
+    assert_eq!(
+        projected.get("toStringArray"),
+        Some(&Bson::String(
+            "[1,true,\"0123456789abcdef01234567\"]".to_string()
+        ))
+    );
+    assert_eq!(
+        projected.get("toStringDecimal"),
+        Some(&Bson::String("1.5".to_string()))
+    );
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -1978,6 +2070,54 @@ fn utility_expression_operators_reject_invalid_inputs() {
         non_array_zip_input,
         QueryError::InvalidArgument(_)
     ));
+}
+
+#[test]
+fn conversion_expression_operators_reject_invalid_inputs() {
+    let invalid_shape = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$convert": ["$value", "int"] }
+        }),
+    )
+    .expect_err("convert requires a named-argument object");
+    assert!(matches!(invalid_shape, QueryError::InvalidStructure));
+
+    let unsupported_field = apply_projection(
+        &doc! { "_id": 1, "value": "1" },
+        Some(&doc! {
+            "out": { "$convert": { "input": "$value", "to": "int", "base": 16 } }
+        }),
+    )
+    .expect_err("convert base is not supported");
+    assert!(matches!(unsupported_field, QueryError::InvalidArgument(_)));
+
+    let invalid_target = apply_projection(
+        &doc! { "_id": 1, "value": "1" },
+        Some(&doc! {
+            "out": { "$convert": { "input": "$value", "to": "array" } }
+        }),
+    )
+    .expect_err("array target remains unsupported");
+    assert!(matches!(invalid_target, QueryError::InvalidArgument(_)));
+
+    let invalid_object_id = apply_projection(
+        &doc! { "_id": 1, "value": "not-an-object-id" },
+        Some(&doc! {
+            "out": { "$toObjectId": "$value" }
+        }),
+    )
+    .expect_err("object id conversion should fail");
+    assert!(matches!(invalid_object_id, QueryError::InvalidArgument(_)));
+
+    let invalid_date = apply_projection(
+        &doc! { "_id": 1, "value": false },
+        Some(&doc! {
+            "out": { "$toDate": "$value" }
+        }),
+    )
+    .expect_err("bool cannot convert to date");
+    assert!(matches!(invalid_date, QueryError::InvalidArgument(_)));
 }
 
 #[test]
@@ -5506,12 +5646,12 @@ fn projection_rejects_function_expression_operator() {
 fn projection_rejects_unsupported_expression_operator() {
     let error = apply_projection(
         &doc! { "_id": 1, "value": 2 },
-        Some(&doc! { "out": { "$convert": { "input": 1, "to": "string" } } }),
+        Some(&doc! { "out": { "$week": "$value" } }),
     )
     .expect_err("unsupported expression");
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$convert"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$week"
     ));
 }

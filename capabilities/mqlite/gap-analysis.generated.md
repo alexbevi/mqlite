@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 105 | 47 | 24 |
+| Aggregation expression operators | 176 | 114 | 38 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 105. Unsupported: 47. Ignored: 24.
+Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 
 ### Supported Public
 
@@ -249,6 +249,7 @@ Public upstream: 176. Supported: 105. Unsupported: 47. Ignored: 24.
 - `$concatArrays`
 - `$cond`
 - `$const`
+- `$convert`
 - `$cos`
 - `$cosh`
 - `$degreesToRadians`
@@ -319,7 +320,15 @@ Public upstream: 176. Supported: 105. Unsupported: 47. Ignored: 24.
 - `$switch`
 - `$tan`
 - `$tanh`
+- `$toBool`
+- `$toDate`
+- `$toDecimal`
+- `$toDouble`
+- `$toInt`
+- `$toLong`
 - `$toLower`
+- `$toObjectId`
+- `$toString`
 - `$toUpper`
 - `$trim`
 - `$trunc`
@@ -332,7 +341,6 @@ Public upstream: 176. Supported: 105. Unsupported: 47. Ignored: 24.
 ### Unsupported Public
 
 - `$avg`
-- `$convert`
 - `$dateAdd`
 - `$dateDiff`
 - `$dateFromParts`
@@ -367,15 +375,7 @@ Public upstream: 176. Supported: 105. Unsupported: 47. Ignored: 24.
 - `$stdDevPop`
 - `$stdDevSamp`
 - `$sum`
-- `$toBool`
-- `$toDate`
-- `$toDecimal`
-- `$toDouble`
 - `$toHashedIndexKey`
-- `$toInt`
-- `$toLong`
-- `$toObjectId`
-- `$toString`
 - `$week`
 - `$year`
 

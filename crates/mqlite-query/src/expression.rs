@@ -1,6 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
-use bson::{Bson, Document, doc};
+use bson::{Bson, Decimal128, Document, doc, oid::ObjectId};
 use chrono::{DateTime, SecondsFormat, Utc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 
@@ -224,6 +227,7 @@ fn eval_expression_operator(
         "$binarySize" => eval_binary_size_expression(document, value, variables),
         "$bsonSize" => eval_bson_size_expression(document, value, variables),
         "$concatArrays" => eval_concat_arrays_expression(document, value, variables),
+        "$convert" => eval_convert_expression(document, value, variables),
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$getField" => eval_get_field_expression(document, value, variables),
@@ -288,6 +292,22 @@ fn eval_expression_operator(
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$sortArray" => eval_sort_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
+        "$toBool" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Bool),
+        "$toDate" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Date),
+        "$toDecimal" => {
+            eval_convert_alias_expression(document, value, variables, ConvertTarget::Decimal)
+        }
+        "$toDouble" => {
+            eval_convert_alias_expression(document, value, variables, ConvertTarget::Double)
+        }
+        "$toInt" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Int),
+        "$toLong" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Long),
+        "$toObjectId" => {
+            eval_convert_alias_expression(document, value, variables, ConvertTarget::ObjectId)
+        }
+        "$toString" => {
+            eval_convert_alias_expression(document, value, variables, ConvertTarget::String)
+        }
         "$acos" => eval_nullable_unary_math_expression(document, value, variables, |number| {
             if number.is_nan() || (-1.0..=1.0).contains(&number) {
                 Ok(number.acos())
@@ -548,6 +568,7 @@ fn validate_expression_operator(
         }
         "$cond" => validate_cond_expression(value, scope),
         "$filter" => validate_filter_expression(value, scope),
+        "$convert" => validate_convert_expression(value, scope),
         "$getField" => {
             let (field, input) = parse_get_field_spec(value)?;
             validate_expression_with_scope(field, scope)?;
@@ -604,6 +625,10 @@ fn validate_expression_operator(
         "$replaceAll" | "$replaceOne" => validate_replace_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
         "$sortArray" => validate_sort_array_expression(value, scope),
+        "$toBool" | "$toDate" | "$toDecimal" | "$toDouble" | "$toInt" | "$toLong"
+        | "$toObjectId" | "$toString" => {
+            validate_expression_with_scope(single_expression_operand(value)?, scope)
+        }
         "$toLower" | "$toUpper" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
@@ -1663,6 +1688,486 @@ fn eval_rand_expression(value: &Bson) -> Result<EvaluatedExpression, QueryError>
     )))
 }
 
+#[derive(Clone, Copy)]
+enum ConvertTarget {
+    Bool,
+    Date,
+    Decimal,
+    Double,
+    Int,
+    Long,
+    ObjectId,
+    String,
+}
+
+struct ConvertSpec<'a> {
+    input: &'a Bson,
+    to: &'a Bson,
+    on_error: Option<&'a Bson>,
+    on_null: Option<&'a Bson>,
+}
+
+fn eval_convert_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = parse_convert_spec(value)?;
+    eval_convert_with_target_expression(
+        document,
+        spec.input,
+        spec.to,
+        spec.on_error,
+        spec.on_null,
+        variables,
+    )
+}
+
+fn eval_convert_alias_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    target: ConvertTarget,
+) -> Result<EvaluatedExpression, QueryError> {
+    let input = single_expression_operand(value)?;
+    eval_convert_with_static_target(document, input, target, None, None, variables)
+}
+
+fn eval_convert_with_target_expression(
+    document: &Document,
+    input_expression: &Bson,
+    target_expression: &Bson,
+    on_error: Option<&Bson>,
+    on_null: Option<&Bson>,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let input = eval_expression_result_with_variables(document, input_expression, variables)?;
+    if input.is_nullish() {
+        return match on_null {
+            Some(on_null) => eval_expression_result_with_variables(document, on_null, variables),
+            None => Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+    }
+
+    let target = eval_expression_result_with_variables(document, target_expression, variables)?;
+    let Some(target) = parse_convert_target_expression(target)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    eval_convert_result(document, input, target, on_error, variables)
+}
+
+fn eval_convert_with_static_target(
+    document: &Document,
+    input_expression: &Bson,
+    target: ConvertTarget,
+    on_error: Option<&Bson>,
+    on_null: Option<&Bson>,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let input = eval_expression_result_with_variables(document, input_expression, variables)?;
+    if input.is_nullish() {
+        return match on_null {
+            Some(on_null) => eval_expression_result_with_variables(document, on_null, variables),
+            None => Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+    }
+
+    eval_convert_result(document, input, target, on_error, variables)
+}
+
+fn eval_convert_result(
+    document: &Document,
+    input: EvaluatedExpression,
+    target: ConvertTarget,
+    on_error: Option<&Bson>,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let EvaluatedExpression::Value(input) = input else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    match convert_bson_value(&input, target) {
+        Ok(value) => Ok(EvaluatedExpression::Value(value)),
+        Err(error) => match on_error {
+            Some(on_error) => eval_expression_result_with_variables(document, on_error, variables),
+            None => Err(error),
+        },
+    }
+}
+
+fn parse_convert_target_expression(
+    target: EvaluatedExpression,
+) -> Result<Option<ConvertTarget>, QueryError> {
+    match target {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(None)
+        }
+        EvaluatedExpression::Value(value) => parse_convert_target_value(&value).map(Some),
+    }
+}
+
+fn parse_convert_target_value(value: &Bson) -> Result<ConvertTarget, QueryError> {
+    match value {
+        Bson::String(value) | Bson::Symbol(value) => match value.as_str() {
+            "bool" | "boolean" => Ok(ConvertTarget::Bool),
+            "date" => Ok(ConvertTarget::Date),
+            "decimal" => Ok(ConvertTarget::Decimal),
+            "double" => Ok(ConvertTarget::Double),
+            "int" => Ok(ConvertTarget::Int),
+            "long" => Ok(ConvertTarget::Long),
+            "objectId" => Ok(ConvertTarget::ObjectId),
+            "string" => Ok(ConvertTarget::String),
+            other => Err(QueryError::InvalidArgument(format!(
+                "$convert target type `{other}` is not supported"
+            ))),
+        },
+        Bson::Document(spec) => {
+            let Some(target_type) = spec.get("type") else {
+                return Err(QueryError::InvalidStructure);
+            };
+            if spec.keys().any(|key| key != "type") {
+                return Err(QueryError::InvalidArgument(
+                    "$convert target objects only support `type` in mqlite".to_string(),
+                ));
+            }
+            parse_convert_target_value(target_type)
+        }
+        _ => {
+            let Some(code) = integer_value(value) else {
+                return Err(QueryError::InvalidArgument(
+                    "$convert requires `to` to evaluate to a string, integer type code, or { type } document"
+                        .to_string(),
+                ));
+            };
+            match code {
+                1 => Ok(ConvertTarget::Double),
+                2 => Ok(ConvertTarget::String),
+                7 => Ok(ConvertTarget::ObjectId),
+                8 => Ok(ConvertTarget::Bool),
+                9 => Ok(ConvertTarget::Date),
+                16 => Ok(ConvertTarget::Int),
+                18 => Ok(ConvertTarget::Long),
+                19 => Ok(ConvertTarget::Decimal),
+                _ => Err(QueryError::InvalidArgument(format!(
+                    "$convert target type code `{code}` is not supported"
+                ))),
+            }
+        }
+    }
+}
+
+fn convert_bson_value(value: &Bson, target: ConvertTarget) -> Result<Bson, QueryError> {
+    match target {
+        ConvertTarget::Bool => Ok(Bson::Boolean(convert_to_bool(value))),
+        ConvertTarget::Date => Ok(Bson::DateTime(convert_to_date(value)?)),
+        ConvertTarget::Decimal => Ok(Bson::Decimal128(convert_to_decimal128(value)?)),
+        ConvertTarget::Double => Ok(Bson::Double(convert_to_double(value)?)),
+        ConvertTarget::Int => Ok(Bson::Int32(convert_to_i32(value)?)),
+        ConvertTarget::Long => Ok(Bson::Int64(convert_to_i64(value)?)),
+        ConvertTarget::ObjectId => Ok(Bson::ObjectId(convert_to_object_id(value)?)),
+        ConvertTarget::String => Ok(Bson::String(convert_to_string(value)?)),
+    }
+}
+
+fn convert_to_bool(value: &Bson) -> bool {
+    match value {
+        Bson::Boolean(value) => *value,
+        Bson::Int32(value) => *value != 0,
+        Bson::Int64(value) => *value != 0,
+        Bson::Double(value) => *value != 0.0 || value.is_nan(),
+        Bson::Decimal128(value) => value
+            .to_string()
+            .parse::<f64>()
+            .map(|value| value != 0.0 || value.is_nan())
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn convert_to_date(value: &Bson) -> Result<bson::DateTime, QueryError> {
+    match value {
+        Bson::DateTime(value) => Ok(value.to_owned()),
+        Bson::Int32(value) => Ok(bson::DateTime::from_millis(*value as i64)),
+        Bson::Int64(value) => Ok(bson::DateTime::from_millis(*value)),
+        Bson::Double(value) => Ok(bson::DateTime::from_millis(truncate_f64_for_convert(
+            *value, "date",
+        )?)),
+        Bson::Decimal128(value) => Ok(bson::DateTime::from_millis(truncate_decimal_for_convert(
+            value, "date",
+        )?)),
+        Bson::String(value) | Bson::Symbol(value) => {
+            bson::DateTime::parse_rfc3339_str(value).map_err(|_| conversion_failure("date"))
+        }
+        Bson::ObjectId(value) => Ok(value.timestamp()),
+        Bson::Timestamp(value) => Ok(bson::DateTime::from_millis((value.time as i64) * 1_000)),
+        _ => Err(conversion_failure("date")),
+    }
+}
+
+fn convert_to_decimal128(value: &Bson) -> Result<Decimal128, QueryError> {
+    let text = match value {
+        Bson::Decimal128(value) => return Ok(value.to_owned()),
+        Bson::Int32(value) => value.to_string(),
+        Bson::Int64(value) => value.to_string(),
+        Bson::Double(value) => format_f64_for_conversion(*value),
+        Bson::Boolean(value) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Bson::DateTime(value) => value.timestamp_millis().to_string(),
+        Bson::String(value) | Bson::Symbol(value) => value.clone(),
+        _ => return Err(conversion_failure("decimal")),
+    };
+    Decimal128::from_str(&text).map_err(|_| conversion_failure("decimal"))
+}
+
+fn convert_to_double(value: &Bson) -> Result<f64, QueryError> {
+    match value {
+        Bson::Double(value) => Ok(*value),
+        Bson::Int32(value) => Ok(*value as f64),
+        Bson::Int64(value) => Ok(*value as f64),
+        Bson::Decimal128(value) => value
+            .to_string()
+            .parse::<f64>()
+            .map_err(|_| conversion_failure("double")),
+        Bson::Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
+        Bson::DateTime(value) => Ok(value.timestamp_millis() as f64),
+        Bson::String(value) | Bson::Symbol(value) => {
+            parse_f64_for_conversion(value).ok_or_else(|| conversion_failure("double"))
+        }
+        _ => Err(conversion_failure("double")),
+    }
+}
+
+fn convert_to_i32(value: &Bson) -> Result<i32, QueryError> {
+    match value {
+        Bson::Int32(value) => Ok(*value),
+        Bson::Int64(value) => i32::try_from(*value).map_err(|_| conversion_failure("int")),
+        Bson::Double(value) => i32::try_from(truncate_f64_for_convert(*value, "int")?)
+            .map_err(|_| conversion_failure("int")),
+        Bson::Decimal128(value) => i32::try_from(truncate_decimal_for_convert(value, "int")?)
+            .map_err(|_| conversion_failure("int")),
+        Bson::Boolean(value) => Ok(if *value { 1 } else { 0 }),
+        Bson::String(value) | Bson::Symbol(value) => {
+            value.parse::<i32>().map_err(|_| conversion_failure("int"))
+        }
+        _ => Err(conversion_failure("int")),
+    }
+}
+
+fn convert_to_i64(value: &Bson) -> Result<i64, QueryError> {
+    match value {
+        Bson::Int32(value) => Ok(*value as i64),
+        Bson::Int64(value) => Ok(*value),
+        Bson::Double(value) => truncate_f64_for_convert(*value, "long"),
+        Bson::Decimal128(value) => truncate_decimal_for_convert(value, "long"),
+        Bson::Boolean(value) => Ok(if *value { 1 } else { 0 }),
+        Bson::DateTime(value) => Ok(value.timestamp_millis()),
+        Bson::String(value) | Bson::Symbol(value) => {
+            value.parse::<i64>().map_err(|_| conversion_failure("long"))
+        }
+        _ => Err(conversion_failure("long")),
+    }
+}
+
+fn convert_to_object_id(value: &Bson) -> Result<ObjectId, QueryError> {
+    match value {
+        Bson::ObjectId(value) => Ok(value.to_owned()),
+        Bson::String(value) | Bson::Symbol(value) => {
+            ObjectId::parse_str(value).map_err(|_| conversion_failure("objectId"))
+        }
+        _ => Err(conversion_failure("objectId")),
+    }
+}
+
+fn convert_to_string(value: &Bson) -> Result<String, QueryError> {
+    match value {
+        Bson::Document(_) | Bson::Array(_) => stringify_nested_json(value),
+        _ => stringify_scalar_for_conversion(value),
+    }
+}
+
+fn truncate_f64_for_convert(value: f64, target: &str) -> Result<i64, QueryError> {
+    if value.is_nan() || value.is_infinite() {
+        return Err(conversion_failure(target));
+    }
+    truncate_f64_to_i64(value).ok_or_else(|| conversion_failure(target))
+}
+
+fn truncate_decimal_for_convert(value: &Decimal128, target: &str) -> Result<i64, QueryError> {
+    let parsed = value
+        .to_string()
+        .parse::<f64>()
+        .map_err(|_| conversion_failure(target))?;
+    truncate_f64_for_convert(parsed, target)
+}
+
+fn parse_f64_for_conversion(value: &str) -> Option<f64> {
+    match value {
+        "Infinity" | "+Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        "NaN" | "+NaN" | "-NaN" => Some(f64::NAN),
+        _ => value.parse::<f64>().ok(),
+    }
+}
+
+fn format_f64_for_conversion(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+fn conversion_failure(target: &str) -> QueryError {
+    QueryError::InvalidArgument(format!("$convert failed to convert input to {target}"))
+}
+
+fn stringify_scalar_for_conversion(value: &Bson) -> Result<String, QueryError> {
+    match value {
+        Bson::Null | Bson::Undefined => Ok("null".to_string()),
+        Bson::Boolean(value) => Ok(if *value { "true" } else { "false" }.to_string()),
+        Bson::Int32(value) => Ok(value.to_string()),
+        Bson::Int64(value) => Ok(value.to_string()),
+        Bson::Double(value) => Ok(format_f64_for_conversion(*value)),
+        Bson::Decimal128(value) => Ok(value.to_string()),
+        Bson::String(value) | Bson::Symbol(value) => Ok(value.clone()),
+        Bson::DateTime(value) => {
+            let value = DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
+                .ok_or_else(|| conversion_failure("string"))?;
+            Ok(value.to_rfc3339_opts(SecondsFormat::Millis, true))
+        }
+        Bson::ObjectId(value) => Ok(value.to_hex()),
+        Bson::Timestamp(value) => Ok(value.to_string()),
+        Bson::RegularExpression(value) => Ok(format!("/{}/{}", value.pattern, value.options)),
+        Bson::JavaScriptCode(value) => Ok(value.clone()),
+        Bson::JavaScriptCodeWithScope(value) => Ok(value.code.clone()),
+        Bson::MinKey => Ok("MinKey".to_string()),
+        Bson::MaxKey => Ok("MaxKey".to_string()),
+        Bson::Binary(value) => Ok(format!("{value:?}")),
+        Bson::DbPointer(value) => Ok(format!("{value:?}")),
+        Bson::Document(_) | Bson::Array(_) => Err(conversion_failure("string")),
+    }
+}
+
+fn stringify_nested_json(value: &Bson) -> Result<String, QueryError> {
+    let mut output = String::new();
+    append_nested_json(&mut output, value)?;
+    Ok(output)
+}
+
+fn append_nested_json(output: &mut String, value: &Bson) -> Result<(), QueryError> {
+    match value {
+        Bson::Document(document) => {
+            output.push('{');
+            for (index, (key, value)) in document.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).expect("json string"));
+                output.push(':');
+                append_nested_json(output, value)?;
+            }
+            output.push('}');
+            Ok(())
+        }
+        Bson::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                append_nested_json(output, value)?;
+            }
+            output.push(']');
+            Ok(())
+        }
+        Bson::Null | Bson::Undefined => {
+            output.push_str("null");
+            Ok(())
+        }
+        Bson::Boolean(value) => {
+            output.push_str(if *value { "true" } else { "false" });
+            Ok(())
+        }
+        Bson::Int32(value) => {
+            output.push_str(&value.to_string());
+            Ok(())
+        }
+        Bson::Int64(value) => {
+            output.push_str(&value.to_string());
+            Ok(())
+        }
+        Bson::Double(value) => {
+            if value.is_finite() {
+                output.push_str(&value.to_string());
+            } else {
+                output.push_str(
+                    &serde_json::to_string(&format_f64_for_conversion(*value))
+                        .expect("json string"),
+                );
+            }
+            Ok(())
+        }
+        Bson::Decimal128(value) => {
+            let rendered = value.to_string();
+            if rendered.parse::<f64>().is_ok_and(f64::is_finite) {
+                output.push_str(&rendered);
+            } else {
+                output.push_str(&serde_json::to_string(&rendered).expect("json string"));
+            }
+            Ok(())
+        }
+        _ => {
+            let rendered = stringify_scalar_for_conversion(value)?;
+            output.push_str(&serde_json::to_string(&rendered).expect("json string"));
+            Ok(())
+        }
+    }
+}
+
+fn parse_convert_spec(value: &Bson) -> Result<ConvertSpec<'_>, QueryError> {
+    let Bson::Document(spec) = value else {
+        return Err(QueryError::InvalidStructure);
+    };
+
+    let mut input = None;
+    let mut to = None;
+    let mut on_error = None;
+    let mut on_null = None;
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "to" => to = Some(value),
+            "onError" => on_error = Some(value),
+            "onNull" => on_null = Some(value),
+            "base" | "format" | "byteOrder" => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "$convert field `{field}` is not supported in mqlite"
+                )));
+            }
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok(ConvertSpec {
+        input: input.ok_or(QueryError::InvalidStructure)?,
+        to: to.ok_or(QueryError::InvalidStructure)?,
+        on_error,
+        on_null,
+    })
+}
+
 fn eval_sort_array_expression(
     document: &Document,
     value: &Bson,
@@ -2027,6 +2532,19 @@ fn validate_rand_expression(value: &Bson) -> Result<(), QueryError> {
         Bson::Array(arguments) if arguments.is_empty() => Ok(()),
         _ => Err(QueryError::InvalidStructure),
     }
+}
+
+fn validate_convert_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let spec = parse_convert_spec(value)?;
+    validate_expression_with_scope(spec.input, scope)?;
+    validate_expression_with_scope(spec.to, scope)?;
+    if let Some(on_error) = spec.on_error {
+        validate_expression_with_scope(on_error, scope)?;
+    }
+    if let Some(on_null) = spec.on_null {
+        validate_expression_with_scope(on_null, scope)?;
+    }
+    Ok(())
 }
 
 fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {

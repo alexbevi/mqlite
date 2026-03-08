@@ -1512,6 +1512,9 @@ mod tests {
             "$concatArrays" => doc! { "value": { "$concatArrays": ["$array", [4, 5]] } },
             "$cond" => doc! { "value": { "$cond": [{ "$eq": ["$left", "$left"] }, "yes", "no"] } },
             "$const" => doc! { "value": { "$const": 5 } },
+            "$convert" => {
+                doc! { "value": { "$convert": { "input": "1", "to": "int", "onError": 0, "onNull": -1 } } }
+            }
             "$cos" => doc! { "value": { "$cos": 0 } },
             "$cosh" => doc! { "value": { "$cosh": 0 } },
             "$degreesToRadians" => doc! { "value": { "$degreesToRadians": 180 } },
@@ -1608,7 +1611,17 @@ mod tests {
             "$sqrt" => doc! { "value": { "$sqrt": 4 } },
             "$tan" => doc! { "value": { "$tan": 0 } },
             "$tanh" => doc! { "value": { "$tanh": 0 } },
+            "$toBool" => doc! { "value": { "$toBool": 1 } },
+            "$toDate" => doc! { "value": { "$toDate": 1_i64 } },
+            "$toDecimal" => doc! { "value": { "$toDecimal": "1.5" } },
+            "$toDouble" => doc! { "value": { "$toDouble": "1.5" } },
+            "$toInt" => doc! { "value": { "$toInt": "1" } },
             "$toLower" => doc! { "value": { "$toLower": "AbC" } },
+            "$toLong" => doc! { "value": { "$toLong": "1" } },
+            "$toObjectId" => {
+                doc! { "value": { "$toObjectId": "0123456789abcdef01234567" } }
+            }
+            "$toString" => doc! { "value": { "$toString": 1 } },
             "$toUpper" => doc! { "value": { "$toUpper": "AbC" } },
             "$trim" => doc! { "value": { "$trim": { "input": "  abc  " } } },
             "$ltrim" => doc! { "value": { "$ltrim": { "input": "  abc  " } } },
