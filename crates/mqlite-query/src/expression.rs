@@ -180,6 +180,16 @@ fn eval_expression_operator(
         "$floor" => eval_unary_numeric_expression(document, value, variables, |number| {
             Ok(EvaluatedExpression::Value(number_bson(number.floor())))
         }),
+        "$allElementsTrue" => eval_array_truth_expression(document, value, variables, true),
+        "$anyElementTrue" => eval_array_truth_expression(document, value, variables, false),
+        "$concat" => eval_concat_expression(document, value, variables),
+        "$isNumber" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
+            eval_expression_result_with_variables(document, unary_expression_operand(value), variables)?,
+            EvaluatedExpression::Value(Bson::Int32(_)
+                | Bson::Int64(_)
+                | Bson::Double(_)
+                | Bson::Decimal128(_))
+        )))),
         "$round" => eval_rounding_expression(document, value, variables, f64::round),
         "$trunc" => eval_rounding_expression(document, value, variables, f64::trunc),
         "$ifNull" => eval_if_null_expression(document, value, variables),
@@ -297,6 +307,13 @@ fn expression_arguments<const N: usize>(value: &Bson) -> Result<[&Bson; N], Quer
         return Err(QueryError::InvalidStructure);
     }
     Ok(std::array::from_fn(|index| &arguments[index]))
+}
+
+fn unary_expression_operand(value: &Bson) -> &Bson {
+    match value {
+        Bson::Array(arguments) if arguments.len() == 1 => &arguments[0],
+        _ => value,
+    }
 }
 
 fn eval_add_expression(
@@ -638,6 +655,64 @@ fn eval_merge_objects_expression(
     }
 
     Ok(EvaluatedExpression::Value(Bson::Document(merged)))
+}
+
+fn eval_array_truth_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    require_all: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let evaluated =
+        eval_expression_result_with_variables(document, unary_expression_operand(value), variables)?;
+    let EvaluatedExpression::Value(Bson::Array(items)) = evaluated else {
+        return Err(QueryError::InvalidArgument(
+            if require_all {
+                "$allElementsTrue requires an array input"
+            } else {
+                "$anyElementTrue requires an array input"
+            }
+            .to_string(),
+        ));
+    };
+
+    let result = if require_all {
+        items.iter().all(expression_truthy)
+    } else {
+        items.iter().any(expression_truthy)
+    };
+    Ok(EvaluatedExpression::Value(Bson::Boolean(result)))
+}
+
+fn eval_concat_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = match value {
+        Bson::Array(arguments) => arguments.as_slice(),
+        _ => std::slice::from_ref(value),
+    };
+
+    let mut output = String::new();
+    for argument in arguments {
+        match eval_expression_result_with_variables(document, argument, variables)? {
+            EvaluatedExpression::Missing
+            | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            EvaluatedExpression::Value(Bson::String(value) | Bson::Symbol(value)) => {
+                output.push_str(&value);
+            }
+            EvaluatedExpression::Value(_) => {
+                return Err(QueryError::InvalidArgument(
+                    "$concat requires string inputs".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::String(output)))
 }
 
 fn merge_object_input(value: Bson, merged: &mut Document) -> Result<(), QueryError> {

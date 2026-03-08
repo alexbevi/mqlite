@@ -2456,16 +2456,20 @@ fn command_aggregate_project_supports_expression_operators() {
                     "_id": 0,
                     "sum": { "$add": ["$left", "$right"] },
                     "difference": { "$subtract": ["$left", "$right"] },
+                    "allTrue": { "$allElementsTrue": [true, 1, "ok"] },
                     "quotient": { "$divide": [7, 2] },
+                    "anyTrue": { "$anyElementTrue": [0, false, "ok"] },
                     "remainder": { "$mod": [17, 5] },
                     "rounded": { "$round": [2.65, 1] },
                     "fallback": { "$ifNull": ["$missing", "$left"] },
                     "cmp": { "$cmp": ["$left", "$right"] },
+                    "concat": { "$concat": ["prefix-", "$text"] },
                     "expr": { "$expr": { "$eq": ["$text", "abc"] } },
                     "const": { "$const": "fixed" },
                     "last": { "$arrayElemAt": ["$array", -1] },
                     "size": { "$size": "$array" },
                     "isArray": { "$isArray": "$array" },
+                    "isNumber": { "$isNumber": "$left" },
                     "merged": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
                     "expanded": { "$objectToArray": "$object" },
                     "collapsed": { "$arrayToObject": "$pairs" },
@@ -2505,16 +2509,20 @@ fn command_aggregate_project_supports_expression_operators() {
     assert_eq!(first_batch.len(), 1);
     assert_eq!(first_batch[0]["sum"], 8);
     assert_eq!(first_batch[0]["difference"], 2);
+    assert_eq!(first_batch[0]["allTrue"], true);
     assert_eq!(first_batch[0]["quotient"], 3.5);
+    assert_eq!(first_batch[0]["anyTrue"], true);
     assert_eq!(first_batch[0]["remainder"], 2);
     assert_eq!(first_batch[0]["rounded"], 2.7);
     assert_eq!(first_batch[0]["fallback"], 5);
     assert_eq!(first_batch[0]["cmp"], 1);
+    assert_eq!(first_batch[0]["concat"], "prefix-abc");
     assert_eq!(first_batch[0]["expr"], true);
     assert_eq!(first_batch[0]["const"], "fixed");
     assert_eq!(first_batch[0]["last"], 3);
     assert_eq!(first_batch[0]["size"], 3);
     assert_eq!(first_batch[0]["isArray"], true);
+    assert_eq!(first_batch[0]["isNumber"], true);
     assert_eq!(first_batch[0]["merged"], json!({ "a": 1, "b": 9, "c": 3 }));
     assert_eq!(
         first_batch[0]["expanded"],

@@ -825,15 +825,18 @@ fn projection_supports_expression_operators() {
         Some(&doc! {
             "abs": { "$abs": -5 },
             "add": { "$add": ["$left", "$right", 2] },
+            "allElementsTrue": { "$allElementsTrue": [true, 1, "ok"] },
             "eq": { "$eq": ["$left", 5] },
             "ne": { "$ne": ["$left", "$right"] },
             "gt": { "$gt": ["$left", "$right"] },
             "gte": { "$gte": ["$left", 5] },
             "lt": { "$lt": ["$right", "$left"] },
             "lte": { "$lte": ["$right", 3] },
+            "anyElementTrue": { "$anyElementTrue": [0, false, "ok"] },
             "arrayElemAt": { "$arrayElemAt": ["$array", -1] },
             "arrayToObject": { "$arrayToObject": "$pairs" },
             "cmp": { "$cmp": ["$left", "$right"] },
+            "concat": { "$concat": ["prefix-", "$sku"] },
             "concatArrays": { "$concatArrays": ["$array", [4, 5]] },
             "and": { "$and": [true, { "$eq": ["$left", 5] }] },
             "or": { "$or": [false, { "$eq": ["$sku", "abc"] }] },
@@ -847,6 +850,7 @@ fn projection_supports_expression_operators() {
             "ceil": { "$ceil": 2.2 },
             "ifNull": { "$ifNull": [null, "$left"] },
             "isArray": { "$isArray": "$array" },
+            "isNumber": { "$isNumber": "$left" },
             "last": { "$last": "$array" },
             "mod": { "$mod": [17, 5] },
             "mergeObjects": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
@@ -867,15 +871,18 @@ fn projection_supports_expression_operators() {
             "_id": 1,
             "abs": 5_i64,
             "add": 10_i64,
+            "allElementsTrue": true,
             "eq": true,
             "ne": true,
             "gt": true,
             "gte": true,
             "lt": true,
             "lte": true,
+            "anyElementTrue": true,
             "arrayElemAt": 3,
             "arrayToObject": { "price": 24, "item": "apple" },
             "cmp": 1,
+            "concat": "prefix-abc",
             "concatArrays": [1, 2, 3, 4, 5],
             "and": true,
             "or": true,
@@ -889,6 +896,7 @@ fn projection_supports_expression_operators() {
             "ceil": 3_i64,
             "ifNull": 5,
             "isArray": true,
+            "isNumber": true,
             "last": 3,
             "mod": 2_i64,
             "mergeObjects": { "a": 1, "b": 9, "c": 3 },
@@ -1021,6 +1029,26 @@ fn expression_operators_reject_invalid_array_and_object_forms() {
     .expect_err("objectToArray non document");
     assert!(matches!(
         object_to_array_rejects_non_documents,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let concat_requires_string_inputs = apply_projection(
+        &doc! { "_id": 1, "value": 3 },
+        Some(&doc! { "value": { "$concat": ["prefix-", "$value"] } }),
+    )
+    .expect_err("concat string");
+    assert!(matches!(
+        concat_requires_string_inputs,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let any_elements_true_requires_array_input = apply_projection(
+        &doc! { "_id": 1, "value": 3 },
+        Some(&doc! { "value": { "$anyElementTrue": "$value" } }),
+    )
+    .expect_err("anyElementTrue array");
+    assert!(matches!(
+        any_elements_true_requires_array_input,
         QueryError::InvalidArgument(_)
     ));
 }
