@@ -126,6 +126,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$size",
     "$slice",
     "$subtract",
+    "$switch",
     "$type",
     "$trunc",
     "$unsetField",

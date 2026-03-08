@@ -202,6 +202,7 @@ fn eval_expression_operator(
         "$trunc" => eval_rounding_expression(document, value, variables, f64::trunc),
         "$ifNull" => eval_if_null_expression(document, value, variables),
         "$let" => eval_let_expression(document, value, variables),
+        "$switch" => eval_switch_expression(document, value, variables),
         "$arrayElemAt" => eval_array_elem_at_expression(document, value, variables),
         "$arrayToObject" => eval_array_to_object_expression(document, value, variables),
         "$concatArrays" => eval_concat_arrays_expression(document, value, variables),
@@ -377,6 +378,7 @@ fn validate_expression_operator(
         }
         "$let" => validate_let_expression(value, scope),
         "$map" => validate_map_expression(value, scope),
+        "$switch" => validate_switch_expression(value, scope),
         "$range" => {
             let arguments = expression_argument_slice(value)?;
             if !(2..=3).contains(&arguments.len()) {
@@ -1066,6 +1068,27 @@ fn eval_cond_expression(
     }
 }
 
+fn eval_switch_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (branches, default) = parse_switch_spec(value)?;
+    for (condition, then_expression) in branches {
+        let condition = eval_expression_with_variables(document, condition, variables)?;
+        if expression_truthy(&condition) {
+            return eval_expression_result_with_variables(document, then_expression, variables);
+        }
+    }
+
+    match default {
+        Some(default) => eval_expression_result_with_variables(document, default, variables),
+        None => Err(QueryError::InvalidArgument(
+            "$switch matched no branch and no default was provided".to_string(),
+        )),
+    }
+}
+
 fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
     match value {
         Bson::Array(_) => {
@@ -1087,6 +1110,18 @@ fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<()
         _ => return Err(QueryError::InvalidStructure),
     }
 
+    Ok(())
+}
+
+fn validate_switch_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (branches, default) = parse_switch_spec(value)?;
+    for (condition, then_expression) in branches {
+        validate_expression_with_scope(condition, scope)?;
+        validate_expression_with_scope(then_expression, scope)?;
+    }
+    if let Some(default) = default {
+        validate_expression_with_scope(default, scope)?;
+    }
     Ok(())
 }
 
@@ -1277,6 +1312,48 @@ fn parse_reduce_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError> 
         initial_value.ok_or(QueryError::InvalidStructure)?,
         in_expression.ok_or(QueryError::InvalidStructure)?,
     ))
+}
+
+type SwitchBranches<'a> = Vec<(&'a Bson, &'a Bson)>;
+
+fn parse_switch_spec(value: &Bson) -> Result<(SwitchBranches<'_>, Option<&Bson>), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut branches = None;
+    let mut default = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "branches" => {
+                let values = value.as_array().ok_or(QueryError::InvalidStructure)?;
+                let mut parsed = Vec::with_capacity(values.len());
+                for branch in values {
+                    let branch = branch.as_document().ok_or(QueryError::InvalidStructure)?;
+                    let mut condition = None;
+                    let mut then_expression = None;
+                    for (field, value) in branch {
+                        match field.as_str() {
+                            "case" => condition = Some(value),
+                            "then" => then_expression = Some(value),
+                            _ => return Err(QueryError::InvalidStructure),
+                        }
+                    }
+                    parsed.push((
+                        condition.ok_or(QueryError::InvalidStructure)?,
+                        then_expression.ok_or(QueryError::InvalidStructure)?,
+                    ));
+                }
+                branches = Some(parsed);
+            }
+            "default" => default = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let branches = branches.ok_or(QueryError::InvalidStructure)?;
+    if branches.is_empty() {
+        return Err(QueryError::InvalidStructure);
+    }
+    Ok((branches, default))
 }
 
 fn constant_field_name(expression: &Bson) -> Result<String, QueryError> {

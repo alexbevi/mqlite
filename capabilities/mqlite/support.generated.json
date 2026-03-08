@@ -125,6 +125,7 @@
     "$size",
     "$slice",
     "$subtract",
+    "$switch",
     "$trunc",
     "$type",
     "$unsetField"

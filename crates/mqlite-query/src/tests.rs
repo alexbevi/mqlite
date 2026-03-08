@@ -1173,6 +1173,175 @@ fn projection_preserves_nullish_reduce_input() {
 }
 
 #[test]
+fn projection_supports_switch_expression() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "flag": true, "qty": 2 },
+        Some(&doc! {
+            "firstMatch": {
+                "$switch": {
+                    "branches": [
+                        { "case": { "$eq": [1, 1] }, "then": "one is equal to one!" },
+                        { "case": { "$eq": [2, 2] }, "then": "two is equal to two!" }
+                    ]
+                }
+            },
+            "defaulted": {
+                "$switch": {
+                    "branches": [{ "case": { "$eq": [1, 2] }, "then": "one is equal to two!" }],
+                    "default": "no case matched."
+                }
+            },
+            "nullCase": {
+                "$switch": {
+                    "branches": [{ "case": Bson::Null, "then": "Null was true!" }],
+                    "default": "No case matched."
+                }
+            },
+            "missingCase": {
+                "$switch": {
+                    "branches": [{ "case": "$missingField", "then": "Missing was true!" }],
+                    "default": "No case matched."
+                }
+            },
+            "nullThen": {
+                "$switch": {
+                    "branches": [{ "case": true, "then": Bson::Null }],
+                    "default": false
+                }
+            },
+            "nullDefault": {
+                "$switch": {
+                    "branches": [{ "case": Bson::Null, "then": false }],
+                    "default": Bson::Null
+                }
+            }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "firstMatch": "one is equal to one!",
+            "defaulted": "no case matched.",
+            "nullCase": "No case matched.",
+            "missingCase": "No case matched.",
+            "nullThen": Bson::Null,
+            "nullDefault": Bson::Null
+        }
+    );
+}
+
+#[test]
+fn projection_preserves_missing_switch_results() {
+    let projected = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "missingThen": {
+                "$switch": {
+                    "branches": [{ "case": true, "then": "$missingField" }],
+                    "default": false
+                }
+            },
+            "missingDefault": {
+                "$switch": {
+                    "branches": [{ "case": Bson::Null, "then": false }],
+                    "default": "$missingField"
+                }
+            }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected, doc! { "_id": 1 });
+}
+
+#[test]
+fn switch_expression_rejects_invalid_arguments() {
+    let non_object = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": "not an object" }
+        }),
+    )
+    .expect_err("switch requires object");
+    assert!(matches!(non_object, QueryError::InvalidStructure));
+
+    let branches_not_array = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": "not an array" } }
+        }),
+    )
+    .expect_err("branches must be array");
+    assert!(matches!(branches_not_array, QueryError::InvalidStructure));
+
+    let branch_not_object = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": ["not an object"] } }
+        }),
+    )
+    .expect_err("branch must be object");
+    assert!(matches!(branch_not_object, QueryError::InvalidStructure));
+
+    let missing_case = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": [{}] } }
+        }),
+    )
+    .expect_err("branch case required");
+    assert!(matches!(missing_case, QueryError::InvalidStructure));
+
+    let missing_then = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": [{ "case": 1 }] } }
+        }),
+    )
+    .expect_err("branch then required");
+    assert!(matches!(missing_then, QueryError::InvalidStructure));
+
+    let branch_unknown = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": [{ "case": true, "then": false, "badKey": 1 }] } }
+        }),
+    )
+    .expect_err("unknown branch key");
+    assert!(matches!(branch_unknown, QueryError::InvalidStructure));
+
+    let unknown_argument = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "notAnArgument": 1 } }
+        }),
+    )
+    .expect_err("unknown argument");
+    assert!(matches!(unknown_argument, QueryError::InvalidStructure));
+
+    let empty_branches = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": [] } }
+        }),
+    )
+    .expect_err("requires at least one branch");
+    assert!(matches!(empty_branches, QueryError::InvalidStructure));
+
+    let no_default_match = apply_projection(
+        &doc! { "_id": 1, "x": 1 },
+        Some(&doc! {
+            "out": { "$switch": { "branches": [{ "case": { "$eq": ["$x", 0] }, "then": 1 }] } }
+        }),
+    )
+    .expect_err("missing default should fail");
+    assert!(matches!(no_default_match, QueryError::InvalidArgument(_)));
+}
+
+#[test]
 fn reduce_expression_rejects_invalid_arguments() {
     let non_object = apply_projection(
         &doc! { "_id": 1, "items": [1, 2] },

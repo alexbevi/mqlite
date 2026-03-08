@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 51,
-    "public_supported": 51,
-    "total_unsupported": 133,
-    "public_unsupported": 102,
+    "total_supported": 52,
+    "public_supported": 52,
+    "total_unsupported": 132,
+    "public_unsupported": 101,
     "public_ignored": 23,
     "items": [
       {
@@ -5625,8 +5625,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$tan",
