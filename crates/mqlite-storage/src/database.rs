@@ -89,6 +89,20 @@ pub enum WalMutation {
         #[serde(default)]
         change_events: Vec<PersistedChangeEvent>,
     },
+    ApplyCollectionChanges {
+        database: String,
+        collection: String,
+        #[serde(default)]
+        create_options: Option<bson::Document>,
+        #[serde(default)]
+        inserts: Vec<CollectionRecord>,
+        #[serde(default)]
+        updates: Vec<CollectionRecord>,
+        #[serde(default)]
+        deletes: Vec<u64>,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
+    },
     DropCollection {
         database: String,
         collection: String,
@@ -105,6 +119,7 @@ pub struct DatabaseFile {
     active_slot: usize,
     active_superblock: Superblock,
     valid_superblocks: usize,
+    wal_end_offset: u64,
     wal_records_since_checkpoint: usize,
     wal_bytes_since_checkpoint: u64,
     truncated_wal_tail: bool,
@@ -369,6 +384,7 @@ impl DatabaseFile {
             active_slot: 0,
             active_superblock: Superblock::default(),
             valid_superblocks: 0,
+            wal_end_offset: DATA_START_OFFSET,
             wal_records_since_checkpoint: 0,
             wal_bytes_since_checkpoint: 0,
             truncated_wal_tail: false,
@@ -411,19 +427,20 @@ impl DatabaseFile {
     }
 
     pub fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
-        let mut state = self.state.clone();
-        let sequence = state.last_applied_sequence + 1;
-        apply_mutation(&mut state, sequence, &mutation)?;
+        let sequence = self.state.last_applied_sequence + 1;
+        validate_mutation(&self.state, &mutation)?;
 
         let appended_bytes = append_wal_entry(
             &mut self.file,
+            self.wal_end_offset,
             &WalEntry {
                 sequence,
                 mutation: mutation.clone(),
             },
         )?;
 
-        self.state = state;
+        apply_mutation(&mut self.state, sequence, &mutation)?;
+        self.wal_end_offset += appended_bytes;
         self.wal_records_since_checkpoint += 1;
         self.wal_bytes_since_checkpoint += appended_bytes;
         self.truncated_wal_tail = false;
@@ -519,6 +536,7 @@ impl DatabaseFile {
         self.active_slot = loaded.active_slot;
         self.active_superblock = loaded.active_superblock;
         self.valid_superblocks = loaded.valid_superblocks;
+        self.wal_end_offset = loaded.file_size.max(DATA_START_OFFSET);
         self.wal_records_since_checkpoint = loaded.wal_recovery.records;
         self.wal_bytes_since_checkpoint = loaded.wal_recovery.bytes;
         self.truncated_wal_tail = loaded.wal_recovery.truncated_tail;
@@ -530,7 +548,7 @@ impl DatabaseFile {
         self.state.file_format_version = FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
-        let pages_start = self.file.metadata()?.len().max(DATA_START_OFFSET);
+        let pages_start = self.wal_end_offset.max(DATA_START_OFFSET);
         let encoded_catalog =
             encode_snapshot_catalog(&self.state.catalog, &self.state.change_events)?;
 
@@ -598,6 +616,7 @@ impl DatabaseFile {
         self.active_slot = next_slot;
         self.active_superblock = superblock;
         self.valid_superblocks = self.valid_superblocks.max(1);
+        self.wal_end_offset = self.active_superblock.wal_offset;
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
         self.truncated_wal_tail = false;
@@ -870,11 +889,10 @@ fn read_snapshot(
     ))
 }
 
-fn append_wal_entry(file: &mut File, entry: &WalEntry) -> Result<u64> {
+fn append_wal_entry(file: &mut File, frame_offset: u64, entry: &WalEntry) -> Result<u64> {
     let payload = bson::to_vec(entry)?;
     let payload_checksum = hash_bytes(&payload);
     let frame_len = (WAL_HEADER_LEN + payload.len()) as u64;
-    let frame_offset = file.metadata()?.len().max(DATA_START_OFFSET);
 
     file.seek(SeekFrom::Start(frame_offset))?;
     file.write_all(WAL_FRAME_MAGIC)?;
@@ -882,7 +900,7 @@ fn append_wal_entry(file: &mut File, entry: &WalEntry) -> Result<u64> {
     file.write_all(&payload_checksum)?;
     file.write_all(&payload)?;
     file.flush()?;
-    file.sync_all()?;
+    file.sync_data()?;
     Ok(frame_len)
 }
 
@@ -960,6 +978,26 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
                 .replace_collection(database, collection, hydrated);
             state.change_events.extend(change_events.iter().cloned());
         }
+        WalMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            create_options,
+            inserts,
+            updates,
+            deletes,
+            change_events,
+        } => {
+            apply_collection_changes(
+                state,
+                database,
+                collection,
+                create_options.as_ref(),
+                inserts,
+                updates,
+                deletes,
+            )?;
+            state.change_events.extend(change_events.iter().cloned());
+        }
         WalMutation::DropCollection {
             database,
             collection,
@@ -970,6 +1008,138 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
         }
     }
     state.last_applied_sequence = sequence;
+    Ok(())
+}
+
+fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<()> {
+    match mutation {
+        WalMutation::ReplaceCollection {
+            collection_state, ..
+        } => {
+            let mut hydrated = collection_state.clone();
+            hydrated.hydrate_indexes();
+            validate_collection_indexes(&hydrated).map_err(map_catalog_error)?;
+        }
+        WalMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            create_options,
+            inserts,
+            updates,
+            deletes,
+            ..
+        } => {
+            validate_collection_changes(
+                state,
+                database,
+                collection,
+                create_options.as_ref(),
+                inserts,
+                updates,
+                deletes,
+            )?;
+        }
+        WalMutation::DropCollection {
+            database,
+            collection,
+            ..
+        } => {
+            state.catalog.get_collection(database, collection)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_collection_changes(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    inserts: &[CollectionRecord],
+    updates: &[CollectionRecord],
+    deletes: &[u64],
+) -> Result<()> {
+    if state.catalog.get_collection(database, collection).is_err() {
+        let Some(options) = create_options else {
+            return Err(CatalogError::NamespaceNotFound(
+                database.to_string(),
+                collection.to_string(),
+            )
+            .into());
+        };
+        state
+            .catalog
+            .create_collection(database, collection, options.clone())?;
+    }
+
+    let collection_state = state.catalog.get_collection_mut(database, collection)?;
+    apply_collection_change_set(collection_state, inserts, updates, deletes)
+}
+
+fn validate_collection_changes(
+    state: &PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    inserts: &[CollectionRecord],
+    updates: &[CollectionRecord],
+    deletes: &[u64],
+) -> Result<()> {
+    let mut collection_state = match state.catalog.get_collection(database, collection) {
+        Ok(collection_state) => collection_state.clone(),
+        Err(CatalogError::NamespaceNotFound(_, _)) => {
+            let Some(options) = create_options else {
+                return Err(CatalogError::NamespaceNotFound(
+                    database.to_string(),
+                    collection.to_string(),
+                )
+                .into());
+            };
+            CollectionCatalog::new(options.clone())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    apply_collection_change_set(&mut collection_state, inserts, updates, deletes)
+}
+
+fn apply_collection_change_set(
+    collection_state: &mut CollectionCatalog,
+    inserts: &[CollectionRecord],
+    updates: &[CollectionRecord],
+    deletes: &[u64],
+) -> Result<()> {
+    for record in inserts {
+        collection_state
+            .insert_record(record.clone())
+            .map_err(map_catalog_error)?;
+    }
+
+    if !updates.is_empty() {
+        let positions = collection_state
+            .records
+            .iter()
+            .enumerate()
+            .map(|(position, record)| (record.record_id, position))
+            .collect::<BTreeMap<_, _>>();
+        for record in updates {
+            let Some(&position) = positions.get(&record.record_id) else {
+                return Err(CatalogError::InvalidIndexState(format!(
+                    "record id {} is missing for update",
+                    record.record_id
+                ))
+                .into());
+            };
+            collection_state
+                .update_record_at(position, record.document.clone())
+                .map_err(map_catalog_error)?;
+        }
+    }
+
+    if !deletes.is_empty() {
+        let removed = deletes.iter().copied().collect::<BTreeSet<_>>();
+        collection_state.delete_records(&removed);
+    }
+
     Ok(())
 }
 
@@ -1714,6 +1884,150 @@ mod tests {
         assert_eq!(inspect.last_applied_sequence, 1);
         assert_eq!(inspect.wal_records_since_checkpoint, 1);
         assert_eq!(inspect.databases, vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn recovers_incremental_collection_creation_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-create-recovery.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(doc! { "validator": { "qty": { "$gte": 0 } } }),
+                    inserts: vec![CollectionRecord {
+                        record_id: 1,
+                        document: doc! { "_id": 1, "sku": "alpha", "qty": 4 },
+                    }],
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: vec![sample_change_event(1, "insert")],
+                })
+                .expect("commit mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(
+            collection
+                .options
+                .get_document("validator")
+                .expect("validator")
+                .get_document("qty")
+                .expect("qty")
+                .get_i32("$gte")
+                .expect("$gte"),
+            0
+        );
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(collection.records[0].record_id, 1);
+        assert_eq!(
+            collection.records[0].document.get_str("sku").expect("sku"),
+            "alpha"
+        );
+        assert_eq!(
+            reopened.change_events(),
+            &[sample_change_event(1, "insert")]
+        );
+    }
+
+    #[test]
+    fn recovers_incremental_collection_changes_and_indexes_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-delta-recovery.mongodb");
+        let change_events = vec![
+            sample_change_event(2, "insert"),
+            sample_change_event(3, "update"),
+            sample_change_event(4, "delete"),
+        ];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(
+                &mut collection,
+                1,
+                doc! { "_id": 1, "sku": "alpha", "qty": 1 },
+            );
+            insert_record(
+                &mut collection,
+                2,
+                doc! { "_id": 2, "sku": "beta", "qty": 2 },
+            );
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    inserts: vec![CollectionRecord {
+                        record_id: 3,
+                        document: doc! { "_id": 3, "sku": "charlie", "qty": 3 },
+                    }],
+                    updates: vec![CollectionRecord {
+                        record_id: 1,
+                        document: doc! { "_id": 1, "sku": "delta", "qty": 9 },
+                    }],
+                    deletes: vec![2],
+                    change_events: change_events.clone(),
+                })
+                .expect("delta mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(
+            collection
+                .records
+                .iter()
+                .map(|record| record.record_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            collection.records[0].document.get_str("sku").expect("sku"),
+            "delta"
+        );
+        assert_eq!(
+            collection.records[1].document.get_str("sku").expect("sku"),
+            "charlie"
+        );
+        let index = collection.indexes.get("sku_1").expect("sku index");
+        assert_eq!(
+            index
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.record_id,
+                        entry.key.get_str("sku").expect("sku").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(3, "charlie".to_string()), (1, "delta".to_string())]
+        );
+        assert_eq!(reopened.change_events(), change_events.as_slice());
     }
 
     #[test]

@@ -898,10 +898,13 @@ impl Broker {
         }
         let sequence = storage.last_applied_sequence() + 1;
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database: database.clone(),
                 collection: collection.to_string(),
-                collection_state: CollectionCatalog::new(options),
+                create_options: Some(options),
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
                 change_events: vec![change_stream_event(
                     sequence,
                     0,
@@ -1338,9 +1341,11 @@ impl Broker {
             .get_collection(&database, collection_name)
             .cloned()
             .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+        let create_options = (!collection_exists).then_some(Document::new());
         let inserted_total = documents.len() as i32;
         let sequence = storage.last_applied_sequence() + 1;
         let mut change_events = Vec::new();
+        let mut inserts = Vec::with_capacity(documents.len());
         if !collection_exists {
             change_events.push(change_stream_event(
                 sequence,
@@ -1366,10 +1371,12 @@ impl Broker {
             let record_id = collection_state.next_record_id();
             let document_key = document_key_for_change_stream(&document);
             let full_document = document.clone();
-            collection_state.insert_record(CollectionRecord {
+            let record = CollectionRecord {
                 record_id,
                 document,
-            })?;
+            };
+            collection_state.insert_record(record.clone())?;
+            inserts.push(record);
             change_events.push(change_stream_event(
                 sequence,
                 change_events.len(),
@@ -1385,10 +1392,13 @@ impl Broker {
             ));
         }
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
-                collection_state,
+                create_options,
+                inserts,
+                updates: Vec::new(),
+                deletes: Vec::new(),
                 change_events,
             })
             .map_err(internal_error)?;
@@ -1559,6 +1569,9 @@ impl Broker {
         let mut upserted = Vec::new();
         let sequence = storage.last_applied_sequence() + 1;
         let mut change_events = Vec::new();
+        let create_options = (!collection_exists).then_some(Document::new());
+        let mut inserts = Vec::new();
+        let mut updates = Vec::new();
 
         for (operation_index, operation) in operations.iter().enumerate() {
             let query = operation.get_document("q").map_err(|_| {
@@ -1608,10 +1621,12 @@ impl Broker {
                     let upserted_id = ensure_object_id(&mut document);
                     let record_id = collection_state.next_record_id();
                     let full_document = document.clone();
-                    collection_state.insert_record(CollectionRecord {
+                    let record = CollectionRecord {
                         record_id,
                         document,
-                    })?;
+                    };
+                    collection_state.insert_record(record.clone())?;
+                    inserts.push(record);
                     upserted
                         .push(doc! { "index": operation_index as i32, "_id": upserted_id.clone() });
                     change_events.push(change_stream_event(
@@ -1633,6 +1648,7 @@ impl Broker {
 
             let mut touched = 0;
             for document_index in matching_indexes {
+                let record_id = collection_state.records[document_index].record_id;
                 let original = collection_state.records[document_index].document.clone();
                 let mut updated = original.clone();
                 apply_update(&mut updated, &update_spec)?;
@@ -1643,6 +1659,10 @@ impl Broker {
                     modified += 1;
                     let updated_document =
                         collection_state.records[document_index].document.clone();
+                    updates.push(CollectionRecord {
+                        record_id,
+                        document: updated_document.clone(),
+                    });
                     let document_key = document_key_for_change_stream(&updated_document);
                     match &update_spec {
                         mqlite_query::UpdateSpec::Replacement(_) => {
@@ -1687,10 +1707,13 @@ impl Broker {
         }
 
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
-                collection_state,
+                create_options,
+                inserts,
+                updates,
+                deletes: Vec::new(),
                 change_events,
             })
             .map_err(internal_error)?;
@@ -1739,6 +1762,7 @@ impl Broker {
         let mut deleted = 0_i32;
         let sequence = storage.last_applied_sequence() + 1;
         let mut change_events = Vec::new();
+        let mut deletes = Vec::new();
 
         for (query, limit) in validated_operations {
             let mut removed_record_ids = BTreeSet::new();
@@ -1765,13 +1789,17 @@ impl Broker {
                 }
             }
             deleted += collection_state.delete_records(&removed_record_ids) as i32;
+            deletes.extend(removed_record_ids.iter().copied());
         }
 
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
-                collection_state,
+                create_options: None,
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes,
                 change_events,
             })
             .map_err(internal_error)?;

@@ -251,7 +251,8 @@ Current cross-namespace aggregation behavior:
 
 Mutations are durable through an append-only WAL.
 
-- Every logical collection replacement or drop is written as a typed WAL frame.
+- CRUD writes append typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
+- Collection replacement and drop operations are still written as collection-level WAL frames.
 - WAL frames include a sequence number and checksum.
 - The broker applies the mutation to in-memory state only after the WAL append succeeds.
 - Recovery loads the newest valid checkpoint, then replays WAL frames with sequence numbers greater than the checkpoint sequence.
