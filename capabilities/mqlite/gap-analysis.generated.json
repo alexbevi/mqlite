@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 57,
-    "public_supported": 57,
-    "total_unsupported": 127,
-    "public_unsupported": 96,
+    "total_supported": 60,
+    "public_supported": 60,
+    "total_unsupported": 124,
+    "public_unsupported": 93,
     "public_ignored": 23,
     "items": [
       {
@@ -5499,8 +5499,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$substr",
@@ -5823,8 +5823,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$toObject",
@@ -5913,8 +5913,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$top",

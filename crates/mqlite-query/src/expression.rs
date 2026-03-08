@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bson::{Bson, Document, doc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 
 use crate::{QueryError, filter::bson_type_alias};
@@ -199,6 +200,7 @@ fn eval_expression_operator(
             },
         ))),
         "$round" => eval_rounding_expression(document, value, variables, f64::round),
+        "$strcasecmp" => eval_strcasecmp_expression(document, value, variables),
         "$trunc" => eval_rounding_expression(document, value, variables, f64::trunc),
         "$ifNull" => eval_if_null_expression(document, value, variables),
         "$let" => eval_let_expression(document, value, variables),
@@ -274,6 +276,8 @@ fn eval_expression_operator(
                     .any(|candidate| compare_bson(&needle, candidate).is_eq()),
             )))
         }
+        "$toLower" => eval_case_fold_expression(document, value, variables, false),
+        "$toUpper" => eval_case_fold_expression(document, value, variables, true),
         "$unsetField" => eval_set_field_expression(document, value, variables, true),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
@@ -351,6 +355,12 @@ fn validate_expression_operator(
             }
             Ok(())
         }
+        "$strcasecmp" => {
+            for argument in expression_arguments::<2>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
         "$cond" => validate_cond_expression(value, scope),
         "$filter" => validate_filter_expression(value, scope),
         "$getField" => {
@@ -396,6 +406,9 @@ fn validate_expression_operator(
         }
         "$reduce" => validate_reduce_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
+        "$toLower" | "$toUpper" => {
+            validate_expression_with_scope(single_expression_operand(value)?, scope)
+        }
         "$setDifference" | "$setIsSubset" => {
             for argument in expression_arguments::<2>(value)? {
                 validate_expression_with_scope(argument, scope)?;
@@ -560,6 +573,14 @@ fn unary_expression_operand(value: &Bson) -> &Bson {
     match value {
         Bson::Array(arguments) if arguments.len() == 1 => &arguments[0],
         _ => value,
+    }
+}
+
+fn single_expression_operand(value: &Bson) -> Result<&Bson, QueryError> {
+    match value {
+        Bson::Array(arguments) if arguments.len() == 1 => Ok(&arguments[0]),
+        Bson::Array(_) => Err(QueryError::InvalidStructure),
+        _ => Ok(value),
     }
 }
 
@@ -1236,6 +1257,46 @@ fn eval_switch_expression(
     }
 }
 
+fn eval_strcasecmp_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let [left, right] = expression_arguments::<2>(value)?;
+    let left = coerce_case_string(
+        eval_expression_result_with_variables(document, left, variables)?,
+        "$strcasecmp",
+    )?;
+    let right = coerce_case_string(
+        eval_expression_result_with_variables(document, right, variables)?,
+        "$strcasecmp",
+    )?;
+    let ordering = left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase());
+    Ok(EvaluatedExpression::Value(Bson::Int32(match ordering {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })))
+}
+
+fn eval_case_fold_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    uppercase: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if uppercase { "$toUpper" } else { "$toLower" };
+    let operand = single_expression_operand(value)?;
+    let value = eval_expression_result_with_variables(document, operand, variables)?;
+    let value = coerce_case_string(value, operator)?;
+    let value = if uppercase {
+        value.to_ascii_uppercase()
+    } else {
+        value.to_ascii_lowercase()
+    };
+    Ok(EvaluatedExpression::Value(Bson::String(value)))
+}
+
 fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
     match value {
         Bson::Array(_) => {
@@ -1561,6 +1622,36 @@ fn eval_set_operand(
         EvaluatedExpression::Value(Bson::Array(values)) => Ok(Some(values)),
         _ => Err(QueryError::InvalidArgument(format!(
             "{operator} requires array inputs"
+        ))),
+    }
+}
+
+fn coerce_case_string(value: EvaluatedExpression, operator: &str) -> Result<String, QueryError> {
+    let value = match value {
+        EvaluatedExpression::Missing => return Ok(String::new()),
+        EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => return Ok(String::new()),
+        EvaluatedExpression::Value(value) => value,
+    };
+
+    match value {
+        Bson::String(value) => Ok(value),
+        Bson::Symbol(value) => Ok(value),
+        Bson::Int32(value) => Ok(value.to_string()),
+        Bson::Int64(value) => Ok(value.to_string()),
+        Bson::Double(value) => Ok(value.to_string()),
+        Bson::Decimal128(value) => Ok(value.to_string()),
+        Bson::DateTime(value) => {
+            let value = DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(format!(
+                        "{operator} requires a string-compatible input"
+                    ))
+                })?;
+            Ok(value.to_rfc3339_opts(SecondsFormat::Millis, true))
+        }
+        Bson::ObjectId(value) => Ok(value.to_hex()),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires a string-compatible input"
         ))),
     }
 }

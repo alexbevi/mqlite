@@ -129,8 +129,11 @@
     "$setUnion",
     "$size",
     "$slice",
+    "$strcasecmp",
     "$subtract",
     "$switch",
+    "$toLower",
+    "$toUpper",
     "$trunc",
     "$type",
     "$unsetField"

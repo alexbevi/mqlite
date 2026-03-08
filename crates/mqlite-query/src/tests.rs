@@ -1439,6 +1439,103 @@ fn set_expressions_handle_nullish_and_invalid_inputs() {
 }
 
 #[test]
+fn projection_supports_case_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "text": "aBz",
+            "number": 555.5,
+            "when": DateTime::from_millis(0),
+            "nested": { "str": "hello world" },
+            "unicode": "\u{0080}D€"
+        },
+        Some(&doc! {
+            "upper": { "$toUpper": "$text" },
+            "lower": { "$toLower": ["$text"] },
+            "numberLower": { "$toLower": "$number" },
+            "dateLower": { "$toLower": "$when" },
+            "nullUpper": { "$toUpper": Bson::Null },
+            "fieldUpper": { "$toUpper": "$nested.str" },
+            "strcasecmpEqual": { "$strcasecmp": ["Ab", "aB"] },
+            "strcasecmpNumeric": { "$strcasecmp": ["1.23", 1.23] },
+            "strcasecmpAccent": { "$strcasecmp": ["ó", "Ó"] },
+            "unicodeUpper": { "$toUpper": "$unicode" },
+            "unicodeLower": { "$toLower": "$unicode" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "upper": "ABZ",
+            "lower": "abz",
+            "numberLower": "555.5",
+            "dateLower": "1970-01-01t00:00:00.000z",
+            "nullUpper": "",
+            "fieldUpper": "HELLO WORLD",
+            "strcasecmpEqual": 0,
+            "strcasecmpNumeric": 0,
+            "strcasecmpAccent": 1,
+            "unicodeUpper": "\u{0080}D€",
+            "unicodeLower": "\u{0080}d€"
+        }
+    );
+}
+
+#[test]
+fn case_expression_operators_reject_invalid_inputs() {
+    let wrong_arity = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$toUpper": ["a", "b"] }
+        }),
+    )
+    .expect_err("toUpper rejects multiple arguments");
+    assert!(matches!(wrong_arity, QueryError::InvalidStructure));
+
+    let invalid_upper = apply_projection(
+        &doc! { "_id": 1, "flag": true },
+        Some(&doc! {
+            "out": { "$toUpper": "$flag" }
+        }),
+    )
+    .expect_err("toUpper requires string-compatible input");
+    assert!(matches!(invalid_upper, QueryError::InvalidArgument(_)));
+
+    let invalid_lower = apply_projection(
+        &doc! { "_id": 1, "items": ["a"] },
+        Some(&doc! {
+            "out": { "$toLower": "$items" }
+        }),
+    )
+    .expect_err("toLower rejects arrays");
+    assert!(matches!(invalid_lower, QueryError::InvalidArgument(_)));
+
+    let invalid_strcasecmp = apply_projection(
+        &doc! { "_id": 1, "value": { "a": 1 } },
+        Some(&doc! {
+            "out": { "$strcasecmp": ["$value", "abc"] }
+        }),
+    )
+    .expect_err("strcasecmp rejects documents");
+    assert!(matches!(invalid_strcasecmp, QueryError::InvalidArgument(_)));
+
+    let invalid_strcasecmp_arity = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$strcasecmp": ["a"] }
+        }),
+    )
+    .expect_err("strcasecmp requires two arguments");
+    assert!(matches!(
+        invalid_strcasecmp_arity,
+        QueryError::InvalidStructure
+    ));
+}
+
+#[test]
 fn reduce_expression_rejects_invalid_arguments() {
     let non_object = apply_projection(
         &doc! { "_id": 1, "items": [1, 2] },

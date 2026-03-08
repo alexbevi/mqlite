@@ -200,7 +200,8 @@ Current cross-namespace aggregation behavior:
 - Aggregation control flow currently includes `$cond` and `$switch`, while scoped expressions
   include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
-  `$setUnion`, alongside literal field access and mutation via `$getField`, `$setField`, and
+  `$setUnion`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
+  `$strcasecmp`, alongside literal field access and mutation via `$getField`, `$setField`, and
   `$unsetField`, all executed in-process without a separate expression VM.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
