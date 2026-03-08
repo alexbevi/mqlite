@@ -4087,6 +4087,153 @@ fn command_aggregate_project_supports_accumulator_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_statistical_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("statistical-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"array":[0,"non-numeric",1,2],"continuous":[0,1,2],"twoValues":[0,2],"scalar":7,"std":[1,2,3],"argA":1,"argB":"skip","argC":3,"noNumeric":["non-numeric",[1,2,3]]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "percentileDiscrete": {
+                        "$percentile": {
+                            "input": "$array",
+                            "p": [0.5, 0.9, 0.1],
+                            "method": "discrete"
+                        }
+                    },
+                    "percentileContinuous": {
+                        "$let": {
+                            "vars": { "ps": [0.1, 0.5, 0.9] },
+                            "in": {
+                                "$percentile": {
+                                    "input": "$continuous",
+                                    "p": "$$ps",
+                                    "method": "continuous"
+                                }
+                            }
+                        }
+                    },
+                    "medianDiscrete": { "$median": { "input": "$array", "method": "discrete" } },
+                    "medianContinuous": { "$median": { "input": "$twoValues", "method": "continuous" } },
+                    "stdDevPopArray": { "$stdDevPop": "$std" },
+                    "stdDevSampArray": { "$stdDevSamp": "$std" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    let percentile_discrete = first["percentileDiscrete"]
+        .as_array()
+        .expect("percentile array");
+    assert_json_number_close(&percentile_discrete[0], 1.0);
+    assert_json_number_close(&percentile_discrete[1], 2.0);
+    assert_json_number_close(&percentile_discrete[2], 0.0);
+    let percentile_continuous = first["percentileContinuous"]
+        .as_array()
+        .expect("percentile array");
+    assert_json_number_close(&percentile_continuous[0], 0.2);
+    assert_json_number_close(&percentile_continuous[1], 1.0);
+    assert_json_number_close(&percentile_continuous[2], 1.8);
+    assert_json_number_close(&first["medianDiscrete"], 1.0);
+    assert_json_number_close(&first["medianContinuous"], 1.0);
+    assert_json_number_close(&first["stdDevPopArray"], 0.816496580927726);
+    assert_json_number_close(&first["stdDevSampArray"], 1.0);
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_statistical_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-statistical-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"array":[1,2,3]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$percentile":{"input":"$array","p":[0.5,2],"method":"continuous"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_project_supports_n_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("n-expression.mongodb");

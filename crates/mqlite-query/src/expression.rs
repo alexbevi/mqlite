@@ -221,6 +221,7 @@ fn eval_expression_operator(
         "$avg" => {
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Avg)
         }
+        "$median" => eval_median_expression(document, value, variables),
         "$concat" => eval_concat_expression(document, value, variables),
         "$isNumber" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(
@@ -369,6 +370,7 @@ fn eval_expression_operator(
             eval_date_part_expression(document, value, variables, DatePartExpressionMode::Month)
         }
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
+        "$percentile" => eval_percentile_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
         "$regexFind" => {
@@ -391,6 +393,18 @@ fn eval_expression_operator(
         "$sum" => {
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Sum)
         }
+        "$stdDevPop" => eval_expression_accumulator(
+            document,
+            value,
+            variables,
+            ExpressionAccumulator::StdDevPop,
+        ),
+        "$stdDevSamp" => eval_expression_accumulator(
+            document,
+            value,
+            variables,
+            ExpressionAccumulator::StdDevSamp,
+        ),
         "$toBool" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Bool),
         "$toDate" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Date),
         "$toDecimal" => {
@@ -658,7 +672,7 @@ fn validate_expression_operator(
         "$strLenBytes" | "$strLenCP" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
-        "$avg" | "$max" | "$min" | "$sum" => {
+        "$avg" | "$max" | "$min" | "$sum" | "$stdDevPop" | "$stdDevSamp" => {
             if let Bson::Array(arguments) = value {
                 for argument in arguments {
                     validate_expression_with_scope(argument, scope)?;
@@ -668,6 +682,8 @@ fn validate_expression_operator(
                 validate_expression_with_scope(value, scope)
             }
         }
+        "$median" => validate_median_expression(value, scope),
+        "$percentile" => validate_percentile_expression(value, scope),
         "$substr" | "$substrBytes" | "$substrCP" => {
             for argument in expression_arguments::<3>(value)? {
                 validate_expression_with_scope(argument, scope)?;
@@ -1894,6 +1910,8 @@ enum ExpressionAccumulator {
     Max,
     Min,
     Sum,
+    StdDevPop,
+    StdDevSamp,
 }
 
 #[derive(Clone, Copy)]
@@ -1976,6 +1994,13 @@ enum DateUnit {
     Year,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuantileMethod {
+    Approximate,
+    Discrete,
+    Continuous,
+}
+
 fn eval_expression_accumulator(
     document: &Document,
     value: &Bson,
@@ -2013,6 +2038,12 @@ fn evaluate_expression_accumulator_values(
         ExpressionAccumulator::Max => evaluate_expression_extrema(values, single_argument, true),
         ExpressionAccumulator::Min => evaluate_expression_extrema(values, single_argument, false),
         ExpressionAccumulator::Sum => evaluate_expression_sum(values, single_argument),
+        ExpressionAccumulator::StdDevPop => {
+            evaluate_expression_std_dev(values, single_argument, false)
+        }
+        ExpressionAccumulator::StdDevSamp => {
+            evaluate_expression_std_dev(values, single_argument, true)
+        }
     }
 }
 
@@ -2070,6 +2101,41 @@ fn evaluate_expression_extrema(
     Ok(best
         .map(EvaluatedExpression::Value)
         .unwrap_or(EvaluatedExpression::Value(Bson::Null)))
+}
+
+fn evaluate_expression_std_dev(
+    values: Vec<EvaluatedExpression>,
+    single_argument: bool,
+    sample: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let mut count = 0usize;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+    for value in expression_accumulator_items(values, single_argument) {
+        let Some(number) = numeric_value_or_none(&value)? else {
+            continue;
+        };
+
+        count += 1;
+        let delta = number - mean;
+        if delta != 0.0 {
+            mean += delta / count as f64;
+            m2 += delta * (number - mean);
+        }
+    }
+
+    let adjusted_count = if sample {
+        count.saturating_sub(1)
+    } else {
+        count
+    };
+    if adjusted_count == 0 {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Double(
+        (m2 / adjusted_count as f64).max(0.0).sqrt(),
+    )))
 }
 
 fn expression_accumulator_items(
@@ -2138,6 +2204,241 @@ fn bson_is_nan(value: &Bson) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn eval_percentile_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (input, p, method) = parse_percentile_expression_spec(value)?;
+    let percentiles = eval_percentile_array_expression(document, p, variables)?;
+    Ok(EvaluatedExpression::Value(Bson::Array(
+        evaluate_quantile_expression(document, input, variables, &percentiles, method)?
+            .into_iter()
+            .map(|item| item.unwrap_or(Bson::Null))
+            .collect(),
+    )))
+}
+
+fn eval_median_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (input, method) = parse_median_expression_spec(value)?;
+    let result = evaluate_quantile_expression(document, input, variables, &[0.5], method)?
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or(Bson::Null);
+    Ok(EvaluatedExpression::Value(result))
+}
+
+fn validate_percentile_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let (input, p, _) = parse_percentile_expression_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    validate_expression_with_scope(p, scope)?;
+    Ok(())
+}
+
+fn validate_median_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, _) = parse_median_expression_spec(value)?;
+    validate_expression_with_scope(input, scope)
+}
+
+fn evaluate_quantile_expression(
+    document: &Document,
+    input: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    percentiles: &[f64],
+    method: QuantileMethod,
+) -> Result<Vec<Option<Bson>>, QueryError> {
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let samples = quantile_samples(input)?;
+    if samples.is_empty() {
+        return Ok(vec![None; percentiles.len()]);
+    }
+
+    if samples.len() == 1 {
+        let value = Bson::Double(samples[0]);
+        return Ok(vec![Some(value); percentiles.len()]);
+    }
+
+    let mut sorted = samples;
+    sorted.sort_by(f64::total_cmp);
+    Ok(percentiles
+        .iter()
+        .map(|percentile| {
+            let value = match method {
+                QuantileMethod::Approximate | QuantileMethod::Discrete => {
+                    discrete_percentile_value(&sorted, *percentile)
+                }
+                QuantileMethod::Continuous => continuous_percentile_value(&sorted, *percentile),
+            };
+            Some(Bson::Double(value))
+        })
+        .collect())
+}
+
+fn quantile_samples(input: EvaluatedExpression) -> Result<Vec<f64>, QueryError> {
+    match input {
+        EvaluatedExpression::Missing => Ok(Vec::new()),
+        EvaluatedExpression::Value(Bson::Array(items)) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                if let Some(value) = numeric_value_or_none(&item)? {
+                    values.push(value);
+                }
+            }
+            Ok(values)
+        }
+        EvaluatedExpression::Value(value) => {
+            Ok(numeric_value_or_none(&value)?.into_iter().collect())
+        }
+    }
+}
+
+fn discrete_percentile_value(sorted: &[f64], percentile: f64) -> f64 {
+    let len = sorted.len();
+    let rank = if percentile >= 1.0 {
+        len - 1
+    } else {
+        std::cmp::max(0, (len as f64 * percentile).ceil() as isize - 1) as usize
+    };
+    sorted[rank]
+}
+
+fn continuous_percentile_value(sorted: &[f64], percentile: f64) -> f64 {
+    let rank = percentile * (sorted.len().saturating_sub(1)) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+
+    interpolate_percentile_values(sorted[lower], sorted[upper], rank - lower as f64)
+}
+
+fn interpolate_percentile_values(lower: f64, upper: f64, fraction: f64) -> f64 {
+    if lower == upper {
+        return lower;
+    }
+    if lower.is_infinite() && upper.is_finite() {
+        return lower;
+    }
+    if lower.is_finite() && upper.is_infinite() {
+        return upper;
+    }
+    if lower.is_infinite() || upper.is_infinite() {
+        return if fraction < 0.5 { lower } else { upper };
+    }
+    ((1.0 - fraction) * lower) + (fraction * upper)
+}
+
+fn parse_percentile_expression_spec(
+    value: &Bson,
+) -> Result<(&Bson, &Bson, QuantileMethod), QueryError> {
+    let Bson::Document(spec) = value else {
+        return Err(QueryError::InvalidStructure);
+    };
+
+    let mut input = None;
+    let mut percentiles = None;
+    let mut method = None;
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "p" => percentiles = Some(value),
+            "method" => method = Some(parse_quantile_method(value)?),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        percentiles.ok_or(QueryError::InvalidStructure)?,
+        method.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
+fn parse_median_expression_spec(value: &Bson) -> Result<(&Bson, QuantileMethod), QueryError> {
+    let Bson::Document(spec) = value else {
+        return Err(QueryError::InvalidStructure);
+    };
+
+    let mut input = None;
+    let mut method = None;
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "method" => method = Some(parse_quantile_method(value)?),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        method.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
+fn parse_quantile_method(value: &Bson) -> Result<QuantileMethod, QueryError> {
+    let (Bson::String(value) | Bson::Symbol(value)) = value else {
+        return Err(QueryError::InvalidArgument(
+            "quantile method must be a string".to_string(),
+        ));
+    };
+
+    match value.as_str() {
+        "approximate" => Ok(QuantileMethod::Approximate),
+        "discrete" => Ok(QuantileMethod::Discrete),
+        "continuous" => Ok(QuantileMethod::Continuous),
+        _ => Err(QueryError::InvalidArgument(
+            "quantile method must be one of `approximate`, `discrete`, or `continuous`".to_string(),
+        )),
+    }
+}
+
+fn eval_percentile_array_expression(
+    document: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Vec<f64>, QueryError> {
+    let value = eval_expression_result_with_variables(document, expression, variables)?;
+    let EvaluatedExpression::Value(Bson::Array(values)) = value else {
+        return Err(QueryError::InvalidArgument(
+            "$percentile requires `p` to evaluate to a non-empty array of numbers from [0, 1]"
+                .to_string(),
+        ));
+    };
+    if values.is_empty() {
+        return Err(QueryError::InvalidArgument(
+            "$percentile requires `p` to evaluate to a non-empty array of numbers from [0, 1]"
+                .to_string(),
+        ));
+    }
+
+    let mut percentiles = Vec::with_capacity(values.len());
+    for value in values {
+        let percentile = numeric_value(&value).map_err(|_| {
+            QueryError::InvalidArgument(
+                "$percentile requires `p` to evaluate to a non-empty array of numbers from [0, 1]"
+                    .to_string(),
+            )
+        })?;
+        if !percentile.is_finite() || !(0.0..=1.0).contains(&percentile) {
+            return Err(QueryError::InvalidArgument(
+                "$percentile requires `p` to evaluate to a non-empty array of numbers from [0, 1]"
+                    .to_string(),
+            ));
+        }
+        percentiles.push(percentile);
+    }
+    Ok(percentiles)
 }
 
 fn eval_convert_expression(

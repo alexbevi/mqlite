@@ -2545,6 +2545,167 @@ fn projection_supports_accumulator_expression_operators() {
 }
 
 #[test]
+fn projection_supports_statistical_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "array": [0, "non-numeric", 1, 2],
+            "continuous": [0, 1, 2],
+            "twoValues": [0, 2],
+            "scalar": 7,
+            "std": [1, 2, 3],
+            "argA": 1,
+            "argB": "skip",
+            "argC": 3,
+            "noNumeric": ["non-numeric", [1, 2, 3]]
+        },
+        Some(&doc! {
+            "percentileDiscrete": {
+                "$percentile": {
+                    "input": "$array",
+                    "p": [0.5, 0.9, 0.1],
+                    "method": "discrete"
+                }
+            },
+            "percentileContinuous": {
+                "$let": {
+                    "vars": { "ps": [0.1, 0.5, 0.9] },
+                    "in": {
+                        "$percentile": {
+                            "input": "$continuous",
+                            "p": "$$ps",
+                            "method": "continuous"
+                        }
+                    }
+                }
+            },
+            "percentileScalar": {
+                "$percentile": {
+                    "input": "$scalar",
+                    "p": [0.25, 0.75],
+                    "method": "approximate"
+                }
+            },
+            "medianDiscrete": { "$median": { "input": "$array", "method": "discrete" } },
+            "medianContinuous": { "$median": { "input": "$twoValues", "method": "continuous" } },
+            "medianNonNumeric": { "$median": { "input": "$noNumeric", "method": "approximate" } },
+            "stdDevPopArray": { "$stdDevPop": "$std" },
+            "stdDevPopArgs": { "$stdDevPop": ["$argA", "$argB", "$argC", Bson::Null] },
+            "stdDevSampArray": { "$stdDevSamp": "$std" },
+            "stdDevSampSingle": { "$stdDevSamp": "$scalar" }
+        }),
+    )
+    .expect("apply projection");
+
+    let percentile_discrete = projected
+        .get_array("percentileDiscrete")
+        .expect("percentile discrete");
+    assert_bson_f64_close(&percentile_discrete[0], 1.0);
+    assert_bson_f64_close(&percentile_discrete[1], 2.0);
+    assert_bson_f64_close(&percentile_discrete[2], 0.0);
+
+    let percentile_continuous = projected
+        .get_array("percentileContinuous")
+        .expect("percentile continuous");
+    assert_bson_f64_close(&percentile_continuous[0], 0.2);
+    assert_bson_f64_close(&percentile_continuous[1], 1.0);
+    assert_bson_f64_close(&percentile_continuous[2], 1.8);
+
+    let percentile_scalar = projected
+        .get_array("percentileScalar")
+        .expect("percentile scalar");
+    assert_bson_f64_close(&percentile_scalar[0], 7.0);
+    assert_bson_f64_close(&percentile_scalar[1], 7.0);
+
+    assert_bson_f64_close(
+        projected.get("medianDiscrete").expect("median discrete"),
+        1.0,
+    );
+    assert_bson_f64_close(
+        projected
+            .get("medianContinuous")
+            .expect("median continuous"),
+        1.0,
+    );
+    assert_eq!(projected.get("medianNonNumeric"), Some(&Bson::Null));
+    assert_bson_f64_close(
+        projected.get("stdDevPopArray").expect("stddev pop"),
+        0.816496580927726,
+    );
+    assert_bson_f64_close(
+        projected.get("stdDevPopArgs").expect("stddev pop args"),
+        1.0,
+    );
+    assert_bson_f64_close(projected.get("stdDevSampArray").expect("stddev samp"), 1.0);
+    assert_eq!(projected.get("stdDevSampSingle"), Some(&Bson::Null));
+}
+
+#[test]
+fn statistical_expression_operators_reject_invalid_inputs() {
+    let missing_percentiles = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3] },
+        Some(&doc! {
+            "out": {
+                "$percentile": {
+                    "input": "$array",
+                    "method": "approximate"
+                }
+            }
+        }),
+    )
+    .expect_err("percentile requires p");
+    assert!(matches!(missing_percentiles, QueryError::InvalidStructure));
+
+    let invalid_percentiles = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3] },
+        Some(&doc! {
+            "out": {
+                "$percentile": {
+                    "input": "$array",
+                    "p": [0.5, 2],
+                    "method": "continuous"
+                }
+            }
+        }),
+    )
+    .expect_err("percentile validates p");
+    assert!(matches!(
+        invalid_percentiles,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_method = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3] },
+        Some(&doc! {
+            "out": {
+                "$percentile": {
+                    "input": "$array",
+                    "p": [0.5],
+                    "method": 5
+                }
+            }
+        }),
+    )
+    .expect_err("percentile validates method");
+    assert!(matches!(invalid_method, QueryError::InvalidArgument(_)));
+
+    let invalid_median = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3] },
+        Some(&doc! {
+            "out": {
+                "$median": {
+                    "input": "$array",
+                    "method": "approximate",
+                    "p": [0.5]
+                }
+            }
+        }),
+    )
+    .expect_err("median rejects unexpected p");
+    assert!(matches!(invalid_median, QueryError::InvalidStructure));
+}
+
+#[test]
 fn projection_supports_n_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -6473,9 +6634,8 @@ fn projection_rejects_unsupported_expression_operator() {
         &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
         Some(&doc! {
             "out": {
-                "$median": {
-                    "input": [1, 2, 3],
-                    "method": "approximate"
+                "$toHashedIndexKey": {
+                    "input": [1, 2, 3]
                 }
             }
         }),
@@ -6484,6 +6644,6 @@ fn projection_rejects_unsupported_expression_operator() {
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$median"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$toHashedIndexKey"
     ));
 }

@@ -201,8 +201,10 @@ Current cross-namespace aggregation behavior:
   include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
   `$setUnion`. Accumulator-style expressions currently include `$sum`, `$avg`, `$min`, and
-  `$max`, while array-selection `N` expressions include `$firstN`, `$lastN`, `$minN`, and
-  `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
+  `$max`, while statistical expressions currently include `$stdDevPop`, `$stdDevSamp`,
+  `$percentile`, and `$median`, with local `approximate`, `discrete`, and `continuous`
+  percentile evaluators over per-document scalar or array inputs. Array-selection `N`
+  expressions include `$firstN`, `$lastN`, `$minN`, and `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
   `$dayOfWeek`, `$dayOfYear`, `$hour`, `$minute`, `$second`, `$millisecond`, `$week`,
   `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction, parsing, formatting,
   and arithmetic currently include `$dateFromString`, `$dateToString`, `$dateFromParts`,

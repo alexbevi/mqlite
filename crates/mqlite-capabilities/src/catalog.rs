@@ -1591,6 +1591,9 @@ mod tests {
             }
             "$max" => doc! { "value": { "$max": ["$left", "$right"] } },
             "$maxN" => doc! { "value": { "$maxN": { "n": 2, "input": "$array" } } },
+            "$median" => {
+                doc! { "value": { "$median": { "input": "$array", "method": "discrete" } } }
+            }
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
             "$millisecond" => doc! { "value": { "$millisecond": "$date" } },
             "$min" => doc! { "value": { "$min": ["$left", "$right"] } },
@@ -1603,6 +1606,9 @@ mod tests {
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$percentile" => {
+                doc! { "value": { "$percentile": { "input": "$array", "p": [0.5, 0.9], "method": "continuous" } } }
+            }
             "$pow" => doc! { "value": { "$pow": [2, 3] } },
             "$rand" => doc! { "value": { "$rand": {} } },
             "$radiansToDegrees" => doc! { "value": { "$radiansToDegrees": std::f64::consts::PI } },
@@ -1660,6 +1666,8 @@ mod tests {
             "$substr" => doc! { "value": { "$substr": ["éclair", 0, 4] } },
             "$substrBytes" => doc! { "value": { "$substrBytes": ["éclair", 0, 4] } },
             "$substrCP" => doc! { "value": { "$substrCP": ["éclair", 0, 4] } },
+            "$stdDevPop" => doc! { "value": { "$stdDevPop": "$array" } },
+            "$stdDevSamp" => doc! { "value": { "$stdDevSamp": "$array" } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$sum" => doc! { "value": { "$sum": [1, 2, 3] } },
             "$switch" => {

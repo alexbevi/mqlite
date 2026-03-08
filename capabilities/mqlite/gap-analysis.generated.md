@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 146 | 6 | 24 |
+| Aggregation expression operators | 176 | 150 | 2 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
+Public upstream: 176. Supported: 150. Unsupported: 2. Ignored: 24.
 
 ### Supported Public
 
@@ -300,6 +300,7 @@ Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
 - `$map`
 - `$max`
 - `$maxN`
+- `$median`
 - `$mergeObjects`
 - `$millisecond`
 - `$min`
@@ -312,6 +313,7 @@ Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
 - `$not`
 - `$objectToArray`
 - `$or`
+- `$percentile`
 - `$pow`
 - `$radiansToDegrees`
 - `$rand`
@@ -339,6 +341,8 @@ Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
 - `$sortArray`
 - `$split`
 - `$sqrt`
+- `$stdDevPop`
+- `$stdDevSamp`
 - `$strLenBytes`
 - `$strLenCP`
 - `$strcasecmp`
@@ -372,11 +376,7 @@ Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
 
 ### Unsupported Public
 
-- `$median`
 - `$meta` (conditional)
-- `$percentile`
-- `$stdDevPop`
-- `$stdDevSamp`
 - `$toHashedIndexKey`
 
 ### Ignored Public
