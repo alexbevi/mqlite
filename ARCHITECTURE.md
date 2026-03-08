@@ -204,11 +204,12 @@ Current cross-namespace aggregation behavior:
   `$max`, while array-selection `N` expressions include `$firstN`, `$lastN`, `$minN`, and
   `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
   `$dayOfWeek`, `$dayOfYear`, `$hour`, `$minute`, `$second`, `$millisecond`, `$week`,
-  `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction and arithmetic
-  currently include `$dateFromParts`, `$dateToParts`, `$dateAdd`, `$dateSubtract`, `$dateDiff`,
-  and `$dateTrunc`, including Mongo-style named timezone arguments over UTC, fixed-offset, and
-  Olson timezone names plus ISO-week construction and week-boundary handling through
-  `startOfWeek`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`,
+  `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction, parsing, formatting,
+  and arithmetic currently include `$dateFromString`, `$dateToString`, `$dateFromParts`,
+  `$dateToParts`, `$dateAdd`, `$dateSubtract`, `$dateDiff`, and `$dateTrunc`, including
+  Mongo-style named timezone arguments over UTC, fixed-offset, and Olson timezone names plus
+  ISO-week construction and week-boundary handling through `startOfWeek`. Basic ASCII string case
+  expressions currently include `$toLower`, `$toUpper`,
   and `$strcasecmp`. Size introspection currently includes `$binarySize` and `$bsonSize`. String
   trimming currently includes `$trim`, `$ltrim`, and `$rtrim`. Logarithmic and power expressions
   currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and

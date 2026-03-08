@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 144 | 8 | 24 |
+| Aggregation expression operators | 176 | 146 | 6 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 144. Unsupported: 8. Ignored: 24.
+Public upstream: 176. Supported: 146. Unsupported: 6. Ignored: 24.
 
 ### Supported Public
 
@@ -256,8 +256,10 @@ Public upstream: 176. Supported: 144. Unsupported: 8. Ignored: 24.
 - `$dateAdd`
 - `$dateDiff`
 - `$dateFromParts`
+- `$dateFromString`
 - `$dateSubtract`
 - `$dateToParts`
+- `$dateToString`
 - `$dateTrunc`
 - `$dayOfMonth`
 - `$dayOfWeek`
@@ -370,8 +372,6 @@ Public upstream: 176. Supported: 144. Unsupported: 8. Ignored: 24.
 
 ### Unsupported Public
 
-- `$dateFromString`
-- `$dateToString`
 - `$median`
 - `$meta` (conditional)
 - `$percentile`

@@ -2223,6 +2223,110 @@ fn projection_supports_date_parts_conversion_expression_operators() {
 }
 
 #[test]
+fn projection_supports_date_string_expression_operators() {
+    let date = bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date");
+    let projected = apply_projection(
+        &doc! { "_id": 1, "date": date, "timezone": "America/New_York" },
+        Some(&doc! {
+            "fromString": { "$dateFromString": { "dateString": "2020-05-14T12:34:56.789Z" } },
+            "fromStringTz": {
+                "$dateFromString": {
+                    "dateString": "2020/05/14 08:34:56",
+                    "format": "%Y/%m/%d %H:%M:%S",
+                    "timezone": "$timezone"
+                }
+            },
+            "fromStringOnNull": {
+                "$dateFromString": {
+                    "dateString": "$missingDateString",
+                    "onNull": "fallback"
+                }
+            },
+            "fromStringOnError": {
+                "$dateFromString": {
+                    "dateString": "not a date",
+                    "onError": "invalid"
+                }
+            },
+            "toStringDefault": { "$dateToString": { "date": "$date" } },
+            "toStringTz": {
+                "$dateToString": {
+                    "date": "$date",
+                    "timezone": "$timezone",
+                    "format": "%Y-%m-%d %H:%M:%S %z (%Z minutes)"
+                }
+            },
+            "toStringIso": {
+                "$dateToString": {
+                    "date": "$date",
+                    "format": "%G-W%V-%u"
+                }
+            },
+            "toStringMonth": {
+                "$dateToString": {
+                    "date": "$date",
+                    "format": "%b (%B) %d, %Y"
+                }
+            },
+            "nullTimezone": {
+                "$dateToString": {
+                    "date": "2020-05-14T12:34:56.789Z",
+                    "timezone": "$missingTz"
+                }
+            },
+            "nullFormat": {
+                "$dateFromString": {
+                    "dateString": "2020-05-14T12:34:56.789Z",
+                    "format": "$missingFormat"
+                }
+            }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("fromString"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("fromStringTz"),
+        Some(&Bson::DateTime(
+            bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.000Z").expect("date")
+        ))
+    );
+    assert_eq!(
+        projected.get("fromStringOnNull"),
+        Some(&Bson::String("fallback".to_string()))
+    );
+    assert_eq!(
+        projected.get("fromStringOnError"),
+        Some(&Bson::String("invalid".to_string()))
+    );
+    assert_eq!(
+        projected.get("toStringDefault"),
+        Some(&Bson::String("2020-05-14T12:34:56.789Z".to_string()))
+    );
+    assert_eq!(
+        projected.get("toStringTz"),
+        Some(&Bson::String(
+            "2020-05-14 08:34:56 -0400 (-240 minutes)".to_string()
+        ))
+    );
+    assert_eq!(
+        projected.get("toStringIso"),
+        Some(&Bson::String("2020-W20-4".to_string()))
+    );
+    assert_eq!(
+        projected.get("toStringMonth"),
+        Some(&Bson::String("May (May) 14, 2020".to_string()))
+    );
+    assert_eq!(projected.get("nullTimezone"), Some(&Bson::Null));
+    assert_eq!(projected.get("nullFormat"), Some(&Bson::Null));
+}
+
+#[test]
 fn date_arithmetic_expression_operators_reject_invalid_inputs() {
     let invalid_unit = apply_projection(
         &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
@@ -2308,6 +2412,76 @@ fn date_parts_conversion_expression_operators_reject_invalid_inputs() {
     )
     .expect_err("dateToParts requires boolean iso flag");
     assert!(matches!(invalid_iso_flag, QueryError::InvalidArgument(_)));
+}
+
+#[test]
+fn date_string_expression_operators_reject_invalid_inputs() {
+    let invalid_from_string_format = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": {
+                "$dateFromString": {
+                    "dateString": "2020-05-14",
+                    "format": "%n"
+                }
+            }
+        }),
+    )
+    .expect_err("dateFromString rejects invalid format directives");
+    assert!(matches!(
+        invalid_from_string_format,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_from_string_type = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": {
+                "$dateFromString": {
+                    "dateString": 5
+                }
+            }
+        }),
+    )
+    .expect_err("dateFromString requires a string input");
+    assert!(matches!(
+        invalid_from_string_type,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_to_string_timezone = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": {
+                "$dateToString": {
+                    "date": "$date",
+                    "timezone": "DoesNot/Exist"
+                }
+            }
+        }),
+    )
+    .expect_err("dateToString requires a valid timezone");
+    assert!(matches!(
+        invalid_to_string_timezone,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_to_string_format = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2020-05-14T12:34:56.789Z").expect("date") },
+        Some(&doc! {
+            "out": {
+                "$dateToString": {
+                    "date": "$date",
+                    "format": 5
+                }
+            }
+        }),
+    )
+    .expect_err("dateToString requires a string format");
+    assert!(matches!(
+        invalid_to_string_format,
+        QueryError::InvalidArgument(_)
+    ));
 }
 
 #[test]
@@ -6299,8 +6473,9 @@ fn projection_rejects_unsupported_expression_operator() {
         &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
         Some(&doc! {
             "out": {
-                "$dateFromString": {
-                    "dateString": "2024-02-01T00:00:00.000Z"
+                "$median": {
+                    "input": [1, 2, 3],
+                    "method": "approximate"
                 }
             }
         }),
@@ -6309,6 +6484,6 @@ fn projection_rejects_unsupported_expression_operator() {
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateFromString"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$median"
     ));
 }

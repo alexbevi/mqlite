@@ -4454,6 +4454,134 @@ fn command_aggregate_project_supports_date_parts_conversion_expression_operators
 }
 
 #[test]
+fn command_aggregate_project_supports_date_string_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("date-string-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2020-05-14T12:34:56.789Z"},"timezone":"America/New_York"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "fromStringMs": { "$toLong": { "$dateFromString": { "dateString": "2020-05-14T12:34:56.789Z" } } },
+                    "fromStringTzMs": {
+                        "$toLong": {
+                            "$dateFromString": {
+                                "dateString": "2020/05/14 08:34:56",
+                                "format": "%Y/%m/%d %H:%M:%S",
+                                "timezone": "$timezone"
+                            }
+                        }
+                    },
+                    "fromStringOnNull": {
+                        "$dateFromString": {
+                            "dateString": "$missingDateString",
+                            "onNull": "fallback"
+                        }
+                    },
+                    "fromStringOnError": {
+                        "$dateFromString": {
+                            "dateString": "not a date",
+                            "onError": "invalid"
+                        }
+                    },
+                    "toStringDefault": { "$dateToString": { "date": "$date" } },
+                    "toStringTz": {
+                        "$dateToString": {
+                            "date": "$date",
+                            "timezone": "$timezone",
+                            "format": "%Y-%m-%d %H:%M:%S %z (%Z minutes)"
+                        }
+                    },
+                    "toStringIso": {
+                        "$dateToString": {
+                            "date": "$date",
+                            "format": "%G-W%V-%u"
+                        }
+                    },
+                    "toStringMonth": {
+                        "$dateToString": {
+                            "date": "$date",
+                            "format": "%b (%B) %d, %Y"
+                        }
+                    },
+                    "nullTimezone": {
+                        "$dateToString": {
+                            "date": "2020-05-14T12:34:56.789Z",
+                            "timezone": "$missingTz"
+                        }
+                    },
+                    "nullFormat": {
+                        "$dateFromString": {
+                            "dateString": "2020-05-14T12:34:56.789Z",
+                            "format": "$missingFormat"
+                        }
+                    }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["fromStringMs"], 1_589_459_696_789_i64);
+    assert_eq!(first["fromStringTzMs"], 1_589_459_696_000_i64);
+    assert_eq!(first["fromStringOnNull"], "fallback");
+    assert_eq!(first["fromStringOnError"], "invalid");
+    assert_eq!(first["toStringDefault"], "2020-05-14T12:34:56.789Z");
+    assert_eq!(
+        first["toStringTz"],
+        "2020-05-14 08:34:56 -0400 (-240 minutes)"
+    );
+    assert_eq!(first["toStringIso"], "2020-W20-4");
+    assert_eq!(first["toStringMonth"], "May (May) 14, 2020");
+    assert_eq!(first["nullTimezone"], Value::Null);
+    assert_eq!(first["nullFormat"], Value::Null);
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -4746,6 +4874,53 @@ fn command_aggregate_project_rejects_invalid_date_parts_conversion_expression() 
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$dateToParts":{"date":"$date","iso8601":"yes"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_date_string_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-date-string-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2020-05-14T12:34:56.789Z"}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$dateFromString":{"dateString":"2020-05-14","format":"%n"}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

@@ -1527,11 +1527,17 @@ mod tests {
             "$dateDiff" => {
                 doc! { "value": { "$dateDiff": { "startDate": "$date", "endDate": "$otherDate", "unit": "week", "startOfWeek": "monday" } } }
             }
+            "$dateFromString" => {
+                doc! { "value": { "$dateFromString": { "dateString": "2020-05-14T12:34:56.789Z" } } }
+            }
             "$dateFromParts" => {
                 doc! { "value": { "$dateFromParts": { "year": 2020, "month": 5, "day": 14, "hour": 12, "minute": 34, "second": 56, "millisecond": 789 } } }
             }
             "$dateSubtract" => {
                 doc! { "value": { "$dateSubtract": { "startDate": "$date", "unit": "day", "amount": 2 } } }
+            }
+            "$dateToString" => {
+                doc! { "value": { "$dateToString": { "date": "$date", "format": "%Y-%m-%d %H:%M:%S %z" } } }
             }
             "$dateToParts" => {
                 doc! { "value": { "$dateToParts": { "date": "$date", "iso8601": true } } }

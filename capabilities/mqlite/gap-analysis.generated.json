@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 144,
-    "public_supported": 144,
-    "total_unsupported": 40,
-    "public_unsupported": 8,
+    "total_supported": 146,
+    "public_supported": 146,
+    "total_unsupported": 38,
+    "public_unsupported": 6,
     "public_ignored": 24,
     "items": [
       {
@@ -3645,8 +3645,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$dateSubtract",
@@ -3699,8 +3699,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$dateTrunc",

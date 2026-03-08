@@ -5,7 +5,7 @@ use std::{
 
 use bson::{Bson, Decimal128, Document, doc, oid::ObjectId};
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, LocalResult, NaiveDate, NaiveDateTime,
+    DateTime, Datelike, Duration, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, Offset,
     SecondsFormat, TimeZone, Timelike, Utc, Weekday,
 };
 use chrono_tz::Tz;
@@ -122,6 +122,7 @@ fn eval_expression_operator(
             DateArithmeticExpressionMode::Add,
         ),
         "$dateDiff" => eval_date_diff_expression(document, value, variables),
+        "$dateFromString" => eval_date_from_string_expression(document, value, variables),
         "$dateFromParts" => eval_date_from_parts_expression(document, value, variables),
         "$dateSubtract" => eval_date_arithmetic_expression(
             document,
@@ -129,6 +130,7 @@ fn eval_expression_operator(
             variables,
             DateArithmeticExpressionMode::Subtract,
         ),
+        "$dateToString" => eval_date_to_string_expression(document, value, variables),
         "$dateToParts" => eval_date_to_parts_expression(document, value, variables),
         "$dateTrunc" => eval_date_trunc_expression(document, value, variables),
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$cmp" => {
@@ -687,7 +689,9 @@ fn validate_expression_operator(
         | "$year" => validate_date_part_expression(value, scope),
         "$dateAdd" | "$dateSubtract" => validate_date_arithmetic_expression(value, scope, operator),
         "$dateDiff" => validate_date_diff_expression(value, scope),
+        "$dateFromString" => validate_date_from_string_expression(value, scope),
         "$dateFromParts" => validate_date_from_parts_expression(value, scope),
+        "$dateToString" => validate_date_to_string_expression(value, scope),
         "$dateToParts" => validate_date_to_parts_expression(value, scope),
         "$dateTrunc" => validate_date_trunc_expression(value, scope),
         "$getField" => {
@@ -4552,6 +4556,136 @@ fn eval_date_from_parts_expression(
     )))
 }
 
+fn eval_date_from_string_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = parse_date_from_string_expression_spec(value)?;
+    let date_string = eval_expression_result_with_variables(document, spec.date_string, variables)?;
+    if date_string.is_nullish() {
+        return match spec.on_null {
+            Some(on_null) => eval_expression_result_with_variables(document, on_null, variables),
+            None => Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+    }
+
+    let date_string = match date_string {
+        EvaluatedExpression::Value(Bson::String(value)) => value,
+        _ => {
+            return match spec.on_error {
+                Some(on_error) => {
+                    eval_expression_result_with_variables(document, on_error, variables)
+                }
+                None => Err(QueryError::InvalidArgument(
+                    "$dateFromString requires `dateString` to evaluate to a string".to_string(),
+                )),
+            };
+        }
+    };
+
+    let format = match spec.format {
+        Some(format) => {
+            let format = eval_expression_result_with_variables(document, format, variables)?;
+            if format.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            Some(require_named_string_operand(
+                format,
+                "$dateFromString",
+                "format",
+            )?)
+        }
+        None => None,
+    };
+
+    let timezone = match spec.timezone {
+        Some(timezone) => {
+            let timezone = eval_expression_result_with_variables(document, timezone, variables)?;
+            if timezone.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            let timezone = require_named_string_operand(timezone, "$dateFromString", "timezone")?;
+            Some(parse_timezone(&timezone).ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$dateFromString requires a valid timezone string".to_string(),
+                )
+            })?)
+        }
+        None => None,
+    };
+
+    let result =
+        match parse_date_from_string_input(&date_string, format.as_deref(), timezone.as_ref()) {
+            Ok(result) => result,
+            Err(error) => {
+                return match spec.on_error {
+                    Some(on_error) => {
+                        eval_expression_result_with_variables(document, on_error, variables)
+                    }
+                    None => Err(error),
+                };
+            }
+        };
+
+    Ok(EvaluatedExpression::Value(Bson::DateTime(
+        bson::DateTime::from_millis(result.timestamp_millis()),
+    )))
+}
+
+fn eval_date_to_string_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = parse_date_to_string_expression_spec(value)?;
+    let date = eval_expression_result_with_variables(document, spec.date, variables)?;
+    if date.is_nullish() {
+        return match spec.on_null {
+            Some(on_null) => eval_expression_result_with_variables(document, on_null, variables),
+            None => Ok(EvaluatedExpression::Value(Bson::Null)),
+        };
+    }
+
+    let format = match spec.format {
+        Some(format) => {
+            let format = eval_expression_result_with_variables(document, format, variables)?;
+            if format.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            Some(require_named_string_operand(
+                format,
+                "$dateToString",
+                "format",
+            )?)
+        }
+        None => None,
+    };
+
+    let timezone = match spec.timezone {
+        Some(timezone) => {
+            let timezone = eval_expression_result_with_variables(document, timezone, variables)?;
+            if timezone.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            let timezone = require_named_string_operand(timezone, "$dateToString", "timezone")?;
+            parse_timezone(&timezone).ok_or_else(|| {
+                QueryError::InvalidArgument(
+                    "$dateToString requires a valid timezone string".to_string(),
+                )
+            })?
+        }
+        None => ResolvedTimeZone::Utc,
+    };
+
+    let date = coerce_date_expression_value(date, "$dateToString", "date")?;
+    let rendered = match format.as_deref() {
+        Some(format) => format_date_to_string(date, &timezone, format)?,
+        None => default_date_to_string(date, &timezone),
+    };
+    Ok(EvaluatedExpression::Value(Bson::String(rendered)))
+}
+
 fn eval_date_to_parts_expression(
     document: &Document,
     value: &Bson,
@@ -4692,6 +4826,21 @@ struct DateFromPartsSpec<'a> {
     iso_week: Option<&'a Bson>,
     iso_day_of_week: Option<&'a Bson>,
     timezone: Option<&'a Bson>,
+}
+
+struct DateFromStringSpec<'a> {
+    date_string: &'a Bson,
+    timezone: Option<&'a Bson>,
+    format: Option<&'a Bson>,
+    on_null: Option<&'a Bson>,
+    on_error: Option<&'a Bson>,
+}
+
+struct DateToStringSpec<'a> {
+    date: &'a Bson,
+    format: Option<&'a Bson>,
+    timezone: Option<&'a Bson>,
+    on_null: Option<&'a Bson>,
 }
 
 struct DateToPartsSpec<'a> {
@@ -4873,6 +5022,69 @@ fn parse_date_from_parts_expression_spec(
     Ok(parsed)
 }
 
+fn parse_date_from_string_expression_spec(
+    value: &Bson,
+) -> Result<DateFromStringSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut date_string = None;
+    let mut timezone = None;
+    let mut format = None;
+    let mut on_null = None;
+    let mut on_error = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "dateString" => date_string = Some(value),
+            "timezone" => timezone = Some(value),
+            "format" => format = Some(value),
+            "onNull" => on_null = Some(value),
+            "onError" => on_error = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateFromString: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok(DateFromStringSpec {
+        date_string: date_string.ok_or(QueryError::InvalidStructure)?,
+        timezone,
+        format,
+        on_null,
+        on_error,
+    })
+}
+
+fn parse_date_to_string_expression_spec(value: &Bson) -> Result<DateToStringSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut date = None;
+    let mut format = None;
+    let mut timezone = None;
+    let mut on_null = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "date" => date = Some(value),
+            "format" => format = Some(value),
+            "timezone" => timezone = Some(value),
+            "onNull" => on_null = Some(value),
+            _ => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Unrecognized argument to $dateToString: {field}"
+                )));
+            }
+        }
+    }
+
+    Ok(DateToStringSpec {
+        date: date.ok_or(QueryError::InvalidStructure)?,
+        format,
+        timezone,
+        on_null,
+    })
+}
+
 fn parse_date_to_parts_expression_spec(value: &Bson) -> Result<DateToPartsSpec<'_>, QueryError> {
     let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
     let mut date = None;
@@ -4956,6 +5168,45 @@ fn validate_date_from_parts_expression(
     Ok(())
 }
 
+fn validate_date_from_string_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let spec = parse_date_from_string_expression_spec(value)?;
+    validate_expression_with_scope(spec.date_string, scope)?;
+    if let Some(timezone) = spec.timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    if let Some(format) = spec.format {
+        validate_expression_with_scope(format, scope)?;
+    }
+    if let Some(on_null) = spec.on_null {
+        validate_expression_with_scope(on_null, scope)?;
+    }
+    if let Some(on_error) = spec.on_error {
+        validate_expression_with_scope(on_error, scope)?;
+    }
+    Ok(())
+}
+
+fn validate_date_to_string_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let spec = parse_date_to_string_expression_spec(value)?;
+    validate_expression_with_scope(spec.date, scope)?;
+    if let Some(format) = spec.format {
+        validate_expression_with_scope(format, scope)?;
+    }
+    if let Some(timezone) = spec.timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    if let Some(on_null) = spec.on_null {
+        validate_expression_with_scope(on_null, scope)?;
+    }
+    Ok(())
+}
+
 fn validate_date_to_parts_expression(
     value: &Bson,
     scope: &BTreeSet<String>,
@@ -4998,6 +5249,245 @@ fn parse_timezone(value: &str) -> Option<ResolvedTimeZone> {
         return Some(ResolvedTimeZone::Fixed(offset));
     }
     value.parse::<Tz>().ok().map(ResolvedTimeZone::Named)
+}
+
+fn parse_date_from_string_input(
+    input: &str,
+    format: Option<&str>,
+    timezone: Option<&ResolvedTimeZone>,
+) -> Result<DateTime<Utc>, QueryError> {
+    match format {
+        Some(format) => parse_date_from_string_with_format(input, format, timezone),
+        None => parse_date_from_string_default(input, timezone),
+    }
+}
+
+fn parse_date_from_string_default(
+    input: &str,
+    timezone: Option<&ResolvedTimeZone>,
+) -> Result<DateTime<Utc>, QueryError> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(input) {
+        if timezone.is_some() {
+            return Err(QueryError::InvalidArgument(
+                "$dateFromString cannot use a timezone argument when dateString contains timezone information".to_string(),
+            ));
+        }
+        return Ok(parsed.with_timezone(&Utc));
+    }
+
+    for pattern in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(input, pattern) {
+            let timezone = timezone.cloned().unwrap_or(ResolvedTimeZone::Utc);
+            return resolve_local_datetime(&timezone, parsed, "$dateFromString");
+        }
+    }
+
+    if let Ok(parsed) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        let timezone = timezone.cloned().unwrap_or(ResolvedTimeZone::Utc);
+        let local = parsed.and_hms_milli_opt(0, 0, 0, 0).expect("midnight");
+        return resolve_local_datetime(&timezone, local, "$dateFromString");
+    }
+
+    Err(QueryError::InvalidArgument(
+        "$dateFromString failed to parse the provided date string".to_string(),
+    ))
+}
+
+fn parse_date_from_string_with_format(
+    input: &str,
+    format: &str,
+    timezone: Option<&ResolvedTimeZone>,
+) -> Result<DateTime<Utc>, QueryError> {
+    let translated = translate_mongo_datetime_parse_format(format)?;
+    if translated.has_timezone && timezone.is_some() {
+        return Err(QueryError::InvalidArgument(
+            "$dateFromString cannot use a timezone argument when the format includes timezone information".to_string(),
+        ));
+    }
+
+    if translated.has_timezone {
+        return DateTime::parse_from_str(input, &translated.chrono_format)
+            .map(|parsed| parsed.with_timezone(&Utc))
+            .map_err(|_| {
+                QueryError::InvalidArgument(
+                    "$dateFromString failed to parse the provided date string".to_string(),
+                )
+            });
+    }
+
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(input, &translated.chrono_format) {
+        let timezone = timezone.cloned().unwrap_or(ResolvedTimeZone::Utc);
+        return resolve_local_datetime(&timezone, parsed, "$dateFromString");
+    }
+
+    NaiveDate::parse_from_str(input, &translated.chrono_format)
+        .map_err(|_| {
+            QueryError::InvalidArgument(
+                "$dateFromString failed to parse the provided date string".to_string(),
+            )
+        })
+        .and_then(|parsed| {
+            let timezone = timezone.cloned().unwrap_or(ResolvedTimeZone::Utc);
+            let local = parsed.and_hms_milli_opt(0, 0, 0, 0).expect("midnight");
+            resolve_local_datetime(&timezone, local, "$dateFromString")
+        })
+}
+
+struct MongoDateParseFormat {
+    chrono_format: String,
+    has_timezone: bool,
+}
+
+fn translate_mongo_datetime_parse_format(format: &str) -> Result<MongoDateParseFormat, QueryError> {
+    let mut translated = String::new();
+    let mut chars = format.chars().peekable();
+    let mut has_timezone = false;
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            translated.push(ch);
+            continue;
+        }
+
+        let directive = chars.next().ok_or_else(|| {
+            QueryError::InvalidArgument("Invalid trailing '%' in format string".to_string())
+        })?;
+        match directive {
+            '%' => translated.push_str("%%"),
+            'Y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'G' | 'V' | 'u' | 'j' | 'b' | 'B' => {
+                translated.push('%');
+                translated.push(directive);
+            }
+            'L' => {
+                if translated.ends_with('.') {
+                    translated.pop();
+                    translated.push_str("%.3f");
+                } else {
+                    translated.push_str("%3f");
+                }
+            }
+            'z' => {
+                has_timezone = true;
+                translated.push_str("%z");
+            }
+            other => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Invalid format character '%{other}' in format string"
+                )));
+            }
+        }
+    }
+
+    Ok(MongoDateParseFormat {
+        chrono_format: translated,
+        has_timezone,
+    })
+}
+
+fn default_date_to_string(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> String {
+    match timezone {
+        ResolvedTimeZone::Utc => format_date_to_string(date, timezone, "%Y-%m-%dT%H:%M:%S.%LZ")
+            .expect("default UTC format"),
+        _ => format_date_to_string(date, timezone, "%Y-%m-%dT%H:%M:%S.%L")
+            .expect("default local format"),
+    }
+}
+
+fn format_date_to_string(
+    date: DateTime<Utc>,
+    timezone: &ResolvedTimeZone,
+    format: &str,
+) -> Result<String, QueryError> {
+    let offset_minutes = timezone_offset_minutes(date, timezone);
+    let parts = date_parts_in_timezone(date, timezone);
+    let mut rendered = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            rendered.push(ch);
+            continue;
+        }
+
+        let directive = chars.next().ok_or_else(|| {
+            QueryError::InvalidArgument("Invalid trailing '%' in format string".to_string())
+        })?;
+        match directive {
+            '%' => rendered.push('%'),
+            'Y' => rendered.push_str(&format!("{:04}", parts.year)),
+            'm' => rendered.push_str(&format!("{:02}", parts.month)),
+            'd' => rendered.push_str(&format!("{:02}", parts.day_of_month)),
+            'H' => rendered.push_str(&format!("{:02}", parts.hour)),
+            'M' => rendered.push_str(&format!("{:02}", parts.minute)),
+            'S' => rendered.push_str(&format!("{:02}", parts.second)),
+            'L' => rendered.push_str(&format!("{:03}", parts.millisecond)),
+            'z' => {
+                let sign = if offset_minutes < 0 { '-' } else { '+' };
+                let total = offset_minutes.abs();
+                rendered.push_str(&format!("{sign}{:02}{:02}", total / 60, total % 60));
+            }
+            'Z' => rendered.push_str(&offset_minutes.to_string()),
+            'G' => rendered.push_str(&format!("{:04}", parts.iso_week_year)),
+            'V' => rendered.push_str(&format!("{:02}", parts.iso_week)),
+            'u' => rendered.push_str(&parts.iso_day_of_week.to_string()),
+            'U' => rendered.push_str(&format!("{:02}", parts.week)),
+            'w' => rendered.push_str(&parts.day_of_week.to_string()),
+            'j' => rendered.push_str(&format!("{:03}", parts.day_of_year)),
+            'b' => rendered.push_str(month_name(parts.month, true)),
+            'B' => rendered.push_str(month_name(parts.month, false)),
+            other => {
+                return Err(QueryError::InvalidArgument(format!(
+                    "Invalid format character '%{other}' in format string"
+                )));
+            }
+        }
+    }
+
+    Ok(rendered)
+}
+
+fn timezone_offset_minutes(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> i32 {
+    match timezone {
+        ResolvedTimeZone::Utc => 0,
+        ResolvedTimeZone::Fixed(offset) => offset.local_minus_utc() / 60,
+        ResolvedTimeZone::Named(timezone) => {
+            date.with_timezone(timezone)
+                .offset()
+                .fix()
+                .local_minus_utc()
+                / 60
+        }
+    }
+}
+
+fn month_name(month: u32, abbreviated: bool) -> &'static str {
+    const SHORT: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const LONG: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+
+    let names = if abbreviated { &SHORT } else { &LONG };
+    month
+        .checked_sub(1)
+        .and_then(|index| names.get(index as usize))
+        .copied()
+        .unwrap_or("")
 }
 
 fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
