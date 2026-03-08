@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 26 | 127 | 23 |
+| Aggregation expression operators | 176 | 35 | 118 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,34 +219,43 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
+Public upstream: 176. Supported: 35. Unsupported: 118. Ignored: 23.
 
 ### Supported Public
 
 - `$abs`
 - `$add`
 - `$and`
+- `$arrayElemAt`
+- `$arrayToObject`
 - `$ceil`
 - `$cmp`
+- `$concatArrays`
 - `$cond`
 - `$const`
 - `$divide`
 - `$eq`
 - `$expr`
+- `$first`
 - `$floor`
 - `$gt`
 - `$gte`
 - `$ifNull`
 - `$in`
+- `$isArray`
+- `$last`
 - `$literal`
 - `$lt`
 - `$lte`
+- `$mergeObjects`
 - `$mod`
 - `$multiply`
 - `$ne`
 - `$not`
+- `$objectToArray`
 - `$or`
 - `$round`
+- `$size`
 - `$subtract`
 - `$trunc`
 
@@ -256,8 +265,6 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$acosh`
 - `$allElementsTrue`
 - `$anyElementTrue`
-- `$arrayElemAt`
-- `$arrayToObject`
 - `$asin`
 - `$asinh`
 - `$atan`
@@ -271,7 +278,6 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$bitXor`
 - `$bsonSize`
 - `$concat`
-- `$concatArrays`
 - `$convert`
 - `$cos`
 - `$cosh`
@@ -289,7 +295,6 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$degreesToRadians`
 - `$exp`
 - `$filter`
-- `$first`
 - `$firstN`
 - `$function`
 - `$getField`
@@ -297,12 +302,10 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$indexOfArray`
 - `$indexOfBytes`
 - `$indexOfCP`
-- `$isArray`
 - `$isNumber`
 - `$isoDayOfWeek`
 - `$isoWeek`
 - `$isoWeekYear`
-- `$last`
 - `$lastN`
 - `$let`
 - `$ln`
@@ -313,14 +316,12 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$max`
 - `$maxN`
 - `$median`
-- `$mergeObjects`
 - `$meta` (conditional)
 - `$millisecond`
 - `$min`
 - `$minN`
 - `$minute`
 - `$month`
-- `$objectToArray`
 - `$percentile`
 - `$pow`
 - `$radiansToDegrees`
@@ -343,7 +344,6 @@ Public upstream: 176. Supported: 26. Unsupported: 127. Ignored: 23.
 - `$setUnion`
 - `$sin`
 - `$sinh`
-- `$size`
 - `$slice`
 - `$sortArray`
 - `$split`

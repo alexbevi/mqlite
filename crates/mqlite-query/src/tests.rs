@@ -810,7 +810,16 @@ fn projection_supports_nested_inclusion_and_computed_fields() {
 
 #[test]
 fn projection_supports_expression_operators() {
-    let document = doc! { "_id": 1, "left": 5, "right": 3, "sku": "abc" };
+    let document = doc! {
+        "_id": 1,
+        "left": 5,
+        "right": 3,
+        "sku": "abc",
+        "array": [1, 2, 3],
+        "empty": [],
+        "object": { "a": 1, "b": 2 },
+        "pairs": [["price", 24], ["item", "apple"]]
+    };
     let projected = apply_projection(
         &document,
         Some(&doc! {
@@ -822,7 +831,10 @@ fn projection_supports_expression_operators() {
             "gte": { "$gte": ["$left", 5] },
             "lt": { "$lt": ["$right", "$left"] },
             "lte": { "$lte": ["$right", 3] },
+            "arrayElemAt": { "$arrayElemAt": ["$array", -1] },
+            "arrayToObject": { "$arrayToObject": "$pairs" },
             "cmp": { "$cmp": ["$left", "$right"] },
+            "concatArrays": { "$concatArrays": ["$array", [4, 5]] },
             "and": { "$and": [true, { "$eq": ["$left", 5] }] },
             "or": { "$or": [false, { "$eq": ["$sku", "abc"] }] },
             "not": { "$not": [{ "$eq": ["$right", 5] }] },
@@ -830,12 +842,18 @@ fn projection_supports_expression_operators() {
             "const": { "$const": "fixed" },
             "divide": { "$divide": [7, 2] },
             "expr": { "$expr": { "$eq": ["$left", 5] } },
+            "first": { "$first": "$array" },
             "floor": { "$floor": 2.8 },
             "ceil": { "$ceil": 2.2 },
             "ifNull": { "$ifNull": [null, "$left"] },
+            "isArray": { "$isArray": "$array" },
+            "last": { "$last": "$array" },
             "mod": { "$mod": [17, 5] },
+            "mergeObjects": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
             "multiply": { "$multiply": ["$left", 2] },
+            "objectToArray": { "$objectToArray": "$object" },
             "round": { "$round": [2.65, 1] },
+            "size": { "$size": "$array" },
             "subtract": { "$subtract": ["$left", "$right"] },
             "trunc": { "$trunc": [2.65, 1] },
             "literal": { "$literal": { "nested": true } }
@@ -855,7 +873,10 @@ fn projection_supports_expression_operators() {
             "gte": true,
             "lt": true,
             "lte": true,
+            "arrayElemAt": 3,
+            "arrayToObject": { "price": 24, "item": "apple" },
             "cmp": 1,
+            "concatArrays": [1, 2, 3, 4, 5],
             "and": true,
             "or": true,
             "not": true,
@@ -863,16 +884,41 @@ fn projection_supports_expression_operators() {
             "const": "fixed",
             "divide": 3.5,
             "expr": true,
+            "first": 1,
             "floor": 2_i64,
             "ceil": 3_i64,
             "ifNull": 5,
+            "isArray": true,
+            "last": 3,
             "mod": 2_i64,
+            "mergeObjects": { "a": 1, "b": 9, "c": 3 },
             "multiply": 10_i64,
+            "objectToArray": [{ "k": "a", "v": 1 }, { "k": "b", "v": 2 }],
             "round": 2.7,
+            "size": 3_i64,
             "subtract": 2_i64,
             "trunc": 2.6,
             "literal": { "nested": true }
         }
+    );
+}
+
+#[test]
+fn projection_preserves_missing_expression_results() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3], "object": { "a": 1 } },
+        Some(&doc! {
+            "outOfBounds": { "$arrayElemAt": ["$array", 5] },
+            "firstEmpty": { "$first": [] },
+            "lastEmpty": { "$last": "$missingArray" },
+            "merged": { "$mergeObjects": ["$object", { "b": "$missingField" }] }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! { "_id": 1, "lastEmpty": Bson::Null, "merged": { "a": 1 } }
     );
 }
 
@@ -913,6 +959,69 @@ fn expression_operators_reject_invalid_numeric_forms() {
     assert!(matches!(
         add_requires_numeric_operands,
         QueryError::ExpectedNumeric
+    ));
+}
+
+#[test]
+fn expression_operators_reject_invalid_array_and_object_forms() {
+    let array_elem_at_requires_an_array = apply_projection(
+        &doc! { "_id": 1, "value": "text" },
+        Some(&doc! { "value": { "$arrayElemAt": ["$value", 0] } }),
+    )
+    .expect_err("arrayElemAt array");
+    assert!(matches!(
+        array_elem_at_requires_an_array,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let array_elem_at_requires_an_integral_index = apply_projection(
+        &doc! { "_id": 1, "array": [1, 2, 3] },
+        Some(&doc! { "value": { "$arrayElemAt": ["$array", 1.5] } }),
+    )
+    .expect_err("arrayElemAt index");
+    assert!(matches!(
+        array_elem_at_requires_an_integral_index,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let size_requires_array_input = apply_projection(
+        &doc! { "_id": 1, "value": 3 },
+        Some(&doc! { "value": { "$size": "$value" } }),
+    )
+    .expect_err("size input");
+    assert!(matches!(
+        size_requires_array_input,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let array_to_object_rejects_mixed_entry_shapes = apply_projection(
+        &doc! { "_id": 1, "entries": [["price", 24], { "k": "item", "v": "apple" }] },
+        Some(&doc! { "value": { "$arrayToObject": "$entries" } }),
+    )
+    .expect_err("arrayToObject mixed");
+    assert!(matches!(
+        array_to_object_rejects_mixed_entry_shapes,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let merge_objects_rejects_non_documents = apply_projection(
+        &doc! { "_id": 1, "value": "text" },
+        Some(&doc! { "value": { "$mergeObjects": ["$value", { "ok": true }] } }),
+    )
+    .expect_err("mergeObjects non document");
+    assert!(matches!(
+        merge_objects_rejects_non_documents,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let object_to_array_rejects_non_documents = apply_projection(
+        &doc! { "_id": 1, "value": [1, 2, 3] },
+        Some(&doc! { "value": { "$objectToArray": "$value" } }),
+    )
+    .expect_err("objectToArray non document");
+    assert!(matches!(
+        object_to_array_rejects_non_documents,
+        QueryError::InvalidArgument(_)
     ));
 }
 

@@ -1066,7 +1066,11 @@ mod tests {
             "_id": 1,
             "left": 5,
             "right": 3,
-            "text": "abc"
+            "text": "abc",
+            "array": [1, 2, 3],
+            "emptyArray": [],
+            "object": { "a": 1, "b": 2 },
+            "pairs": [["price", 24], ["item", "apple"]]
         };
 
         for item in &gap.aggregation_expression_operators.items {
@@ -1081,10 +1085,15 @@ mod tests {
                     let projection = unsupported_expression_projection(&item.name);
                     let error = apply_projection(&document, Some(&projection))
                         .expect_err("unsupported expression operator");
-                    assert!(matches!(
-                        error,
-                        QueryError::UnsupportedOperator(ref operator) if operator == &item.name
-                    ));
+                    assert!(
+                        matches!(
+                            error,
+                            QueryError::UnsupportedOperator(ref operator) if operator == &item.name
+                        ),
+                        "{} rejected with {:?}",
+                        item.name,
+                        error
+                    );
                 }
             }
         }
@@ -1469,27 +1478,36 @@ mod tests {
             "$abs" => doc! { "value": { "$abs": -5 } },
             "$add" => doc! { "value": { "$add": ["$left", "$right", 2] } },
             "$and" => doc! { "value": { "$and": [true, { "$eq": ["$left", "$left"] }] } },
+            "$arrayElemAt" => doc! { "value": { "$arrayElemAt": ["$array", 1] } },
+            "$arrayToObject" => doc! { "value": { "$arrayToObject": "$pairs" } },
             "$ceil" => doc! { "value": { "$ceil": 2.2 } },
             "$cmp" => doc! { "value": { "$cmp": ["$left", "$right"] } },
+            "$concatArrays" => doc! { "value": { "$concatArrays": ["$array", [4, 5]] } },
             "$cond" => doc! { "value": { "$cond": [{ "$eq": ["$left", "$left"] }, "yes", "no"] } },
             "$const" => doc! { "value": { "$const": 5 } },
             "$divide" => doc! { "value": { "$divide": [9, 3] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
             "$expr" => doc! { "value": { "$expr": { "$eq": ["$left", "$left"] } } },
+            "$first" => doc! { "value": { "$first": "$array" } },
             "$floor" => doc! { "value": { "$floor": 2.8 } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
             "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
             "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
             "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
+            "$isArray" => doc! { "value": { "$isArray": "$array" } },
+            "$last" => doc! { "value": { "$last": "$array" } },
             "$literal" => doc! { "value": { "$literal": 5 } },
             "$lt" => doc! { "value": { "$lt": ["$left", "$right"] } },
             "$lte" => doc! { "value": { "$lte": ["$left", "$right"] } },
+            "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
             "$mod" => doc! { "value": { "$mod": [17, 5] } },
             "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },
             "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
+            "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
+            "$size" => doc! { "value": { "$size": "$array" } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
             other => panic!("missing supported expression fixture for {other}"),

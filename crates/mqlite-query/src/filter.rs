@@ -12,8 +12,8 @@ use regex::{Regex as RustRegex, RegexBuilder};
 use crate::{
     QueryError,
     expression::{
-        coerce_to_i64, eval_expression_with_variables, expression_truthy, truncate_f64_to_i64,
-        validate_expression,
+        array_length, coerce_to_i64, eval_expression_with_variables, expression_truthy,
+        truncate_f64_to_i64, validate_expression,
     },
     types::{BitTestMode, MatchExpr, TypeSet},
 };
@@ -203,7 +203,7 @@ fn matches_expression(
             .any(|value| matches_regex(value, pattern, options)),
         MatchExpr::Size { path, size } => path_candidates(document, path)
             .into_iter()
-            .any(|value| value.as_array().is_some_and(|values| values.len() == *size)),
+            .any(|value| array_length(value).is_some_and(|length| length == *size)),
         MatchExpr::BitTest {
             path,
             mode,

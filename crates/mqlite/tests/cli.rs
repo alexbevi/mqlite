@@ -2421,7 +2421,15 @@ fn command_aggregate_project_supports_expression_operators() {
 
     let insert_command = json!({
         "insert": "widgets",
-        "documents": [{ "_id": 1, "left": 5, "right": 3, "text": "abc" }]
+        "documents": [{
+            "_id": 1,
+            "left": 5,
+            "right": 3,
+            "text": "abc",
+            "array": [1, 2, 3],
+            "object": { "a": 1, "b": 2 },
+            "pairs": [["price", 24], ["item", "apple"]]
+        }]
     })
     .to_string();
     let mut insert = Command::cargo_bin("mqlite").expect("binary");
@@ -2454,7 +2462,17 @@ fn command_aggregate_project_supports_expression_operators() {
                     "fallback": { "$ifNull": ["$missing", "$left"] },
                     "cmp": { "$cmp": ["$left", "$right"] },
                     "expr": { "$expr": { "$eq": ["$text", "abc"] } },
-                    "const": { "$const": "fixed" }
+                    "const": { "$const": "fixed" },
+                    "last": { "$arrayElemAt": ["$array", -1] },
+                    "size": { "$size": "$array" },
+                    "isArray": { "$isArray": "$array" },
+                    "merged": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
+                    "expanded": { "$objectToArray": "$object" },
+                    "collapsed": { "$arrayToObject": "$pairs" },
+                    "joined": { "$concatArrays": ["$array", [4, 5]] },
+                    "first": { "$first": "$array" },
+                    "tail": { "$last": "$array" },
+                    "missing": { "$arrayElemAt": ["$array", 99] }
                 }
             }
         ],
@@ -2494,6 +2512,22 @@ fn command_aggregate_project_supports_expression_operators() {
     assert_eq!(first_batch[0]["cmp"], 1);
     assert_eq!(first_batch[0]["expr"], true);
     assert_eq!(first_batch[0]["const"], "fixed");
+    assert_eq!(first_batch[0]["last"], 3);
+    assert_eq!(first_batch[0]["size"], 3);
+    assert_eq!(first_batch[0]["isArray"], true);
+    assert_eq!(first_batch[0]["merged"], json!({ "a": 1, "b": 9, "c": 3 }));
+    assert_eq!(
+        first_batch[0]["expanded"],
+        json!([{ "k": "a", "v": 1 }, { "k": "b", "v": 2 }])
+    );
+    assert_eq!(
+        first_batch[0]["collapsed"],
+        json!({ "price": 24, "item": "apple" })
+    );
+    assert_eq!(first_batch[0]["joined"], json!([1, 2, 3, 4, 5]));
+    assert_eq!(first_batch[0]["first"], 1);
+    assert_eq!(first_batch[0]["tail"], 3);
+    assert!(first_batch[0].get("missing").is_none());
 }
 
 #[test]

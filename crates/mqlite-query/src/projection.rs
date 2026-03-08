@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use bson::{Bson, Document};
 use mqlite_bson::{lookup_path, remove_path, set_path};
 
-use crate::{QueryError, expression::eval_expression_with_variables};
+use crate::{
+    QueryError,
+    expression::{EvaluatedExpression, eval_expression_result_with_variables},
+};
 
 pub fn apply_projection(
     document: &Document,
@@ -69,12 +72,12 @@ pub(crate) fn apply_projection_with_variables(
                     }
                 }
                 Some(false) => {}
-                None => {
-                    projected.insert(
-                        field,
-                        eval_expression_with_variables(document, value, variables)?,
-                    );
-                }
+                None => match eval_expression_result_with_variables(document, value, variables)? {
+                    EvaluatedExpression::Missing => {}
+                    EvaluatedExpression::Value(value) => {
+                        projected.insert(field, value);
+                    }
+                },
             }
         }
 
