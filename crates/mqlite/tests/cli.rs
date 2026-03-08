@@ -1718,6 +1718,112 @@ fn command_aggregate_supports_geo_near_stage() {
 }
 
 #[test]
+fn command_aggregate_project_supports_meta_expression() {
+    const EXPECTED_DISTANCE: f64 = 111_319.490_793_273_57;
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-meta-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"name":"north","loc":{"type":"Point","coordinates":[0.0,1.0]}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$geoNear":{"near":{"type":"Point","coordinates":[0.0,0.0]},"key":"loc","distanceField":"dist","includeLocs":"matchedLoc","spherical":true}},{"$project":{"_id":0,"dist":1,"matchedLoc":1,"distMeta":{"$meta":"geoNearDistance"},"pointMeta":{"$meta":"geoNearPoint"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("document");
+    assert_json_number_close(&first["dist"], EXPECTED_DISTANCE);
+    assert_json_number_close(&first["distMeta"], EXPECTED_DISTANCE);
+    assert_eq!(
+        first["matchedLoc"],
+        json!({ "type": "Point", "coordinates": [0.0, 1.0] })
+    );
+    assert_eq!(
+        first["pointMeta"],
+        json!({ "type": "Point", "coordinates": [0.0, 1.0] })
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_meta_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("command-meta-expression-invalid.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$meta":"searchScore"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_rejects_non_initial_geo_near_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-geo-near-invalid.mongodb");

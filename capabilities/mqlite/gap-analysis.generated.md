@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 150 | 2 | 24 |
+| Aggregation expression operators | 176 | 151 | 1 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 150. Unsupported: 2. Ignored: 24.
+Public upstream: 176. Supported: 151. Unsupported: 1. Ignored: 24.
 
 ### Supported Public
 
@@ -302,6 +302,7 @@ Public upstream: 176. Supported: 150. Unsupported: 2. Ignored: 24.
 - `$maxN`
 - `$median`
 - `$mergeObjects`
+- `$meta` (conditional)
 - `$millisecond`
 - `$min`
 - `$minN`
@@ -376,7 +377,6 @@ Public upstream: 176. Supported: 150. Unsupported: 2. Ignored: 24.
 
 ### Unsupported Public
 
-- `$meta` (conditional)
 - `$toHashedIndexKey`
 
 ### Ignored Public

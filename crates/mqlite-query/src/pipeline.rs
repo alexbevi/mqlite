@@ -42,6 +42,7 @@ const CHANGE_STREAM_SPLIT_TOKEN_FIELD: &str = "fragmentNum";
 const CHANGE_STREAM_SPLIT_EVENT_FIELD: &str = "splitEvent";
 const CHANGE_STREAM_SPLIT_EVENT_FRAGMENT_FIELD: &str = "fragment";
 const CHANGE_STREAM_SPLIT_EVENT_TOTAL_FIELD: &str = "of";
+pub(crate) const INTERNAL_METADATA_FIELD: &str = "_mqliteMeta";
 
 pub fn run_pipeline(
     documents: Vec<Document>,
@@ -282,7 +283,13 @@ fn run_pipeline_with_context<R: CollectionResolver>(
         validate_change_stream_output_sizes(&current)?;
     }
 
-    Ok(current)
+    Ok(current
+        .into_iter()
+        .map(|mut document| {
+            document.remove(INTERNAL_METADATA_FIELD);
+            document
+        })
+        .collect())
 }
 
 fn facet_documents<R: CollectionResolver>(
@@ -1227,9 +1234,15 @@ fn geo_near_documents(
             .map_err(|_| QueryError::InvalidStructure)?;
         }
         if let Some(include_locs) = &spec.include_locs {
-            set_path(&mut document, include_locs, location_bson)
+            set_path(&mut document, include_locs, location_bson.clone())
                 .map_err(|_| QueryError::InvalidStructure)?;
         }
+        set_internal_metadata(
+            &mut document,
+            "geoNearDistance",
+            Bson::Double(distance * spec.distance_multiplier),
+        );
+        set_internal_metadata(&mut document, "geoNearPoint", location_bson);
 
         results.push((distance, document));
     }
@@ -1241,6 +1254,19 @@ fn geo_near_documents(
     });
 
     Ok(results.into_iter().map(|(_, document)| document).collect())
+}
+
+fn set_internal_metadata(document: &mut Document, key: &str, value: Bson) {
+    match document.get_mut(INTERNAL_METADATA_FIELD) {
+        Some(Bson::Document(metadata)) => {
+            metadata.insert(key, value);
+        }
+        _ => {
+            let mut metadata = Document::new();
+            metadata.insert(key, value);
+            document.insert(INTERNAL_METADATA_FIELD, Bson::Document(metadata));
+        }
+    }
 }
 
 fn parse_geo_near_spec(spec: &Bson) -> Result<GeoNearStage, QueryError> {

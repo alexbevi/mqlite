@@ -2706,6 +2706,61 @@ fn statistical_expression_operators_reject_invalid_inputs() {
 }
 
 #[test]
+fn projection_supports_meta_expression_operator() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            crate::pipeline::INTERNAL_METADATA_FIELD: {
+                "geoNearDistance": 2.5,
+                "geoNearPoint": [0.0, 1.0],
+                "indexKey": { "a": 1 },
+                "recordId": 42,
+                "sortKey": { "qty": 1 }
+            }
+        },
+        Some(&doc! {
+            "distance": { "$meta": "geoNearDistance" },
+            "point": { "$meta": "geoNearPoint" },
+            "indexKey": { "$meta": "indexKey" },
+            "recordId": { "$meta": "recordId" },
+            "sortKey": { "$meta": "sortKey" },
+            "missing": { "$meta": "randVal" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_bson_f64_close(projected.get("distance").expect("distance"), 2.5);
+    assert_eq!(
+        projected.get("point"),
+        Some(&Bson::Array(vec![Bson::Double(0.0), Bson::Double(1.0)]))
+    );
+    assert_eq!(
+        projected.get("indexKey"),
+        Some(&Bson::Document(doc! { "a": 1 }))
+    );
+    assert_eq!(projected.get("recordId"), Some(&Bson::Int32(42)));
+    assert_eq!(
+        projected.get("sortKey"),
+        Some(&Bson::Document(doc! { "qty": 1 }))
+    );
+    assert!(!projected.contains_key("missing"));
+}
+
+#[test]
+fn meta_expression_rejects_invalid_inputs() {
+    let non_string = apply_projection(&doc! { "_id": 1 }, Some(&doc! { "out": { "$meta": 5 } }))
+        .expect_err("meta requires string arguments");
+    assert!(matches!(non_string, QueryError::InvalidArgument(_)));
+
+    let unsupported_field = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! { "out": { "$meta": "searchScore" } }),
+    )
+    .expect_err("meta rejects unsupported fields");
+    assert!(matches!(unsupported_field, QueryError::InvalidArgument(_)));
+}
+
+#[test]
 fn projection_supports_n_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -4893,6 +4948,56 @@ fn geo_near_stage_supports_spherical_geojson_points() {
 
     let distance = results[0].get_f64("dist").expect("distance");
     assert!((distance - 111_319.49).abs() < 10.0);
+}
+
+#[test]
+fn geo_near_stage_exposes_meta_fields_to_project() {
+    const EXPECTED_DISTANCE: f64 = 111_319.490_793_273_57;
+    let results = run_pipeline_ok(
+        vec![doc! {
+            "name": "north",
+            "loc": { "type": "Point", "coordinates": [0.0, 1.0] }
+        }],
+        &[
+            doc! {
+                "$geoNear": {
+                    "near": { "type": "Point", "coordinates": [0.0, 0.0] },
+                    "key": "loc",
+                    "distanceField": "dist",
+                    "includeLocs": "matchedLoc",
+                    "spherical": true
+                }
+            },
+            doc! {
+                "$project": {
+                    "_id": 0,
+                    "dist": 1,
+                    "matchedLoc": 1,
+                    "distMeta": { "$meta": "geoNearDistance" },
+                    "pointMeta": { "$meta": "geoNearPoint" }
+                }
+            },
+        ],
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_bson_f64_close(results[0].get("dist").expect("dist"), EXPECTED_DISTANCE);
+    assert_bson_f64_close(
+        results[0].get("distMeta").expect("distMeta"),
+        EXPECTED_DISTANCE,
+    );
+    assert_eq!(
+        results[0].get("matchedLoc"),
+        Some(&Bson::Document(
+            doc! { "type": "Point", "coordinates": [0.0, 1.0] }
+        ))
+    );
+    assert_eq!(
+        results[0].get("pointMeta"),
+        Some(&Bson::Document(
+            doc! { "type": "Point", "coordinates": [0.0, 1.0] }
+        ))
+    );
 }
 
 #[test]

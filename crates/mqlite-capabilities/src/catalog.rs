@@ -1594,6 +1594,7 @@ mod tests {
             "$median" => {
                 doc! { "value": { "$median": { "input": "$array", "method": "discrete" } } }
             }
+            "$meta" => doc! { "value": { "$meta": "geoNearDistance" } },
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
             "$millisecond" => doc! { "value": { "$millisecond": "$date" } },
             "$min" => doc! { "value": { "$min": ["$left", "$right"] } },

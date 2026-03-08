@@ -203,7 +203,10 @@ Current cross-namespace aggregation behavior:
   `$setUnion`. Accumulator-style expressions currently include `$sum`, `$avg`, `$min`, and
   `$max`, while statistical expressions currently include `$stdDevPop`, `$stdDevSamp`,
   `$percentile`, and `$median`, with local `approximate`, `discrete`, and `continuous`
-  percentile evaluators over per-document scalar or array inputs. Array-selection `N`
+  percentile evaluators over per-document scalar or array inputs. Metadata expressions currently
+  include `$meta` over broker-local `geoNearDistance`, `geoNearPoint`, `indexKey`, `recordId`,
+  `sortKey`, `randVal`, and `textScore` slots when upstream stages or planners attach them to the
+  in-flight document stream. Array-selection `N`
   expressions include `$firstN`, `$lastN`, `$minN`, and `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
   `$dayOfWeek`, `$dayOfYear`, `$hour`, `$minute`, `$second`, `$millisecond`, `$week`,
   `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction, parsing, formatting,

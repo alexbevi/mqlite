@@ -156,6 +156,7 @@
     "$maxN",
     "$median",
     "$mergeObjects",
+    "$meta",
     "$millisecond",
     "$min",
     "$minN",

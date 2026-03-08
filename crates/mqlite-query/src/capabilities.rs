@@ -155,6 +155,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$max",
     "$maxN",
     "$median",
+    "$meta",
     "$mergeObjects",
     "$millisecond",
     "$min",

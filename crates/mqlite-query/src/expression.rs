@@ -15,7 +15,7 @@ use regex::Regex as RustRegex;
 use crate::{
     QueryError,
     filter::{bson_type_alias, compile_regex},
-    pipeline::{compare_documents_by_sort, validate_sort_spec},
+    pipeline::{INTERNAL_METADATA_FIELD, compare_documents_by_sort, validate_sort_spec},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +222,7 @@ fn eval_expression_operator(
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Avg)
         }
         "$median" => eval_median_expression(document, value, variables),
+        "$meta" => eval_meta_expression(document, value),
         "$concat" => eval_concat_expression(document, value, variables),
         "$isNumber" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(
@@ -627,6 +628,7 @@ fn validate_expression_operator(
 ) -> Result<(), QueryError> {
     match operator {
         "$const" | "$literal" => Ok(()),
+        "$meta" => validate_meta_expression(value),
         "$expr" | "$abs" | "$acos" | "$acosh" | "$asin" | "$asinh" | "$atan" | "$atanh"
         | "$ceil" | "$cos" | "$cosh" | "$degreesToRadians" | "$exp" | "$first" | "$floor"
         | "$isArray" | "$isNumber" | "$last" | "$ln" | "$objectToArray" | "$radiansToDegrees"
@@ -2203,6 +2205,48 @@ fn bson_is_nan(value: &Bson) -> bool {
             .map(f64::is_nan)
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+fn eval_meta_expression(
+    document: &Document,
+    value: &Bson,
+) -> Result<EvaluatedExpression, QueryError> {
+    let meta_path = parse_meta_expression_path(value)?;
+    let Some(Bson::Document(metadata)) = document.get(INTERNAL_METADATA_FIELD) else {
+        return Ok(EvaluatedExpression::Missing);
+    };
+    Ok(lookup_path_owned(metadata, meta_path)
+        .map(EvaluatedExpression::Value)
+        .unwrap_or(EvaluatedExpression::Missing))
+}
+
+fn validate_meta_expression(value: &Bson) -> Result<(), QueryError> {
+    parse_meta_expression_path(value).map(|_| ())
+}
+
+fn parse_meta_expression_path(value: &Bson) -> Result<&str, QueryError> {
+    let (Bson::String(meta) | Bson::Symbol(meta)) = value else {
+        return Err(QueryError::InvalidArgument(
+            "$meta only supports string arguments".to_string(),
+        ));
+    };
+    let root = meta.split('.').next().unwrap_or_default();
+    if matches!(
+        root,
+        "geoNearDistance"
+            | "geoNearPoint"
+            | "indexKey"
+            | "recordId"
+            | "sortKey"
+            | "randVal"
+            | "textScore"
+    ) {
+        Ok(meta)
+    } else {
+        Err(QueryError::InvalidArgument(format!(
+            "$meta field `{meta}` is not supported in mqlite"
+        )))
     }
 }
 

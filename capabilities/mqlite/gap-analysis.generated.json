@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 150,
-    "public_supported": 150,
-    "total_unsupported": 34,
-    "public_unsupported": 2,
+    "total_supported": 151,
+    "public_supported": 151,
+    "total_unsupported": 33,
+    "public_unsupported": 1,
     "public_ignored": 24,
     "items": [
       {
@@ -4617,8 +4617,8 @@
         "feature_flagged": false,
         "conditional": true,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$millisecond",
