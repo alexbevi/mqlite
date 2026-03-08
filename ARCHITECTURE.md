@@ -201,7 +201,8 @@ Current cross-namespace aggregation behavior:
   include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
   `$setUnion`. Accumulator-style expressions currently include `$sum`, `$avg`, `$min`, and
-  `$max`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
+  `$max`, while array-selection `N` expressions include `$firstN`, `$lastN`, `$minN`, and
+  `$maxN`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
   `$strcasecmp`. Size introspection currently includes `$binarySize` and `$bsonSize`. String
   trimming currently includes `$trim`, `$ltrim`, and `$rtrim`. Logarithmic and power expressions
   currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and

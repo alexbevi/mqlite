@@ -1527,6 +1527,7 @@ mod tests {
                 doc! { "value": { "$filter": { "input": "$array", "as": "value", "cond": { "$gt": ["$$value", 1] } } } }
             }
             "$first" => doc! { "value": { "$first": "$array" } },
+            "$firstN" => doc! { "value": { "$firstN": { "n": 2, "input": "$array" } } },
             "$floor" => doc! { "value": { "$floor": 2.8 } },
             "$getField" => doc! { "value": { "$getField": { "field": "a", "input": "$object" } } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
@@ -1539,6 +1540,7 @@ mod tests {
             "$isArray" => doc! { "value": { "$isArray": "$array" } },
             "$isNumber" => doc! { "value": { "$isNumber": "$left" } },
             "$last" => doc! { "value": { "$last": "$array" } },
+            "$lastN" => doc! { "value": { "$lastN": { "n": 2, "input": "$array" } } },
             "$let" => {
                 doc! { "value": { "$let": { "vars": { "factor": 10 }, "in": { "$add": ["$left", "$$factor"] } } } }
             }
@@ -1552,8 +1554,10 @@ mod tests {
                 doc! { "value": { "$map": { "input": "$array", "as": "value", "in": { "$add": ["$$value", 1] } } } }
             }
             "$max" => doc! { "value": { "$max": ["$left", "$right"] } },
+            "$maxN" => doc! { "value": { "$maxN": { "n": 2, "input": "$array" } } },
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
             "$min" => doc! { "value": { "$min": ["$left", "$right"] } },
+            "$minN" => doc! { "value": { "$minN": { "n": 2, "input": "$array" } } },
             "$mod" => doc! { "value": { "$mod": [17, 5] } },
             "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },
             "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },

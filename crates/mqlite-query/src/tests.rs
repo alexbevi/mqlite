@@ -2090,6 +2090,83 @@ fn projection_supports_accumulator_expression_operators() {
 }
 
 #[test]
+fn projection_supports_n_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "a": [1, 2, 3, 5, 7, 9],
+            "n": 4,
+            "diff": 2,
+            "nullable": [Bson::Null, 2, Bson::Null, 1]
+        },
+        Some(&doc! {
+            "minStatic": { "$minN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+            "maxStatic": { "$maxN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+            "firstStatic": { "$firstN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+            "lastStatic": { "$lastN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+            "minField": { "$minN": { "n": 3, "input": "$a" } },
+            "maxField": { "$maxN": { "n": "$n", "input": "$a" } },
+            "firstExprN": { "$firstN": { "n": { "$subtract": ["$n", "$diff"] }, "input": [3, 4, 5] } },
+            "lastField": { "$lastN": { "n": "$n", "input": "$a" } },
+            "minSkipsNullish": { "$minN": { "n": 3, "input": "$nullable" } },
+            "maxSkipsNullish": { "$maxN": { "n": 3, "input": "$nullable" } },
+            "firstPreservesNullish": { "$firstN": { "n": 3, "input": "$nullable" } },
+            "lastPreservesNullish": { "$lastN": { "n": 3, "input": "$nullable" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("minStatic"),
+        Some(&Bson::Array(vec![1.into(), 2.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("maxStatic"),
+        Some(&Bson::Array(vec![5.into(), 4.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("firstStatic"),
+        Some(&Bson::Array(vec![5.into(), 4.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("lastStatic"),
+        Some(&Bson::Array(vec![3.into(), 2.into(), 1.into()]))
+    );
+    assert_eq!(
+        projected.get("minField"),
+        Some(&Bson::Array(vec![1.into(), 2.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("maxField"),
+        Some(&Bson::Array(vec![9.into(), 7.into(), 5.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("firstExprN"),
+        Some(&Bson::Array(vec![3.into(), 4.into()]))
+    );
+    assert_eq!(
+        projected.get("lastField"),
+        Some(&Bson::Array(vec![3.into(), 5.into(), 7.into(), 9.into()]))
+    );
+    assert_eq!(
+        projected.get("minSkipsNullish"),
+        Some(&Bson::Array(vec![1.into(), 2.into()]))
+    );
+    assert_eq!(
+        projected.get("maxSkipsNullish"),
+        Some(&Bson::Array(vec![2.into(), 1.into()]))
+    );
+    assert_eq!(
+        projected.get("firstPreservesNullish"),
+        Some(&Bson::Array(vec![Bson::Null, 2.into(), Bson::Null]))
+    );
+    assert_eq!(
+        projected.get("lastPreservesNullish"),
+        Some(&Bson::Array(vec![2.into(), Bson::Null, 1.into()]))
+    );
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -2186,6 +2263,54 @@ fn utility_expression_operators_reject_invalid_inputs() {
         non_array_zip_input,
         QueryError::InvalidArgument(_)
     ));
+}
+
+#[test]
+fn n_expression_operators_reject_invalid_inputs() {
+    let invalid_shape = apply_projection(
+        &doc! { "_id": 1, "value": [1, 2, 3] },
+        Some(&doc! {
+            "out": { "$firstN": [1, 2, 3] }
+        }),
+    )
+    .expect_err("n expressions require named arguments");
+    assert!(matches!(invalid_shape, QueryError::InvalidStructure));
+
+    let missing_n = apply_projection(
+        &doc! { "_id": 1, "value": [1, 2, 3] },
+        Some(&doc! {
+            "out": { "$firstN": { "input": "$value" } }
+        }),
+    )
+    .expect_err("n expressions require n");
+    assert!(matches!(missing_n, QueryError::InvalidStructure));
+
+    let non_array_input = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$lastN": { "n": 2, "input": "$value" } }
+        }),
+    )
+    .expect_err("n expressions require array input");
+    assert!(matches!(non_array_input, QueryError::InvalidArgument(_)));
+
+    let non_integral_n = apply_projection(
+        &doc! { "_id": 1, "value": [1, 2, 3] },
+        Some(&doc! {
+            "out": { "$minN": { "n": 2.5, "input": "$value" } }
+        }),
+    )
+    .expect_err("n must be integral");
+    assert!(matches!(non_integral_n, QueryError::InvalidArgument(_)));
+
+    let non_positive_n = apply_projection(
+        &doc! { "_id": 1, "value": [1, 2, 3] },
+        Some(&doc! {
+            "out": { "$maxN": { "n": 0, "input": "$value" } }
+        }),
+    )
+    .expect_err("n must be positive");
+    assert!(matches!(non_positive_n, QueryError::InvalidArgument(_)));
 }
 
 #[test]

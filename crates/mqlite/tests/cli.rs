@@ -4087,6 +4087,87 @@ fn command_aggregate_project_supports_accumulator_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_n_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("n-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"a":[1,2,3,5,7,9],"n":4,"diff":2,"nullable":[null,2,null,1]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "minStatic": { "$minN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+                    "maxStatic": { "$maxN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+                    "firstStatic": { "$firstN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+                    "lastStatic": { "$lastN": { "n": 3, "input": [5, 4, 3, 2, 1] } },
+                    "minField": { "$minN": { "n": 3, "input": "$a" } },
+                    "maxField": { "$maxN": { "n": "$n", "input": "$a" } },
+                    "firstExprN": { "$firstN": { "n": { "$subtract": ["$n", "$diff"] }, "input": [3, 4, 5] } },
+                    "lastField": { "$lastN": { "n": "$n", "input": "$a" } },
+                    "minSkipsNullish": { "$minN": { "n": 3, "input": "$nullable" } },
+                    "maxSkipsNullish": { "$maxN": { "n": 3, "input": "$nullable" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["minStatic"], json!([1, 2, 3]));
+    assert_eq!(first["maxStatic"], json!([5, 4, 3]));
+    assert_eq!(first["firstStatic"], json!([5, 4, 3]));
+    assert_eq!(first["lastStatic"], json!([3, 2, 1]));
+    assert_eq!(first["minField"], json!([1, 2, 3]));
+    assert_eq!(first["maxField"], json!([9, 7, 5, 3]));
+    assert_eq!(first["firstExprN"], json!([3, 4]));
+    assert_eq!(first["lastField"], json!([3, 5, 7, 9]));
+    assert_eq!(first["minSkipsNullish"], json!([1, 2]));
+    assert_eq!(first["maxSkipsNullish"], json!([2, 1]));
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -4195,6 +4276,51 @@ fn command_aggregate_project_rejects_invalid_utility_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$tsSecond":"$value"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_n_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-n-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":[1,2,3]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$firstN":{"n":0,"input":"$value"}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

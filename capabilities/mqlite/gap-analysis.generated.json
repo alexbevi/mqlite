@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 121,
-    "public_supported": 121,
-    "total_unsupported": 63,
-    "public_unsupported": 31,
+    "total_supported": 125,
+    "public_supported": 125,
+    "total_unsupported": 59,
+    "public_unsupported": 27,
     "public_ignored": 24,
     "items": [
       {
@@ -4005,8 +4005,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$floor",
@@ -4365,8 +4365,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$let",
@@ -4563,8 +4563,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$median",
@@ -4671,8 +4671,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$minute",

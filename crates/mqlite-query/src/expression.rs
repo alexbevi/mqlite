@@ -234,6 +234,7 @@ fn eval_expression_operator(
         "$convert" => eval_convert_expression(document, value, variables),
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
+        "$firstN" => eval_n_expression(document, value, variables, NExpressionMode::First),
         "$getField" => eval_get_field_expression(document, value, variables),
         "$rand" => eval_rand_expression(value),
         "$exp" => eval_nullable_unary_math_expression(document, value, variables, |number| {
@@ -286,14 +287,17 @@ fn eval_expression_operator(
             EvaluatedExpression::Value(Bson::Array(_))
         )))),
         "$last" => eval_first_last_expression(document, value, variables, false),
+        "$lastN" => eval_n_expression(document, value, variables, NExpressionMode::Last),
         "$map" => eval_map_expression(document, value, variables),
         "$max" => {
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Max)
         }
+        "$maxN" => eval_n_expression(document, value, variables, NExpressionMode::Max),
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
         "$min" => {
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Min)
         }
+        "$minN" => eval_n_expression(document, value, variables, NExpressionMode::Min),
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
@@ -641,6 +645,7 @@ fn validate_expression_operator(
         }
         "$let" => validate_let_expression(value, scope),
         "$map" => validate_map_expression(value, scope),
+        "$firstN" | "$lastN" | "$maxN" | "$minN" => validate_n_expression(value, scope),
         "$rand" => validate_rand_expression(value),
         "$switch" => validate_switch_expression(value, scope),
         "$range" => {
@@ -1807,6 +1812,14 @@ enum RegexExpressionMode {
     Find,
     FindAll,
     Match,
+}
+
+#[derive(Clone, Copy)]
+enum NExpressionMode {
+    First,
+    Last,
+    Max,
+    Min,
 }
 
 fn eval_expression_accumulator(
@@ -3053,6 +3066,13 @@ fn validate_regex_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(
     Ok(())
 }
 
+fn validate_n_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, n) = parse_n_expression_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    validate_expression_with_scope(n, scope)?;
+    Ok(())
+}
+
 fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     match value {
         Bson::Document(spec) => {
@@ -3155,6 +3175,25 @@ fn parse_regex_expression_spec(value: &Bson) -> Result<(&Bson, &Bson, Option<&Bs
         input.ok_or(QueryError::InvalidStructure)?,
         regex.ok_or(QueryError::InvalidStructure)?,
         options,
+    ))
+}
+
+fn parse_n_expression_spec(value: &Bson) -> Result<(&Bson, &Bson), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut n = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "n" => n = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        n.ok_or(QueryError::InvalidStructure)?,
     ))
 }
 
@@ -3939,6 +3978,63 @@ fn eval_first_last_expression(
         .unwrap_or(EvaluatedExpression::Missing))
 }
 
+fn eval_n_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    mode: NExpressionMode,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = match mode {
+        NExpressionMode::First => "$firstN",
+        NExpressionMode::Last => "$lastN",
+        NExpressionMode::Max => "$maxN",
+        NExpressionMode::Min => "$minN",
+    };
+    let (input, n) = parse_n_expression_spec(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let n = eval_expression_with_variables(document, n, variables)?;
+
+    let EvaluatedExpression::Value(Bson::Array(items)) = input else {
+        return Err(QueryError::InvalidArgument(format!(
+            "{operator} requires `input` to evaluate to an array"
+        )));
+    };
+
+    let n = exact_positive_usize(&n).ok_or_else(|| {
+        QueryError::InvalidArgument(format!(
+            "{operator} requires `n` to evaluate to a positive integral value"
+        ))
+    })?;
+
+    let result = match mode {
+        NExpressionMode::First => items.into_iter().take(n).collect(),
+        NExpressionMode::Last => {
+            let start = items.len().saturating_sub(n);
+            items.into_iter().skip(start).collect()
+        }
+        NExpressionMode::Min => {
+            let mut values = items
+                .into_iter()
+                .filter(|value| !matches!(value, Bson::Null | Bson::Undefined))
+                .collect::<Vec<_>>();
+            values.sort_by(compare_bson);
+            values.truncate(n);
+            values
+        }
+        NExpressionMode::Max => {
+            let mut values = items
+                .into_iter()
+                .filter(|value| !matches!(value, Bson::Null | Bson::Undefined))
+                .collect::<Vec<_>>();
+            values.sort_by(|left, right| compare_bson(right, left));
+            values.truncate(n);
+            values
+        }
+    };
+
+    Ok(EvaluatedExpression::Value(Bson::Array(result)))
+}
+
 fn eval_concat_arrays_expression(
     document: &Document,
     value: &Bson,
@@ -4279,6 +4375,25 @@ pub(crate) fn coerce_to_i64(value: &Bson) -> Option<i64> {
         Bson::Decimal128(value) => truncate_f64_to_i64(value.to_string().parse::<f64>().ok()?),
         _ => None,
     }
+}
+
+fn exact_positive_usize(value: &Bson) -> Option<usize> {
+    let integer = match value {
+        Bson::Int32(value) if *value > 0 => *value as i64,
+        Bson::Int64(value) if *value > 0 => *value,
+        Bson::Double(value) if value.is_finite() && value.fract() == 0.0 && *value > 0.0 => {
+            *value as i64
+        }
+        Bson::Decimal128(value) => {
+            let parsed = value.to_string().parse::<f64>().ok()?;
+            if !(parsed.is_finite() && parsed.fract() == 0.0 && parsed > 0.0) {
+                return None;
+            }
+            parsed as i64
+        }
+        _ => return None,
+    };
+    usize::try_from(integer).ok()
 }
 
 pub(crate) fn truncate_f64_to_i64(value: f64) -> Option<i64> {

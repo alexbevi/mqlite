@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 121 | 31 | 24 |
+| Aggregation expression operators | 176 | 125 | 27 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
+Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 
 ### Supported Public
 
@@ -260,6 +260,7 @@ Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
 - `$expr`
 - `$filter`
 - `$first`
+- `$firstN`
 - `$floor`
 - `$getField`
 - `$gt`
@@ -272,6 +273,7 @@ Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
 - `$isArray`
 - `$isNumber`
 - `$last`
+- `$lastN`
 - `$let`
 - `$literal`
 - `$ln`
@@ -282,8 +284,10 @@ Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
 - `$ltrim`
 - `$map`
 - `$max`
+- `$maxN`
 - `$mergeObjects`
 - `$min`
+- `$minN`
 - `$mod`
 - `$multiply`
 - `$ne`
@@ -358,17 +362,13 @@ Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
 - `$dayOfMonth`
 - `$dayOfWeek`
 - `$dayOfYear`
-- `$firstN`
 - `$hour`
 - `$isoDayOfWeek`
 - `$isoWeek`
 - `$isoWeekYear`
-- `$lastN`
-- `$maxN`
 - `$median`
 - `$meta` (conditional)
 - `$millisecond`
-- `$minN`
 - `$minute`
 - `$month`
 - `$percentile`
