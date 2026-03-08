@@ -1342,6 +1342,103 @@ fn switch_expression_rejects_invalid_arguments() {
 }
 
 #[test]
+fn projection_supports_set_expressions() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "arr1": [1, 2, 3, 2, 1],
+            "arr2": [2, 3, 4, 3],
+            "nested": [[1], [1], [2]]
+        },
+        Some(&doc! {
+            "union": { "$setUnion": ["$arr1", "$arr2"] },
+            "intersection": { "$setIntersection": ["$arr1", "$arr2"] },
+            "difference": { "$setDifference": ["$arr1", "$arr2"] },
+            "equals": { "$setEquals": ["$arr1", [1, 2, 3, 2]] },
+            "isSubset": { "$setIsSubset": [[2, 3], "$arr2"] },
+            "nestedUnion": { "$setUnion": ["$nested", [[2], [3]]] },
+            "emptyUnion": { "$setUnion": [] },
+            "emptyIntersection": { "$setIntersection": [] }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "union": [1, 2, 3, 4],
+            "intersection": [2, 3],
+            "difference": [1],
+            "equals": true,
+            "isSubset": true,
+            "nestedUnion": [[1], [2], [3]],
+            "emptyUnion": Bson::Array(Vec::new()),
+            "emptyIntersection": Bson::Array(Vec::new())
+        }
+    );
+}
+
+#[test]
+fn set_expressions_handle_nullish_and_invalid_inputs() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "arr": Bson::Null },
+        Some(&doc! {
+            "union": { "$setUnion": ["$arr", [1, 2, 3]] },
+            "intersection": { "$setIntersection": ["$arr", [1, 2, 3]] },
+            "difference": { "$setDifference": ["$arr", [1, 2, 3]] }
+        }),
+    )
+    .expect("nullish null-result operators");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "union": Bson::Null,
+            "intersection": Bson::Null,
+            "difference": Bson::Null
+        }
+    );
+
+    let equals_null = apply_projection(
+        &doc! { "_id": 1, "arr": Bson::Null },
+        Some(&doc! {
+            "out": { "$setEquals": ["$arr", [1, 2, 3]] }
+        }),
+    )
+    .expect_err("setEquals rejects nullish arrays");
+    assert!(matches!(equals_null, QueryError::InvalidArgument(_)));
+
+    let subset_missing = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$setIsSubset": [[1], "$missing"] }
+        }),
+    )
+    .expect_err("setIsSubset rejects missing arrays");
+    assert!(matches!(subset_missing, QueryError::InvalidArgument(_)));
+
+    let union_non_array = apply_projection(
+        &doc! { "_id": 1, "arr": "nope" },
+        Some(&doc! {
+            "out": { "$setUnion": ["$arr", [1, 2, 3]] }
+        }),
+    )
+    .expect_err("setUnion requires arrays");
+    assert!(matches!(union_non_array, QueryError::InvalidArgument(_)));
+
+    let equals_too_few = apply_projection(
+        &doc! { "_id": 1, "arr": [1, 2] },
+        Some(&doc! {
+            "out": { "$setEquals": ["$arr"] }
+        }),
+    )
+    .expect_err("setEquals requires two operands");
+    assert!(matches!(equals_too_few, QueryError::InvalidStructure));
+}
+
+#[test]
 fn reduce_expression_rejects_invalid_arguments() {
     let non_object = apply_projection(
         &doc! { "_id": 1, "items": [1, 2] },

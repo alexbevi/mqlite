@@ -1527,6 +1527,21 @@ mod tests {
             }
             "$reverseArray" => doc! { "value": { "$reverseArray": "$array" } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
+            "$setDifference" => {
+                doc! { "value": { "$setDifference": ["$array", [2, 4]] } }
+            }
+            "$setEquals" => {
+                doc! { "value": { "$setEquals": ["$array", [1, 2, 3, 2]] } }
+            }
+            "$setIntersection" => {
+                doc! { "value": { "$setIntersection": ["$array", [2, 4]] } }
+            }
+            "$setIsSubset" => {
+                doc! { "value": { "$setIsSubset": [[2, 3], "$array"] } }
+            }
+            "$setUnion" => {
+                doc! { "value": { "$setUnion": ["$array", [3, 4]] } }
+            }
             "$setField" => {
                 doc! { "value": { "$setField": { "field": "a", "input": "$object", "value": 9 } } }
             }

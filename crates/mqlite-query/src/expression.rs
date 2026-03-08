@@ -222,6 +222,11 @@ fn eval_expression_operator(
         "$reduce" => eval_reduce_expression(document, value, variables),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
+        "$setDifference" => eval_set_difference_expression(document, value, variables),
+        "$setEquals" => eval_set_equals_expression(document, value, variables),
+        "$setIntersection" => eval_set_intersection_expression(document, value, variables),
+        "$setIsSubset" => eval_set_is_subset_expression(document, value, variables),
+        "$setUnion" => eval_set_union_expression(document, value, variables),
         "$setField" => eval_set_field_expression(document, value, variables, false),
         "$size" => eval_size_expression(document, value, variables),
         "$and" => {
@@ -391,6 +396,28 @@ fn validate_expression_operator(
         }
         "$reduce" => validate_reduce_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
+        "$setDifference" | "$setIsSubset" => {
+            for argument in expression_arguments::<2>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$setEquals" => {
+            let arguments = expression_argument_slice(value)?;
+            if arguments.len() < 2 {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$setIntersection" | "$setUnion" => {
+            for argument in expression_argument_slice(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
         "$setField" => validate_set_field_expression(value, scope, false),
         "$slice" => {
             let arguments = expression_argument_slice(value)?;
@@ -961,6 +988,126 @@ fn eval_reduce_expression(
     Ok(EvaluatedExpression::Value(accumulator))
 }
 
+fn eval_set_difference_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let [left, right] = expression_arguments::<2>(value)?;
+    let Some(left) = eval_set_operand(document, left, variables, "$setDifference", true)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    let Some(right) = eval_set_operand(document, right, variables, "$setDifference", true)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+
+    let right = unique_bson_values(&right);
+    let mut result = Vec::new();
+    for item in unique_bson_values(&left) {
+        if !bson_array_contains(&right, &item) {
+            result.push(item);
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(result)))
+}
+
+fn eval_set_equals_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if arguments.len() < 2 {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    let mut sets = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let values = eval_set_operand(document, argument, variables, "$setEquals", false)?
+            .expect("non-nullish set operand");
+        sets.push(unique_bson_values(&values));
+    }
+
+    let first = &sets[0];
+    let equals = sets[1..].iter().all(|candidate| {
+        first.len() == candidate.len()
+            && first
+                .iter()
+                .all(|value| bson_array_contains(candidate, value))
+    });
+    Ok(EvaluatedExpression::Value(Bson::Boolean(equals)))
+}
+
+fn eval_set_intersection_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    if arguments.is_empty() {
+        return Ok(EvaluatedExpression::Value(Bson::Array(Vec::new())));
+    }
+
+    let mut sets = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let Some(values) =
+            eval_set_operand(document, argument, variables, "$setIntersection", true)?
+        else {
+            return Ok(EvaluatedExpression::Value(Bson::Null));
+        };
+        sets.push(unique_bson_values(&values));
+    }
+
+    let mut result = Vec::new();
+    for item in &sets[0] {
+        if sets[1..]
+            .iter()
+            .all(|candidate| bson_array_contains(candidate, item))
+        {
+            result.push(item.clone());
+        }
+    }
+    Ok(EvaluatedExpression::Value(Bson::Array(result)))
+}
+
+fn eval_set_is_subset_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let [left, right] = expression_arguments::<2>(value)?;
+    let left = eval_set_operand(document, left, variables, "$setIsSubset", false)?
+        .expect("non-nullish set operand");
+    let right = eval_set_operand(document, right, variables, "$setIsSubset", false)?
+        .expect("non-nullish set operand");
+
+    let left = unique_bson_values(&left);
+    let right = unique_bson_values(&right);
+    Ok(EvaluatedExpression::Value(Bson::Boolean(
+        left.iter().all(|value| bson_array_contains(&right, value)),
+    )))
+}
+
+fn eval_set_union_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = expression_argument_slice(value)?;
+    let mut result = Vec::new();
+    for argument in arguments {
+        let Some(values) = eval_set_operand(document, argument, variables, "$setUnion", true)?
+        else {
+            return Ok(EvaluatedExpression::Value(Bson::Null));
+        };
+        for item in values {
+            push_unique_bson(&mut result, item);
+        }
+    }
+    Ok(EvaluatedExpression::Value(Bson::Array(result)))
+}
+
 fn eval_reverse_array_expression(
     document: &Document,
     value: &Bson,
@@ -1391,6 +1538,51 @@ fn constant_field_name(expression: &Bson) -> Result<String, QueryError> {
 
     validate_object_key(&value)?;
     Ok(value)
+}
+
+fn eval_set_operand(
+    document: &Document,
+    expression: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+    nullish_returns_null: bool,
+) -> Result<Option<Vec<Bson>>, QueryError> {
+    let value = eval_expression_result_with_variables(document, expression, variables)?;
+    if value.is_nullish() {
+        return if nullish_returns_null {
+            Ok(None)
+        } else {
+            Err(QueryError::InvalidArgument(format!(
+                "{operator} requires array inputs"
+            )))
+        };
+    }
+    match value {
+        EvaluatedExpression::Value(Bson::Array(values)) => Ok(Some(values)),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires array inputs"
+        ))),
+    }
+}
+
+fn unique_bson_values(values: &[Bson]) -> Vec<Bson> {
+    let mut unique = Vec::new();
+    for value in values {
+        push_unique_bson(&mut unique, value.clone());
+    }
+    unique
+}
+
+fn push_unique_bson(values: &mut Vec<Bson>, candidate: Bson) {
+    if !bson_array_contains(values, &candidate) {
+        values.push(candidate);
+    }
+}
+
+fn bson_array_contains(values: &[Bson], candidate: &Bson) -> bool {
+    values
+        .iter()
+        .any(|value| compare_bson(value, candidate).is_eq())
 }
 
 fn is_remove_expression(expression: &Bson) -> bool {

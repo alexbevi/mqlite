@@ -2956,6 +2956,125 @@ fn command_aggregate_project_rejects_invalid_switch_expression() {
 }
 
 #[test]
+fn command_aggregate_project_supports_set_expressions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("set-expressions.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"arr1":[1,2,3,2,1],"arr2":[2,3,4,3]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "union": { "$setUnion": ["$arr1", "$arr2"] },
+                    "intersection": { "$setIntersection": ["$arr1", "$arr2"] },
+                    "difference": { "$setDifference": ["$arr1", "$arr2"] },
+                    "equals": { "$setEquals": ["$arr1", [1, 2, 3, 2]] },
+                    "isSubset": { "$setIsSubset": [[2, 3], "$arr2"] }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "union": [1, 2, 3, 4],
+            "intersection": [2, 3],
+            "difference": [1],
+            "equals": true,
+            "isSubset": true
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_set_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-set-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"arr":"nope"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$setUnion":["$arr",[1,2,3]]}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_project_supports_field_mutation_expressions() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("field-mutation-expression.mongodb");
