@@ -1552,6 +1552,8 @@ mod tests {
             "$size" => doc! { "value": { "$size": "$array" } },
             "$slice" => doc! { "value": { "$slice": ["$array", 2] } },
             "$strcasecmp" => doc! { "value": { "$strcasecmp": ["Ab", "aB"] } },
+            "$strLenBytes" => doc! { "value": { "$strLenBytes": "é" } },
+            "$strLenCP" => doc! { "value": { "$strLenCP": "é" } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$switch" => {
                 doc! { "value": { "$switch": { "branches": [{ "case": { "$eq": ["$left", "$left"] }, "then": "yes" }], "default": "no" } } }

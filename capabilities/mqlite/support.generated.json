@@ -133,6 +133,8 @@
     "$setUnion",
     "$size",
     "$slice",
+    "$strLenBytes",
+    "$strLenCP",
     "$strcasecmp",
     "$subtract",
     "$switch",

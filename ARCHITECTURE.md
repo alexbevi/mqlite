@@ -201,9 +201,10 @@ Current cross-namespace aggregation behavior:
   include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
   `$setUnion`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
-  `$strcasecmp`, while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and
-  `$bitNot`, alongside literal field access and mutation via `$getField`, `$setField`, and
-  `$unsetField`, all executed in-process without a separate expression VM.
+  `$strcasecmp`. String-length expressions currently include `$strLenBytes` and `$strLenCP`,
+  while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
+  alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
+  all executed in-process without a separate expression VM.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file

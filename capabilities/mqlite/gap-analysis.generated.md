@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 64 | 89 | 23 |
+| Aggregation expression operators | 176 | 66 | 87 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 64. Unsupported: 89. Ignored: 23.
+Public upstream: 176. Supported: 66. Unsupported: 87. Ignored: 23.
 
 ### Supported Public
 
@@ -279,6 +279,8 @@ Public upstream: 176. Supported: 64. Unsupported: 89. Ignored: 23.
 - `$setUnion`
 - `$size`
 - `$slice`
+- `$strLenBytes`
+- `$strLenCP`
 - `$strcasecmp`
 - `$subtract`
 - `$switch`
@@ -356,8 +358,6 @@ Public upstream: 176. Supported: 64. Unsupported: 89. Ignored: 23.
 - `$sqrt`
 - `$stdDevPop`
 - `$stdDevSamp`
-- `$strLenBytes`
-- `$strLenCP`
 - `$substr`
 - `$substrBytes`
 - `$substrCP`

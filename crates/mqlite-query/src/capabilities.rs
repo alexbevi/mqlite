@@ -135,6 +135,8 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$size",
     "$slice",
     "$strcasecmp",
+    "$strLenBytes",
+    "$strLenCP",
     "$subtract",
     "$switch",
     "$toLower",

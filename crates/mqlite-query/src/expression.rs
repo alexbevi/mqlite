@@ -241,6 +241,8 @@ fn eval_expression_operator(
         "$setUnion" => eval_set_union_expression(document, value, variables),
         "$setField" => eval_set_field_expression(document, value, variables, false),
         "$size" => eval_size_expression(document, value, variables),
+        "$strLenBytes" => eval_string_length_expression(document, value, variables, false),
+        "$strLenCP" => eval_string_length_expression(document, value, variables, true),
         "$and" => {
             let arguments = expression_argument_slice(value)?;
             Ok(EvaluatedExpression::Value(Bson::Boolean(
@@ -375,6 +377,9 @@ fn validate_expression_operator(
                 validate_expression_with_scope(argument, scope)?;
             }
             Ok(())
+        }
+        "$strLenBytes" | "$strLenCP" => {
+            validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
         "$strcasecmp" => {
             for argument in expression_arguments::<2>(value)? {
@@ -1352,6 +1357,28 @@ fn eval_case_fold_expression(
     Ok(EvaluatedExpression::Value(Bson::String(value)))
 }
 
+fn eval_string_length_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    code_points: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if code_points {
+        "$strLenCP"
+    } else {
+        "$strLenBytes"
+    };
+    let operand = single_expression_operand(value)?;
+    let value = eval_expression_result_with_variables(document, operand, variables)?;
+    let string = require_string_operand(value, operator)?;
+    let length = if code_points {
+        string.chars().count() as i64
+    } else {
+        string.len() as i64
+    };
+    Ok(EvaluatedExpression::Value(Bson::Int64(length)))
+}
+
 fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
     match value {
         Bson::Array(_) => {
@@ -1707,6 +1734,19 @@ fn coerce_case_string(value: EvaluatedExpression, operator: &str) -> Result<Stri
         Bson::ObjectId(value) => Ok(value.to_hex()),
         _ => Err(QueryError::InvalidArgument(format!(
             "{operator} requires a string-compatible input"
+        ))),
+    }
+}
+
+fn require_string_operand(
+    value: EvaluatedExpression,
+    operator: &str,
+) -> Result<String, QueryError> {
+    match value {
+        EvaluatedExpression::Value(Bson::String(value)) => Ok(value),
+        EvaluatedExpression::Value(Bson::Symbol(value)) => Ok(value),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires a string argument"
         ))),
     }
 }

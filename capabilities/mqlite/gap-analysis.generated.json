@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 64,
-    "public_supported": 64,
-    "total_unsupported": 120,
-    "public_unsupported": 89,
+    "total_supported": 66,
+    "public_supported": 66,
+    "total_unsupported": 118,
+    "public_unsupported": 87,
     "public_ignored": 23,
     "items": [
       {
@@ -5463,8 +5463,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$strLenCP",
@@ -5481,8 +5481,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$strcasecmp",

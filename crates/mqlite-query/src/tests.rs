@@ -1521,6 +1521,50 @@ fn projection_supports_bitwise_expression_operators() {
 }
 
 #[test]
+fn projection_supports_string_length_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "ascii": "MyString",
+            "multi": "é",
+            "multiWide": "匣6卜十戈大中金",
+            "mixed": "i ♥ u",
+            "emoji": "🧐🤓😎🥸🤩"
+        },
+        Some(&doc! {
+            "asciiBytes": { "$strLenBytes": "$ascii" },
+            "asciiCp": { "$strLenCP": "$ascii" },
+            "multiBytes": { "$strLenBytes": "$multi" },
+            "multiCp": { "$strLenCP": "$multi" },
+            "wideBytes": { "$strLenBytes": "$multiWide" },
+            "wideCp": { "$strLenCP": "$multiWide" },
+            "mixedBytes": { "$strLenBytes": "$mixed" },
+            "mixedCp": { "$strLenCP": "$mixed" },
+            "emojiBytes": { "$strLenBytes": "$emoji" },
+            "emojiCp": { "$strLenCP": "$emoji" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "asciiBytes": 8_i64,
+            "asciiCp": 8_i64,
+            "multiBytes": 2_i64,
+            "multiCp": 1_i64,
+            "wideBytes": 22_i64,
+            "wideCp": 8_i64,
+            "mixedBytes": 7_i64,
+            "mixedCp": 5_i64,
+            "emojiBytes": 20_i64,
+            "emojiCp": 5_i64
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1569,6 +1613,45 @@ fn case_expression_operators_reject_invalid_inputs() {
         invalid_strcasecmp_arity,
         QueryError::InvalidStructure
     ));
+}
+
+#[test]
+fn string_length_expression_operators_reject_invalid_inputs() {
+    let invalid_null = apply_projection(
+        &doc! { "_id": 1, "value": Bson::Null },
+        Some(&doc! {
+            "out": { "$strLenBytes": "$value" }
+        }),
+    )
+    .expect_err("strLenBytes rejects null");
+    assert!(matches!(invalid_null, QueryError::InvalidArgument(_)));
+
+    let invalid_missing = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$strLenCP": "$missing" }
+        }),
+    )
+    .expect_err("strLenCP rejects missing");
+    assert!(matches!(invalid_missing, QueryError::InvalidArgument(_)));
+
+    let invalid_type = apply_projection(
+        &doc! { "_id": 1, "value": 1 },
+        Some(&doc! {
+            "out": { "$strLenCP": "$value" }
+        }),
+    )
+    .expect_err("strLenCP rejects non-strings");
+    assert!(matches!(invalid_type, QueryError::InvalidArgument(_)));
+
+    let invalid_arity = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$strLenBytes": ["hello", "hello"] }
+        }),
+    )
+    .expect_err("strLenBytes requires one operand");
+    assert!(matches!(invalid_arity, QueryError::InvalidStructure));
 }
 
 #[test]
