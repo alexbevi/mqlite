@@ -2684,6 +2684,153 @@ fn command_aggregate_project_rejects_invalid_scoped_expression() {
 }
 
 #[test]
+fn command_aggregate_project_supports_reduce_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("reduce-expression.mongodb");
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [
+            {
+                "_id": 1,
+                "array": [1, 2, 3],
+                "nested": [[1, 2, 3], [4, 5]]
+            }
+        ]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "sum": {
+                        "$reduce": {
+                            "input": "$array",
+                            "initialValue": 0,
+                            "in": { "$add": ["$$value", "$$this"] }
+                        }
+                    },
+                    "nestedReduce": {
+                        "$reduce": {
+                            "input": "$nested",
+                            "initialValue": 1,
+                            "in": {
+                                "$multiply": [
+                                    "$$value",
+                                    {
+                                        "$reduce": {
+                                            "input": "$$this",
+                                            "initialValue": 0,
+                                            "in": { "$add": ["$$value", "$$this"] }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "sum": 6,
+            "nestedReduce": 54
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_reduce_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-reduce-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"items":[1,2]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$reduce":{"input":"$$value","initialValue":[],"in":[]}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_project_supports_field_mutation_expressions() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("field-mutation-expression.mongodb");

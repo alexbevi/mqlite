@@ -118,6 +118,7 @@
     "$objectToArray",
     "$or",
     "$range",
+    "$reduce",
     "$reverseArray",
     "$round",
     "$setField",

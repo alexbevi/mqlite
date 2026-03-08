@@ -1067,6 +1067,169 @@ fn projection_supports_array_sequence_expressions() {
 }
 
 #[test]
+fn projection_supports_reduce_expression() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "array": [1, 2, 3],
+            "nested": [[1, 2, 3], [4, 5]],
+            "matrix": [[0, 1], [2, 3]]
+        },
+        Some(&doc! {
+            "sum": {
+                "$reduce": {
+                    "input": "$array",
+                    "initialValue": { "$literal": 0 },
+                    "in": { "$add": ["$$value", "$$this"] }
+                }
+            },
+            "empty": {
+                "$reduce": {
+                    "input": [],
+                    "initialValue": { "$literal": 0 },
+                    "in": 10
+                }
+            },
+            "concat": {
+                "$reduce": {
+                    "input": "$array",
+                    "initialValue": [],
+                    "in": { "$concatArrays": ["$$value", ["$$this"]] }
+                }
+            },
+            "nestedReduce": {
+                "$reduce": {
+                    "input": "$nested",
+                    "initialValue": 1,
+                    "in": {
+                        "$multiply": [
+                            "$$value",
+                            {
+                                "$reduce": {
+                                    "input": "$$this",
+                                    "initialValue": 0,
+                                    "in": { "$add": ["$$value", "$$this"] }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "nestedLet": {
+                "$reduce": {
+                    "input": "$matrix",
+                    "initialValue": { "allElements": [], "sumOfInner": { "$literal": 0 } },
+                    "in": {
+                        "$let": {
+                            "vars": { "outerValue": "$$value", "innerArray": "$$this" },
+                            "in": {
+                                "$reduce": {
+                                    "input": "$$innerArray",
+                                    "initialValue": "$$outerValue",
+                                    "in": {
+                                        "allElements": {
+                                            "$concatArrays": ["$$value.allElements", ["$$this"]]
+                                        },
+                                        "sumOfInner": { "$add": ["$$value.sumOfInner", "$$this"] }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "sum": 6_i64,
+            "empty": 0,
+            "concat": [1, 2, 3],
+            "nestedReduce": 54_i64,
+            "nestedLet": { "allElements": [0, 1, 2, 3], "sumOfInner": 6_i64 }
+        }
+    );
+}
+
+#[test]
+fn projection_preserves_nullish_reduce_input() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "items": Bson::Null },
+        Some(&doc! {
+            "nullInput": { "$reduce": { "input": "$items", "initialValue": 0, "in": 5 } },
+            "missingInput": { "$reduce": { "input": "$missing", "initialValue": 0, "in": 5 } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! { "_id": 1, "nullInput": Bson::Null, "missingInput": Bson::Null }
+    );
+}
+
+#[test]
+fn reduce_expression_rejects_invalid_arguments() {
+    let non_object = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$reduce": 0 }
+        }),
+    )
+    .expect_err("reduce requires object");
+    assert!(matches!(non_object, QueryError::InvalidStructure));
+
+    let missing_field = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$reduce": { "input": "$items", "initialValue": 0 } }
+        }),
+    )
+    .expect_err("missing in");
+    assert!(matches!(missing_field, QueryError::InvalidStructure));
+
+    let unknown_field = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$reduce": { "input": "$items", "initialValue": 0, "in": "$$value", "notAField": 1 } }
+        }),
+    )
+    .expect_err("unknown field");
+    assert!(matches!(unknown_field, QueryError::InvalidStructure));
+
+    let non_array_input = apply_projection(
+        &doc! { "_id": 1, "items": 5 },
+        Some(&doc! {
+            "out": { "$reduce": { "input": "$items", "initialValue": 0, "in": "$$value" } }
+        }),
+    )
+    .expect_err("non array input");
+    assert!(matches!(non_array_input, QueryError::InvalidArgument(_)));
+
+    let undefined_value = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$reduce": { "input": "$$value", "initialValue": [], "in": [] } }
+        }),
+    )
+    .expect_err("undefined $$value outside in");
+    assert!(matches!(undefined_value, QueryError::InvalidArgument(_)));
+
+    let undefined_this = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$reduce": { "input": "$$this", "initialValue": [], "in": [] } }
+        }),
+    )
+    .expect_err("undefined $$this outside in");
+    assert!(matches!(undefined_this, QueryError::InvalidArgument(_)));
+}
+
+#[test]
 fn projection_preserves_missing_expression_results() {
     let projected = apply_projection(
         &doc! { "_id": 1, "array": [1, 2, 3], "object": { "a": 1 } },
@@ -4069,14 +4232,12 @@ fn projection_rejects_function_expression_operator() {
 fn projection_rejects_unsupported_expression_operator() {
     let error = apply_projection(
         &doc! { "_id": 1, "value": 2 },
-        Some(
-            &doc! { "out": { "$reduce": { "input": [1, 2], "initialValue": 0, "in": "$$value" } } },
-        ),
+        Some(&doc! { "out": { "$convert": { "input": 1, "to": "string" } } }),
     )
     .expect_err("unsupported expression");
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$reduce"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$convert"
     ));
 }

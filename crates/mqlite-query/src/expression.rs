@@ -218,6 +218,7 @@ fn eval_expression_operator(
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
+        "$reduce" => eval_reduce_expression(document, value, variables),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
         "$setField" => eval_set_field_expression(document, value, variables, false),
@@ -386,6 +387,7 @@ fn validate_expression_operator(
             }
             Ok(())
         }
+        "$reduce" => validate_reduce_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
         "$setField" => validate_set_field_expression(value, scope, false),
         "$slice" => {
@@ -929,6 +931,34 @@ fn eval_range_expression(
     Ok(EvaluatedExpression::Value(Bson::Array(values)))
 }
 
+fn eval_reduce_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (input, initial_value, in_expression) = parse_reduce_spec(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    if input.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let EvaluatedExpression::Value(Bson::Array(items)) = input else {
+        return Err(QueryError::InvalidArgument(
+            "$reduce input must evaluate to an array".to_string(),
+        ));
+    };
+
+    let mut accumulator = eval_expression_with_variables(document, initial_value, variables)?;
+    for item in items {
+        let mut scoped = variables.clone();
+        scoped.insert("this".to_string(), item);
+        scoped.insert("value".to_string(), accumulator);
+        accumulator = eval_expression_with_variables(document, in_expression, &scoped)?;
+    }
+
+    Ok(EvaluatedExpression::Value(accumulator))
+}
+
 fn eval_reverse_array_expression(
     document: &Document,
     value: &Bson,
@@ -1155,6 +1185,17 @@ fn validate_set_field_expression(
     Ok(())
 }
 
+fn validate_reduce_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, initial_value, in_expression) = parse_reduce_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    validate_expression_with_scope(initial_value, scope)?;
+
+    let mut inner_scope = scope.clone();
+    inner_scope.insert("this".to_string());
+    inner_scope.insert("value".to_string());
+    validate_expression_with_scope(in_expression, &inner_scope)
+}
+
 fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     match value {
         Bson::Document(spec) => {
@@ -1213,6 +1254,28 @@ fn parse_set_field_spec(
         } else {
             Some(assigned.ok_or(QueryError::InvalidStructure)?)
         },
+    ))
+}
+
+fn parse_reduce_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut initial_value = None;
+    let mut in_expression = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "initialValue" => initial_value = Some(value),
+            "in" => in_expression = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        initial_value.ok_or(QueryError::InvalidStructure)?,
+        in_expression.ok_or(QueryError::InvalidStructure)?,
     ))
 }
 

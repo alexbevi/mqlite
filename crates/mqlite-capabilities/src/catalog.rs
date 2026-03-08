@@ -1522,6 +1522,9 @@ mod tests {
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
             "$range" => doc! { "value": { "$range": [0, 5, 2] } },
+            "$reduce" => {
+                doc! { "value": { "$reduce": { "input": "$array", "initialValue": 0, "in": { "$add": ["$$value", "$$this"] } } } }
+            }
             "$reverseArray" => doc! { "value": { "$reverseArray": "$array" } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
             "$setField" => {

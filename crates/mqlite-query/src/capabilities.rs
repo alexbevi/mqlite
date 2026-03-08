@@ -119,6 +119,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$objectToArray",
     "$or",
     "$range",
+    "$reduce",
     "$reverseArray",
     "$round",
     "$setField",
