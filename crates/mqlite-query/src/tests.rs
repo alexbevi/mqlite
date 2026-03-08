@@ -1565,6 +1565,45 @@ fn projection_supports_string_length_expression_operators() {
 }
 
 #[test]
+fn projection_supports_string_position_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "ascii": "foobar foobar",
+            "utf8Bytes": "a∫∫b",
+            "utf8CodePoints": "cafétéria",
+            "empty": ""
+        },
+        Some(&doc! {
+            "asciiBytes": { "$indexOfBytes": ["$ascii", "bar"] },
+            "asciiBytesFrom": { "$indexOfBytes": ["$ascii", "bar", 5] },
+            "asciiEmptyToken": { "$indexOfBytes": ["$ascii", "", 3] },
+            "utf8Bytes": { "$indexOfBytes": ["$utf8Bytes", "b", 6] },
+            "utf8Cp": { "$indexOfCP": ["$utf8CodePoints", "é"] },
+            "utf8CpFrom": { "$indexOfCP": ["$utf8CodePoints", "é", 4] },
+            "utf8CpEmptyToken": { "$indexOfCP": ["$utf8CodePoints", "", 1] },
+            "emptyCp": { "$indexOfCP": ["$empty", ""] }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "asciiBytes": 3_i64,
+            "asciiBytesFrom": 10_i64,
+            "asciiEmptyToken": 3_i64,
+            "utf8Bytes": 7_i64,
+            "utf8Cp": 3_i64,
+            "utf8CpFrom": 5_i64,
+            "utf8CpEmptyToken": 1_i64,
+            "emptyCp": 0_i64
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1651,6 +1690,63 @@ fn string_length_expression_operators_reject_invalid_inputs() {
         }),
     )
     .expect_err("strLenBytes requires one operand");
+    assert!(matches!(invalid_arity, QueryError::InvalidStructure));
+}
+
+#[test]
+fn string_position_expression_operators_reject_invalid_inputs() {
+    let nullish_input = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$indexOfBytes": ["$missing", 4] }
+        }),
+    )
+    .expect("missing first argument should yield null");
+    assert_eq!(nullish_input.get("out"), Some(&Bson::Null));
+
+    let invalid_first = apply_projection(
+        &doc! { "_id": 1, "value": 4, "token": "a" },
+        Some(&doc! {
+            "out": { "$indexOfBytes": ["$value", "$token"] }
+        }),
+    )
+    .expect_err("indexOfBytes rejects non-string input");
+    assert!(matches!(invalid_first, QueryError::InvalidArgument(_)));
+
+    let invalid_second = apply_projection(
+        &doc! { "_id": 1, "value": "abc", "token": Bson::Null },
+        Some(&doc! {
+            "out": { "$indexOfCP": ["$value", "$token"] }
+        }),
+    )
+    .expect_err("indexOfCP rejects null token");
+    assert!(matches!(invalid_second, QueryError::InvalidArgument(_)));
+
+    let invalid_bound = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$indexOfBytes": ["$value", "b", -1] }
+        }),
+    )
+    .expect_err("indexOfBytes rejects negative bounds");
+    assert!(matches!(invalid_bound, QueryError::InvalidArgument(_)));
+
+    let invalid_bound_type = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$indexOfCP": ["$value", "b", "bad"] }
+        }),
+    )
+    .expect_err("indexOfCP rejects non-numeric bounds");
+    assert!(matches!(invalid_bound_type, QueryError::InvalidArgument(_)));
+
+    let invalid_arity = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$indexOfBytes": ["$value"] }
+        }),
+    )
+    .expect_err("indexOfBytes requires at least two arguments");
     assert!(matches!(invalid_arity, QueryError::InvalidStructure));
 }
 

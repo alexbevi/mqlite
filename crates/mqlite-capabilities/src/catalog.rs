@@ -1506,6 +1506,8 @@ mod tests {
             "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
             "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
             "$indexOfArray" => doc! { "value": { "$indexOfArray": ["$array", 2] } },
+            "$indexOfBytes" => doc! { "value": { "$indexOfBytes": ["cafétéria", "é", 4] } },
+            "$indexOfCP" => doc! { "value": { "$indexOfCP": ["cafétéria", "é", 4] } },
             "$isArray" => doc! { "value": { "$isArray": "$array" } },
             "$isNumber" => doc! { "value": { "$isNumber": "$left" } },
             "$last" => doc! { "value": { "$last": "$array" } },

@@ -107,6 +107,8 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$ifNull",
     "$in",
     "$indexOfArray",
+    "$indexOfBytes",
+    "$indexOfCP",
     "$isArray",
     "$isNumber",
     "$last",

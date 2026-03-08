@@ -221,6 +221,8 @@ fn eval_expression_operator(
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$getField" => eval_get_field_expression(document, value, variables),
+        "$indexOfBytes" => eval_index_of_string_expression(document, value, variables, false),
+        "$indexOfCP" => eval_index_of_string_expression(document, value, variables, true),
         "$indexOfArray" => eval_index_of_array_expression(document, value, variables),
         "$isArray" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(document, value, variables)?,
@@ -398,6 +400,16 @@ fn validate_expression_operator(
             Ok(())
         }
         "$indexOfArray" => {
+            let arguments = expression_argument_slice(value)?;
+            if !(2..=4).contains(&arguments.len()) {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$indexOfBytes" | "$indexOfCP" => {
             let arguments = expression_argument_slice(value)?;
             if !(2..=4).contains(&arguments.len()) {
                 return Err(QueryError::InvalidStructure);
@@ -960,6 +972,64 @@ fn eval_index_of_array_expression(
     Ok(EvaluatedExpression::Value(Bson::Int64(-1)))
 }
 
+fn eval_index_of_string_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    code_points: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if code_points {
+        "$indexOfCP"
+    } else {
+        "$indexOfBytes"
+    };
+    let arguments = expression_argument_slice(value)?;
+    if !(2..=4).contains(&arguments.len()) {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    let input = eval_expression_result_with_variables(document, &arguments[0], variables)?;
+    let input = match input {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            return Ok(EvaluatedExpression::Value(Bson::Null));
+        }
+        EvaluatedExpression::Value(Bson::String(value) | Bson::Symbol(value)) => value,
+        EvaluatedExpression::Value(_) => {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires a string as the first argument"
+            )));
+        }
+    };
+
+    let token = eval_expression_result_with_variables(document, &arguments[1], variables)?;
+    let token = match token {
+        EvaluatedExpression::Value(Bson::String(value) | Bson::Symbol(value)) => value,
+        _ => {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires a string as the second argument"
+            )));
+        }
+    };
+
+    let start = match arguments.get(2) {
+        Some(start) => parse_non_negative_index(document, start, variables, operator)?,
+        None => 0,
+    };
+    let end = match arguments.get(3) {
+        Some(end) => Some(parse_non_negative_index(
+            document, end, variables, operator,
+        )?),
+        None => None,
+    };
+
+    let index = if code_points {
+        index_of_code_points(&input, &token, start, end)
+    } else {
+        index_of_bytes(&input, &token, start, end)
+    };
+    Ok(EvaluatedExpression::Value(Bson::Int64(index)))
+}
+
 fn eval_range_expression(
     document: &Document,
     value: &Bson,
@@ -1355,6 +1425,63 @@ fn eval_case_fold_expression(
         value.to_ascii_lowercase()
     };
     Ok(EvaluatedExpression::Value(Bson::String(value)))
+}
+
+fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
+    let haystack = input.as_bytes();
+    let needle = token.as_bytes();
+    let end = end.unwrap_or(haystack.len()).min(haystack.len());
+    if start > haystack.len() || end < start {
+        return -1;
+    }
+    if needle.is_empty() {
+        return start as i64;
+    }
+    if needle.len() > end.saturating_sub(start) {
+        return -1;
+    }
+
+    for byte_index in start..=end - needle.len() {
+        if &haystack[byte_index..byte_index + needle.len()] == needle {
+            return byte_index as i64;
+        }
+    }
+    -1
+}
+
+fn index_of_code_points(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
+    let boundaries = code_point_boundaries(input);
+    let code_point_len = boundaries.len() - 1;
+    if start > code_point_len {
+        return -1;
+    }
+
+    let end = end.unwrap_or(code_point_len).min(code_point_len);
+    if end < start {
+        return -1;
+    }
+    if start == 0 && input.is_empty() && token.is_empty() {
+        return 0;
+    }
+
+    let needle = token.as_bytes();
+    let haystack = input.as_bytes();
+    for (code_point_index, byte_index) in boundaries.iter().enumerate().take(end).skip(start) {
+        let byte_index = *byte_index;
+        if haystack[byte_index..].starts_with(needle) {
+            return code_point_index as i64;
+        }
+    }
+    -1
+}
+
+fn code_point_boundaries(input: &str) -> Vec<usize> {
+    let mut boundaries = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(input.len());
+    boundaries
 }
 
 fn eval_string_length_expression(

@@ -106,6 +106,8 @@
     "$ifNull",
     "$in",
     "$indexOfArray",
+    "$indexOfBytes",
+    "$indexOfCP",
     "$isArray",
     "$isNumber",
     "$last",
