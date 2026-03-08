@@ -4,7 +4,11 @@ use bson::{Bson, Document, doc};
 use chrono::{DateTime, SecondsFormat, Utc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 
-use crate::{QueryError, filter::bson_type_alias};
+use crate::{
+    QueryError,
+    filter::bson_type_alias,
+    pipeline::{compare_documents_by_sort, validate_sort_spec},
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EvaluatedExpression {
@@ -223,6 +227,7 @@ fn eval_expression_operator(
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$getField" => eval_get_field_expression(document, value, variables),
+        "$rand" => eval_rand_expression(value),
         "$exp" => eval_nullable_unary_math_expression(document, value, variables, |number| {
             Ok(number.exp())
         }),
@@ -281,6 +286,7 @@ fn eval_expression_operator(
         "$replaceAll" => eval_replace_expression(document, value, variables, true),
         "$replaceOne" => eval_replace_expression(document, value, variables, false),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
+        "$sortArray" => eval_sort_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
         "$acos" => eval_nullable_unary_math_expression(document, value, variables, |number| {
             if number.is_nan() || (-1.0..=1.0).contains(&number) {
@@ -377,9 +383,12 @@ fn eval_expression_operator(
         "$strLenCP" => eval_string_length_expression(document, value, variables, true),
         "$substr" | "$substrBytes" => eval_substring_expression(document, value, variables, false),
         "$substrCP" => eval_substring_expression(document, value, variables, true),
+        "$tsIncrement" => eval_timestamp_part_expression(document, value, variables, false),
+        "$tsSecond" => eval_timestamp_part_expression(document, value, variables, true),
         "$trim" => eval_trim_expression(document, value, variables, TrimType::Both),
         "$ltrim" => eval_trim_expression(document, value, variables, TrimType::Left),
         "$rtrim" => eval_trim_expression(document, value, variables, TrimType::Right),
+        "$zip" => eval_zip_expression(document, value, variables),
         "$and" => {
             let arguments = expression_argument_slice(value)?;
             Ok(EvaluatedExpression::Value(Bson::Boolean(
@@ -482,7 +491,8 @@ fn validate_expression_operator(
         "$expr" | "$abs" | "$acos" | "$acosh" | "$asin" | "$asinh" | "$atan" | "$atanh"
         | "$ceil" | "$cos" | "$cosh" | "$degreesToRadians" | "$exp" | "$first" | "$floor"
         | "$isArray" | "$isNumber" | "$last" | "$ln" | "$objectToArray" | "$radiansToDegrees"
-        | "$sin" | "$sinh" | "$size" | "$sqrt" | "$tan" | "$tanh" | "$type" | "$log10" => {
+        | "$sin" | "$sinh" | "$size" | "$sqrt" | "$tan" | "$tanh" | "$tsIncrement"
+        | "$tsSecond" | "$type" | "$log10" => {
             validate_expression_with_scope(unary_expression_operand(value), scope)
         }
         "$binarySize" | "$bsonSize" => {
@@ -578,6 +588,7 @@ fn validate_expression_operator(
         }
         "$let" => validate_let_expression(value, scope),
         "$map" => validate_map_expression(value, scope),
+        "$rand" => validate_rand_expression(value),
         "$switch" => validate_switch_expression(value, scope),
         "$range" => {
             let arguments = expression_argument_slice(value)?;
@@ -592,6 +603,7 @@ fn validate_expression_operator(
         "$reduce" => validate_reduce_expression(value, scope),
         "$replaceAll" | "$replaceOne" => validate_replace_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
+        "$sortArray" => validate_sort_array_expression(value, scope),
         "$toLower" | "$toUpper" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
         }
@@ -634,6 +646,7 @@ fn validate_expression_operator(
             }
             Ok(())
         }
+        "$zip" => validate_zip_expression(value, scope),
         "$unsetField" => validate_set_field_expression(value, scope, true),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
@@ -1639,6 +1652,156 @@ fn eval_replace_expression(
     Ok(EvaluatedExpression::Value(Bson::String(result)))
 }
 
+fn eval_rand_expression(value: &Bson) -> Result<EvaluatedExpression, QueryError> {
+    validate_rand_expression(value)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    Ok(EvaluatedExpression::Value(Bson::Double(
+        nanos as f64 / 1_000_000_000.0,
+    )))
+}
+
+fn eval_sort_array_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (input, sort_by) = parse_sort_array_spec(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    if input.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let EvaluatedExpression::Value(Bson::Array(mut items)) = input else {
+        return Err(QueryError::InvalidArgument(
+            "$sortArray requires an array input".to_string(),
+        ));
+    };
+    if items.len() < 2 {
+        return Ok(EvaluatedExpression::Value(Bson::Array(items)));
+    }
+
+    match parse_sort_array_order(sort_by)? {
+        SortArrayOrder::Scalar(direction) => {
+            items.sort_by(|left, right| {
+                let ordering = compare_bson(left, right);
+                if direction < 0 {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+        }
+        SortArrayOrder::Document(sort) => {
+            if !items.iter().all(|item| matches!(item, Bson::Document(_))) {
+                return Err(QueryError::InvalidArgument(
+                    "$sortArray requires document array elements when sortBy is an object"
+                        .to_string(),
+                ));
+            }
+            items.sort_by(|left, right| {
+                let left = left.as_document().expect("document item");
+                let right = right.as_document().expect("document item");
+                compare_documents_by_sort(left, right, &sort)
+            });
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(items)))
+}
+
+fn eval_timestamp_part_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    seconds: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if seconds { "$tsSecond" } else { "$tsIncrement" };
+    let operand = single_expression_operand(value)?;
+    match eval_expression_result_with_variables(document, operand, variables)? {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::Timestamp(timestamp)) => {
+            let value = if seconds {
+                timestamp.time as i64
+            } else {
+                timestamp.increment as i64
+            };
+            Ok(EvaluatedExpression::Value(Bson::Int64(value)))
+        }
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires a timestamp input"
+        ))),
+    }
+}
+
+fn eval_zip_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (inputs, defaults, use_longest_length) = parse_zip_spec(value)?;
+
+    let mut input_values = Vec::with_capacity(inputs.len());
+    let mut min_array_size = 0usize;
+    let mut max_array_size = 0usize;
+    for (index, input) in inputs.iter().enumerate() {
+        let input = eval_expression_result_with_variables(document, input, variables)?;
+        if input.is_nullish() {
+            return Ok(EvaluatedExpression::Value(Bson::Null));
+        }
+
+        let EvaluatedExpression::Value(Bson::Array(values)) = input else {
+            return Err(QueryError::InvalidArgument(
+                "$zip requires array inputs".to_string(),
+            ));
+        };
+
+        let array_size = values.len();
+        if index == 0 {
+            min_array_size = array_size;
+            max_array_size = array_size;
+        } else {
+            min_array_size = min_array_size.min(array_size);
+            max_array_size = max_array_size.max(array_size);
+        }
+        input_values.push(values);
+    }
+
+    let mut evaluated_defaults = vec![Bson::Null; inputs.len()];
+    if min_array_size != max_array_size {
+        if let Some(defaults) = defaults {
+            for (index, default) in defaults.iter().enumerate() {
+                evaluated_defaults[index] =
+                    eval_expression_with_variables(document, default, variables)?;
+            }
+        }
+    }
+
+    let output_length = if use_longest_length {
+        max_array_size
+    } else {
+        min_array_size
+    };
+    let mut output = Vec::with_capacity(output_length);
+    for row in 0..output_length {
+        let mut zipped = Vec::with_capacity(inputs.len());
+        for (column, values) in input_values.iter().enumerate() {
+            if let Some(value) = values.get(row) {
+                zipped.push(value.clone());
+            } else {
+                zipped.push(evaluated_defaults[column].clone());
+            }
+        }
+        output.push(Bson::Array(zipped));
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(output)))
+}
+
 fn eval_cond_expression(
     document: &Document,
     value: &Bson,
@@ -1830,6 +1993,40 @@ fn validate_replace_expression(value: &Bson, scope: &BTreeSet<String>) -> Result
     validate_expression_with_scope(input, scope)?;
     validate_expression_with_scope(find, scope)?;
     validate_expression_with_scope(replacement, scope)
+}
+
+fn validate_sort_array_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let (input, sort_by) = parse_sort_array_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    match sort_by {
+        Bson::Document(sort) => validate_sort_spec(sort).map_err(|_| QueryError::InvalidStructure),
+        _ if integer_value(sort_by).is_some_and(|direction| matches!(direction, 1 | -1)) => Ok(()),
+        _ => Err(QueryError::InvalidStructure),
+    }
+}
+
+fn validate_zip_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (inputs, defaults, _) = parse_zip_spec(value)?;
+    for input in inputs {
+        validate_expression_with_scope(input, scope)?;
+    }
+    if let Some(defaults) = defaults {
+        for default in defaults {
+            validate_expression_with_scope(default, scope)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_rand_expression(value: &Bson) -> Result<(), QueryError> {
+    match value {
+        Bson::Document(spec) if spec.is_empty() => Ok(()),
+        Bson::Array(arguments) if arguments.is_empty() => Ok(()),
+        _ => Err(QueryError::InvalidStructure),
+    }
 }
 
 fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
@@ -2180,6 +2377,81 @@ fn parse_replace_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError>
         input.ok_or(QueryError::InvalidStructure)?,
         find.ok_or(QueryError::InvalidStructure)?,
         replacement.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
+enum SortArrayOrder {
+    Scalar(i64),
+    Document(Document),
+}
+
+fn parse_sort_array_spec(value: &Bson) -> Result<(&Bson, &Bson), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut sort_by = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "sortBy" => sort_by = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        sort_by.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
+fn parse_sort_array_order(value: &Bson) -> Result<SortArrayOrder, QueryError> {
+    if let Some(direction) = integer_value(value) {
+        if matches!(direction, 1 | -1) {
+            return Ok(SortArrayOrder::Scalar(direction));
+        }
+    }
+
+    let sort = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    validate_sort_spec(sort).map_err(|_| QueryError::InvalidStructure)?;
+    Ok(SortArrayOrder::Document(sort.clone()))
+}
+
+type ZipSpec<'a> = (&'a [Bson], Option<&'a [Bson]>, bool);
+
+fn parse_zip_spec(value: &Bson) -> Result<ZipSpec<'_>, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut inputs = None;
+    let mut defaults = None;
+    let mut use_longest_length = false;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "inputs" => inputs = Some(value.as_array().ok_or(QueryError::InvalidStructure)?),
+            "defaults" => defaults = Some(value.as_array().ok_or(QueryError::InvalidStructure)?),
+            "useLongestLength" => {
+                use_longest_length = value.as_bool().ok_or(QueryError::InvalidStructure)?
+            }
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let inputs = inputs.ok_or(QueryError::InvalidStructure)?;
+    if inputs.is_empty() {
+        return Err(QueryError::InvalidStructure);
+    }
+    if defaults.is_some() && !use_longest_length {
+        return Err(QueryError::InvalidStructure);
+    }
+    if let Some(defaults) = defaults
+        && defaults.len() != inputs.len()
+    {
+        return Err(QueryError::InvalidStructure);
+    }
+
+    Ok((
+        inputs.as_slice(),
+        defaults.map(Vec::as_slice),
+        use_longest_length,
     ))
 }
 

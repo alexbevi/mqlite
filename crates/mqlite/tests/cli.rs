@@ -3722,6 +3722,79 @@ fn command_aggregate_project_supports_split_and_replace_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_utility_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("utility-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"ts":{"$timestamp":{"t":42,"i":7}},"nums":[2,1,3],"letters":["a","b"],"docs":[{"a":2},{"a":1}]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "rand": { "$rand": {} },
+                    "tsSecond": { "$tsSecond": "$ts" },
+                    "tsIncrement": { "$tsIncrement": "$ts" },
+                    "sortForward": { "$sortArray": { "input": "$nums", "sortBy": 1 } },
+                    "zipDefaults": { "$zip": { "inputs": ["$nums", "$letters"], "defaults": [0, "?"], "useLongestLength": true } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    let rand = first["rand"].as_f64().expect("rand result");
+    assert!(rand >= 0.0);
+    assert!(rand < 1.0);
+    assert_eq!(first["tsSecond"], 42);
+    assert_eq!(first["tsIncrement"], 7);
+    assert_eq!(first["sortForward"], json!([1, 2, 3]));
+    assert_eq!(first["zipDefaults"], json!([[2, "a"], [1, "b"], [3, "?"]]));
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -3795,6 +3868,51 @@ fn command_aggregate_project_supports_trim_expression_operators() {
             "rightCustomSet": "xyztrim"
         })]
     );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_utility_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-utility-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":5}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$tsSecond":"$value"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
 }
 
 #[test]

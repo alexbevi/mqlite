@@ -141,6 +141,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$objectToArray",
     "$or",
     "$pow",
+    "$rand",
     "$radiansToDegrees",
     "$range",
     "$reduce",
@@ -159,6 +160,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$split",
     "$sin",
     "$sinh",
+    "$sortArray",
     "$strcasecmp",
     "$strLenBytes",
     "$strLenCP",
@@ -176,8 +178,11 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$ltrim",
     "$rtrim",
     "$type",
+    "$tsIncrement",
+    "$tsSecond",
     "$trunc",
     "$unsetField",
+    "$zip",
 ];
 
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =

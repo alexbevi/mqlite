@@ -1544,6 +1544,7 @@ mod tests {
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
             "$pow" => doc! { "value": { "$pow": [2, 3] } },
+            "$rand" => doc! { "value": { "$rand": {} } },
             "$radiansToDegrees" => doc! { "value": { "$radiansToDegrees": std::f64::consts::PI } },
             "$range" => doc! { "value": { "$range": [0, 5, 2] } },
             "$reduce" => {
@@ -1580,6 +1581,9 @@ mod tests {
             "$split" => doc! { "value": { "$split": ["abc->def", "->"] } },
             "$sin" => doc! { "value": { "$sin": 0 } },
             "$sinh" => doc! { "value": { "$sinh": 0 } },
+            "$sortArray" => {
+                doc! { "value": { "$sortArray": { "input": [2, 1, 3], "sortBy": 1 } } }
+            }
             "$strcasecmp" => doc! { "value": { "$strcasecmp": ["Ab", "aB"] } },
             "$strLenBytes" => doc! { "value": { "$strLenBytes": "é" } },
             "$strLenCP" => doc! { "value": { "$strLenCP": "é" } },
@@ -1599,9 +1603,18 @@ mod tests {
             "$ltrim" => doc! { "value": { "$ltrim": { "input": "  abc  " } } },
             "$rtrim" => doc! { "value": { "$rtrim": { "input": "  abc  " } } },
             "$type" => doc! { "value": { "$type": "$left" } },
+            "$tsIncrement" => {
+                doc! { "value": { "$tsIncrement": Bson::Timestamp(bson::Timestamp { time: 7, increment: 3 }) } }
+            }
+            "$tsSecond" => {
+                doc! { "value": { "$tsSecond": Bson::Timestamp(bson::Timestamp { time: 7, increment: 3 }) } }
+            }
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
             "$unsetField" => {
                 doc! { "value": { "$unsetField": { "field": "a", "input": "$object" } } }
+            }
+            "$zip" => {
+                doc! { "value": { "$zip": { "inputs": [[1, 2], ["a", "b", "c"]], "useLongestLength": true } } }
             }
             other => panic!("missing supported expression fixture for {other}"),
         }

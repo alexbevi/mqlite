@@ -1806,6 +1806,82 @@ fn projection_supports_split_and_replace_expression_operators() {
 }
 
 #[test]
+fn projection_supports_utility_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "ts": Timestamp { time: 42, increment: 7 },
+            "nums": [2, 1, 3],
+            "letters": ["a", "b"],
+            "docs": [{ "a": 2 }, { "a": 1 }]
+        },
+        Some(&doc! {
+            "rand": { "$rand": {} },
+            "tsSecond": { "$tsSecond": "$ts" },
+            "tsIncrement": { "$tsIncrement": "$ts" },
+            "sortForward": { "$sortArray": { "input": "$nums", "sortBy": 1 } },
+            "sortDocuments": { "$sortArray": { "input": "$docs", "sortBy": { "a": 1 } } },
+            "zipShortest": { "$zip": { "inputs": ["$nums", "$letters"] } },
+            "zipLongest": { "$zip": { "inputs": ["$nums", "$letters"], "useLongestLength": true } },
+            "zipDefaults": { "$zip": { "inputs": ["$nums", "$letters"], "defaults": [0, "?"], "useLongestLength": true } },
+            "nullZip": { "$zip": { "inputs": ["$missing", "$letters"] } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected.get("tsSecond"), Some(&Bson::Int64(42)));
+    assert_eq!(projected.get("tsIncrement"), Some(&Bson::Int64(7)));
+    assert_eq!(
+        projected.get("sortForward"),
+        Some(&Bson::Array(vec![1.into(), 2.into(), 3.into()]))
+    );
+    assert_eq!(
+        projected.get("sortDocuments"),
+        Some(&Bson::Array(vec![
+            Bson::Document(doc! { "a": 1 }),
+            Bson::Document(doc! { "a": 2 })
+        ]))
+    );
+    assert_eq!(
+        projected.get("zipShortest"),
+        Some(&Bson::Array(vec![
+            Bson::Array(vec![2.into(), "a".into()]),
+            Bson::Array(vec![1.into(), "b".into()])
+        ]))
+    );
+    assert_eq!(
+        projected.get("zipLongest"),
+        Some(&Bson::Array(vec![
+            Bson::Array(vec![2.into(), "a".into()]),
+            Bson::Array(vec![1.into(), "b".into()]),
+            Bson::Array(vec![3.into(), Bson::Null])
+        ]))
+    );
+    assert_eq!(
+        projected.get("zipDefaults"),
+        Some(&Bson::Array(vec![
+            Bson::Array(vec![2.into(), "a".into()]),
+            Bson::Array(vec![1.into(), "b".into()]),
+            Bson::Array(vec![3.into(), "?".into()])
+        ]))
+    );
+    assert_eq!(projected.get("nullZip"), Some(&Bson::Null));
+
+    let rand = projected
+        .get("rand")
+        .expect("rand result")
+        .as_f64()
+        .or_else(|| {
+            projected
+                .get("rand")
+                .and_then(Bson::as_i64)
+                .map(|value| value as f64)
+        })
+        .expect("numeric rand");
+    assert!((0.0..1.0).contains(&rand));
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -1842,6 +1918,66 @@ fn projection_supports_trim_expression_operators() {
             "nullChars": Bson::Null
         }
     );
+}
+
+#[test]
+fn utility_expression_operators_reject_invalid_inputs() {
+    let rand_arity = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$rand": [1] }
+        }),
+    )
+    .expect_err("rand does not accept arguments");
+    assert!(matches!(rand_arity, QueryError::InvalidStructure));
+
+    let non_timestamp = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$tsSecond": "$value" }
+        }),
+    )
+    .expect_err("tsSecond requires a timestamp");
+    assert!(matches!(non_timestamp, QueryError::InvalidArgument(_)));
+
+    let non_array_sort = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$sortArray": { "input": "$value", "sortBy": 1 } }
+        }),
+    )
+    .expect_err("sortArray requires an array input");
+    assert!(matches!(non_array_sort, QueryError::InvalidArgument(_)));
+
+    let invalid_sort_by = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$sortArray": { "input": "$items", "sortBy": 0 } }
+        }),
+    )
+    .expect_err("sortArray requires 1, -1, or a valid sort document");
+    assert!(matches!(invalid_sort_by, QueryError::InvalidStructure));
+
+    let invalid_zip_defaults = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$zip": { "inputs": ["$items"], "defaults": [0] } }
+        }),
+    )
+    .expect_err("zip defaults require useLongestLength");
+    assert!(matches!(invalid_zip_defaults, QueryError::InvalidStructure));
+
+    let non_array_zip_input = apply_projection(
+        &doc! { "_id": 1, "items": 5 },
+        Some(&doc! {
+            "out": { "$zip": { "inputs": ["$items"] } }
+        }),
+    )
+    .expect_err("zip requires array inputs");
+    assert!(matches!(
+        non_array_zip_input,
+        QueryError::InvalidArgument(_)
+    ));
 }
 
 #[test]

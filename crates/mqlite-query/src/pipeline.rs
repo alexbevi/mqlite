@@ -3640,7 +3640,7 @@ fn single_sort_field(sort_by: Option<&Document>) -> Option<(&str, i64)> {
     Some((field.as_str(), integer_value(direction)?))
 }
 
-fn validate_sort_spec(sort: &Document) -> Result<(), QueryError> {
+pub(crate) fn validate_sort_spec(sort: &Document) -> Result<(), QueryError> {
     if sort.is_empty() {
         return Err(QueryError::InvalidStage);
     }
@@ -4536,7 +4536,7 @@ fn parse_unset(spec: &Bson) -> Result<Vec<String>, QueryError> {
     }
 }
 
-fn compare_documents_by_sort(
+pub(crate) fn compare_documents_by_sort(
     left: &Document,
     right: &Document,
     sort: &Document,

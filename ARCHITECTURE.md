@@ -209,6 +209,8 @@ Current cross-namespace aggregation behavior:
   and `$radiansToDegrees`. String-length, string-position, substring, split, and replacement
   expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`,
   `$substr`, `$substrBytes`, `$substrCP`, `$split`, `$replaceOne`, and `$replaceAll`,
+  utility expressions currently include `$rand`, `$sortArray`, `$tsSecond`, `$tsIncrement`, and
+  `$zip`,
   while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
   alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
   all executed in-process without a separate expression VM. Nullable numeric operators share a

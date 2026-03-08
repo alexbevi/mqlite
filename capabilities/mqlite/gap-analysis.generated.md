@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 100 | 53 | 23 |
+| Aggregation expression operators | 176 | 105 | 48 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
+Public upstream: 176. Supported: 105. Unsupported: 48. Ignored: 23.
 
 ### Supported Public
 
@@ -288,6 +288,7 @@ Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
 - `$or`
 - `$pow`
 - `$radiansToDegrees`
+- `$rand`
 - `$range`
 - `$reduce`
 - `$replaceAll`
@@ -305,6 +306,7 @@ Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
 - `$sinh`
 - `$size`
 - `$slice`
+- `$sortArray`
 - `$split`
 - `$sqrt`
 - `$strLenBytes`
@@ -321,8 +323,11 @@ Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
 - `$toUpper`
 - `$trim`
 - `$trunc`
+- `$tsIncrement`
+- `$tsSecond`
 - `$type`
 - `$unsetField`
+- `$zip`
 
 ### Unsupported Public
 
@@ -356,12 +361,10 @@ Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
 - `$minute`
 - `$month`
 - `$percentile`
-- `$rand`
 - `$regexFind`
 - `$regexFindAll`
 - `$regexMatch`
 - `$second`
-- `$sortArray`
 - `$stdDevPop`
 - `$stdDevSamp`
 - `$sum`
@@ -374,11 +377,8 @@ Public upstream: 176. Supported: 100. Unsupported: 53. Ignored: 23.
 - `$toLong`
 - `$toObjectId`
 - `$toString`
-- `$tsIncrement`
-- `$tsSecond`
 - `$week`
 - `$year`
-- `$zip`
 
 ### Ignored Public
 

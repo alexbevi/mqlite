@@ -142,6 +142,7 @@
     "$or",
     "$pow",
     "$radiansToDegrees",
+    "$rand",
     "$range",
     "$reduce",
     "$replaceAll",
@@ -159,6 +160,7 @@
     "$sinh",
     "$size",
     "$slice",
+    "$sortArray",
     "$split",
     "$sqrt",
     "$strLenBytes",
@@ -175,8 +177,11 @@
     "$toUpper",
     "$trim",
     "$trunc",
+    "$tsIncrement",
+    "$tsSecond",
     "$type",
-    "$unsetField"
+    "$unsetField",
+    "$zip"
   ],
   "aggregation_accumulator_operators": [
     "$addToSet",
