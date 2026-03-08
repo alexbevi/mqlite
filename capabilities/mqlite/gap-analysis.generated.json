@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 97,
-    "public_supported": 97,
-    "total_unsupported": 87,
-    "public_unsupported": 56,
+    "total_supported": 100,
+    "public_supported": 100,
+    "total_unsupported": 84,
+    "public_unsupported": 53,
     "public_ignored": 23,
     "items": [
       {
@@ -4995,8 +4995,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$replaceOne",
@@ -5013,8 +5013,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$reverseArray",
@@ -5391,8 +5391,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$sqrt",

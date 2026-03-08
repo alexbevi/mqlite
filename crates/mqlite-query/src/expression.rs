@@ -278,6 +278,8 @@ fn eval_expression_operator(
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
+        "$replaceAll" => eval_replace_expression(document, value, variables, true),
+        "$replaceOne" => eval_replace_expression(document, value, variables, false),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
         "$acos" => eval_nullable_unary_math_expression(document, value, variables, |number| {
@@ -370,6 +372,7 @@ fn eval_expression_operator(
         "$setUnion" => eval_set_union_expression(document, value, variables),
         "$setField" => eval_set_field_expression(document, value, variables, false),
         "$size" => eval_size_expression(document, value, variables),
+        "$split" => eval_split_expression(document, value, variables),
         "$strLenBytes" => eval_string_length_expression(document, value, variables, false),
         "$strLenCP" => eval_string_length_expression(document, value, variables, true),
         "$substr" | "$substrBytes" => eval_substring_expression(document, value, variables, false),
@@ -587,6 +590,7 @@ fn validate_expression_operator(
             Ok(())
         }
         "$reduce" => validate_reduce_expression(value, scope),
+        "$replaceAll" | "$replaceOne" => validate_replace_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
         "$toLower" | "$toUpper" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
@@ -620,6 +624,12 @@ fn validate_expression_operator(
                 return Err(QueryError::InvalidStructure);
             }
             for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$split" => {
+            for argument in expression_arguments::<2>(value)? {
                 validate_expression_with_scope(argument, scope)?;
             }
             Ok(())
@@ -1568,6 +1578,67 @@ fn eval_slice_expression(
     )))
 }
 
+fn eval_split_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let [input, separator] = expression_arguments::<2>(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let separator = eval_expression_result_with_variables(document, separator, variables)?;
+
+    if input.is_nullish() || separator.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let input = require_string_operand(input, "$split")?;
+    let separator = require_string_operand(separator, "$split")?;
+    if separator.is_empty() {
+        return Err(QueryError::InvalidArgument(
+            "$split requires a non-empty separator".to_string(),
+        ));
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(
+        input
+            .split(&separator)
+            .map(|segment| Bson::String(segment.to_string()))
+            .collect(),
+    )))
+}
+
+fn eval_replace_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    replace_all: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = if replace_all {
+        "$replaceAll"
+    } else {
+        "$replaceOne"
+    };
+    let (input, find, replacement) = parse_replace_spec(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let find = eval_expression_result_with_variables(document, find, variables)?;
+    let replacement = eval_expression_result_with_variables(document, replacement, variables)?;
+
+    if input.is_nullish() || find.is_nullish() || replacement.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+
+    let input = require_named_string_operand(input, operator, "input")?;
+    let find = require_named_string_operand(find, operator, "find")?;
+    let replacement = require_named_string_operand(replacement, operator, "replacement")?;
+
+    let result = if replace_all {
+        input.replace(&find, &replacement)
+    } else {
+        input.replacen(&find, &replacement, 1)
+    };
+    Ok(EvaluatedExpression::Value(Bson::String(result)))
+}
+
 fn eval_cond_expression(
     document: &Document,
     value: &Bson,
@@ -1752,6 +1823,13 @@ fn eval_trim_expression(
     };
 
     Ok(EvaluatedExpression::Value(Bson::String(trimmed)))
+}
+
+fn validate_replace_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, find, replacement) = parse_replace_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    validate_expression_with_scope(find, scope)?;
+    validate_expression_with_scope(replacement, scope)
 }
 
 fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
@@ -2083,6 +2161,28 @@ fn parse_trim_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     Ok((input.ok_or(QueryError::InvalidStructure)?, chars))
 }
 
+fn parse_replace_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut find = None;
+    let mut replacement = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "find" => find = Some(value),
+            "replacement" => replacement = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        find.ok_or(QueryError::InvalidStructure)?,
+        replacement.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
 type SwitchBranches<'a> = Vec<(&'a Bson, &'a Bson)>;
 
 fn parse_switch_spec(value: &Bson) -> Result<(SwitchBranches<'_>, Option<&Bson>), QueryError> {
@@ -2255,6 +2355,20 @@ fn require_string_operand(
         EvaluatedExpression::Value(Bson::Symbol(value)) => Ok(value),
         _ => Err(QueryError::InvalidArgument(format!(
             "{operator} requires a string argument"
+        ))),
+    }
+}
+
+fn require_named_string_operand(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
+) -> Result<String, QueryError> {
+    match value {
+        EvaluatedExpression::Value(Bson::String(value)) => Ok(value),
+        EvaluatedExpression::Value(Bson::Symbol(value)) => Ok(value),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires `{field}` to evaluate to a string"
         ))),
     }
 }

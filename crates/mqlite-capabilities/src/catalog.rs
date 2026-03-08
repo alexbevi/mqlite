@@ -1549,6 +1549,12 @@ mod tests {
             "$reduce" => {
                 doc! { "value": { "$reduce": { "input": "$array", "initialValue": 0, "in": { "$add": ["$$value", "$$this"] } } } }
             }
+            "$replaceAll" => {
+                doc! { "value": { "$replaceAll": { "input": "a.b.c", "find": ".", "replacement": ".." } } }
+            }
+            "$replaceOne" => {
+                doc! { "value": { "$replaceOne": { "input": "a.b.c", "find": ".", "replacement": ".." } } }
+            }
             "$reverseArray" => doc! { "value": { "$reverseArray": "$array" } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
             "$setDifference" => {
@@ -1571,6 +1577,7 @@ mod tests {
             }
             "$size" => doc! { "value": { "$size": "$array" } },
             "$slice" => doc! { "value": { "$slice": ["$array", 2] } },
+            "$split" => doc! { "value": { "$split": ["abc->def", "->"] } },
             "$sin" => doc! { "value": { "$sin": 0 } },
             "$sinh" => doc! { "value": { "$sinh": 0 } },
             "$strcasecmp" => doc! { "value": { "$strcasecmp": ["Ab", "aB"] } },

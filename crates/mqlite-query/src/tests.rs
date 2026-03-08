@@ -1765,6 +1765,47 @@ fn projection_supports_math_and_trigonometric_expression_operators() {
 }
 
 #[test]
+fn projection_supports_split_and_replace_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "value": "abc->defg->hij",
+            "dotted": "a.b.c",
+            "unicode": "e\u{301}",
+            "precomposed": "é"
+        },
+        Some(&doc! {
+            "splitArrow": { "$split": ["$value", "->"] },
+            "splitUnicode": { "$split": ["$unicode", "e"] },
+            "splitNoMatch": { "$split": ["$precomposed", "e"] },
+            "replaceOne": { "$replaceOne": { "input": "$value", "find": "->", "replacement": "." } },
+            "replaceAll": { "$replaceAll": { "input": "$value", "find": "->", "replacement": "." } },
+            "replaceOneReplacementLiteral": { "$replaceOne": { "input": "$dotted", "find": ".", "replacement": ".." } },
+            "replaceAllReplacementLiteral": { "$replaceAll": { "input": "$dotted", "find": ".", "replacement": ".." } },
+            "nullSplit": { "$split": ["$missing", ","] },
+            "nullReplace": { "$replaceAll": { "input": "$missing", "find": "x", "replacement": "y" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "splitArrow": ["abc", "defg", "hij"],
+            "splitUnicode": ["", "\u{301}"],
+            "splitNoMatch": ["é"],
+            "replaceOne": "abc.defg->hij",
+            "replaceAll": "abc.defg.hij",
+            "replaceOneReplacementLiteral": "a..b.c",
+            "replaceAllReplacementLiteral": "a..b..c",
+            "nullSplit": Bson::Null,
+            "nullReplace": Bson::Null
+        }
+    );
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -1801,6 +1842,63 @@ fn projection_supports_trim_expression_operators() {
             "nullChars": Bson::Null
         }
     );
+}
+
+#[test]
+fn split_and_replace_expression_operators_reject_invalid_inputs() {
+    let non_string_split = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$split": ["$value", ","] }
+        }),
+    )
+    .expect_err("split requires string input");
+    assert!(matches!(non_string_split, QueryError::InvalidArgument(_)));
+
+    let empty_separator = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$split": ["$value", ""] }
+        }),
+    )
+    .expect_err("split requires a non-empty separator");
+    assert!(matches!(empty_separator, QueryError::InvalidArgument(_)));
+
+    let invalid_replace_shape = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$replaceOne": { "input": "$value", "find": "a" } }
+        }),
+    )
+    .expect_err("replaceOne requires all named fields");
+    assert!(matches!(
+        invalid_replace_shape,
+        QueryError::InvalidStructure
+    ));
+
+    let invalid_replace_find = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$replaceAll": { "input": "$value", "find": 5, "replacement": "x" } }
+        }),
+    )
+    .expect_err("replaceAll requires a string find value");
+    assert!(matches!(
+        invalid_replace_find,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_replace_regex = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$replaceAll": { "input": "$value", "find": Bson::RegularExpression(bson::Regex { pattern: "a".to_string(), options: String::new() }), "replacement": "x" } }
+        }),
+    )
+    .expect_err("replaceAll rejects feature-flagged regex find");
+    assert!(matches!(
+        invalid_replace_regex,
+        QueryError::InvalidArgument(_)
+    ));
 }
 
 #[test]

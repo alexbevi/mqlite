@@ -206,14 +206,15 @@ Current cross-namespace aggregation behavior:
   currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and
   angular-conversion expressions currently include `$acos`, `$acosh`, `$asin`, `$asinh`, `$atan`,
   `$atan2`, `$atanh`, `$cos`, `$cosh`, `$sin`, `$sinh`, `$tan`, `$tanh`, `$degreesToRadians`,
-  and `$radiansToDegrees`. String-length, string-position, and substring expressions currently
-  include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`, `$substr`, `$substrBytes`,
-  and `$substrCP`,
+  and `$radiansToDegrees`. String-length, string-position, substring, split, and replacement
+  expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`,
+  `$substr`, `$substrBytes`, `$substrCP`, `$split`, `$replaceOne`, and `$replaceAll`,
   while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
   alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
   all executed in-process without a separate expression VM. Nullable numeric operators share a
   common evaluator path so nullish inputs return `null` consistently while domain violations fail
-  explicitly.
+  explicitly. String replacement and split currently support string operands only; regex-backed
+  variants remain out of scope until the feature-flagged upstream behavior is intentionally adopted.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file
