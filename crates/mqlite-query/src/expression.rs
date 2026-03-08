@@ -184,11 +184,14 @@ fn eval_expression_operator(
         "$anyElementTrue" => eval_array_truth_expression(document, value, variables, false),
         "$concat" => eval_concat_expression(document, value, variables),
         "$isNumber" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
-            eval_expression_result_with_variables(document, unary_expression_operand(value), variables)?,
-            EvaluatedExpression::Value(Bson::Int32(_)
-                | Bson::Int64(_)
-                | Bson::Double(_)
-                | Bson::Decimal128(_))
+            eval_expression_result_with_variables(
+                document,
+                unary_expression_operand(value),
+                variables
+            )?,
+            EvaluatedExpression::Value(
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+            )
         )))),
         "$type" => Ok(EvaluatedExpression::Value(Bson::String(
             match eval_expression_result_with_variables(
@@ -673,8 +676,11 @@ fn eval_array_truth_expression(
     variables: &BTreeMap<String, Bson>,
     require_all: bool,
 ) -> Result<EvaluatedExpression, QueryError> {
-    let evaluated =
-        eval_expression_result_with_variables(document, unary_expression_operand(value), variables)?;
+    let evaluated = eval_expression_result_with_variables(
+        document,
+        unary_expression_operand(value),
+        variables,
+    )?;
     let EvaluatedExpression::Value(Bson::Array(items)) = evaluated else {
         return Err(QueryError::InvalidArgument(
             if require_all {

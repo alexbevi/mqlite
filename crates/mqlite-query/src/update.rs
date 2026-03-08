@@ -49,7 +49,12 @@ pub fn parse_update_value(update: &Bson) -> Result<UpdateSpec, QueryError> {
         Bson::Array(stages) => {
             let pipeline = stages
                 .iter()
-                .map(|stage| stage.as_document().cloned().ok_or(QueryError::InvalidUpdate))
+                .map(|stage| {
+                    stage
+                        .as_document()
+                        .cloned()
+                        .ok_or(QueryError::InvalidUpdate)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             if pipeline.is_empty() {
                 return Err(QueryError::InvalidUpdate);

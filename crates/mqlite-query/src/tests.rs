@@ -823,14 +823,20 @@ fn projection_supports_expression_operators() {
     let mut projection = Document::new();
     projection.insert("abs", doc! { "$abs": -5 });
     projection.insert("add", doc! { "$add": ["$left", "$right", 2] });
-    projection.insert("allElementsTrue", doc! { "$allElementsTrue": [true, 1, "ok"] });
+    projection.insert(
+        "allElementsTrue",
+        doc! { "$allElementsTrue": [true, 1, "ok"] },
+    );
     projection.insert("eq", doc! { "$eq": ["$left", 5] });
     projection.insert("ne", doc! { "$ne": ["$left", "$right"] });
     projection.insert("gt", doc! { "$gt": ["$left", "$right"] });
     projection.insert("gte", doc! { "$gte": ["$left", 5] });
     projection.insert("lt", doc! { "$lt": ["$right", "$left"] });
     projection.insert("lte", doc! { "$lte": ["$right", 3] });
-    projection.insert("anyElementTrue", doc! { "$anyElementTrue": [0, false, "ok"] });
+    projection.insert(
+        "anyElementTrue",
+        doc! { "$anyElementTrue": [0, false, "ok"] },
+    );
     projection.insert("arrayElemAt", doc! { "$arrayElemAt": ["$array", -1] });
     projection.insert("arrayToObject", doc! { "$arrayToObject": "$pairs" });
     projection.insert("cmp", doc! { "$cmp": ["$left", "$right"] });
@@ -851,7 +857,10 @@ fn projection_supports_expression_operators() {
     projection.insert("isNumber", doc! { "$isNumber": "$left" });
     projection.insert("last", doc! { "$last": "$array" });
     projection.insert("mod", doc! { "$mod": [17, 5] });
-    projection.insert("mergeObjects", doc! { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] });
+    projection.insert(
+        "mergeObjects",
+        doc! { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
+    );
     projection.insert("multiply", doc! { "$multiply": ["$left", 2] });
     projection.insert("objectToArray", doc! { "$objectToArray": "$object" });
     projection.insert("round", doc! { "$round": [2.65, 1] });
@@ -860,11 +869,7 @@ fn projection_supports_expression_operators() {
     projection.insert("type", doc! { "$type": "$left" });
     projection.insert("trunc", doc! { "$trunc": [2.65, 1] });
     projection.insert("literal", doc! { "$literal": { "nested": true } });
-    let projected = apply_projection(
-        &document,
-        Some(&projection),
-    )
-    .expect("apply projection");
+    let projected = apply_projection(&document, Some(&projection)).expect("apply projection");
 
     let mut expected = Document::new();
     expected.insert("_id", 1);
@@ -911,10 +916,7 @@ fn projection_supports_expression_operators() {
     expected.insert("trunc", 2.6);
     expected.insert("literal", doc! { "nested": true });
 
-    assert_eq!(
-        projected,
-        expected
-    );
+    assert_eq!(projected, expected);
 }
 
 #[test]
