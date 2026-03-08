@@ -833,7 +833,7 @@ fn matches_regex_compiled(value: &Bson, regex: &RustRegex) -> bool {
     }
 }
 
-fn compile_regex(pattern: &str, options: &str) -> Result<RustRegex, QueryError> {
+pub(crate) fn compile_regex(pattern: &str, options: &str) -> Result<RustRegex, QueryError> {
     let mut builder = RegexBuilder::new(pattern);
     for option in options.chars() {
         match option {

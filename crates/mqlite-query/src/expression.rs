@@ -6,10 +6,11 @@ use std::{
 use bson::{Bson, Decimal128, Document, doc, oid::ObjectId};
 use chrono::{DateTime, SecondsFormat, Utc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
+use regex::Regex as RustRegex;
 
 use crate::{
     QueryError,
-    filter::bson_type_alias,
+    filter::{bson_type_alias, compile_regex},
     pipeline::{compare_documents_by_sort, validate_sort_spec},
 };
 
@@ -296,6 +297,15 @@ fn eval_expression_operator(
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
+        "$regexFind" => {
+            eval_regex_expression(document, value, variables, RegexExpressionMode::Find)
+        }
+        "$regexFindAll" => {
+            eval_regex_expression(document, value, variables, RegexExpressionMode::FindAll)
+        }
+        "$regexMatch" => {
+            eval_regex_expression(document, value, variables, RegexExpressionMode::Match)
+        }
         "$replaceAll" => eval_replace_expression(document, value, variables, true),
         "$replaceOne" => eval_replace_expression(document, value, variables, false),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
@@ -644,6 +654,7 @@ fn validate_expression_operator(
             Ok(())
         }
         "$reduce" => validate_reduce_expression(value, scope),
+        "$regexFind" | "$regexFindAll" | "$regexMatch" => validate_regex_expression(value, scope),
         "$replaceAll" | "$replaceOne" => validate_replace_expression(value, scope),
         "$reverseArray" => validate_expression_with_scope(unary_expression_operand(value), scope),
         "$sortArray" => validate_sort_array_expression(value, scope),
@@ -1407,6 +1418,60 @@ fn eval_reduce_expression(
     Ok(EvaluatedExpression::Value(accumulator))
 }
 
+fn eval_regex_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    mode: RegexExpressionMode,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = match mode {
+        RegexExpressionMode::Find => "$regexFind",
+        RegexExpressionMode::FindAll => "$regexFindAll",
+        RegexExpressionMode::Match => "$regexMatch",
+    };
+    let (input, regex, options) = parse_regex_expression_spec(value)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    let regex = eval_expression_result_with_variables(document, regex, variables)?;
+    let options = options
+        .map(|options| eval_expression_result_with_variables(document, options, variables))
+        .transpose()?;
+    let input = if input.is_nullish() {
+        None
+    } else {
+        Some(require_named_string_operand(input, operator, "input")?)
+    };
+    let compiled = compile_expression_regex(operator, regex, options, value)?;
+
+    if input.is_none() || compiled.is_none() {
+        return Ok(match mode {
+            RegexExpressionMode::Find => EvaluatedExpression::Value(Bson::Null),
+            RegexExpressionMode::FindAll => EvaluatedExpression::Value(Bson::Array(Vec::new())),
+            RegexExpressionMode::Match => EvaluatedExpression::Value(Bson::Boolean(false)),
+        });
+    }
+
+    let input = input.expect("validated input");
+    let compiled = compiled.expect("validated regex");
+
+    Ok(match mode {
+        RegexExpressionMode::Find => regex_match_documents(&input, &compiled)
+            .into_iter()
+            .next()
+            .map(Bson::Document)
+            .map(EvaluatedExpression::Value)
+            .unwrap_or(EvaluatedExpression::Value(Bson::Null)),
+        RegexExpressionMode::FindAll => EvaluatedExpression::Value(Bson::Array(
+            regex_match_documents(&input, &compiled)
+                .into_iter()
+                .map(Bson::Document)
+                .collect(),
+        )),
+        RegexExpressionMode::Match => {
+            EvaluatedExpression::Value(Bson::Boolean(compiled.is_match(&input)))
+        }
+    })
+}
+
 fn eval_bitwise_expression(
     document: &Document,
     value: &Bson,
@@ -1735,6 +1800,13 @@ enum ExpressionAccumulator {
     Max,
     Min,
     Sum,
+}
+
+#[derive(Clone, Copy)]
+enum RegexExpressionMode {
+    Find,
+    FindAll,
+    Match,
 }
 
 fn eval_expression_accumulator(
@@ -2971,6 +3043,16 @@ fn validate_reduce_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<
     validate_expression_with_scope(in_expression, &inner_scope)
 }
 
+fn validate_regex_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, regex, options) = parse_regex_expression_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    validate_expression_with_scope(regex, scope)?;
+    if let Some(options) = options {
+        validate_expression_with_scope(options, scope)?;
+    }
+    Ok(())
+}
+
 fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     match value {
         Bson::Document(spec) => {
@@ -3051,6 +3133,28 @@ fn parse_reduce_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError> 
         input.ok_or(QueryError::InvalidStructure)?,
         initial_value.ok_or(QueryError::InvalidStructure)?,
         in_expression.ok_or(QueryError::InvalidStructure)?,
+    ))
+}
+
+fn parse_regex_expression_spec(value: &Bson) -> Result<(&Bson, &Bson, Option<&Bson>), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut regex = None;
+    let mut options = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "regex" => regex = Some(value),
+            "options" => options = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        input.ok_or(QueryError::InvalidStructure)?,
+        regex.ok_or(QueryError::InvalidStructure)?,
+        options,
     ))
 }
 
@@ -3355,6 +3459,123 @@ fn require_named_string_operand(
             "{operator} requires `{field}` to evaluate to a string"
         ))),
     }
+}
+
+fn compile_expression_regex(
+    operator: &str,
+    regex: EvaluatedExpression,
+    options: Option<EvaluatedExpression>,
+    spec: &Bson,
+) -> Result<Option<RustRegex>, QueryError> {
+    let options_present = parse_regex_expression_spec(spec)?.2.is_some();
+    let explicit_options = match options {
+        Some(
+            EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined),
+        ) => None,
+        Some(EvaluatedExpression::Value(Bson::String(options))) => Some(options),
+        Some(_) => {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires `options` to evaluate to a string"
+            )));
+        }
+        None => None,
+    };
+
+    let (pattern, embedded_options) = match regex {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            return Ok(None);
+        }
+        EvaluatedExpression::Value(Bson::String(pattern)) => (pattern, String::new()),
+        EvaluatedExpression::Value(Bson::RegularExpression(regex)) => {
+            if options_present && !regex.options.is_empty() {
+                return Err(QueryError::InvalidArgument(format!(
+                    "{operator} cannot specify regex options in both `regex` and `options`"
+                )));
+            }
+            (regex.pattern, regex.options)
+        }
+        _ => {
+            return Err(QueryError::InvalidArgument(format!(
+                "{operator} requires `regex` to evaluate to a string or regex"
+            )));
+        }
+    };
+
+    let options = match explicit_options {
+        Some(options) => {
+            if !embedded_options.is_empty() {
+                return Err(QueryError::InvalidArgument(format!(
+                    "{operator} cannot specify regex options in both `regex` and `options`"
+                )));
+            }
+            options
+        }
+        None => embedded_options,
+    };
+
+    Ok(Some(compile_regex(&pattern, &options)?))
+}
+
+fn regex_match_documents(input: &str, regex: &RustRegex) -> Vec<Document> {
+    let mut results = Vec::new();
+    let mut search_start = 0usize;
+
+    loop {
+        let Some(captures) = regex.captures_at(input, search_start) else {
+            break;
+        };
+        let matched = captures.get(0).expect("captures always include group zero");
+        if matched.start() == input.len() && matched.end() == input.len() && !input.is_empty() {
+            break;
+        }
+
+        results.push(regex_match_document(input, &captures));
+
+        if matched.end() > matched.start() {
+            search_start = matched.end();
+            continue;
+        }
+
+        let Some(next) = next_char_boundary(input, matched.start()) else {
+            break;
+        };
+        search_start = next;
+    }
+
+    results
+}
+
+fn regex_match_document(input: &str, captures: &regex::Captures<'_>) -> Document {
+    let matched = captures.get(0).expect("captures always include group zero");
+    let mut document = Document::new();
+    document.insert("match", matched.as_str());
+    document.insert("idx", regex_code_point_index(input, matched.start()));
+    document.insert(
+        "captures",
+        Bson::Array(
+            (1..captures.len())
+                .map(|index| match captures.get(index) {
+                    Some(capture) => Bson::String(capture.as_str().to_string()),
+                    None => Bson::Null,
+                })
+                .collect(),
+        ),
+    );
+    document
+}
+
+fn regex_code_point_index(input: &str, byte_index: usize) -> Bson {
+    let count = input[..byte_index].chars().count();
+    i32::try_from(count)
+        .map(Bson::Int32)
+        .unwrap_or_else(|_| Bson::Int64(count as i64))
+}
+
+fn next_char_boundary(input: &str, start: usize) -> Option<usize> {
+    input[start..]
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
 }
 
 fn require_trim_string(

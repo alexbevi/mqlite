@@ -1567,6 +1567,15 @@ mod tests {
             "$reduce" => {
                 doc! { "value": { "$reduce": { "input": "$array", "initialValue": 0, "in": { "$add": ["$$value", "$$this"] } } } }
             }
+            "$regexFind" => {
+                doc! { "value": { "$regexFind": { "input": "$text", "regex": "b" } } }
+            }
+            "$regexFindAll" => {
+                doc! { "value": { "$regexFindAll": { "input": "$text", "regex": "b" } } }
+            }
+            "$regexMatch" => {
+                doc! { "value": { "$regexMatch": { "input": "$text", "regex": "b" } } }
+            }
             "$replaceAll" => {
                 doc! { "value": { "$replaceAll": { "input": "a.b.c", "find": ".", "replacement": ".." } } }
             }

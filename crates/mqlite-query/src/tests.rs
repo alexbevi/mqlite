@@ -1806,6 +1806,62 @@ fn projection_supports_split_and_replace_expression_operators() {
 }
 
 #[test]
+fn projection_supports_regex_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "text": "Simple Example",
+            "unicode": "cafétéria",
+            "mixed": "Camel Case",
+            "dynamicRegex": Bson::RegularExpression(bson::Regex {
+                pattern: "(té)".to_string(),
+                options: String::new()
+            })
+        },
+        Some(&doc! {
+            "firstMatch": { "$regexFind": { "input": "$text", "regex": "(m(p))" } },
+            "allMatches": { "$regexFindAll": { "input": "$unicode", "regex": "$dynamicRegex" } },
+            "caseInsensitive": { "$regexMatch": { "input": "$mixed", "regex": "camel", "options": "i" } },
+            "nullFind": { "$regexFind": { "input": "$missing", "regex": "abc" } },
+            "nullFindAll": { "$regexFindAll": { "input": "$mixed", "regex": "$missing" } },
+            "nullMatch": { "$regexMatch": { "input": Bson::Null, "regex": "abc" } },
+            "emptyMatches": { "$regexFindAll": { "input": "bbbb", "regex": "()" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected.get("firstMatch"),
+        Some(&Bson::Document(doc! {
+            "match": "mp",
+            "idx": 2,
+            "captures": ["mp", "p"]
+        }))
+    );
+    assert_eq!(
+        projected.get("allMatches"),
+        Some(&Bson::Array(vec![Bson::Document(doc! {
+            "match": "té",
+            "idx": 4,
+            "captures": ["té"]
+        })]))
+    );
+    assert_eq!(projected.get("caseInsensitive"), Some(&Bson::Boolean(true)));
+    assert_eq!(projected.get("nullFind"), Some(&Bson::Null));
+    assert_eq!(projected.get("nullFindAll"), Some(&Bson::Array(Vec::new())));
+    assert_eq!(projected.get("nullMatch"), Some(&Bson::Boolean(false)));
+    assert_eq!(
+        projected.get("emptyMatches"),
+        Some(&Bson::Array(vec![
+            Bson::Document(doc! { "match": "", "idx": 0, "captures": [""] }),
+            Bson::Document(doc! { "match": "", "idx": 1, "captures": [""] }),
+            Bson::Document(doc! { "match": "", "idx": 2, "captures": [""] }),
+            Bson::Document(doc! { "match": "", "idx": 3, "captures": [""] })
+        ]))
+    );
+}
+
+#[test]
 fn projection_supports_utility_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -2235,6 +2291,81 @@ fn split_and_replace_expression_operators_reject_invalid_inputs() {
         invalid_replace_regex,
         QueryError::InvalidArgument(_)
     ));
+}
+
+#[test]
+fn regex_expression_operators_reject_invalid_inputs() {
+    let invalid_shape = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$regexFind": "abc" }
+        }),
+    )
+    .expect_err("regex expressions require an object");
+    assert!(matches!(invalid_shape, QueryError::InvalidStructure));
+
+    let missing_input = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$regexFind": { "regex": "abc" } }
+        }),
+    )
+    .expect_err("regex expressions require input");
+    assert!(matches!(missing_input, QueryError::InvalidStructure));
+
+    let invalid_input = apply_projection(
+        &doc! { "_id": 1, "value": { "nested": true } },
+        Some(&doc! {
+            "out": { "$regexFind": { "input": "$value", "regex": "abc" } }
+        }),
+    )
+    .expect_err("regex input must evaluate to a string");
+    assert!(matches!(invalid_input, QueryError::InvalidArgument(_)));
+
+    let invalid_regex = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$regexFind": { "input": "$value", "regex": ["abc"] } }
+        }),
+    )
+    .expect_err("regex must evaluate to a string or regex");
+    assert!(matches!(invalid_regex, QueryError::InvalidArgument(_)));
+
+    let invalid_options = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$regexFind": { "input": "$value", "regex": "abc", "options": 1 } }
+        }),
+    )
+    .expect_err("regex options must evaluate to a string");
+    assert!(matches!(invalid_options, QueryError::InvalidArgument(_)));
+
+    let duplicate_options = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": {
+                "$regexFind": {
+                    "input": "$value",
+                    "regex": Bson::RegularExpression(bson::Regex {
+                        pattern: "abc".to_string(),
+                        options: "i".to_string()
+                    }),
+                    "options": "m"
+                }
+            }
+        }),
+    )
+    .expect_err("regex options cannot be specified twice");
+    assert!(matches!(duplicate_options, QueryError::InvalidArgument(_)));
+
+    let malformed_regex = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$regexFind": { "input": "$value", "regex": "[0-9" } }
+        }),
+    )
+    .expect_err("malformed regex should fail");
+    assert!(matches!(malformed_regex, QueryError::InvalidStructure));
 }
 
 #[test]

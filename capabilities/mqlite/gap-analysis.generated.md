@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 118 | 34 | 24 |
+| Aggregation expression operators | 176 | 121 | 31 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 118. Unsupported: 34. Ignored: 24.
+Public upstream: 176. Supported: 121. Unsupported: 31. Ignored: 24.
 
 ### Supported Public
 
@@ -295,6 +295,9 @@ Public upstream: 176. Supported: 118. Unsupported: 34. Ignored: 24.
 - `$rand`
 - `$range`
 - `$reduce`
+- `$regexFind`
+- `$regexFindAll`
+- `$regexMatch`
 - `$replaceAll`
 - `$replaceOne`
 - `$reverseArray`
@@ -369,9 +372,6 @@ Public upstream: 176. Supported: 118. Unsupported: 34. Ignored: 24.
 - `$minute`
 - `$month`
 - `$percentile`
-- `$regexFind`
-- `$regexFindAll`
-- `$regexMatch`
 - `$second`
 - `$stdDevPop`
 - `$stdDevSamp`

@@ -207,9 +207,10 @@ Current cross-namespace aggregation behavior:
   currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and
   angular-conversion expressions currently include `$acos`, `$acosh`, `$asin`, `$asinh`, `$atan`,
   `$atan2`, `$atanh`, `$cos`, `$cosh`, `$sin`, `$sinh`, `$tan`, `$tanh`, `$degreesToRadians`,
-  and `$radiansToDegrees`. String-length, string-position, substring, split, and replacement
+  and `$radiansToDegrees`. String-length, string-position, substring, regex, split, and replacement
   expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`,
-  `$substr`, `$substrBytes`, `$substrCP`, `$split`, `$replaceOne`, and `$replaceAll`,
+  `$substr`, `$substrBytes`, `$substrCP`, `$regexFind`, `$regexFindAll`, `$regexMatch`, `$split`,
+  `$replaceOne`, and `$replaceAll`,
   conversion expressions currently include `$convert`, `$toBool`, `$toDate`, `$toDecimal`,
   `$toDouble`, `$toInt`, `$toLong`, `$toObjectId`, and `$toString`,
   utility expressions currently include `$rand`, `$sortArray`, `$tsSecond`, `$tsIncrement`, and

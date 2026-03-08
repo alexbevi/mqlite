@@ -3722,6 +3722,146 @@ fn command_aggregate_project_supports_split_and_replace_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_regex_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("regex-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"text":"Simple Example","unicode":"cafétéria","mixed":"Camel Case","dynamicRegex":{"$regularExpression":{"pattern":"(té)","options":""}}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "firstMatch": { "$regexFind": { "input": "$text", "regex": "(m(p))" } },
+                    "allMatches": { "$regexFindAll": { "input": "$unicode", "regex": "$dynamicRegex" } },
+                    "caseInsensitive": { "$regexMatch": { "input": "$mixed", "regex": "camel", "options": "i" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "firstMatch": { "match": "mp", "idx": 2, "captures": ["mp", "p"] },
+            "allMatches": [{ "match": "té", "idx": 4, "captures": ["té"] }],
+            "caseInsensitive": true
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_regex_expression_inputs() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("regex-expression-invalid.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"text":"abc"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "out": {
+                        "$regexFind": {
+                            "input": "$text",
+                            "regex": {
+                                "$regularExpression": {
+                                    "pattern": "abc",
+                                    "options": "i"
+                                }
+                            },
+                            "options": "m"
+                        }
+                    }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_project_supports_utility_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("utility-expression.mongodb");
