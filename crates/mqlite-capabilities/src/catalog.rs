@@ -1500,6 +1500,7 @@ mod tests {
             "$atan" => doc! { "value": { "$atan": 0 } },
             "$atan2" => doc! { "value": { "$atan2": [0, 1] } },
             "$atanh" => doc! { "value": { "$atanh": 0 } },
+            "$avg" => doc! { "value": { "$avg": [1, 2, 3] } },
             "$binarySize" => doc! { "value": { "$binarySize": "abc" } },
             "$bsonSize" => doc! { "value": { "$bsonSize": "$$CURRENT" } },
             "$bitAnd" => doc! { "value": { "$bitAnd": ["$left", 6] } },
@@ -1550,7 +1551,9 @@ mod tests {
             "$map" => {
                 doc! { "value": { "$map": { "input": "$array", "as": "value", "in": { "$add": ["$$value", 1] } } } }
             }
+            "$max" => doc! { "value": { "$max": ["$left", "$right"] } },
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
+            "$min" => doc! { "value": { "$min": ["$left", "$right"] } },
             "$mod" => doc! { "value": { "$mod": [17, 5] } },
             "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },
             "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
@@ -1605,6 +1608,7 @@ mod tests {
             "$substrBytes" => doc! { "value": { "$substrBytes": ["éclair", 0, 4] } },
             "$substrCP" => doc! { "value": { "$substrCP": ["éclair", 0, 4] } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
+            "$sum" => doc! { "value": { "$sum": [1, 2, 3] } },
             "$switch" => {
                 doc! { "value": { "$switch": { "branches": [{ "case": { "$eq": ["$left", "$left"] }, "then": "yes" }], "default": "no" } } }
             }

@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 114 | 38 | 24 |
+| Aggregation expression operators | 176 | 118 | 34 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
+Public upstream: 176. Supported: 118. Unsupported: 34. Ignored: 24.
 
 ### Supported Public
 
@@ -237,6 +237,7 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 - `$atan`
 - `$atan2`
 - `$atanh`
+- `$avg`
 - `$binarySize`
 - `$bitAnd`
 - `$bitNot`
@@ -280,7 +281,9 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 - `$lte`
 - `$ltrim`
 - `$map`
+- `$max`
 - `$mergeObjects`
+- `$min`
 - `$mod`
 - `$multiply`
 - `$ne`
@@ -317,6 +320,7 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 - `$substrBytes`
 - `$substrCP`
 - `$subtract`
+- `$sum`
 - `$switch`
 - `$tan`
 - `$tanh`
@@ -340,7 +344,6 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 
 ### Unsupported Public
 
-- `$avg`
 - `$dateAdd`
 - `$dateDiff`
 - `$dateFromParts`
@@ -358,12 +361,10 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 - `$isoWeek`
 - `$isoWeekYear`
 - `$lastN`
-- `$max`
 - `$maxN`
 - `$median`
 - `$meta` (conditional)
 - `$millisecond`
-- `$min`
 - `$minN`
 - `$minute`
 - `$month`
@@ -374,7 +375,6 @@ Public upstream: 176. Supported: 114. Unsupported: 38. Ignored: 24.
 - `$second`
 - `$stdDevPop`
 - `$stdDevSamp`
-- `$sum`
 - `$toHashedIndexKey`
 - `$week`
 - `$year`

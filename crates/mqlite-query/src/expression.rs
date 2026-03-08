@@ -195,6 +195,9 @@ fn eval_expression_operator(
         }),
         "$allElementsTrue" => eval_array_truth_expression(document, value, variables, true),
         "$anyElementTrue" => eval_array_truth_expression(document, value, variables, false),
+        "$avg" => {
+            eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Avg)
+        }
         "$concat" => eval_concat_expression(document, value, variables),
         "$isNumber" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(
@@ -283,7 +286,13 @@ fn eval_expression_operator(
         )))),
         "$last" => eval_first_last_expression(document, value, variables, false),
         "$map" => eval_map_expression(document, value, variables),
+        "$max" => {
+            eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Max)
+        }
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
+        "$min" => {
+            eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Min)
+        }
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
@@ -292,6 +301,9 @@ fn eval_expression_operator(
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$sortArray" => eval_sort_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
+        "$sum" => {
+            eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Sum)
+        }
         "$toBool" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Bool),
         "$toDate" => eval_convert_alias_expression(document, value, variables, ConvertTarget::Date),
         "$toDecimal" => {
@@ -552,6 +564,16 @@ fn validate_expression_operator(
         }
         "$strLenBytes" | "$strLenCP" => {
             validate_expression_with_scope(single_expression_operand(value)?, scope)
+        }
+        "$avg" | "$max" | "$min" | "$sum" => {
+            if let Bson::Array(arguments) = value {
+                for argument in arguments {
+                    validate_expression_with_scope(argument, scope)?;
+                }
+                Ok(())
+            } else {
+                validate_expression_with_scope(value, scope)
+            }
         }
         "$substr" | "$substrBytes" | "$substrCP" => {
             for argument in expression_arguments::<3>(value)? {
@@ -1705,6 +1727,178 @@ struct ConvertSpec<'a> {
     to: &'a Bson,
     on_error: Option<&'a Bson>,
     on_null: Option<&'a Bson>,
+}
+
+#[derive(Clone, Copy)]
+enum ExpressionAccumulator {
+    Avg,
+    Max,
+    Min,
+    Sum,
+}
+
+fn eval_expression_accumulator(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    accumulator: ExpressionAccumulator,
+) -> Result<EvaluatedExpression, QueryError> {
+    match value {
+        Bson::Array(arguments) if arguments.len() != 1 => {
+            let mut evaluated = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                evaluated.push(eval_expression_result_with_variables(
+                    document, argument, variables,
+                )?);
+            }
+            evaluate_expression_accumulator_values(evaluated, accumulator, false)
+        }
+        _ => {
+            let evaluated = eval_expression_result_with_variables(
+                document,
+                unary_expression_operand(value),
+                variables,
+            )?;
+            evaluate_expression_accumulator_values(vec![evaluated], accumulator, true)
+        }
+    }
+}
+
+fn evaluate_expression_accumulator_values(
+    values: Vec<EvaluatedExpression>,
+    accumulator: ExpressionAccumulator,
+    single_argument: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    match accumulator {
+        ExpressionAccumulator::Avg => evaluate_expression_avg(values, single_argument),
+        ExpressionAccumulator::Max => evaluate_expression_extrema(values, single_argument, true),
+        ExpressionAccumulator::Min => evaluate_expression_extrema(values, single_argument, false),
+        ExpressionAccumulator::Sum => evaluate_expression_sum(values, single_argument),
+    }
+}
+
+fn evaluate_expression_avg(
+    values: Vec<EvaluatedExpression>,
+    single_argument: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for value in expression_accumulator_items(values, single_argument) {
+        if let Some(number) = numeric_value_or_none(&value)? {
+            sum += number;
+            count += 1;
+        }
+    }
+
+    Ok(if count == 0 {
+        EvaluatedExpression::Value(Bson::Null)
+    } else {
+        EvaluatedExpression::Value(Bson::Double(sum / count as f64))
+    })
+}
+
+fn evaluate_expression_sum(
+    values: Vec<EvaluatedExpression>,
+    single_argument: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let mut sum = 0.0;
+    for value in expression_accumulator_items(values, single_argument) {
+        if let Some(number) = numeric_value_or_none(&value)? {
+            sum += number;
+        }
+    }
+    Ok(EvaluatedExpression::Value(number_bson(sum)))
+}
+
+fn evaluate_expression_extrema(
+    values: Vec<EvaluatedExpression>,
+    single_argument: bool,
+    max: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let mut best = None;
+    for value in expression_accumulator_items(values, single_argument) {
+        if matches!(value, Bson::Null | Bson::Undefined) {
+            continue;
+        }
+
+        match &best {
+            None => best = Some(value),
+            Some(current) if extrema_prefers_candidate(current, &value, max) => best = Some(value),
+            _ => {}
+        }
+    }
+
+    Ok(best
+        .map(EvaluatedExpression::Value)
+        .unwrap_or(EvaluatedExpression::Value(Bson::Null)))
+}
+
+fn expression_accumulator_items(
+    values: Vec<EvaluatedExpression>,
+    single_argument: bool,
+) -> Vec<Bson> {
+    if single_argument {
+        match values
+            .into_iter()
+            .next()
+            .unwrap_or(EvaluatedExpression::Missing)
+        {
+            EvaluatedExpression::Missing => vec![Bson::Null],
+            EvaluatedExpression::Value(Bson::Array(items)) => items,
+            EvaluatedExpression::Value(value) => vec![value],
+        }
+    } else {
+        values
+            .into_iter()
+            .map(|value| match value {
+                EvaluatedExpression::Missing => Bson::Null,
+                EvaluatedExpression::Value(value) => value,
+            })
+            .collect()
+    }
+}
+
+fn numeric_value_or_none(value: &Bson) -> Result<Option<f64>, QueryError> {
+    match value {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+            numeric_value(value).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn extrema_prefers_candidate(current: &Bson, candidate: &Bson, max: bool) -> bool {
+    let current_nan = bson_is_nan(current);
+    let candidate_nan = bson_is_nan(candidate);
+    if max {
+        if candidate_nan {
+            return false;
+        }
+        if current_nan {
+            return true;
+        }
+        compare_bson(candidate, current).is_gt()
+    } else {
+        if candidate_nan {
+            return true;
+        }
+        if current_nan {
+            return false;
+        }
+        compare_bson(candidate, current).is_lt()
+    }
+}
+
+fn bson_is_nan(value: &Bson) -> bool {
+    match value {
+        Bson::Double(value) => value.is_nan(),
+        Bson::Decimal128(value) => value
+            .to_string()
+            .parse::<f64>()
+            .map(f64::is_nan)
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn eval_convert_expression(

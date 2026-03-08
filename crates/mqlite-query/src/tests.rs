@@ -1974,6 +1974,66 @@ fn projection_supports_conversion_expression_operators() {
 }
 
 #[test]
+fn projection_supports_accumulator_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "nums": [1, 2, 3],
+            "mixed": [1, 2, 3, "string", Bson::Null],
+            "nested": [[1, 2, 3], 1, Bson::Null],
+            "value": 5,
+            "text": "hello"
+        },
+        Some(&doc! {
+            "avgScalar": { "$avg": "$value" },
+            "avgArray": { "$avg": "$mixed" },
+            "sumArray": { "$sum": "$mixed" },
+            "sumArgs": { "$sum": ["$value", 2, 3, { "$sum": [4, 5] }] },
+            "minArray": { "$min": "$mixed" },
+            "maxArray": { "$max": "$mixed" },
+            "minArgs": { "$min": ["$text", 3, "z"] },
+            "maxArgs": { "$max": ["$text", 3, "z"] },
+            "minNested": { "$min": "$nested" },
+            "maxNested": { "$max": "$nested" },
+            "maxNaN": { "$max": [1, 2, Bson::Double(f64::NAN)] },
+            "minNaN": { "$min": [1, 2, Bson::Double(f64::NAN)] },
+            "sumMissing": { "$sum": "$missing" },
+            "avgMissing": { "$avg": "$missing" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected.get("avgScalar"), Some(&Bson::Double(5.0)));
+    assert_eq!(projected.get("avgArray"), Some(&Bson::Double(2.0)));
+    assert_eq!(projected.get("sumArray"), Some(&Bson::Int64(6)));
+    assert_eq!(projected.get("sumArgs"), Some(&Bson::Int64(19)));
+    assert_eq!(projected.get("minArray"), Some(&Bson::Int32(1)));
+    assert_eq!(
+        projected.get("maxArray"),
+        Some(&Bson::String("string".to_string()))
+    );
+    assert_eq!(projected.get("minArgs"), Some(&Bson::Int32(3)));
+    assert_eq!(
+        projected.get("maxArgs"),
+        Some(&Bson::String("z".to_string()))
+    );
+    assert_eq!(projected.get("minNested"), Some(&Bson::Int32(1)));
+    assert_eq!(
+        projected.get("maxNested"),
+        Some(&Bson::Array(vec![1.into(), 2.into(), 3.into()]))
+    );
+    assert_eq!(projected.get("maxNaN"), Some(&Bson::Int32(2)));
+    assert!(
+        projected
+            .get("minNaN")
+            .and_then(Bson::as_f64)
+            .is_some_and(f64::is_nan)
+    );
+    assert_eq!(projected.get("sumMissing"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("avgMissing"), Some(&Bson::Null));
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {

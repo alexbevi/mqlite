@@ -3872,6 +3872,81 @@ fn command_aggregate_project_supports_conversion_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_accumulator_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("accumulator-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"mixed":[1,2,3,"string",null],"nested":[[1,2,3],1,null],"value":5,"text":"hello"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "avgArray": { "$avg": "$mixed" },
+                    "sumArray": { "$sum": "$mixed" },
+                    "sumArgs": { "$sum": ["$value", 2, 3, { "$sum": [4, 5] }] },
+                    "minArray": { "$min": "$mixed" },
+                    "maxArray": { "$max": "$mixed" },
+                    "minNested": { "$min": "$nested" },
+                    "maxNested": { "$max": "$nested" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_json_number_close(&first["avgArray"], 2.0);
+    assert_eq!(first["sumArray"], 6);
+    assert_eq!(first["sumArgs"], 19);
+    assert_eq!(first["minArray"], 1);
+    assert_eq!(first["maxArray"], "string");
+    assert_eq!(first["minNested"], 1);
+    assert_eq!(first["maxNested"], json!([1, 2, 3]));
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
