@@ -4,7 +4,8 @@ use std::{
 };
 
 use bson::{Bson, Decimal128, Document, doc, oid::ObjectId};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, SecondsFormat, Timelike, Utc};
+use chrono_tz::Tz;
 use mqlite_bson::{compare_bson, lookup_path_owned};
 use regex::Regex as RustRegex;
 
@@ -232,10 +233,31 @@ fn eval_expression_operator(
         "$bsonSize" => eval_bson_size_expression(document, value, variables),
         "$concatArrays" => eval_concat_arrays_expression(document, value, variables),
         "$convert" => eval_convert_expression(document, value, variables),
+        "$dayOfMonth" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::DayOfMonth,
+        ),
+        "$dayOfWeek" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::DayOfWeek,
+        ),
+        "$dayOfYear" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::DayOfYear,
+        ),
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$firstN" => eval_n_expression(document, value, variables, NExpressionMode::First),
         "$getField" => eval_get_field_expression(document, value, variables),
+        "$hour" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Hour)
+        }
         "$rand" => eval_rand_expression(value),
         "$exp" => eval_nullable_unary_math_expression(document, value, variables, |number| {
             Ok(number.exp())
@@ -282,6 +304,21 @@ fn eval_expression_operator(
         "$indexOfBytes" => eval_index_of_string_expression(document, value, variables, false),
         "$indexOfCP" => eval_index_of_string_expression(document, value, variables, true),
         "$indexOfArray" => eval_index_of_array_expression(document, value, variables),
+        "$isoDayOfWeek" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::IsoDayOfWeek,
+        ),
+        "$isoWeek" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::IsoWeek)
+        }
+        "$isoWeekYear" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::IsoWeekYear,
+        ),
         "$isArray" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(document, value, variables)?,
             EvaluatedExpression::Value(Bson::Array(_))
@@ -294,10 +331,22 @@ fn eval_expression_operator(
         }
         "$maxN" => eval_n_expression(document, value, variables, NExpressionMode::Max),
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
+        "$millisecond" => eval_date_part_expression(
+            document,
+            value,
+            variables,
+            DatePartExpressionMode::Millisecond,
+        ),
         "$min" => {
             eval_expression_accumulator(document, value, variables, ExpressionAccumulator::Min)
         }
         "$minN" => eval_n_expression(document, value, variables, NExpressionMode::Min),
+        "$minute" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Minute)
+        }
+        "$month" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Month)
+        }
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$range" => eval_range_expression(document, value, variables),
         "$reduce" => eval_reduce_expression(document, value, variables),
@@ -313,6 +362,9 @@ fn eval_expression_operator(
         "$replaceAll" => eval_replace_expression(document, value, variables, true),
         "$replaceOne" => eval_replace_expression(document, value, variables, false),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
+        "$second" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Second)
+        }
         "$sortArray" => eval_sort_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
         "$sum" => {
@@ -483,6 +535,12 @@ fn eval_expression_operator(
         "$toLower" => eval_case_fold_expression(document, value, variables, false),
         "$toUpper" => eval_case_fold_expression(document, value, variables, true),
         "$unsetField" => eval_set_field_expression(document, value, variables, true),
+        "$week" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Week)
+        }
+        "$year" => {
+            eval_date_part_expression(document, value, variables, DatePartExpressionMode::Year)
+        }
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
 }
@@ -605,6 +663,9 @@ fn validate_expression_operator(
         "$cond" => validate_cond_expression(value, scope),
         "$filter" => validate_filter_expression(value, scope),
         "$convert" => validate_convert_expression(value, scope),
+        "$dayOfMonth" | "$dayOfWeek" | "$dayOfYear" | "$hour" | "$isoDayOfWeek" | "$isoWeek"
+        | "$isoWeekYear" | "$millisecond" | "$minute" | "$month" | "$second" | "$week"
+        | "$year" => validate_date_part_expression(value, scope),
         "$getField" => {
             let (field, input) = parse_get_field_spec(value)?;
             validate_expression_with_scope(field, scope)?;
@@ -1820,6 +1881,43 @@ enum NExpressionMode {
     Last,
     Max,
     Min,
+}
+
+#[derive(Clone, Copy)]
+enum DatePartExpressionMode {
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    Hour,
+    IsoDayOfWeek,
+    IsoWeek,
+    IsoWeekYear,
+    Millisecond,
+    Minute,
+    Month,
+    Second,
+    Week,
+    Year,
+}
+
+impl DatePartExpressionMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::DayOfMonth => "$dayOfMonth",
+            Self::DayOfWeek => "$dayOfWeek",
+            Self::DayOfYear => "$dayOfYear",
+            Self::Hour => "$hour",
+            Self::IsoDayOfWeek => "$isoDayOfWeek",
+            Self::IsoWeek => "$isoWeek",
+            Self::IsoWeekYear => "$isoWeekYear",
+            Self::Millisecond => "$millisecond",
+            Self::Minute => "$minute",
+            Self::Month => "$month",
+            Self::Second => "$second",
+            Self::Week => "$week",
+            Self::Year => "$year",
+        }
+    }
 }
 
 fn eval_expression_accumulator(
@@ -3073,6 +3171,15 @@ fn validate_n_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), Q
     Ok(())
 }
 
+fn validate_date_part_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (date, timezone) = parse_date_part_expression_spec(value)?;
+    validate_expression_with_scope(date, scope)?;
+    if let Some(timezone) = timezone {
+        validate_expression_with_scope(timezone, scope)?;
+    }
+    Ok(())
+}
+
 fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     match value {
         Bson::Document(spec) => {
@@ -3195,6 +3302,30 @@ fn parse_n_expression_spec(value: &Bson) -> Result<(&Bson, &Bson), QueryError> {
         input.ok_or(QueryError::InvalidStructure)?,
         n.ok_or(QueryError::InvalidStructure)?,
     ))
+}
+
+fn parse_date_part_expression_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
+    match value {
+        Bson::Document(spec) => {
+            let mut date = None;
+            let mut timezone = None;
+            for (field, value) in spec {
+                match field.as_str() {
+                    "date" => date = Some(value),
+                    "timezone" => timezone = Some(value),
+                    _ => return Err(QueryError::InvalidStructure),
+                }
+            }
+            Ok((date.ok_or(QueryError::InvalidStructure)?, timezone))
+        }
+        Bson::Array(arguments) => {
+            if arguments.len() != 1 {
+                return Err(QueryError::InvalidStructure);
+            }
+            Ok((&arguments[0], None))
+        }
+        _ => Ok((value, None)),
+    }
 }
 
 fn parse_trim_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
@@ -4033,6 +4164,190 @@ fn eval_n_expression(
     };
 
     Ok(EvaluatedExpression::Value(Bson::Array(result)))
+}
+
+fn eval_date_part_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    mode: DatePartExpressionMode,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = mode.name();
+    let (date, timezone) = parse_date_part_expression_spec(value)?;
+    let date = eval_expression_result_with_variables(document, date, variables)?;
+    if date.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let date = coerce_date_part_value(date, operator)?;
+    let timezone = resolve_timezone_expression(document, timezone, variables, operator)?;
+    let Some(timezone) = timezone else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    let parts = date_parts_in_timezone(date, &timezone);
+
+    Ok(EvaluatedExpression::Value(match mode {
+        DatePartExpressionMode::DayOfMonth => Bson::Int32(parts.day_of_month as i32),
+        DatePartExpressionMode::DayOfWeek => Bson::Int32(parts.day_of_week as i32),
+        DatePartExpressionMode::DayOfYear => Bson::Int32(parts.day_of_year as i32),
+        DatePartExpressionMode::Hour => Bson::Int32(parts.hour as i32),
+        DatePartExpressionMode::IsoDayOfWeek => Bson::Int32(parts.iso_day_of_week as i32),
+        DatePartExpressionMode::IsoWeek => Bson::Int32(parts.iso_week as i32),
+        DatePartExpressionMode::IsoWeekYear => Bson::Int32(parts.iso_week_year),
+        DatePartExpressionMode::Millisecond => Bson::Int32(parts.millisecond as i32),
+        DatePartExpressionMode::Minute => Bson::Int32(parts.minute as i32),
+        DatePartExpressionMode::Month => Bson::Int32(parts.month as i32),
+        DatePartExpressionMode::Second => Bson::Int32(parts.second as i32),
+        DatePartExpressionMode::Week => Bson::Int32(parts.week as i32),
+        DatePartExpressionMode::Year => Bson::Int32(parts.year),
+    }))
+}
+
+#[derive(Clone)]
+enum ResolvedTimeZone {
+    Utc,
+    Fixed(FixedOffset),
+    Named(Tz),
+}
+
+#[derive(Clone, Copy)]
+struct DateParts {
+    year: i32,
+    month: u32,
+    day_of_month: u32,
+    day_of_week: u32,
+    day_of_year: u32,
+    hour: u32,
+    iso_day_of_week: u32,
+    iso_week: u32,
+    iso_week_year: i32,
+    millisecond: u32,
+    minute: u32,
+    second: u32,
+    week: u32,
+}
+
+fn resolve_timezone_expression(
+    document: &Document,
+    timezone: Option<&Bson>,
+    variables: &BTreeMap<String, Bson>,
+    operator: &str,
+) -> Result<Option<ResolvedTimeZone>, QueryError> {
+    let Some(timezone) = timezone else {
+        return Ok(Some(ResolvedTimeZone::Utc));
+    };
+    let timezone = eval_expression_result_with_variables(document, timezone, variables)?;
+    if timezone.is_nullish() {
+        return Ok(None);
+    }
+    let timezone = require_named_string_operand(timezone, operator, "timezone")?;
+    parse_timezone(&timezone).map(Some).ok_or_else(|| {
+        QueryError::InvalidArgument(format!("{operator} requires a valid timezone string"))
+    })
+}
+
+fn parse_timezone(value: &str) -> Option<ResolvedTimeZone> {
+    if matches!(value, "UTC" | "GMT" | "Z") {
+        return Some(ResolvedTimeZone::Utc);
+    }
+    if let Some(offset) = parse_fixed_offset(value) {
+        return Some(ResolvedTimeZone::Fixed(offset));
+    }
+    value.parse::<Tz>().ok().map(ResolvedTimeZone::Named)
+}
+
+fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => return None,
+    };
+
+    let (hours, minutes) = if let Some((hours, minutes)) = rest.split_once(':') {
+        (hours, minutes)
+    } else if rest.len() == 2 {
+        (rest, "00")
+    } else if rest.len() == 4 {
+        (&rest[..2], &rest[2..])
+    } else {
+        return None;
+    };
+
+    let hours = hours.parse::<i32>().ok()?;
+    let minutes = minutes.parse::<i32>().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+
+    let total_seconds = sign * ((hours * 60 + minutes) * 60);
+    FixedOffset::east_opt(total_seconds)
+}
+
+fn coerce_date_part_value(
+    value: EvaluatedExpression,
+    operator: &str,
+) -> Result<DateTime<Utc>, QueryError> {
+    let value = match value {
+        EvaluatedExpression::Value(value) => value,
+        EvaluatedExpression::Missing => return Ok(DateTime::<Utc>::UNIX_EPOCH),
+    };
+
+    match value {
+        Bson::DateTime(value) => DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis())
+            .ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "{operator} requires a date, timestamp, or objectId input"
+                ))
+            }),
+        Bson::Timestamp(value) => {
+            DateTime::<Utc>::from_timestamp(value.time as i64, 0).ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "{operator} requires a date, timestamp, or objectId input"
+                ))
+            })
+        }
+        Bson::ObjectId(value) => DateTime::<Utc>::from_timestamp_millis(
+            value.timestamp().timestamp_millis(),
+        )
+        .ok_or_else(|| {
+            QueryError::InvalidArgument(format!(
+                "{operator} requires a date, timestamp, or objectId input"
+            ))
+        }),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires a date, timestamp, or objectId input"
+        ))),
+    }
+}
+
+fn date_parts_in_timezone(date: DateTime<Utc>, timezone: &ResolvedTimeZone) -> DateParts {
+    match timezone {
+        ResolvedTimeZone::Utc => extract_date_parts(date),
+        ResolvedTimeZone::Fixed(offset) => extract_date_parts(date.with_timezone(offset)),
+        ResolvedTimeZone::Named(timezone) => extract_date_parts(date.with_timezone(timezone)),
+    }
+}
+
+fn extract_date_parts<Tz: chrono::TimeZone>(date: DateTime<Tz>) -> DateParts {
+    DateParts {
+        year: date.year(),
+        month: date.month(),
+        day_of_month: date.day(),
+        day_of_week: date.weekday().num_days_from_sunday() + 1,
+        day_of_year: date.ordinal(),
+        hour: date.hour(),
+        iso_day_of_week: date.weekday().num_days_from_monday() + 1,
+        iso_week: date.iso_week().week(),
+        iso_week_year: date.iso_week().year(),
+        millisecond: date.timestamp_subsec_millis(),
+        minute: date.minute(),
+        second: date.second(),
+        week: date
+            .naive_local()
+            .format("%U")
+            .to_string()
+            .parse::<u32>()
+            .unwrap_or(0),
+    }
 }
 
 fn eval_concat_arrays_expression(

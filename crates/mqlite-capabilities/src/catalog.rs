@@ -1078,6 +1078,8 @@ mod tests {
             "left": 5,
             "right": 3,
             "text": "abc",
+            "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date"),
+            "timezone": "America/New_York",
             "array": [1, 2, 3],
             "emptyArray": [],
             "object": { "a": 1, "b": 2 },
@@ -1518,6 +1520,11 @@ mod tests {
             }
             "$cos" => doc! { "value": { "$cos": 0 } },
             "$cosh" => doc! { "value": { "$cosh": 0 } },
+            "$dayOfMonth" => doc! { "value": { "$dayOfMonth": "$date" } },
+            "$dayOfWeek" => {
+                doc! { "value": { "$dayOfWeek": { "date": "$date", "timezone": "$timezone" } } }
+            }
+            "$dayOfYear" => doc! { "value": { "$dayOfYear": "$date" } },
             "$degreesToRadians" => doc! { "value": { "$degreesToRadians": 180 } },
             "$divide" => doc! { "value": { "$divide": [9, 3] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
@@ -1532,11 +1539,15 @@ mod tests {
             "$getField" => doc! { "value": { "$getField": { "field": "a", "input": "$object" } } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
             "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
+            "$hour" => doc! { "value": { "$hour": { "date": "$date", "timezone": "$timezone" } } },
             "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
             "$in" => doc! { "value": { "$in": ["$left", [1, 5, 9]] } },
             "$indexOfArray" => doc! { "value": { "$indexOfArray": ["$array", 2] } },
             "$indexOfBytes" => doc! { "value": { "$indexOfBytes": ["cafétéria", "é", 4] } },
             "$indexOfCP" => doc! { "value": { "$indexOfCP": ["cafétéria", "é", 4] } },
+            "$isoDayOfWeek" => doc! { "value": { "$isoDayOfWeek": "$date" } },
+            "$isoWeek" => doc! { "value": { "$isoWeek": "$date" } },
+            "$isoWeekYear" => doc! { "value": { "$isoWeekYear": "$date" } },
             "$isArray" => doc! { "value": { "$isArray": "$array" } },
             "$isNumber" => doc! { "value": { "$isNumber": "$left" } },
             "$last" => doc! { "value": { "$last": "$array" } },
@@ -1556,9 +1567,12 @@ mod tests {
             "$max" => doc! { "value": { "$max": ["$left", "$right"] } },
             "$maxN" => doc! { "value": { "$maxN": { "n": 2, "input": "$array" } } },
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
+            "$millisecond" => doc! { "value": { "$millisecond": "$date" } },
             "$min" => doc! { "value": { "$min": ["$left", "$right"] } },
             "$minN" => doc! { "value": { "$minN": { "n": 2, "input": "$array" } } },
+            "$minute" => doc! { "value": { "$minute": "$date" } },
             "$mod" => doc! { "value": { "$mod": [17, 5] } },
+            "$month" => doc! { "value": { "$month": "$date" } },
             "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },
             "$ne" => doc! { "value": { "$ne": ["$left", "$right"] } },
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
@@ -1606,6 +1620,7 @@ mod tests {
             "$setField" => {
                 doc! { "value": { "$setField": { "field": "a", "input": "$object", "value": 9 } } }
             }
+            "$second" => doc! { "value": { "$second": "$date" } },
             "$size" => doc! { "value": { "$size": "$array" } },
             "$slice" => doc! { "value": { "$slice": ["$array", 2] } },
             "$split" => doc! { "value": { "$split": ["abc->def", "->"] } },
@@ -1654,6 +1669,8 @@ mod tests {
             "$unsetField" => {
                 doc! { "value": { "$unsetField": { "field": "a", "input": "$object" } } }
             }
+            "$week" => doc! { "value": { "$week": "$date" } },
+            "$year" => doc! { "value": { "$year": "$date" } },
             "$zip" => {
                 doc! { "value": { "$zip": { "inputs": [[1, 2], ["a", "b", "c"]], "useLongestLength": true } } }
             }

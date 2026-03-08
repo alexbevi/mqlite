@@ -4168,6 +4168,99 @@ fn command_aggregate_project_supports_n_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_date_part_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("date-part-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2017-06-19T15:13:25.713Z"},"timestamp":{"$timestamp":{"t":1497885205,"i":1}},"timezone":"America/New_York","offset":"+02:00"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "year": { "$year": "$date" },
+                    "month": { "$month": "$date" },
+                    "dayOfMonth": { "$dayOfMonth": ["$date"] },
+                    "dayOfWeek": { "$dayOfWeek": "$date" },
+                    "dayOfYear": { "$dayOfYear": "$date" },
+                    "hourTz": { "$hour": { "date": "$date", "timezone": "$timezone" } },
+                    "hourOffset": { "$hour": { "date": "$date", "timezone": "$offset" } },
+                    "isoDayOfWeek": { "$isoDayOfWeek": "$date" },
+                    "isoWeek": { "$isoWeek": "$date" },
+                    "isoWeekYear": { "$isoWeekYear": "$date" },
+                    "millisecond": { "$millisecond": "$date" },
+                    "minute": { "$minute": "$date" },
+                    "second": { "$second": "$timestamp" },
+                    "week": { "$week": "$date" },
+                    "nullTimezone": { "$year": { "date": "$date", "timezone": "$missing" } },
+                    "nullDate": { "$month": "$missingDate" }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["year"], 2017);
+    assert_eq!(first["month"], 6);
+    assert_eq!(first["dayOfMonth"], 19);
+    assert_eq!(first["dayOfWeek"], 2);
+    assert_eq!(first["dayOfYear"], 170);
+    assert_eq!(first["hourTz"], 11);
+    assert_eq!(first["hourOffset"], 17);
+    assert_eq!(first["isoDayOfWeek"], 1);
+    assert_eq!(first["isoWeek"], 25);
+    assert_eq!(first["isoWeekYear"], 2017);
+    assert_eq!(first["millisecond"], 713);
+    assert_eq!(first["minute"], 13);
+    assert_eq!(first["second"], 25);
+    assert_eq!(first["week"], 25);
+    assert_eq!(first["nullTimezone"], Value::Null);
+    assert_eq!(first["nullDate"], Value::Null);
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -4321,6 +4414,51 @@ fn command_aggregate_project_rejects_invalid_n_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$firstN":{"n":0,"input":"$value"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_date_part_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-date-part-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"date":{"$date":"2017-06-19T15:13:25.713Z"}}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$hour":{"date":"$date","timezone":"DoesNot/Exist"}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()

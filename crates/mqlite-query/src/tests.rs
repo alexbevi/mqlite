@@ -2030,6 +2030,56 @@ fn projection_supports_conversion_expression_operators() {
 }
 
 #[test]
+fn projection_supports_date_part_expression_operators() {
+    let date = bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date");
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "date": date,
+            "timestamp": Bson::Timestamp(Timestamp { time: 1_497_885_205, increment: 1 }),
+            "timezone": "America/New_York",
+            "offset": "+02:00"
+        },
+        Some(&doc! {
+            "year": { "$year": "$date" },
+            "month": { "$month": "$date" },
+            "dayOfMonth": { "$dayOfMonth": ["$date"] },
+            "dayOfWeek": { "$dayOfWeek": "$date" },
+            "dayOfYear": { "$dayOfYear": "$date" },
+            "hourTz": { "$hour": { "date": "$date", "timezone": "$timezone" } },
+            "hourOffset": { "$hour": { "date": "$date", "timezone": "$offset" } },
+            "isoDayOfWeek": { "$isoDayOfWeek": "$date" },
+            "isoWeek": { "$isoWeek": "$date" },
+            "isoWeekYear": { "$isoWeekYear": "$date" },
+            "millisecond": { "$millisecond": "$date" },
+            "minute": { "$minute": "$date" },
+            "second": { "$second": "$timestamp" },
+            "week": { "$week": "$date" },
+            "nullTimezone": { "$year": { "date": "$date", "timezone": "$missing" } },
+            "nullDate": { "$month": "$missingDate" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected.get("year"), Some(&Bson::Int32(2017)));
+    assert_eq!(projected.get("month"), Some(&Bson::Int32(6)));
+    assert_eq!(projected.get("dayOfMonth"), Some(&Bson::Int32(19)));
+    assert_eq!(projected.get("dayOfWeek"), Some(&Bson::Int32(2)));
+    assert_eq!(projected.get("dayOfYear"), Some(&Bson::Int32(170)));
+    assert_eq!(projected.get("hourTz"), Some(&Bson::Int32(11)));
+    assert_eq!(projected.get("hourOffset"), Some(&Bson::Int32(17)));
+    assert_eq!(projected.get("isoDayOfWeek"), Some(&Bson::Int32(1)));
+    assert_eq!(projected.get("isoWeek"), Some(&Bson::Int32(25)));
+    assert_eq!(projected.get("isoWeekYear"), Some(&Bson::Int32(2017)));
+    assert_eq!(projected.get("millisecond"), Some(&Bson::Int32(713)));
+    assert_eq!(projected.get("minute"), Some(&Bson::Int32(13)));
+    assert_eq!(projected.get("second"), Some(&Bson::Int32(25)));
+    assert_eq!(projected.get("week"), Some(&Bson::Int32(25)));
+    assert_eq!(projected.get("nullTimezone"), Some(&Bson::Null));
+    assert_eq!(projected.get("nullDate"), Some(&Bson::Null));
+}
+
+#[test]
 fn projection_supports_accumulator_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -2311,6 +2361,60 @@ fn n_expression_operators_reject_invalid_inputs() {
     )
     .expect_err("n must be positive");
     assert!(matches!(non_positive_n, QueryError::InvalidArgument(_)));
+}
+
+#[test]
+fn date_part_expression_operators_reject_invalid_inputs() {
+    let missing_date = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date") },
+        Some(&doc! {
+            "out": { "$year": { "timezone": "UTC" } }
+        }),
+    )
+    .expect_err("date part expressions require date");
+    assert!(matches!(missing_date, QueryError::InvalidStructure));
+
+    let invalid_array_arity = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date") },
+        Some(&doc! {
+            "out": { "$month": ["$date", "extra"] }
+        }),
+    )
+    .expect_err("date part array form takes one argument");
+    assert!(matches!(invalid_array_arity, QueryError::InvalidStructure));
+
+    let invalid_date_type = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$dayOfMonth": "$value" }
+        }),
+    )
+    .expect_err("date part expressions require date-compatible input");
+    assert!(matches!(invalid_date_type, QueryError::InvalidArgument(_)));
+
+    let invalid_timezone_type = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date") },
+        Some(&doc! {
+            "out": { "$hour": { "date": "$date", "timezone": 5 } }
+        }),
+    )
+    .expect_err("timezone must evaluate to a string");
+    assert!(matches!(
+        invalid_timezone_type,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_timezone_value = apply_projection(
+        &doc! { "_id": 1, "date": bson::DateTime::parse_rfc3339_str("2017-06-19T15:13:25.713Z").expect("date") },
+        Some(&doc! {
+            "out": { "$hour": { "date": "$date", "timezone": "DoesNot/Exist" } }
+        }),
+    )
+    .expect_err("timezone must be valid");
+    assert!(matches!(
+        invalid_timezone_value,
+        QueryError::InvalidArgument(_)
+    ));
 }
 
 #[test]
@@ -5961,13 +6065,21 @@ fn projection_rejects_function_expression_operator() {
 #[test]
 fn projection_rejects_unsupported_expression_operator() {
     let error = apply_projection(
-        &doc! { "_id": 1, "value": 2 },
-        Some(&doc! { "out": { "$week": "$value" } }),
+        &doc! { "_id": 1, "value": bson::DateTime::parse_rfc3339_str("2024-02-01T00:00:00Z").expect("date") },
+        Some(&doc! {
+            "out": {
+                "$dateAdd": {
+                    "startDate": "$value",
+                    "unit": "day",
+                    "amount": 1
+                }
+            }
+        }),
     )
     .expect_err("unsupported expression");
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$week"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$dateAdd"
     ));
 }

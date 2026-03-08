@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 125 | 27 | 24 |
+| Aggregation expression operators | 176 | 138 | 14 | 24 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
+Public upstream: 176. Supported: 138. Unsupported: 14. Ignored: 24.
 
 ### Supported Public
 
@@ -253,6 +253,9 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$convert`
 - `$cos`
 - `$cosh`
+- `$dayOfMonth`
+- `$dayOfWeek`
+- `$dayOfYear`
 - `$degreesToRadians`
 - `$divide`
 - `$eq`
@@ -265,6 +268,7 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$getField`
 - `$gt`
 - `$gte`
+- `$hour`
 - `$ifNull`
 - `$in`
 - `$indexOfArray`
@@ -272,6 +276,9 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$indexOfCP`
 - `$isArray`
 - `$isNumber`
+- `$isoDayOfWeek`
+- `$isoWeek`
+- `$isoWeekYear`
 - `$last`
 - `$lastN`
 - `$let`
@@ -286,9 +293,12 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$max`
 - `$maxN`
 - `$mergeObjects`
+- `$millisecond`
 - `$min`
 - `$minN`
+- `$minute`
 - `$mod`
+- `$month`
 - `$multiply`
 - `$ne`
 - `$not`
@@ -307,6 +317,7 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$reverseArray`
 - `$round`
 - `$rtrim`
+- `$second`
 - `$setDifference`
 - `$setEquals`
 - `$setField`
@@ -347,6 +358,8 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$tsSecond`
 - `$type`
 - `$unsetField`
+- `$week`
+- `$year`
 - `$zip`
 
 ### Unsupported Public
@@ -359,25 +372,12 @@ Public upstream: 176. Supported: 125. Unsupported: 27. Ignored: 24.
 - `$dateToParts`
 - `$dateToString`
 - `$dateTrunc`
-- `$dayOfMonth`
-- `$dayOfWeek`
-- `$dayOfYear`
-- `$hour`
-- `$isoDayOfWeek`
-- `$isoWeek`
-- `$isoWeekYear`
 - `$median`
 - `$meta` (conditional)
-- `$millisecond`
-- `$minute`
-- `$month`
 - `$percentile`
-- `$second`
 - `$stdDevPop`
 - `$stdDevSamp`
 - `$toHashedIndexKey`
-- `$week`
-- `$year`
 
 ### Ignored Public
 
