@@ -1491,8 +1491,12 @@ mod tests {
             "$divide" => doc! { "value": { "$divide": [9, 3] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
             "$expr" => doc! { "value": { "$expr": { "$eq": ["$left", "$left"] } } },
+            "$filter" => {
+                doc! { "value": { "$filter": { "input": "$array", "as": "value", "cond": { "$gt": ["$$value", 1] } } } }
+            }
             "$first" => doc! { "value": { "$first": "$array" } },
             "$floor" => doc! { "value": { "$floor": 2.8 } },
+            "$getField" => doc! { "value": { "$getField": { "field": "a", "input": "$object" } } },
             "$gt" => doc! { "value": { "$gt": ["$left", "$right"] } },
             "$gte" => doc! { "value": { "$gte": ["$left", "$right"] } },
             "$ifNull" => doc! { "value": { "$ifNull": [null, "$left"] } },
@@ -1500,9 +1504,15 @@ mod tests {
             "$isArray" => doc! { "value": { "$isArray": "$array" } },
             "$isNumber" => doc! { "value": { "$isNumber": "$left" } },
             "$last" => doc! { "value": { "$last": "$array" } },
+            "$let" => {
+                doc! { "value": { "$let": { "vars": { "factor": 10 }, "in": { "$add": ["$left", "$$factor"] } } } }
+            }
             "$literal" => doc! { "value": { "$literal": 5 } },
             "$lt" => doc! { "value": { "$lt": ["$left", "$right"] } },
             "$lte" => doc! { "value": { "$lte": ["$left", "$right"] } },
+            "$map" => {
+                doc! { "value": { "$map": { "input": "$array", "as": "value", "in": { "$add": ["$$value", 1] } } } }
+            }
             "$mergeObjects" => doc! { "value": { "$mergeObjects": ["$object", { "c": 3 }] } },
             "$mod" => doc! { "value": { "$mod": [17, 5] } },
             "$multiply" => doc! { "value": { "$multiply": ["$left", 2] } },

@@ -147,7 +147,7 @@ Any driver integration should include:
 - `hello` handshake compatibility.
 - CRUD smoke tests over the local stream.
 - Query and aggregation smoke coverage for every currently supported operator and stage listed in `capabilities/mqlite/gap-analysis.generated.md`, rather than only broad happy-path CRUD.
-- Aggregation expression smoke coverage for every currently supported public expression operator listed in `capabilities/mqlite/gap-analysis.generated.md`, including arithmetic, comparison, boolean, boolean-array, type-introspection, string-concatenation, null-coalescing, and array/document transformation cases.
+- Aggregation expression smoke coverage for every currently supported public expression operator listed in `capabilities/mqlite/gap-analysis.generated.md`, including arithmetic, comparison, boolean, boolean-array, scoped-variable (`$let`/`$map`/`$filter`), field-access (`$getField`), type-introspection, string-concatenation, null-coalescing, and array/document transformation cases.
 - Dedicated aggregation smoke coverage for `$setWindowFields`, including at least one supported document window, one supported range window, one ranking function, and one explicit unsupported window-function rejection.
 - Broker restart tests after index creation so unique-index durability is exercised through reopen.
 - `explain` smoke tests so plan-cache usage, persisted plan-cache reuse after restart, branch-union `OR`, compound-prefix, point-prefix, multi-interval `$or`/`$in`, range, cost-based, covered-projection, and null-vs-missing covered `IXSCAN` selection can be validated over the file-backed broker, including `planCacheUsed`, `keysExamined`, and `docsExamined`.

@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 40,
-    "public_supported": 40,
-    "total_unsupported": 144,
-    "public_unsupported": 113,
+    "total_supported": 44,
+    "public_supported": 44,
+    "total_unsupported": 140,
+    "public_unsupported": 109,
     "public_ignored": 23,
     "items": [
       {
@@ -3969,8 +3969,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$first",
@@ -4059,8 +4059,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$gt",
@@ -4383,8 +4383,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$literal",
@@ -4527,8 +4527,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$max",

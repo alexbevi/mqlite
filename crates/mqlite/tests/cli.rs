@@ -2541,6 +2541,149 @@ fn command_aggregate_project_supports_expression_operators() {
 }
 
 #[test]
+fn command_aggregate_project_supports_scoped_and_field_access_expressions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("scoped-expression-operators.mongodb");
+
+    let insert_command = json!({
+        "insert": "widgets",
+        "documents": [{
+            "_id": 1,
+            "simple": [1, 2, 3, 4],
+            "nested": [{ "a": 1 }, { "a": 2 }],
+            "mixed": [{ "a": 1 }, {}, { "a": 2 }, { "a": null }],
+            "nestedDoc": { "four": 4 },
+            "lookupField": "a.b",
+            "a.b": "literal",
+            "special": { "$price": 5 }
+        }]
+    })
+    .to_string();
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&insert_command)
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "mapped": { "$map": { "input": "$simple", "as": "outer", "in": { "$add": [10, "$$outer"] } } },
+                    "mappedCurrent": { "$map": { "input": "$nested", "as": "CURRENT", "in": "$a" } },
+                    "mappedMixed": { "$map": { "input": "$mixed", "as": "item", "in": "$$item.a" } },
+                    "filtered": { "$filter": { "input": "$simple", "as": "value", "cond": { "$gt": ["$$value", 2] } } },
+                    "filteredDefault": { "$filter": { "input": "$simple", "cond": { "$eq": [2, "$$this"] }, "limit": { "$literal": 1 } } },
+                    "letValue": {
+                        "$let": {
+                            "vars": { "CURRENT": "$nestedDoc", "factor": 10 },
+                            "in": { "$add": ["$four", "$$factor"] }
+                        }
+                    },
+                    "getFieldDynamic": { "$getField": "$lookupField" },
+                    "getFieldObject": { "$getField": { "field": { "$const": "$price" }, "input": "$special" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "mapped": [11, 12, 13, 14],
+            "mappedCurrent": [1, 2],
+            "mappedMixed": [1, null, 2, null],
+            "filtered": [3, 4],
+            "filteredDefault": [2],
+            "letValue": 14,
+            "getFieldDynamic": "literal",
+            "getFieldObject": 5
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_scoped_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-scoped-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"items":[1,2]}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$map":{"input":"$items","as":"value","in":"$$this"}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_supports_facet_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-facet.mongodb");

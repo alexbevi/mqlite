@@ -163,6 +163,9 @@ transforms and broker-backed collection resolution.
   - whether execution is inside `$facet`
   - the collection resolver
   - expression variables for correlated subpipelines
+- Expression evaluation treats `$$CURRENT` as the source for ordinary `"$field.path"` lookups,
+  so scoped operators and correlated subpipelines can rebind field-path resolution without
+  rewriting inner expressions.
 
 Current cross-namespace aggregation behavior:
 
@@ -194,6 +197,8 @@ Current cross-namespace aggregation behavior:
   - explicit parse-time rejection for unsupported window functions
 - Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
   continue to work in nested stages.
+- Scoped aggregation expressions currently include `$let`, `$map`, `$filter` with optional
+  `limit`, and `$getField`, all executed in-process without a separate expression VM.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file

@@ -920,6 +920,84 @@ fn projection_supports_expression_operators() {
 }
 
 #[test]
+fn projection_supports_scoped_and_field_access_expressions() {
+    let document = doc! {
+        "_id": 1,
+        "simple": [1, 2, 3, 4],
+        "nested": [{ "a": 1 }, { "a": 2 }],
+        "mixed": [{ "a": 1 }, {}, { "a": 2 }, { "a": Bson::Null }],
+        "nestedDoc": { "four": 4 },
+        "lookupField": "a.b",
+        "a.b": "literal",
+        "special": { "$price": 5 }
+    };
+    let projected = apply_projection(
+        &document,
+        Some(&doc! {
+            "mapped": { "$map": { "input": "$simple", "as": "outer", "in": { "$add": [10, "$$outer"] } } },
+            "mappedCurrent": { "$map": { "input": "$nested", "as": "CURRENT", "in": "$a" } },
+            "mappedMixed": { "$map": { "input": "$mixed", "as": "item", "in": "$$item.a" } },
+            "filtered": { "$filter": { "input": "$simple", "as": "value", "cond": { "$gt": ["$$value", 2] } } },
+            "filteredDefault": { "$filter": { "input": "$simple", "cond": { "$eq": [2, "$$this"] }, "limit": { "$literal": 1 } } },
+            "letValue": {
+                "$let": {
+                    "vars": { "CURRENT": "$nestedDoc", "factor": 10 },
+                    "in": { "$add": ["$four", "$$factor"] }
+                }
+            },
+            "swapped": {
+                "$let": {
+                    "vars": { "x": 6, "y": 10 },
+                    "in": {
+                        "$let": {
+                            "vars": { "x": "$$y", "y": "$$x" },
+                            "in": { "$subtract": ["$$x", "$$y"] }
+                        }
+                    }
+                }
+            },
+            "getFieldDynamic": { "$getField": "$lookupField" },
+            "getFieldObject": { "$getField": { "field": { "$const": "$price" }, "input": "$special" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "mapped": [11_i64, 12_i64, 13_i64, 14_i64],
+            "mappedCurrent": [1, 2],
+            "mappedMixed": [1, Bson::Null, 2, Bson::Null],
+            "filtered": [3, 4],
+            "filteredDefault": [2],
+            "letValue": 14_i64,
+            "swapped": 4_i64,
+            "getFieldDynamic": "literal",
+            "getFieldObject": 5
+        }
+    );
+}
+
+#[test]
+fn projection_preserves_missing_results_for_scoped_and_field_access_expressions() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "maybeArray": Bson::Null, "special": { "present": 1 } },
+        Some(&doc! {
+            "nullMap": { "$map": { "input": "$maybeArray", "in": "$$this" } },
+            "nullFilter": { "$filter": { "input": "$missing", "cond": true } },
+            "missingField": { "$getField": { "field": "missing", "input": "$special" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! { "_id": 1, "nullMap": Bson::Null, "nullFilter": Bson::Null }
+    );
+}
+
+#[test]
 fn projection_preserves_missing_expression_results() {
     let projected = apply_projection(
         &doc! { "_id": 1, "array": [1, 2, 3], "object": { "a": 1 } },
@@ -969,6 +1047,36 @@ fn projection_supports_type_expression_for_missing_and_present_values() {
             "missingType": "missing"
         }
     );
+}
+
+#[test]
+fn scoped_expressions_reject_invalid_variables_and_shapes() {
+    let invalid_name = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$let": { "vars": { "ROOT": 1 }, "in": "$$ROOT" } }
+        }),
+    )
+    .expect_err("invalid variable name");
+    assert!(matches!(invalid_name, QueryError::InvalidArgument(_)));
+
+    let undefined_default = apply_projection(
+        &doc! { "_id": 1, "items": [1, 2] },
+        Some(&doc! {
+            "out": { "$map": { "input": "$items", "as": "value", "in": "$$this" } }
+        }),
+    )
+    .expect_err("undefined variable");
+    assert!(matches!(undefined_default, QueryError::InvalidArgument(_)));
+
+    let invalid_get_field = apply_projection(
+        &doc! { "_id": 1, "value": 2 },
+        Some(&doc! {
+            "out": { "$getField": { "field": 5, "input": { "a": 1 } } }
+        }),
+    )
+    .expect_err("non-string getField");
+    assert!(matches!(invalid_get_field, QueryError::InvalidArgument(_)));
 }
 
 #[test]
@@ -3811,12 +3919,14 @@ fn projection_rejects_function_expression_operator() {
 fn projection_rejects_unsupported_expression_operator() {
     let error = apply_projection(
         &doc! { "_id": 1, "value": 2 },
-        Some(&doc! { "out": { "$map": { "input": [1, 2], "as": "value", "in": "$$value" } } }),
+        Some(
+            &doc! { "out": { "$reduce": { "input": [1, 2], "initialValue": 0, "in": "$$value" } } },
+        ),
     )
     .expect_err("unsupported expression");
 
     assert!(matches!(
         error,
-        crate::QueryError::UnsupportedOperator(operator) if operator == "$map"
+        crate::QueryError::UnsupportedOperator(operator) if operator == "$reduce"
     ));
 }

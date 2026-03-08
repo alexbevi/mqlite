@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
@@ -27,10 +27,6 @@ impl EvaluatedExpression {
     }
 }
 
-pub(crate) fn eval_expression(document: &Document, expression: &Bson) -> Result<Bson, QueryError> {
-    eval_expression_with_variables(document, expression, &BTreeMap::new())
-}
-
 pub(crate) fn eval_expression_with_variables(
     document: &Document,
     expression: &Bson,
@@ -45,12 +41,10 @@ pub(crate) fn eval_expression_result_with_variables(
     variables: &BTreeMap<String, Bson>,
 ) -> Result<EvaluatedExpression, QueryError> {
     match expression {
-        Bson::String(path) if path.starts_with("$$") => {
-            Ok(variable_value(document, path, variables))
+        Bson::String(path) if path.starts_with("$$") => variable_value(document, path, variables),
+        Bson::String(path) if path.starts_with('$') => {
+            Ok(field_path_value(document, path, variables))
         }
-        Bson::String(path) if path.starts_with('$') => Ok(lookup_path_owned(document, &path[1..])
-            .map(EvaluatedExpression::Value)
-            .unwrap_or(EvaluatedExpression::Missing)),
         Bson::Document(spec) if spec.len() == 1 => {
             let (field, value) = spec.iter().next().expect("single field");
             if field.starts_with('$') {
@@ -94,7 +88,8 @@ pub(crate) fn eval_expression_result_with_variables(
 }
 
 pub(crate) fn validate_expression(expression: &Bson) -> Result<(), QueryError> {
-    eval_expression(&Document::new(), expression).map(|_| ())
+    let scope = default_validation_scope();
+    validate_expression_with_scope(expression, &scope)
 }
 
 fn eval_expression_operator(
@@ -206,15 +201,19 @@ fn eval_expression_operator(
         "$round" => eval_rounding_expression(document, value, variables, f64::round),
         "$trunc" => eval_rounding_expression(document, value, variables, f64::trunc),
         "$ifNull" => eval_if_null_expression(document, value, variables),
+        "$let" => eval_let_expression(document, value, variables),
         "$arrayElemAt" => eval_array_elem_at_expression(document, value, variables),
         "$arrayToObject" => eval_array_to_object_expression(document, value, variables),
         "$concatArrays" => eval_concat_arrays_expression(document, value, variables),
+        "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
+        "$getField" => eval_get_field_expression(document, value, variables),
         "$isArray" => Ok(EvaluatedExpression::Value(Bson::Boolean(matches!(
             eval_expression_result_with_variables(document, value, variables)?,
             EvaluatedExpression::Value(Bson::Array(_))
         )))),
         "$last" => eval_first_last_expression(document, value, variables, false),
+        "$map" => eval_map_expression(document, value, variables),
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
         "$size" => eval_size_expression(document, value, variables),
@@ -267,14 +266,113 @@ fn eval_expression_operator(
     }
 }
 
+fn default_validation_scope() -> BTreeSet<String> {
+    ["CURRENT", "DESCEND", "KEEP", "PRUNE", "ROOT"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_expression_with_scope(
+    expression: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    match expression {
+        Bson::String(path) if path.starts_with("$$") => validate_variable_reference(path, scope),
+        Bson::Document(spec) if spec.len() == 1 => {
+            let (field, value) = spec.iter().next().expect("single field");
+            if field.starts_with('$') {
+                return validate_expression_operator(field, value, scope);
+            }
+
+            for value in spec.values() {
+                validate_expression_with_scope(value, scope)?;
+            }
+            Ok(())
+        }
+        Bson::Document(spec) => {
+            for value in spec.values() {
+                validate_expression_with_scope(value, scope)?;
+            }
+            Ok(())
+        }
+        Bson::Array(items) => {
+            for item in items {
+                validate_expression_with_scope(item, scope)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_expression_operator(
+    operator: &str,
+    value: &Bson,
+    scope: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    match operator {
+        "$const" | "$literal" => Ok(()),
+        "$expr" | "$abs" | "$ceil" | "$floor" | "$first" | "$isArray" | "$isNumber" | "$last"
+        | "$objectToArray" | "$size" | "$type" => {
+            validate_expression_with_scope(unary_expression_operand(value), scope)
+        }
+        "$add" | "$allElementsTrue" | "$and" | "$anyElementTrue" | "$arrayToObject" | "$concat"
+        | "$concatArrays" | "$eq" | "$gt" | "$gte" | "$in" | "$lt" | "$lte" | "$mergeObjects"
+        | "$mod" | "$multiply" | "$ne" | "$not" | "$or" | "$round" | "$subtract" | "$trunc" => {
+            let arguments = match value {
+                Bson::Array(arguments) => arguments.as_slice(),
+                _ => std::slice::from_ref(value),
+            };
+            if arguments.is_empty() {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$arrayElemAt" | "$cmp" | "$divide" => {
+            for argument in expression_arguments::<2>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$cond" => validate_cond_expression(value, scope),
+        "$filter" => validate_filter_expression(value, scope),
+        "$getField" => {
+            let (field, input) = parse_get_field_spec(value)?;
+            validate_expression_with_scope(field, scope)?;
+            if let Some(input) = input {
+                validate_expression_with_scope(input, scope)?;
+            }
+            Ok(())
+        }
+        "$ifNull" => {
+            let arguments = expression_argument_slice(value)?;
+            if arguments.len() < 2 {
+                return Err(QueryError::InvalidStructure);
+            }
+            for argument in arguments {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$let" => validate_let_expression(value, scope),
+        "$map" => validate_map_expression(value, scope),
+        other => Err(QueryError::UnsupportedOperator(other.to_string())),
+    }
+}
+
 fn variable_value(
     document: &Document,
     path: &str,
     variables: &BTreeMap<String, Bson>,
-) -> EvaluatedExpression {
+) -> Result<EvaluatedExpression, QueryError> {
     let mut segments = path[2..].splitn(2, '.');
     let name = segments.next().unwrap_or_default();
     let remainder = segments.next();
+    validate_user_variable_read_name(name)?;
 
     let source = match name {
         "ROOT" => variables
@@ -291,20 +389,86 @@ fn variable_value(
             .get(name)
             .cloned()
             .map(EvaluatedExpression::Value)
-            .unwrap_or(EvaluatedExpression::Missing),
+            .ok_or_else(|| QueryError::InvalidArgument(format!("undefined variable `{name}`")))?,
     };
 
     match remainder {
         Some(path) => match source {
             EvaluatedExpression::Value(Bson::Document(document)) => {
-                lookup_path_owned(&document, path)
+                Ok(lookup_path_owned(&document, path)
                     .map(EvaluatedExpression::Value)
-                    .unwrap_or(EvaluatedExpression::Missing)
+                    .unwrap_or(EvaluatedExpression::Missing))
             }
-            _ => EvaluatedExpression::Missing,
+            _ => Ok(EvaluatedExpression::Missing),
         },
-        None => source,
+        None => Ok(source),
     }
+}
+
+fn field_path_value(
+    document: &Document,
+    path: &str,
+    variables: &BTreeMap<String, Bson>,
+) -> EvaluatedExpression {
+    let current = variables
+        .get("CURRENT")
+        .cloned()
+        .unwrap_or_else(|| Bson::Document(document.clone()));
+
+    match current {
+        Bson::Document(current) => lookup_path_owned(&current, &path[1..])
+            .map(EvaluatedExpression::Value)
+            .unwrap_or(EvaluatedExpression::Missing),
+        _ => EvaluatedExpression::Missing,
+    }
+}
+
+fn validate_variable_reference(path: &str, _scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let mut segments = path[2..].splitn(2, '.');
+    let name = segments.next().unwrap_or_default();
+    validate_user_variable_read_name(name)?;
+    Ok(())
+}
+
+fn validate_user_variable_write_name(name: &str) -> Result<(), QueryError> {
+    if name == "CURRENT" {
+        return Ok(());
+    }
+    if !valid_user_variable_write_name(name) {
+        return Err(QueryError::InvalidArgument(format!(
+            "invalid variable name `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_user_variable_read_name(name: &str) -> Result<(), QueryError> {
+    if !valid_user_variable_read_name(name) {
+        return Err(QueryError::InvalidArgument(format!(
+            "invalid variable name `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_user_variable_write_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || !first.is_ascii()) && chars.all(valid_variable_tail_char)
+}
+
+fn valid_user_variable_read_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || !first.is_ascii()) && chars.all(valid_variable_tail_char)
+}
+
+fn valid_variable_tail_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || !ch.is_ascii()
 }
 
 fn expression_argument_slice(value: &Bson) -> Result<&[Bson], QueryError> {
@@ -427,6 +591,178 @@ fn eval_if_null_expression(
     Ok(EvaluatedExpression::Value(last_value.into_bson_or_null()))
 }
 
+fn eval_let_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut vars_spec = None;
+    let mut in_expression = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "vars" => vars_spec = Some(value.as_document().ok_or(QueryError::InvalidStructure)?),
+            "in" => in_expression = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let vars_spec = vars_spec.ok_or(QueryError::InvalidStructure)?;
+    let in_expression = in_expression.ok_or(QueryError::InvalidStructure)?;
+
+    let mut scoped = variables.clone();
+    for (name, expression) in vars_spec {
+        validate_user_variable_write_name(name)?;
+        let value = eval_expression_result_with_variables(document, expression, variables)?;
+        scoped.insert(name.clone(), materialize_variable_value(value));
+    }
+
+    eval_expression_result_with_variables(document, in_expression, &scoped)
+}
+
+fn eval_map_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut var_name = None;
+    let mut in_expression = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "as" => var_name = Some(value.as_str().ok_or(QueryError::InvalidStructure)?),
+            "in" => in_expression = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let input = input.ok_or(QueryError::InvalidStructure)?;
+    let in_expression = in_expression.ok_or(QueryError::InvalidStructure)?;
+    let var_name = var_name.unwrap_or("this");
+    validate_user_variable_write_name(var_name)?;
+
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    if input.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let EvaluatedExpression::Value(Bson::Array(items)) = input else {
+        return Err(QueryError::InvalidArgument(
+            "$map input must evaluate to an array".to_string(),
+        ));
+    };
+
+    let mut mapped = Vec::with_capacity(items.len());
+    for item in items {
+        let mut scoped = variables.clone();
+        scoped.insert(var_name.to_string(), item.clone());
+        let value = eval_expression_result_with_variables(document, in_expression, &scoped)?;
+        mapped.push(value.into_bson_or_null());
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(mapped)))
+}
+
+fn eval_filter_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut var_name = None;
+    let mut condition = None;
+    let mut limit = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "as" => var_name = Some(value.as_str().ok_or(QueryError::InvalidStructure)?),
+            "cond" => condition = Some(value),
+            "limit" => limit = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let input = input.ok_or(QueryError::InvalidStructure)?;
+    let condition = condition.ok_or(QueryError::InvalidStructure)?;
+    let var_name = var_name.unwrap_or("this");
+    validate_user_variable_write_name(var_name)?;
+
+    let limit = match limit {
+        Some(limit) => Some(parse_filter_limit(document, limit, variables)?),
+        None => None,
+    };
+
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    if input.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let EvaluatedExpression::Value(Bson::Array(items)) = input else {
+        return Err(QueryError::InvalidArgument(
+            "$filter input must evaluate to an array".to_string(),
+        ));
+    };
+
+    let mut filtered = Vec::new();
+    for item in items {
+        let mut scoped = variables.clone();
+        scoped.insert(var_name.to_string(), item.clone());
+        let include = eval_expression_result_with_variables(document, condition, &scoped)?
+            .into_bson_or_null();
+        if expression_truthy(&include) {
+            filtered.push(item);
+            if limit.is_some_and(|limit| filtered.len() >= limit) {
+                break;
+            }
+        }
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Array(filtered)))
+}
+
+fn eval_get_field_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (field, input) = parse_get_field_spec(value)?;
+    let field = eval_expression_result_with_variables(document, field, variables)?;
+    let field = match field {
+        EvaluatedExpression::Value(Bson::String(field) | Bson::Symbol(field)) => field,
+        _ => {
+            return Err(QueryError::InvalidArgument(
+                "$getField requires `field` to evaluate to a string".to_string(),
+            ));
+        }
+    };
+
+    let input = match input {
+        Some(input) => eval_expression_result_with_variables(document, input, variables)?,
+        None => EvaluatedExpression::Value(
+            variables
+                .get("CURRENT")
+                .cloned()
+                .unwrap_or_else(|| Bson::Document(document.clone())),
+        ),
+    };
+
+    match input {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::Document(document)) => Ok(document
+            .get(&field)
+            .cloned()
+            .map(EvaluatedExpression::Value)
+            .unwrap_or(EvaluatedExpression::Missing)),
+        EvaluatedExpression::Value(_) => Ok(EvaluatedExpression::Missing),
+    }
+}
+
 fn eval_cond_expression(
     document: &Document,
     value: &Bson,
@@ -454,6 +790,175 @@ fn eval_cond_expression(
         eval_expression_result_with_variables(document, on_true, variables)
     } else {
         eval_expression_result_with_variables(document, on_false, variables)
+    }
+}
+
+fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    match value {
+        Bson::Array(_) => {
+            for argument in expression_arguments::<3>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+        }
+        Bson::Document(spec) => {
+            if spec.len() != 3 {
+                return Err(QueryError::InvalidStructure);
+            }
+            let condition = spec.get("if").ok_or(QueryError::InvalidStructure)?;
+            let on_true = spec.get("then").ok_or(QueryError::InvalidStructure)?;
+            let on_false = spec.get("else").ok_or(QueryError::InvalidStructure)?;
+            validate_expression_with_scope(condition, scope)?;
+            validate_expression_with_scope(on_true, scope)?;
+            validate_expression_with_scope(on_false, scope)?;
+        }
+        _ => return Err(QueryError::InvalidStructure),
+    }
+
+    Ok(())
+}
+
+fn validate_let_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut vars_spec = None;
+    let mut in_expression = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "vars" => vars_spec = Some(value.as_document().ok_or(QueryError::InvalidStructure)?),
+            "in" => in_expression = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let vars_spec = vars_spec.ok_or(QueryError::InvalidStructure)?;
+    let in_expression = in_expression.ok_or(QueryError::InvalidStructure)?;
+    let mut inner_scope = scope.clone();
+
+    for (name, expression) in vars_spec {
+        validate_user_variable_write_name(name)?;
+        validate_expression_with_scope(expression, scope)?;
+        inner_scope.insert(name.clone());
+    }
+
+    validate_expression_with_scope(in_expression, &inner_scope)
+}
+
+fn validate_map_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut var_name = None;
+    let mut in_expression = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "as" => var_name = Some(value.as_str().ok_or(QueryError::InvalidStructure)?),
+            "in" => in_expression = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let input = input.ok_or(QueryError::InvalidStructure)?;
+    let in_expression = in_expression.ok_or(QueryError::InvalidStructure)?;
+    let var_name = var_name.unwrap_or("this");
+    validate_user_variable_write_name(var_name)?;
+    validate_expression_with_scope(input, scope)?;
+
+    let mut inner_scope = scope.clone();
+    inner_scope.insert(var_name.to_string());
+    validate_expression_with_scope(in_expression, &inner_scope)
+}
+
+fn validate_filter_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut var_name = None;
+    let mut condition = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "as" => var_name = Some(value.as_str().ok_or(QueryError::InvalidStructure)?),
+            "cond" => condition = Some(value),
+            "limit" => validate_expression_with_scope(value, scope)?,
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    let input = input.ok_or(QueryError::InvalidStructure)?;
+    let condition = condition.ok_or(QueryError::InvalidStructure)?;
+    let var_name = var_name.unwrap_or("this");
+    validate_user_variable_write_name(var_name)?;
+    validate_expression_with_scope(input, scope)?;
+
+    let mut inner_scope = scope.clone();
+    inner_scope.insert(var_name.to_string());
+    validate_expression_with_scope(condition, &inner_scope)
+}
+
+fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
+    match value {
+        Bson::Document(spec) => {
+            let mut field = None;
+            let mut input = None;
+
+            if spec.len() == 1
+                && spec
+                    .iter()
+                    .next()
+                    .is_some_and(|(name, _)| name.starts_with('$'))
+            {
+                return Ok((value, None));
+            }
+
+            for (name, value) in spec {
+                match name.as_str() {
+                    "field" => field = Some(value),
+                    "input" => input = Some(value),
+                    _ => return Err(QueryError::InvalidStructure),
+                }
+            }
+
+            Ok((
+                field.ok_or(QueryError::InvalidStructure)?,
+                Some(input.ok_or(QueryError::InvalidStructure)?),
+            ))
+        }
+        _ => Ok((value, None)),
+    }
+}
+
+fn parse_filter_limit(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<usize, QueryError> {
+    let limit = eval_expression_result_with_variables(document, value, variables)?;
+    if limit.is_nullish() {
+        return Ok(usize::MAX);
+    }
+
+    let EvaluatedExpression::Value(limit) = limit else {
+        return Ok(usize::MAX);
+    };
+    let limit = integer_value(&limit).ok_or_else(|| {
+        QueryError::InvalidArgument("$filter limit must evaluate to a positive integer".to_string())
+    })?;
+    if limit <= 0 {
+        return Err(QueryError::InvalidArgument(
+            "$filter limit must evaluate to a positive integer".to_string(),
+        ));
+    }
+
+    usize::try_from(limit).map_err(|_| {
+        QueryError::InvalidArgument("$filter limit must evaluate to a positive integer".to_string())
+    })
+}
+
+fn materialize_variable_value(value: EvaluatedExpression) -> Bson {
+    match value {
+        EvaluatedExpression::Missing => Bson::Null,
+        EvaluatedExpression::Value(value) => value,
     }
 }
 
