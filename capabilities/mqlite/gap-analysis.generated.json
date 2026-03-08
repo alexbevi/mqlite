@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 39,
-    "public_supported": 39,
-    "total_unsupported": 145,
-    "public_unsupported": 114,
+    "total_supported": 40,
+    "public_supported": 40,
+    "total_unsupported": 144,
+    "public_unsupported": 113,
     "public_ignored": 23,
     "items": [
       {
@@ -6039,8 +6039,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$unsetField",

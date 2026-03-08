@@ -1513,6 +1513,7 @@ mod tests {
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
             "$size" => doc! { "value": { "$size": "$array" } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
+            "$type" => doc! { "value": { "$type": "$left" } },
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
             other => panic!("missing supported expression fixture for {other}"),
         }

@@ -115,7 +115,8 @@
     "$round",
     "$size",
     "$subtract",
-    "$trunc"
+    "$trunc",
+    "$type"
   ],
   "aggregation_accumulator_operators": [
     "$addToSet",

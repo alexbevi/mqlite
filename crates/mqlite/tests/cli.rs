@@ -2470,6 +2470,7 @@ fn command_aggregate_project_supports_expression_operators() {
                     "size": { "$size": "$array" },
                     "isArray": { "$isArray": "$array" },
                     "isNumber": { "$isNumber": "$left" },
+                    "type": { "$type": "$left" },
                     "merged": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
                     "expanded": { "$objectToArray": "$object" },
                     "collapsed": { "$arrayToObject": "$pairs" },
@@ -2523,6 +2524,7 @@ fn command_aggregate_project_supports_expression_operators() {
     assert_eq!(first_batch[0]["size"], 3);
     assert_eq!(first_batch[0]["isArray"], true);
     assert_eq!(first_batch[0]["isNumber"], true);
+    assert_eq!(first_batch[0]["type"], "long");
     assert_eq!(first_batch[0]["merged"], json!({ "a": 1, "b": 9, "c": 3 }));
     assert_eq!(
         first_batch[0]["expanded"],

@@ -856,7 +856,7 @@ fn compile_regex(pattern: &str, options: &str) -> Result<RustRegex, QueryError> 
     builder.build().map_err(|_| QueryError::InvalidStructure)
 }
 
-fn type_alias_code(alias: &str) -> Option<i32> {
+pub(crate) fn type_alias_code(alias: &str) -> Option<i32> {
     match alias {
         "double" => Some(1),
         "string" => Some(2),
@@ -892,7 +892,7 @@ fn parse_type_code(value: &Bson) -> Option<i32> {
     }
 }
 
-fn bson_type_code(value: &Bson) -> i32 {
+pub(crate) fn bson_type_code(value: &Bson) -> i32 {
     match value {
         Bson::Double(_) => 1,
         Bson::String(_) => 2,
@@ -918,11 +918,38 @@ fn bson_type_code(value: &Bson) -> i32 {
     }
 }
 
-fn is_numeric_bson(value: &Bson) -> bool {
+pub(crate) fn is_numeric_bson(value: &Bson) -> bool {
     matches!(
         value,
         Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
     )
+}
+
+pub(crate) fn bson_type_alias(value: &Bson) -> &'static str {
+    match bson_type_code(value) {
+        1 => "double",
+        2 => "string",
+        3 => "object",
+        4 => "array",
+        5 => "binData",
+        6 => "undefined",
+        7 => "objectId",
+        8 => "bool",
+        9 => "date",
+        10 => "null",
+        11 => "regex",
+        12 => "dbPointer",
+        13 => "javascript",
+        14 => "symbol",
+        15 => "javascriptWithScope",
+        16 => "int",
+        17 => "timestamp",
+        18 => "long",
+        19 => "decimal",
+        -1 => "minKey",
+        127 => "maxKey",
+        _ => "unknown",
+    }
 }
 
 fn as_document(value: &Bson) -> Result<&Document, QueryError> {

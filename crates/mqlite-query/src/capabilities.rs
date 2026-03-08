@@ -116,6 +116,7 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$round",
     "$size",
     "$subtract",
+    "$type",
     "$trunc",
 ];
 

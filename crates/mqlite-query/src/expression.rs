@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, lookup_path_owned};
 
-use crate::QueryError;
+use crate::{QueryError, filter::bson_type_alias};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EvaluatedExpression {
@@ -190,6 +190,16 @@ fn eval_expression_operator(
                 | Bson::Double(_)
                 | Bson::Decimal128(_))
         )))),
+        "$type" => Ok(EvaluatedExpression::Value(Bson::String(
+            match eval_expression_result_with_variables(
+                document,
+                unary_expression_operand(value),
+                variables,
+            )? {
+                EvaluatedExpression::Missing => "missing".to_string(),
+                EvaluatedExpression::Value(value) => bson_type_alias(&value).to_string(),
+            },
+        ))),
         "$round" => eval_rounding_expression(document, value, variables, f64::round),
         "$trunc" => eval_rounding_expression(document, value, variables, f64::trunc),
         "$ifNull" => eval_if_null_expression(document, value, variables),

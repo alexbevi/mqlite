@@ -820,94 +820,100 @@ fn projection_supports_expression_operators() {
         "object": { "a": 1, "b": 2 },
         "pairs": [["price", 24], ["item", "apple"]]
     };
+    let mut projection = Document::new();
+    projection.insert("abs", doc! { "$abs": -5 });
+    projection.insert("add", doc! { "$add": ["$left", "$right", 2] });
+    projection.insert("allElementsTrue", doc! { "$allElementsTrue": [true, 1, "ok"] });
+    projection.insert("eq", doc! { "$eq": ["$left", 5] });
+    projection.insert("ne", doc! { "$ne": ["$left", "$right"] });
+    projection.insert("gt", doc! { "$gt": ["$left", "$right"] });
+    projection.insert("gte", doc! { "$gte": ["$left", 5] });
+    projection.insert("lt", doc! { "$lt": ["$right", "$left"] });
+    projection.insert("lte", doc! { "$lte": ["$right", 3] });
+    projection.insert("anyElementTrue", doc! { "$anyElementTrue": [0, false, "ok"] });
+    projection.insert("arrayElemAt", doc! { "$arrayElemAt": ["$array", -1] });
+    projection.insert("arrayToObject", doc! { "$arrayToObject": "$pairs" });
+    projection.insert("cmp", doc! { "$cmp": ["$left", "$right"] });
+    projection.insert("concat", doc! { "$concat": ["prefix-", "$sku"] });
+    projection.insert("concatArrays", doc! { "$concatArrays": ["$array", [4, 5]] });
+    projection.insert("and", doc! { "$and": [true, { "$eq": ["$left", 5] }] });
+    projection.insert("or", doc! { "$or": [false, { "$eq": ["$sku", "abc"] }] });
+    projection.insert("not", doc! { "$not": [{ "$eq": ["$right", 5] }] });
+    projection.insert("in", doc! { "$in": ["$sku", ["def", "abc"]] });
+    projection.insert("const", doc! { "$const": "fixed" });
+    projection.insert("divide", doc! { "$divide": [7, 2] });
+    projection.insert("expr", doc! { "$expr": { "$eq": ["$left", 5] } });
+    projection.insert("first", doc! { "$first": "$array" });
+    projection.insert("floor", doc! { "$floor": 2.8 });
+    projection.insert("ceil", doc! { "$ceil": 2.2 });
+    projection.insert("ifNull", doc! { "$ifNull": [null, "$left"] });
+    projection.insert("isArray", doc! { "$isArray": "$array" });
+    projection.insert("isNumber", doc! { "$isNumber": "$left" });
+    projection.insert("last", doc! { "$last": "$array" });
+    projection.insert("mod", doc! { "$mod": [17, 5] });
+    projection.insert("mergeObjects", doc! { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] });
+    projection.insert("multiply", doc! { "$multiply": ["$left", 2] });
+    projection.insert("objectToArray", doc! { "$objectToArray": "$object" });
+    projection.insert("round", doc! { "$round": [2.65, 1] });
+    projection.insert("size", doc! { "$size": "$array" });
+    projection.insert("subtract", doc! { "$subtract": ["$left", "$right"] });
+    projection.insert("type", doc! { "$type": "$left" });
+    projection.insert("trunc", doc! { "$trunc": [2.65, 1] });
+    projection.insert("literal", doc! { "$literal": { "nested": true } });
     let projected = apply_projection(
         &document,
-        Some(&doc! {
-            "abs": { "$abs": -5 },
-            "add": { "$add": ["$left", "$right", 2] },
-            "allElementsTrue": { "$allElementsTrue": [true, 1, "ok"] },
-            "eq": { "$eq": ["$left", 5] },
-            "ne": { "$ne": ["$left", "$right"] },
-            "gt": { "$gt": ["$left", "$right"] },
-            "gte": { "$gte": ["$left", 5] },
-            "lt": { "$lt": ["$right", "$left"] },
-            "lte": { "$lte": ["$right", 3] },
-            "anyElementTrue": { "$anyElementTrue": [0, false, "ok"] },
-            "arrayElemAt": { "$arrayElemAt": ["$array", -1] },
-            "arrayToObject": { "$arrayToObject": "$pairs" },
-            "cmp": { "$cmp": ["$left", "$right"] },
-            "concat": { "$concat": ["prefix-", "$sku"] },
-            "concatArrays": { "$concatArrays": ["$array", [4, 5]] },
-            "and": { "$and": [true, { "$eq": ["$left", 5] }] },
-            "or": { "$or": [false, { "$eq": ["$sku", "abc"] }] },
-            "not": { "$not": [{ "$eq": ["$right", 5] }] },
-            "in": { "$in": ["$sku", ["def", "abc"]] },
-            "const": { "$const": "fixed" },
-            "divide": { "$divide": [7, 2] },
-            "expr": { "$expr": { "$eq": ["$left", 5] } },
-            "first": { "$first": "$array" },
-            "floor": { "$floor": 2.8 },
-            "ceil": { "$ceil": 2.2 },
-            "ifNull": { "$ifNull": [null, "$left"] },
-            "isArray": { "$isArray": "$array" },
-            "isNumber": { "$isNumber": "$left" },
-            "last": { "$last": "$array" },
-            "mod": { "$mod": [17, 5] },
-            "mergeObjects": { "$mergeObjects": ["$object", { "b": 9, "c": 3 }] },
-            "multiply": { "$multiply": ["$left", 2] },
-            "objectToArray": { "$objectToArray": "$object" },
-            "round": { "$round": [2.65, 1] },
-            "size": { "$size": "$array" },
-            "subtract": { "$subtract": ["$left", "$right"] },
-            "trunc": { "$trunc": [2.65, 1] },
-            "literal": { "$literal": { "nested": true } }
-        }),
+        Some(&projection),
     )
     .expect("apply projection");
 
+    let mut expected = Document::new();
+    expected.insert("_id", 1);
+    expected.insert("abs", 5_i64);
+    expected.insert("add", 10_i64);
+    expected.insert("allElementsTrue", true);
+    expected.insert("eq", true);
+    expected.insert("ne", true);
+    expected.insert("gt", true);
+    expected.insert("gte", true);
+    expected.insert("lt", true);
+    expected.insert("lte", true);
+    expected.insert("anyElementTrue", true);
+    expected.insert("arrayElemAt", 3);
+    expected.insert("arrayToObject", doc! { "price": 24, "item": "apple" });
+    expected.insert("cmp", 1);
+    expected.insert("concat", "prefix-abc");
+    expected.insert("concatArrays", vec![1, 2, 3, 4, 5]);
+    expected.insert("and", true);
+    expected.insert("or", true);
+    expected.insert("not", true);
+    expected.insert("in", true);
+    expected.insert("const", "fixed");
+    expected.insert("divide", 3.5);
+    expected.insert("expr", true);
+    expected.insert("first", 1);
+    expected.insert("floor", 2_i64);
+    expected.insert("ceil", 3_i64);
+    expected.insert("ifNull", 5);
+    expected.insert("isArray", true);
+    expected.insert("isNumber", true);
+    expected.insert("last", 3);
+    expected.insert("mod", 2_i64);
+    expected.insert("mergeObjects", doc! { "a": 1, "b": 9, "c": 3 });
+    expected.insert("multiply", 10_i64);
+    expected.insert(
+        "objectToArray",
+        vec![doc! { "k": "a", "v": 1 }, doc! { "k": "b", "v": 2 }],
+    );
+    expected.insert("round", 2.7);
+    expected.insert("size", 3_i64);
+    expected.insert("subtract", 2_i64);
+    expected.insert("type", "int");
+    expected.insert("trunc", 2.6);
+    expected.insert("literal", doc! { "nested": true });
+
     assert_eq!(
         projected,
-        doc! {
-            "_id": 1,
-            "abs": 5_i64,
-            "add": 10_i64,
-            "allElementsTrue": true,
-            "eq": true,
-            "ne": true,
-            "gt": true,
-            "gte": true,
-            "lt": true,
-            "lte": true,
-            "anyElementTrue": true,
-            "arrayElemAt": 3,
-            "arrayToObject": { "price": 24, "item": "apple" },
-            "cmp": 1,
-            "concat": "prefix-abc",
-            "concatArrays": [1, 2, 3, 4, 5],
-            "and": true,
-            "or": true,
-            "not": true,
-            "in": true,
-            "const": "fixed",
-            "divide": 3.5,
-            "expr": true,
-            "first": 1,
-            "floor": 2_i64,
-            "ceil": 3_i64,
-            "ifNull": 5,
-            "isArray": true,
-            "isNumber": true,
-            "last": 3,
-            "mod": 2_i64,
-            "mergeObjects": { "a": 1, "b": 9, "c": 3 },
-            "multiply": 10_i64,
-            "objectToArray": [{ "k": "a", "v": 1 }, { "k": "b", "v": 2 }],
-            "round": 2.7,
-            "size": 3_i64,
-            "subtract": 2_i64,
-            "trunc": 2.6,
-            "literal": { "nested": true }
-        }
+        expected
     );
 }
 
@@ -927,6 +933,39 @@ fn projection_preserves_missing_expression_results() {
     assert_eq!(
         projected,
         doc! { "_id": 1, "lastEmpty": Bson::Null, "merged": { "a": 1 } }
+    );
+}
+
+#[test]
+fn projection_supports_type_expression_for_missing_and_present_values() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "intValue": 5,
+            "text": "abc",
+            "items": [1, 2],
+            "nested": { "ok": true }
+        },
+        Some(&doc! {
+            "intType": { "$type": "$intValue" },
+            "stringType": { "$type": "$text" },
+            "arrayType": { "$type": "$items" },
+            "objectType": { "$type": "$nested" },
+            "missingType": { "$type": "$missing" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "intType": "int",
+            "stringType": "string",
+            "arrayType": "array",
+            "objectType": "object",
+            "missingType": "missing"
+        }
     );
 }
 
