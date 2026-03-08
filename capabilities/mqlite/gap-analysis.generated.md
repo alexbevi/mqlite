@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 73 | 80 | 23 |
+| Aggregation expression operators | 176 | 76 | 77 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
+Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 
 ### Supported Public
 
@@ -263,6 +263,7 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$literal`
 - `$lt`
 - `$lte`
+- `$ltrim`
 - `$map`
 - `$mergeObjects`
 - `$mod`
@@ -275,6 +276,7 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$reduce`
 - `$reverseArray`
 - `$round`
+- `$rtrim`
 - `$setDifference`
 - `$setEquals`
 - `$setField`
@@ -293,6 +295,7 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$switch`
 - `$toLower`
 - `$toUpper`
+- `$trim`
 - `$trunc`
 - `$type`
 - `$unsetField`
@@ -333,7 +336,6 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$ln`
 - `$log`
 - `$log10`
-- `$ltrim`
 - `$max`
 - `$maxN`
 - `$median`
@@ -352,7 +354,6 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$regexMatch`
 - `$replaceAll`
 - `$replaceOne`
-- `$rtrim`
 - `$second`
 - `$sin`
 - `$sinh`
@@ -373,7 +374,6 @@ Public upstream: 176. Supported: 73. Unsupported: 80. Ignored: 23.
 - `$toLong`
 - `$toObjectId`
 - `$toString`
-- `$trim`
 - `$tsIncrement`
 - `$tsSecond`
 - `$week`

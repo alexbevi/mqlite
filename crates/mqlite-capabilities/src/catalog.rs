@@ -1567,6 +1567,9 @@ mod tests {
             }
             "$toLower" => doc! { "value": { "$toLower": "AbC" } },
             "$toUpper" => doc! { "value": { "$toUpper": "AbC" } },
+            "$trim" => doc! { "value": { "$trim": { "input": "  abc  " } } },
+            "$ltrim" => doc! { "value": { "$ltrim": { "input": "  abc  " } } },
+            "$rtrim" => doc! { "value": { "$rtrim": { "input": "  abc  " } } },
             "$type" => doc! { "value": { "$type": "$left" } },
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
             "$unsetField" => {

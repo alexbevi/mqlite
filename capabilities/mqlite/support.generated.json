@@ -117,6 +117,7 @@
     "$literal",
     "$lt",
     "$lte",
+    "$ltrim",
     "$map",
     "$mergeObjects",
     "$mod",
@@ -129,6 +130,7 @@
     "$reduce",
     "$reverseArray",
     "$round",
+    "$rtrim",
     "$setDifference",
     "$setEquals",
     "$setField",
@@ -147,6 +149,7 @@
     "$switch",
     "$toLower",
     "$toUpper",
+    "$trim",
     "$trunc",
     "$type",
     "$unsetField"

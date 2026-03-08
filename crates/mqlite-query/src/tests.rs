@@ -1678,6 +1678,45 @@ fn projection_supports_size_introspection_expression_operators() {
 }
 
 #[test]
+fn projection_supports_trim_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "defaultWhitespace": " \u{2001}\u{2002}Odd unicode indentation\u{200A} ",
+            "customChars": "xXtrimXx",
+            "leftChars": "xyztrimzy",
+            "rightChars": "xyztrimzy"
+        },
+        Some(&doc! {
+            "trimmed": { "$trim": { "input": "$defaultWhitespace" } },
+            "leftTrimmed": { "$ltrim": { "input": "$defaultWhitespace" } },
+            "rightTrimmed": { "$rtrim": { "input": "$defaultWhitespace" } },
+            "customSet": { "$trim": { "input": "$customChars", "chars": "x" } },
+            "leftCustomSet": { "$ltrim": { "input": "$leftChars", "chars": "xyz" } },
+            "rightCustomSet": { "$rtrim": { "input": "$rightChars", "chars": "xyz" } },
+            "nullInput": { "$trim": { "input": "$missing" } },
+            "nullChars": { "$trim": { "input": "$customChars", "chars": "$missingChars" } }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "trimmed": "Odd unicode indentation",
+            "leftTrimmed": "Odd unicode indentation\u{200A} ",
+            "rightTrimmed": " \u{2001}\u{2002}Odd unicode indentation",
+            "customSet": "XtrimX",
+            "leftCustomSet": "trimzy",
+            "rightCustomSet": "xyztrim",
+            "nullInput": Bson::Null,
+            "nullChars": Bson::Null
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1726,6 +1765,64 @@ fn case_expression_operators_reject_invalid_inputs() {
         invalid_strcasecmp_arity,
         QueryError::InvalidStructure
     ));
+}
+
+#[test]
+fn trim_expression_operators_reject_invalid_inputs() {
+    let non_object = apply_projection(
+        &doc! { "_id": 1, "value": " abc " },
+        Some(&doc! {
+            "out": { "$trim": ["$value"] }
+        }),
+    )
+    .expect_err("trim requires an object specification");
+    assert!(matches!(non_object, QueryError::InvalidStructure));
+
+    let missing_input = apply_projection(
+        &doc! { "_id": 1, "value": " abc " },
+        Some(&doc! {
+            "out": { "$trim": { "chars": " " } }
+        }),
+    )
+    .expect_err("trim requires input");
+    assert!(matches!(missing_input, QueryError::InvalidStructure));
+
+    let extra_field = apply_projection(
+        &doc! { "_id": 1, "value": " abc " },
+        Some(&doc! {
+            "out": { "$ltrim": { "input": "$value", "chars": " ", "extra": true } }
+        }),
+    )
+    .expect_err("trim rejects unrecognized fields");
+    assert!(matches!(extra_field, QueryError::InvalidStructure));
+
+    let non_string_input = apply_projection(
+        &doc! { "_id": 1, "value": 5 },
+        Some(&doc! {
+            "out": { "$rtrim": { "input": "$value" } }
+        }),
+    )
+    .expect_err("trim requires string input");
+    assert!(matches!(non_string_input, QueryError::InvalidArgument(_)));
+
+    let non_string_chars = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$trim": { "input": "$value", "chars": 5 } }
+        }),
+    )
+    .expect_err("trim requires string chars");
+    assert!(matches!(non_string_chars, QueryError::InvalidArgument(_)));
+
+    let too_many_chars = "x".repeat(4097);
+    let chars_too_long = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$trim": { "input": "$value", "chars": too_many_chars } }
+        }),
+    )
+    .expect_err("trim enforces maximum chars length");
+    assert!(matches!(chars_too_long, QueryError::InvalidArgument(_)));
 }
 
 #[test]

@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 73,
-    "public_supported": 73,
-    "total_unsupported": 111,
-    "public_unsupported": 80,
+    "total_supported": 76,
+    "public_supported": 76,
+    "total_unsupported": 108,
+    "public_unsupported": 77,
     "public_ignored": 23,
     "items": [
       {
@@ -4509,8 +4509,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$map",
@@ -5067,8 +5067,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$second",
@@ -5967,8 +5967,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$trunc",

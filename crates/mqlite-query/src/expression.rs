@@ -249,6 +249,9 @@ fn eval_expression_operator(
         "$strLenCP" => eval_string_length_expression(document, value, variables, true),
         "$substr" | "$substrBytes" => eval_substring_expression(document, value, variables, false),
         "$substrCP" => eval_substring_expression(document, value, variables, true),
+        "$trim" => eval_trim_expression(document, value, variables, TrimType::Both),
+        "$ltrim" => eval_trim_expression(document, value, variables, TrimType::Left),
+        "$rtrim" => eval_trim_expression(document, value, variables, TrimType::Right),
         "$and" => {
             let arguments = expression_argument_slice(value)?;
             Ok(EvaluatedExpression::Value(Bson::Boolean(
@@ -396,6 +399,7 @@ fn validate_expression_operator(
             }
             Ok(())
         }
+        "$trim" | "$ltrim" | "$rtrim" => validate_trim_expression(value, scope),
         "$strcasecmp" => {
             for argument in expression_arguments::<2>(value)? {
                 validate_expression_with_scope(argument, scope)?;
@@ -1440,6 +1444,13 @@ fn eval_case_fold_expression(
     Ok(EvaluatedExpression::Value(Bson::String(value)))
 }
 
+#[derive(Clone, Copy)]
+enum TrimType {
+    Left,
+    Right,
+    Both,
+}
+
 fn eval_substring_expression(
     document: &Document,
     value: &Bson,
@@ -1486,6 +1497,46 @@ fn eval_substring_expression(
     Ok(EvaluatedExpression::Value(Bson::String(
         input[start..end].to_string(),
     )))
+}
+
+fn eval_trim_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    trim_type: TrimType,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operator = match trim_type {
+        TrimType::Left => "$ltrim",
+        TrimType::Right => "$rtrim",
+        TrimType::Both => "$trim",
+    };
+    let (input, chars) = parse_trim_spec(value)?;
+
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+    if input.is_nullish() {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    }
+    let input = require_trim_string(input, operator, "input")?;
+
+    let trimmed = match chars {
+        Some(chars) => {
+            let chars = eval_expression_result_with_variables(document, chars, variables)?;
+            if chars.is_nullish() {
+                return Ok(EvaluatedExpression::Value(Bson::Null));
+            }
+            let chars = require_trim_string(chars, operator, "chars")?;
+            if chars.len() > 4096 {
+                return Err(QueryError::InvalidArgument(format!(
+                    "{operator} requires `chars` to be at most 4096 bytes"
+                )));
+            }
+            let characters = chars.chars().collect::<BTreeSet<_>>();
+            trim_with_characters(&input, &characters, trim_type).to_string()
+        }
+        None => trim_whitespace(&input, trim_type).to_string(),
+    };
+
+    Ok(EvaluatedExpression::Value(Bson::String(trimmed)))
 }
 
 fn index_of_bytes(input: &str, token: &str, start: usize, end: Option<usize>) -> i64 {
@@ -1565,6 +1616,15 @@ fn eval_string_length_expression(
         string.len() as i64
     };
     Ok(EvaluatedExpression::Value(Bson::Int64(length)))
+}
+
+fn validate_trim_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
+    let (input, chars) = parse_trim_spec(value)?;
+    validate_expression_with_scope(input, scope)?;
+    if let Some(chars) = chars {
+        validate_expression_with_scope(chars, scope)?;
+    }
+    Ok(())
 }
 
 fn validate_cond_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<(), QueryError> {
@@ -1792,6 +1852,22 @@ fn parse_reduce_spec(value: &Bson) -> Result<(&Bson, &Bson, &Bson), QueryError> 
     ))
 }
 
+fn parse_trim_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut input = None;
+    let mut chars = None;
+
+    for (field, value) in spec {
+        match field.as_str() {
+            "input" => input = Some(value),
+            "chars" => chars = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((input.ok_or(QueryError::InvalidStructure)?, chars))
+}
+
 type SwitchBranches<'a> = Vec<(&'a Bson, &'a Bson)>;
 
 fn parse_switch_spec(value: &Bson) -> Result<(SwitchBranches<'_>, Option<&Bson>), QueryError> {
@@ -1965,6 +2041,41 @@ fn require_string_operand(
         _ => Err(QueryError::InvalidArgument(format!(
             "{operator} requires a string argument"
         ))),
+    }
+}
+
+fn require_trim_string(
+    value: EvaluatedExpression,
+    operator: &str,
+    field: &str,
+) -> Result<String, QueryError> {
+    match value {
+        EvaluatedExpression::Value(Bson::String(value)) => Ok(value),
+        EvaluatedExpression::Value(Bson::Symbol(value)) => Ok(value),
+        _ => Err(QueryError::InvalidArgument(format!(
+            "{operator} requires `{field}` to evaluate to a string"
+        ))),
+    }
+}
+
+fn trim_whitespace(input: &str, trim_type: TrimType) -> &str {
+    match trim_type {
+        TrimType::Left => input.trim_start_matches(char::is_whitespace),
+        TrimType::Right => input.trim_end_matches(char::is_whitespace),
+        TrimType::Both => input.trim_matches(char::is_whitespace),
+    }
+}
+
+fn trim_with_characters<'a>(
+    input: &'a str,
+    characters: &BTreeSet<char>,
+    trim_type: TrimType,
+) -> &'a str {
+    let matcher = |character| characters.contains(&character);
+    match trim_type {
+        TrimType::Left => input.trim_start_matches(matcher),
+        TrimType::Right => input.trim_end_matches(matcher),
+        TrimType::Both => input.trim_matches(matcher),
     }
 }
 

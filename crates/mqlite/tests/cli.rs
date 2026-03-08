@@ -3532,6 +3532,82 @@ fn command_aggregate_project_supports_size_introspection_expression_operators() 
 }
 
 #[test]
+fn command_aggregate_project_supports_trim_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("trim-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"defaultWhitespace":" \u2001\u2002Odd unicode indentation\u200A ","customChars":"xXtrimXx","leftChars":"xyztrimzy","rightChars":"xyztrimzy"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "trimmed": { "$trim": { "input": "$defaultWhitespace" } },
+                    "leftTrimmed": { "$ltrim": { "input": "$defaultWhitespace" } },
+                    "rightTrimmed": { "$rtrim": { "input": "$defaultWhitespace" } },
+                    "customSet": { "$trim": { "input": "$customChars", "chars": "x" } },
+                    "leftCustomSet": { "$ltrim": { "input": "$leftChars", "chars": "xyz" } },
+                    "rightCustomSet": { "$rtrim": { "input": "$rightChars", "chars": "xyz" } }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "trimmed": "Odd unicode indentation",
+            "leftTrimmed": "Odd unicode indentation\u{200A} ",
+            "rightTrimmed": " \u{2001}\u{2002}Odd unicode indentation",
+            "customSet": "XtrimX",
+            "leftCustomSet": "trimzy",
+            "rightCustomSet": "xyztrim"
+        })]
+    );
+}
+
+#[test]
 fn command_aggregate_project_rejects_invalid_case_expression() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("invalid-case-expression.mongodb");
@@ -3564,6 +3640,51 @@ fn command_aggregate_project_rejects_invalid_case_expression() {
             "1",
             "--eval",
             r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$toUpper":"$flag"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_trim_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-trim-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":"abc"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$trim":{"input":"$value","chars":5}}}}],"cursor":{}}"#,
         ])
         .assert()
         .failure()
