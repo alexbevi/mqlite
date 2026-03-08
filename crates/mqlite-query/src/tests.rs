@@ -1485,6 +1485,42 @@ fn projection_supports_case_expression_operators() {
 }
 
 #[test]
+fn projection_supports_bitwise_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "a": 3,
+            "b": 5,
+            "arr": [1, 2]
+        },
+        Some(&doc! {
+            "bitAnd": { "$bitAnd": ["$a", "$b"] },
+            "bitOr": { "$bitOr": ["$a", "$b"] },
+            "bitXor": { "$bitXor": ["$a", "$b"] },
+            "bitNot": { "$bitNot": "$a" },
+            "identityAnd": { "$bitAnd": [] },
+            "identityOr": { "$bitOr": [] },
+            "identityXor": { "$bitXor": [] }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "bitAnd": 1_i64,
+            "bitOr": 7_i64,
+            "bitXor": 6_i64,
+            "bitNot": -4_i64,
+            "identityAnd": -1_i64,
+            "identityOr": 0_i64,
+            "identityXor": 0_i64
+        }
+    );
+}
+
+#[test]
 fn case_expression_operators_reject_invalid_inputs() {
     let wrong_arity = apply_projection(
         &doc! { "_id": 1 },
@@ -1533,6 +1569,45 @@ fn case_expression_operators_reject_invalid_inputs() {
         invalid_strcasecmp_arity,
         QueryError::InvalidStructure
     ));
+}
+
+#[test]
+fn bitwise_expression_operators_reject_invalid_inputs() {
+    let invalid_double = apply_projection(
+        &doc! { "_id": 1, "value": 12.0 },
+        Some(&doc! {
+            "out": { "$bitNot": "$value" }
+        }),
+    )
+    .expect_err("bitNot rejects doubles");
+    assert!(matches!(invalid_double, QueryError::InvalidArgument(_)));
+
+    let invalid_decimal = apply_projection(
+        &doc! { "_id": 1, "value": Decimal128::from_str("12").expect("decimal") },
+        Some(&doc! {
+            "out": { "$bitAnd": [1, "$value"] }
+        }),
+    )
+    .expect_err("bitAnd rejects decimals");
+    assert!(matches!(invalid_decimal, QueryError::InvalidArgument(_)));
+
+    let invalid_array = apply_projection(
+        &doc! { "_id": 1, "arr": [1, 2] },
+        Some(&doc! {
+            "out": { "$bitOr": "$arr" }
+        }),
+    )
+    .expect_err("bitOr rejects arrays");
+    assert!(matches!(invalid_array, QueryError::InvalidArgument(_)));
+
+    let invalid_unary_arity = apply_projection(
+        &doc! { "_id": 1, "a": 1, "b": 2 },
+        Some(&doc! {
+            "out": { "$bitNot": ["$a", "$b"] }
+        }),
+    )
+    .expect_err("bitNot requires one operand");
+    assert!(matches!(invalid_unary_arity, QueryError::InvalidStructure));
 }
 
 #[test]

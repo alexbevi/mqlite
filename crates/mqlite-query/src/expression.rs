@@ -170,6 +170,16 @@ fn eval_expression_operator(
         "$abs" => eval_unary_numeric_expression(document, value, variables, |number| {
             Ok(EvaluatedExpression::Value(number_bson(number.abs())))
         }),
+        "$bitAnd" => {
+            eval_bitwise_expression(document, value, variables, |left, right| left & right, -1)
+        }
+        "$bitNot" => eval_bit_not_expression(document, value, variables),
+        "$bitOr" => {
+            eval_bitwise_expression(document, value, variables, |left, right| left | right, 0)
+        }
+        "$bitXor" => {
+            eval_bitwise_expression(document, value, variables, |left, right| left ^ right, 0)
+        }
         "$ceil" => eval_unary_numeric_expression(document, value, variables, |number| {
             Ok(EvaluatedExpression::Value(number_bson(number.ceil())))
         }),
@@ -351,6 +361,17 @@ fn validate_expression_operator(
         }
         "$arrayElemAt" | "$cmp" | "$divide" => {
             for argument in expression_arguments::<2>(value)? {
+                validate_expression_with_scope(argument, scope)?;
+            }
+            Ok(())
+        }
+        "$bitNot" => validate_expression_with_scope(single_expression_operand(value)?, scope),
+        "$bitAnd" | "$bitOr" | "$bitXor" => {
+            let arguments = match value {
+                Bson::Array(arguments) => arguments.as_slice(),
+                _ => std::slice::from_ref(value),
+            };
+            for argument in arguments {
                 validate_expression_with_scope(argument, scope)?;
             }
             Ok(())
@@ -1009,6 +1030,40 @@ fn eval_reduce_expression(
     Ok(EvaluatedExpression::Value(accumulator))
 }
 
+fn eval_bitwise_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    op: fn(i64, i64) -> i64,
+    identity: i64,
+) -> Result<EvaluatedExpression, QueryError> {
+    let arguments = match value {
+        Bson::Array(arguments) => arguments.as_slice(),
+        _ => std::slice::from_ref(value),
+    };
+
+    let mut result = identity;
+    for argument in arguments {
+        let operand = eval_expression_with_variables(document, argument, variables)?;
+        let operand = bitwise_i64(&operand)?;
+        result = op(result, operand);
+    }
+
+    Ok(EvaluatedExpression::Value(Bson::Int64(result)))
+}
+
+fn eval_bit_not_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let operand = single_expression_operand(value)?;
+    let operand = eval_expression_with_variables(document, operand, variables)?;
+    Ok(EvaluatedExpression::Value(Bson::Int64(!bitwise_i64(
+        &operand,
+    )?)))
+}
+
 fn eval_set_difference_expression(
     document: &Document,
     value: &Bson,
@@ -1653,6 +1708,16 @@ fn coerce_case_string(value: EvaluatedExpression, operator: &str) -> Result<Stri
         _ => Err(QueryError::InvalidArgument(format!(
             "{operator} requires a string-compatible input"
         ))),
+    }
+}
+
+fn bitwise_i64(value: &Bson) -> Result<i64, QueryError> {
+    match value {
+        Bson::Int32(value) => Ok(*value as i64),
+        Bson::Int64(value) => Ok(*value),
+        _ => Err(QueryError::InvalidArgument(
+            "bitwise expressions require integer inputs".to_string(),
+        )),
     }
 }
 
