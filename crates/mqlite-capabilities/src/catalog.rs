@@ -1477,11 +1477,18 @@ mod tests {
         match name {
             "$abs" => doc! { "value": { "$abs": -5 } },
             "$add" => doc! { "value": { "$add": ["$left", "$right", 2] } },
+            "$acos" => doc! { "value": { "$acos": 1 } },
+            "$acosh" => doc! { "value": { "$acosh": 1 } },
             "$allElementsTrue" => doc! { "value": { "$allElementsTrue": [true, 1, "ok"] } },
             "$and" => doc! { "value": { "$and": [true, { "$eq": ["$left", "$left"] }] } },
             "$anyElementTrue" => doc! { "value": { "$anyElementTrue": [0, false, "ok"] } },
             "$arrayElemAt" => doc! { "value": { "$arrayElemAt": ["$array", 1] } },
             "$arrayToObject" => doc! { "value": { "$arrayToObject": "$pairs" } },
+            "$asin" => doc! { "value": { "$asin": 0 } },
+            "$asinh" => doc! { "value": { "$asinh": 0 } },
+            "$atan" => doc! { "value": { "$atan": 0 } },
+            "$atan2" => doc! { "value": { "$atan2": [0, 1] } },
+            "$atanh" => doc! { "value": { "$atanh": 0 } },
             "$binarySize" => doc! { "value": { "$binarySize": "abc" } },
             "$bsonSize" => doc! { "value": { "$bsonSize": "$$CURRENT" } },
             "$bitAnd" => doc! { "value": { "$bitAnd": ["$left", 6] } },
@@ -1494,8 +1501,12 @@ mod tests {
             "$concatArrays" => doc! { "value": { "$concatArrays": ["$array", [4, 5]] } },
             "$cond" => doc! { "value": { "$cond": [{ "$eq": ["$left", "$left"] }, "yes", "no"] } },
             "$const" => doc! { "value": { "$const": 5 } },
+            "$cos" => doc! { "value": { "$cos": 0 } },
+            "$cosh" => doc! { "value": { "$cosh": 0 } },
+            "$degreesToRadians" => doc! { "value": { "$degreesToRadians": 180 } },
             "$divide" => doc! { "value": { "$divide": [9, 3] } },
             "$eq" => doc! { "value": { "$eq": ["$left", "$right"] } },
+            "$exp" => doc! { "value": { "$exp": 0 } },
             "$expr" => doc! { "value": { "$expr": { "$eq": ["$left", "$left"] } } },
             "$filter" => {
                 doc! { "value": { "$filter": { "input": "$array", "as": "value", "cond": { "$gt": ["$$value", 1] } } } }
@@ -1517,6 +1528,9 @@ mod tests {
                 doc! { "value": { "$let": { "vars": { "factor": 10 }, "in": { "$add": ["$left", "$$factor"] } } } }
             }
             "$literal" => doc! { "value": { "$literal": 5 } },
+            "$ln" => doc! { "value": { "$ln": 1 } },
+            "$log" => doc! { "value": { "$log": [8, 2] } },
+            "$log10" => doc! { "value": { "$log10": 1000 } },
             "$lt" => doc! { "value": { "$lt": ["$left", "$right"] } },
             "$lte" => doc! { "value": { "$lte": ["$left", "$right"] } },
             "$map" => {
@@ -1529,6 +1543,8 @@ mod tests {
             "$not" => doc! { "value": { "$not": [{ "$eq": ["$left", "$right"] }] } },
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
+            "$pow" => doc! { "value": { "$pow": [2, 3] } },
+            "$radiansToDegrees" => doc! { "value": { "$radiansToDegrees": std::f64::consts::PI } },
             "$range" => doc! { "value": { "$range": [0, 5, 2] } },
             "$reduce" => {
                 doc! { "value": { "$reduce": { "input": "$array", "initialValue": 0, "in": { "$add": ["$$value", "$$this"] } } } }
@@ -1555,6 +1571,8 @@ mod tests {
             }
             "$size" => doc! { "value": { "$size": "$array" } },
             "$slice" => doc! { "value": { "$slice": ["$array", 2] } },
+            "$sin" => doc! { "value": { "$sin": 0 } },
+            "$sinh" => doc! { "value": { "$sinh": 0 } },
             "$strcasecmp" => doc! { "value": { "$strcasecmp": ["Ab", "aB"] } },
             "$strLenBytes" => doc! { "value": { "$strLenBytes": "é" } },
             "$strLenCP" => doc! { "value": { "$strLenCP": "é" } },
@@ -1565,6 +1583,9 @@ mod tests {
             "$switch" => {
                 doc! { "value": { "$switch": { "branches": [{ "case": { "$eq": ["$left", "$left"] }, "then": "yes" }], "default": "no" } } }
             }
+            "$sqrt" => doc! { "value": { "$sqrt": 4 } },
+            "$tan" => doc! { "value": { "$tan": 0 } },
+            "$tanh" => doc! { "value": { "$tanh": 0 } },
             "$toLower" => doc! { "value": { "$toLower": "AbC" } },
             "$toUpper" => doc! { "value": { "$toUpper": "AbC" } },
             "$trim" => doc! { "value": { "$trim": { "input": "  abc  " } } },

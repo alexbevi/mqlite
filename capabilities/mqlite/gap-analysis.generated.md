@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 76 | 77 | 23 |
+| Aggregation expression operators | 176 | 97 | 56 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,17 +219,24 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
+Public upstream: 176. Supported: 97. Unsupported: 56. Ignored: 23.
 
 ### Supported Public
 
 - `$abs`
+- `$acos`
+- `$acosh`
 - `$add`
 - `$allElementsTrue`
 - `$and`
 - `$anyElementTrue`
 - `$arrayElemAt`
 - `$arrayToObject`
+- `$asin`
+- `$asinh`
+- `$atan`
+- `$atan2`
+- `$atanh`
 - `$binarySize`
 - `$bitAnd`
 - `$bitNot`
@@ -242,8 +249,12 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$concatArrays`
 - `$cond`
 - `$const`
+- `$cos`
+- `$cosh`
+- `$degreesToRadians`
 - `$divide`
 - `$eq`
+- `$exp`
 - `$expr`
 - `$filter`
 - `$first`
@@ -261,6 +272,9 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$last`
 - `$let`
 - `$literal`
+- `$ln`
+- `$log`
+- `$log10`
 - `$lt`
 - `$lte`
 - `$ltrim`
@@ -272,6 +286,8 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$not`
 - `$objectToArray`
 - `$or`
+- `$pow`
+- `$radiansToDegrees`
 - `$range`
 - `$reduce`
 - `$reverseArray`
@@ -283,8 +299,11 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$setIntersection`
 - `$setIsSubset`
 - `$setUnion`
+- `$sin`
+- `$sinh`
 - `$size`
 - `$slice`
+- `$sqrt`
 - `$strLenBytes`
 - `$strLenCP`
 - `$strcasecmp`
@@ -293,6 +312,8 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$substrCP`
 - `$subtract`
 - `$switch`
+- `$tan`
+- `$tanh`
 - `$toLower`
 - `$toUpper`
 - `$trim`
@@ -302,17 +323,8 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 
 ### Unsupported Public
 
-- `$acos`
-- `$acosh`
-- `$asin`
-- `$asinh`
-- `$atan`
-- `$atan2`
-- `$atanh`
 - `$avg`
 - `$convert`
-- `$cos`
-- `$cosh`
 - `$dateAdd`
 - `$dateDiff`
 - `$dateFromParts`
@@ -324,8 +336,6 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$dayOfMonth`
 - `$dayOfWeek`
 - `$dayOfYear`
-- `$degreesToRadians`
-- `$exp`
 - `$firstN`
 - `$function`
 - `$hour`
@@ -333,9 +343,6 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$isoWeek`
 - `$isoWeekYear`
 - `$lastN`
-- `$ln`
-- `$log`
-- `$log10`
 - `$max`
 - `$maxN`
 - `$median`
@@ -346,8 +353,6 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$minute`
 - `$month`
 - `$percentile`
-- `$pow`
-- `$radiansToDegrees`
 - `$rand`
 - `$regexFind`
 - `$regexFindAll`
@@ -355,16 +360,11 @@ Public upstream: 176. Supported: 76. Unsupported: 77. Ignored: 23.
 - `$replaceAll`
 - `$replaceOne`
 - `$second`
-- `$sin`
-- `$sinh`
 - `$sortArray`
 - `$split`
-- `$sqrt`
 - `$stdDevPop`
 - `$stdDevSamp`
 - `$sum`
-- `$tan`
-- `$tanh`
 - `$toBool`
 - `$toDate`
 - `$toDecimal`

@@ -70,6 +70,23 @@ fn run_pipeline_with_static_resolver(
     run_pipeline_with_resolver(documents, pipeline, "app", None, resolver).expect("pipeline")
 }
 
+fn assert_bson_f64_close(value: &Bson, expected: f64) {
+    let actual = match value {
+        Bson::Int32(value) => *value as f64,
+        Bson::Int64(value) => *value as f64,
+        Bson::Double(value) => *value,
+        Bson::Decimal128(value) => value
+            .to_string()
+            .parse::<f64>()
+            .expect("decimal can be parsed as f64"),
+        other => panic!("expected numeric BSON, found {other:?}"),
+    };
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn change_event(
     sequence: i64,
@@ -1678,6 +1695,76 @@ fn projection_supports_size_introspection_expression_operators() {
 }
 
 #[test]
+fn projection_supports_math_and_trigonometric_expression_operators() {
+    let projected = apply_projection(
+        &doc! {
+            "_id": 1,
+            "zero": 0.0,
+            "one": 1.0,
+            "two": 2.0,
+            "four": 4.0,
+            "eight": 8.0,
+            "thousand": 1000.0,
+            "degrees": 180.0
+        },
+        Some(&doc! {
+            "expZero": { "$exp": "$zero" },
+            "lnOne": { "$ln": "$one" },
+            "logBaseTwo": { "$log": ["$eight", "$two"] },
+            "logTen": { "$log10": "$thousand" },
+            "pow": { "$pow": ["$two", 3] },
+            "sqrt": { "$sqrt": "$four" },
+            "cosZero": { "$cos": "$zero" },
+            "sinZero": { "$sin": "$zero" },
+            "tanZero": { "$tan": "$zero" },
+            "acosOne": { "$acos": "$one" },
+            "asinZero": { "$asin": "$zero" },
+            "atanZero": { "$atan": "$zero" },
+            "atan2ZeroOne": { "$atan2": ["$zero", "$one"] },
+            "acoshOne": { "$acosh": "$one" },
+            "asinhZero": { "$asinh": "$zero" },
+            "atanhZero": { "$atanh": "$zero" },
+            "coshZero": { "$cosh": "$zero" },
+            "sinhZero": { "$sinh": "$zero" },
+            "tanhZero": { "$tanh": "$zero" },
+            "degToRad": { "$degreesToRadians": "$degrees" },
+            "radToDeg": { "$radiansToDegrees": std::f64::consts::PI },
+            "nullExp": { "$exp": "$missing" }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(projected.get("expZero"), Some(&Bson::Int64(1)));
+    assert_eq!(projected.get("lnOne"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("logBaseTwo"), Some(&Bson::Int64(3)));
+    assert_eq!(projected.get("logTen"), Some(&Bson::Int64(3)));
+    assert_eq!(projected.get("pow"), Some(&Bson::Int64(8)));
+    assert_eq!(projected.get("sqrt"), Some(&Bson::Int64(2)));
+    assert_eq!(projected.get("cosZero"), Some(&Bson::Int64(1)));
+    assert_eq!(projected.get("sinZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("tanZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("acosOne"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("asinZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("atanZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("atan2ZeroOne"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("acoshOne"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("asinhZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("atanhZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("coshZero"), Some(&Bson::Int64(1)));
+    assert_eq!(projected.get("sinhZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("tanhZero"), Some(&Bson::Int64(0)));
+    assert_eq!(projected.get("nullExp"), Some(&Bson::Null));
+    assert_bson_f64_close(
+        projected.get("degToRad").expect("degreesToRadians result"),
+        std::f64::consts::PI,
+    );
+    assert_bson_f64_close(
+        projected.get("radToDeg").expect("radiansToDegrees result"),
+        180.0,
+    );
+}
+
+#[test]
 fn projection_supports_trim_expression_operators() {
     let projected = apply_projection(
         &doc! {
@@ -1714,6 +1801,75 @@ fn projection_supports_trim_expression_operators() {
             "nullChars": Bson::Null
         }
     );
+}
+
+#[test]
+fn math_and_trigonometric_expression_operators_reject_invalid_inputs() {
+    let non_numeric = apply_projection(
+        &doc! { "_id": 1, "value": "abc" },
+        Some(&doc! {
+            "out": { "$exp": "$value" }
+        }),
+    )
+    .expect_err("exp requires numeric input");
+    assert!(matches!(non_numeric, QueryError::ExpectedNumeric));
+
+    let negative_sqrt = apply_projection(
+        &doc! { "_id": 1, "value": -1.0 },
+        Some(&doc! {
+            "out": { "$sqrt": "$value" }
+        }),
+    )
+    .expect_err("sqrt rejects negatives");
+    assert!(matches!(negative_sqrt, QueryError::InvalidArgument(_)));
+
+    let invalid_log_base = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$log": [10, 1] }
+        }),
+    )
+    .expect_err("log rejects base one");
+    assert!(matches!(invalid_log_base, QueryError::InvalidArgument(_)));
+
+    let invalid_pow = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$pow": [0, -1] }
+        }),
+    )
+    .expect_err("pow rejects zero to a negative exponent");
+    assert!(matches!(invalid_pow, QueryError::InvalidArgument(_)));
+
+    let invalid_acos = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$acos": 2 }
+        }),
+    )
+    .expect_err("acos rejects out of bounds values");
+    assert!(matches!(invalid_acos, QueryError::InvalidArgument(_)));
+
+    let invalid_finite_bound = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$tan": f64::INFINITY }
+        }),
+    )
+    .expect_err("tan rejects infinite values");
+    assert!(matches!(
+        invalid_finite_bound,
+        QueryError::InvalidArgument(_)
+    ));
+
+    let invalid_arity = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$atan2": [1] }
+        }),
+    )
+    .expect_err("atan2 requires two arguments");
+    assert!(matches!(invalid_arity, QueryError::InvalidStructure));
 }
 
 #[test]

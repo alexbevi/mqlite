@@ -223,6 +223,48 @@ fn eval_expression_operator(
         "$filter" => eval_filter_expression(document, value, variables),
         "$first" => eval_first_last_expression(document, value, variables, true),
         "$getField" => eval_get_field_expression(document, value, variables),
+        "$exp" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.exp())
+        }),
+        "$ln" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number > 0.0 {
+                Ok(number.ln())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "$ln's argument must be a positive number".to_string(),
+                ))
+            }
+        }),
+        "$log10" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number > 0.0 {
+                Ok(number.log10())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "$log10's argument must be a positive number".to_string(),
+                ))
+            }
+        }),
+        "$sqrt" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number >= 0.0 {
+                Ok(number.sqrt())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "$sqrt's argument must be greater than or equal to 0".to_string(),
+                ))
+            }
+        }),
+        "$degreesToRadians" => {
+            eval_nullable_unary_math_expression(document, value, variables, |number| {
+                Ok(number * (std::f64::consts::PI / 180.0))
+            })
+        }
+        "$radiansToDegrees" => {
+            eval_nullable_unary_math_expression(document, value, variables, |number| {
+                Ok(number * (180.0 / std::f64::consts::PI))
+            })
+        }
+        "$log" => eval_log_expression(document, value, variables),
+        "$pow" => eval_pow_expression(document, value, variables),
         "$indexOfBytes" => eval_index_of_string_expression(document, value, variables, false),
         "$indexOfCP" => eval_index_of_string_expression(document, value, variables, true),
         "$indexOfArray" => eval_index_of_array_expression(document, value, variables),
@@ -238,6 +280,89 @@ fn eval_expression_operator(
         "$reduce" => eval_reduce_expression(document, value, variables),
         "$reverseArray" => eval_reverse_array_expression(document, value, variables),
         "$slice" => eval_slice_expression(document, value, variables),
+        "$acos" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || (-1.0..=1.0).contains(&number) {
+                Ok(number.acos())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $acos to values outside [-1, 1]".to_string(),
+                ))
+            }
+        }),
+        "$asin" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || (-1.0..=1.0).contains(&number) {
+                Ok(number.asin())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $asin to values outside [-1, 1]".to_string(),
+                ))
+            }
+        }),
+        "$atan" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.atan())
+        }),
+        "$atan2" => {
+            eval_nullable_binary_math_expression(document, value, variables, |left, right| {
+                Ok(left.atan2(right))
+            })
+        }
+        "$atanh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || (-1.0..=1.0).contains(&number) {
+                Ok(number.atanh())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $atanh to values outside [-1, 1]".to_string(),
+                ))
+            }
+        }),
+        "$acosh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number >= 1.0 {
+                Ok(number.acosh())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $acosh to values below 1".to_string(),
+                ))
+            }
+        }),
+        "$asinh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.asinh())
+        }),
+        "$cos" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number.is_finite() {
+                Ok(number.cos())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $cos to infinite values".to_string(),
+                ))
+            }
+        }),
+        "$cosh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.cosh())
+        }),
+        "$sin" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number.is_finite() {
+                Ok(number.sin())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $sin to infinite values".to_string(),
+                ))
+            }
+        }),
+        "$sinh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.sinh())
+        }),
+        "$tan" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            if number.is_nan() || number.is_finite() {
+                Ok(number.tan())
+            } else {
+                Err(QueryError::InvalidArgument(
+                    "cannot apply $tan to infinite values".to_string(),
+                ))
+            }
+        }),
+        "$tanh" => eval_nullable_unary_math_expression(document, value, variables, |number| {
+            Ok(number.tanh())
+        }),
         "$setDifference" => eval_set_difference_expression(document, value, variables),
         "$setEquals" => eval_set_equals_expression(document, value, variables),
         "$setIntersection" => eval_set_intersection_expression(document, value, variables),
@@ -351,8 +476,10 @@ fn validate_expression_operator(
 ) -> Result<(), QueryError> {
     match operator {
         "$const" | "$literal" => Ok(()),
-        "$expr" | "$abs" | "$ceil" | "$floor" | "$first" | "$isArray" | "$isNumber" | "$last"
-        | "$objectToArray" | "$size" | "$type" => {
+        "$expr" | "$abs" | "$acos" | "$acosh" | "$asin" | "$asinh" | "$atan" | "$atanh"
+        | "$ceil" | "$cos" | "$cosh" | "$degreesToRadians" | "$exp" | "$first" | "$floor"
+        | "$isArray" | "$isNumber" | "$last" | "$ln" | "$objectToArray" | "$radiansToDegrees"
+        | "$sin" | "$sinh" | "$size" | "$sqrt" | "$tan" | "$tanh" | "$type" | "$log10" => {
             validate_expression_with_scope(unary_expression_operand(value), scope)
         }
         "$binarySize" | "$bsonSize" => {
@@ -373,7 +500,7 @@ fn validate_expression_operator(
             }
             Ok(())
         }
-        "$arrayElemAt" | "$cmp" | "$divide" => {
+        "$arrayElemAt" | "$atan2" | "$cmp" | "$divide" | "$log" | "$pow" => {
             for argument in expression_arguments::<2>(value)? {
                 validate_expression_with_scope(argument, scope)?;
             }
@@ -677,6 +804,36 @@ fn eval_unary_numeric_expression(
     operation(number)
 }
 
+fn eval_nullable_unary_math_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operation: impl FnOnce(f64) -> Result<f64, QueryError>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let Some(number) = eval_nullable_numeric_expression(document, value, variables)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    Ok(EvaluatedExpression::Value(number_bson(operation(number)?)))
+}
+
+fn eval_nullable_binary_math_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    operation: impl FnOnce(f64, f64) -> Result<f64, QueryError>,
+) -> Result<EvaluatedExpression, QueryError> {
+    let [left, right] = expression_arguments::<2>(value)?;
+    let Some(left) = eval_nullable_numeric_operand(document, left, variables)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    let Some(right) = eval_nullable_numeric_operand(document, right, variables)? else {
+        return Ok(EvaluatedExpression::Value(Bson::Null));
+    };
+    Ok(EvaluatedExpression::Value(number_bson(operation(
+        left, right,
+    )?)))
+}
+
 fn eval_numeric_expression(
     document: &Document,
     value: &Bson,
@@ -684,6 +841,64 @@ fn eval_numeric_expression(
 ) -> Result<f64, QueryError> {
     let value = eval_expression_with_variables(document, value, variables)?;
     numeric_value(&value)
+}
+
+fn eval_nullable_numeric_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<f64>, QueryError> {
+    let operand = single_expression_operand(value)?;
+    eval_nullable_numeric_operand(document, operand, variables)
+}
+
+fn eval_nullable_numeric_operand(
+    document: &Document,
+    operand: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<Option<f64>, QueryError> {
+    let value = eval_expression_result_with_variables(document, operand, variables)?;
+    match value {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(None)
+        }
+        EvaluatedExpression::Value(value) => numeric_value(&value).map(Some),
+    }
+}
+
+fn eval_log_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    eval_nullable_binary_math_expression(document, value, variables, |argument, base| {
+        if !(argument.is_nan() || argument > 0.0) {
+            return Err(QueryError::InvalidArgument(
+                "$log's argument must be a positive number".to_string(),
+            ));
+        }
+        if !(base.is_nan() || (base > 0.0 && base != 1.0)) {
+            return Err(QueryError::InvalidArgument(
+                "$log's base must be a positive number not equal to 1".to_string(),
+            ));
+        }
+        Ok(argument.log(base))
+    })
+}
+
+fn eval_pow_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+) -> Result<EvaluatedExpression, QueryError> {
+    eval_nullable_binary_math_expression(document, value, variables, |base, exponent| {
+        if base == 0.0 && exponent < 0.0 {
+            return Err(QueryError::InvalidArgument(
+                "$pow cannot take a base of 0 and a negative exponent".to_string(),
+            ));
+        }
+        Ok(base.powf(exponent))
+    })
 }
 
 fn eval_rounding_expression(

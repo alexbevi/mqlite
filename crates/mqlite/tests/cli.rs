@@ -5,6 +5,17 @@ use bson::{Binary, Bson, doc, spec::BinarySubtype};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+fn assert_json_number_close(value: &Value, expected: f64) {
+    let actual = value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .expect("numeric json value");
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn inspect_and_verify_commands_work() {
     let temp_dir = tempdir().expect("tempdir");
@@ -3532,6 +3543,111 @@ fn command_aggregate_project_supports_size_introspection_expression_operators() 
 }
 
 #[test]
+fn command_aggregate_project_supports_math_and_trigonometric_expression_operators() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("math-trigonometric-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"zero":0,"one":1,"two":2,"four":4,"eight":8,"thousand":1000,"degrees":180}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "expZero": { "$exp": "$zero" },
+                    "lnOne": { "$ln": "$one" },
+                    "logBaseTwo": { "$log": ["$eight", "$two"] },
+                    "logTen": { "$log10": "$thousand" },
+                    "pow": { "$pow": ["$two", 3] },
+                    "sqrt": { "$sqrt": "$four" },
+                    "cosZero": { "$cos": "$zero" },
+                    "sinZero": { "$sin": "$zero" },
+                    "tanZero": { "$tan": "$zero" },
+                    "acosOne": { "$acos": "$one" },
+                    "asinZero": { "$asin": "$zero" },
+                    "atanZero": { "$atan": "$zero" },
+                    "atan2ZeroOne": { "$atan2": ["$zero", "$one"] },
+                    "acoshOne": { "$acosh": "$one" },
+                    "asinhZero": { "$asinh": "$zero" },
+                    "atanhZero": { "$atanh": "$zero" },
+                    "coshZero": { "$cosh": "$zero" },
+                    "sinhZero": { "$sinh": "$zero" },
+                    "tanhZero": { "$tanh": "$zero" },
+                    "degToRad": { "$degreesToRadians": "$degrees" },
+                    "radToDeg": { "$radiansToDegrees": std::f64::consts::PI }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch")
+        .first()
+        .expect("projected document");
+    assert_eq!(first["expZero"], 1);
+    assert_eq!(first["lnOne"], 0);
+    assert_eq!(first["logBaseTwo"], 3);
+    assert_eq!(first["logTen"], 3);
+    assert_eq!(first["pow"], 8);
+    assert_eq!(first["sqrt"], 2);
+    assert_eq!(first["cosZero"], 1);
+    assert_eq!(first["sinZero"], 0);
+    assert_eq!(first["tanZero"], 0);
+    assert_eq!(first["acosOne"], 0);
+    assert_eq!(first["asinZero"], 0);
+    assert_eq!(first["atanZero"], 0);
+    assert_eq!(first["atan2ZeroOne"], 0);
+    assert_eq!(first["acoshOne"], 0);
+    assert_eq!(first["asinhZero"], 0);
+    assert_eq!(first["atanhZero"], 0);
+    assert_eq!(first["coshZero"], 1);
+    assert_eq!(first["sinhZero"], 0);
+    assert_eq!(first["tanhZero"], 0);
+    assert_json_number_close(&first["degToRad"], std::f64::consts::PI);
+    assert_json_number_close(&first["radToDeg"], 180.0);
+}
+
+#[test]
 fn command_aggregate_project_supports_trim_expression_operators() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("trim-expression.mongodb");
@@ -3605,6 +3721,53 @@ fn command_aggregate_project_supports_trim_expression_operators() {
             "rightCustomSet": "xyztrim"
         })]
     );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_math_and_trigonometric_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-math-trigonometric-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"value":-1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$sqrt":"$value"}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
 }
 
 #[test]

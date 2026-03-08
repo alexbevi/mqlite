@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 76,
-    "public_supported": 76,
-    "total_unsupported": 108,
-    "public_unsupported": 77,
+    "total_supported": 97,
+    "public_supported": 97,
+    "total_unsupported": 87,
+    "public_unsupported": 56,
     "public_ignored": 23,
     "items": [
       {
@@ -2979,8 +2979,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$acosh",
@@ -2997,8 +2997,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$add",
@@ -3123,8 +3123,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$asinh",
@@ -3141,8 +3141,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$atan",
@@ -3159,8 +3159,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$atan2",
@@ -3177,8 +3177,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$atanh",
@@ -3195,8 +3195,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$avg",
@@ -3501,8 +3501,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$cosh",
@@ -3519,8 +3519,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$createObjectId",
@@ -3789,8 +3789,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$deserializeEJSON",
@@ -3933,8 +3933,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$expr",
@@ -4419,8 +4419,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$log",
@@ -4437,8 +4437,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$log10",
@@ -4455,8 +4455,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$lt",
@@ -4851,8 +4851,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$radiansToDegrees",
@@ -4869,8 +4869,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$rand",
@@ -5301,8 +5301,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$sinh",
@@ -5319,8 +5319,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$size",
@@ -5409,8 +5409,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$stdDevPop",
@@ -5643,8 +5643,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$tanh",
@@ -5661,8 +5661,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$toArray",

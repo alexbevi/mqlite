@@ -202,12 +202,18 @@ Current cross-namespace aggregation behavior:
   currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
   `$setUnion`. Basic ASCII string case expressions currently include `$toLower`, `$toUpper`, and
   `$strcasecmp`. Size introspection currently includes `$binarySize` and `$bsonSize`. String
-  trimming currently includes `$trim`, `$ltrim`, and `$rtrim`. String-length, string-position,
-  and substring expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`,
-  `$indexOfCP`, `$substr`, `$substrBytes`, and `$substrCP`,
+  trimming currently includes `$trim`, `$ltrim`, and `$rtrim`. Logarithmic and power expressions
+  currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and
+  angular-conversion expressions currently include `$acos`, `$acosh`, `$asin`, `$asinh`, `$atan`,
+  `$atan2`, `$atanh`, `$cos`, `$cosh`, `$sin`, `$sinh`, `$tan`, `$tanh`, `$degreesToRadians`,
+  and `$radiansToDegrees`. String-length, string-position, and substring expressions currently
+  include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`, `$substr`, `$substrBytes`,
+  and `$substrCP`,
   while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
   alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
-  all executed in-process without a separate expression VM.
+  all executed in-process without a separate expression VM. Nullable numeric operators share a
+  common evaluator path so nullish inputs return `null` consistently while domain violations fail
+  explicitly.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file
