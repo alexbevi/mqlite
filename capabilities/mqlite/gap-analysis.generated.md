@@ -30,7 +30,7 @@ cargo run -p mqlite-capabilities -- sync --check
 | --- | ---: | ---: | ---: | ---: |
 | Query operators | 38 | 29 | 9 | 0 |
 | Aggregation stages | 54 | 44 | 0 | 10 |
-| Aggregation expression operators | 176 | 44 | 109 | 23 |
+| Aggregation expression operators | 176 | 46 | 107 | 23 |
 | Aggregation accumulators | 25 | 5 | 20 | 0 |
 | Aggregation window functions | 36 | 15 | 21 | 0 |
 
@@ -219,7 +219,7 @@ Public upstream: 54. Supported: 44. Unsupported: 0. Ignored: 10.
 
 ## Aggregation Expression Operators
 
-Public upstream: 176. Supported: 44. Unsupported: 109. Ignored: 23.
+Public upstream: 176. Supported: 46. Unsupported: 107. Ignored: 23.
 
 ### Supported Public
 
@@ -263,10 +263,12 @@ Public upstream: 176. Supported: 44. Unsupported: 109. Ignored: 23.
 - `$objectToArray`
 - `$or`
 - `$round`
+- `$setField`
 - `$size`
 - `$subtract`
 - `$trunc`
 - `$type`
+- `$unsetField`
 
 ### Unsupported Public
 
@@ -339,7 +341,6 @@ Public upstream: 176. Supported: 44. Unsupported: 109. Ignored: 23.
 - `$second`
 - `$setDifference`
 - `$setEquals`
-- `$setField`
 - `$setIntersection`
 - `$setIsSubset`
 - `$setUnion`
@@ -375,7 +376,6 @@ Public upstream: 176. Supported: 44. Unsupported: 109. Ignored: 23.
 - `$trim`
 - `$tsIncrement`
 - `$tsSecond`
-- `$unsetField`
 - `$week`
 - `$year`
 - `$zip`

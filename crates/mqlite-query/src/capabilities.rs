@@ -118,10 +118,12 @@ pub const SUPPORTED_AGGREGATION_EXPRESSION_OPERATORS: &[&str] = &[
     "$objectToArray",
     "$or",
     "$round",
+    "$setField",
     "$size",
     "$subtract",
     "$type",
     "$trunc",
+    "$unsetField",
 ];
 
 pub const SUPPORTED_AGGREGATION_ACCUMULATORS: &[&str] =

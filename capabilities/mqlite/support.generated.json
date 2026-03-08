@@ -117,10 +117,12 @@
     "$objectToArray",
     "$or",
     "$round",
+    "$setField",
     "$size",
     "$subtract",
     "$trunc",
-    "$type"
+    "$type",
+    "$unsetField"
   ],
   "aggregation_accumulator_operators": [
     "$addToSet",

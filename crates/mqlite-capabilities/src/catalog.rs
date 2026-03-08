@@ -1521,10 +1521,16 @@ mod tests {
             "$objectToArray" => doc! { "value": { "$objectToArray": "$object" } },
             "$or" => doc! { "value": { "$or": [false, { "$eq": ["$left", "$left"] }] } },
             "$round" => doc! { "value": { "$round": [2.65, 1] } },
+            "$setField" => {
+                doc! { "value": { "$setField": { "field": "a", "input": "$object", "value": 9 } } }
+            }
             "$size" => doc! { "value": { "$size": "$array" } },
             "$subtract" => doc! { "value": { "$subtract": ["$left", "$right"] } },
             "$type" => doc! { "value": { "$type": "$left" } },
             "$trunc" => doc! { "value": { "$trunc": [2.65, 1] } },
+            "$unsetField" => {
+                doc! { "value": { "$unsetField": { "field": "a", "input": "$object" } } }
+            }
             other => panic!("missing supported expression fixture for {other}"),
         }
     }

@@ -216,6 +216,7 @@ fn eval_expression_operator(
         "$map" => eval_map_expression(document, value, variables),
         "$mergeObjects" => eval_merge_objects_expression(document, value, variables),
         "$objectToArray" => eval_object_to_array_expression(document, value, variables),
+        "$setField" => eval_set_field_expression(document, value, variables, false),
         "$size" => eval_size_expression(document, value, variables),
         "$and" => {
             let arguments = expression_argument_slice(value)?;
@@ -262,6 +263,7 @@ fn eval_expression_operator(
                     .any(|candidate| compare_bson(&needle, candidate).is_eq()),
             )))
         }
+        "$unsetField" => eval_set_field_expression(document, value, variables, true),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
 }
@@ -360,6 +362,8 @@ fn validate_expression_operator(
         }
         "$let" => validate_let_expression(value, scope),
         "$map" => validate_map_expression(value, scope),
+        "$setField" => validate_set_field_expression(value, scope, false),
+        "$unsetField" => validate_set_field_expression(value, scope, true),
         other => Err(QueryError::UnsupportedOperator(other.to_string())),
     }
 }
@@ -763,6 +767,40 @@ fn eval_get_field_expression(
     }
 }
 
+fn eval_set_field_expression(
+    document: &Document,
+    value: &Bson,
+    variables: &BTreeMap<String, Bson>,
+    unset: bool,
+) -> Result<EvaluatedExpression, QueryError> {
+    let (field, input, assigned) = parse_set_field_spec(value, unset)?;
+    let field = constant_field_name(field)?;
+    let input = eval_expression_result_with_variables(document, input, variables)?;
+
+    match input {
+        EvaluatedExpression::Missing | EvaluatedExpression::Value(Bson::Null | Bson::Undefined) => {
+            Ok(EvaluatedExpression::Value(Bson::Null))
+        }
+        EvaluatedExpression::Value(Bson::Document(mut input)) => {
+            let remove = unset || assigned.is_some_and(is_remove_expression);
+            if remove {
+                input.remove(&field);
+            } else {
+                let value = eval_expression_with_variables(
+                    document,
+                    assigned.expect("setField value is present"),
+                    variables,
+                )?;
+                input.insert(field, value);
+            }
+            Ok(EvaluatedExpression::Value(Bson::Document(input)))
+        }
+        EvaluatedExpression::Value(_) => Err(QueryError::InvalidArgument(
+            "$setField input must evaluate to an object or null".to_string(),
+        )),
+    }
+}
+
 fn eval_cond_expression(
     document: &Document,
     value: &Bson,
@@ -896,6 +934,22 @@ fn validate_filter_expression(value: &Bson, scope: &BTreeSet<String>) -> Result<
     validate_expression_with_scope(condition, &inner_scope)
 }
 
+fn validate_set_field_expression(
+    value: &Bson,
+    scope: &BTreeSet<String>,
+    unset: bool,
+) -> Result<(), QueryError> {
+    let (field, input, assigned) = parse_set_field_spec(value, unset)?;
+    constant_field_name(field)?;
+    validate_expression_with_scope(input, scope)?;
+    if let Some(assigned) = assigned {
+        if !is_remove_expression(assigned) {
+            validate_expression_with_scope(assigned, scope)?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryError> {
     match value {
         Bson::Document(spec) => {
@@ -926,6 +980,76 @@ fn parse_get_field_spec(value: &Bson) -> Result<(&Bson, Option<&Bson>), QueryErr
         }
         _ => Ok((value, None)),
     }
+}
+
+fn parse_set_field_spec(
+    value: &Bson,
+    unset: bool,
+) -> Result<(&Bson, &Bson, Option<&Bson>), QueryError> {
+    let spec = value.as_document().ok_or(QueryError::InvalidStructure)?;
+    let mut field = None;
+    let mut input = None;
+    let mut assigned = None;
+
+    for (name, value) in spec {
+        match name.as_str() {
+            "field" => field = Some(value),
+            "input" => input = Some(value),
+            "value" if !unset => assigned = Some(value),
+            _ => return Err(QueryError::InvalidStructure),
+        }
+    }
+
+    Ok((
+        field.ok_or(QueryError::InvalidStructure)?,
+        input.ok_or(QueryError::InvalidStructure)?,
+        if unset {
+            None
+        } else {
+            Some(assigned.ok_or(QueryError::InvalidStructure)?)
+        },
+    ))
+}
+
+fn constant_field_name(expression: &Bson) -> Result<String, QueryError> {
+    let value = match expression {
+        Bson::String(value) if value.starts_with('$') => {
+            return Err(QueryError::InvalidArgument(
+                "$setField requires `field` to be a constant string".to_string(),
+            ));
+        }
+        Bson::String(value) => value.clone(),
+        Bson::Document(spec) if spec.len() == 1 => {
+            let (operator, value) = spec.iter().next().expect("single field");
+            match operator.as_str() {
+                "$const" | "$literal" => match value {
+                    Bson::String(value) => value.clone(),
+                    _ => {
+                        return Err(QueryError::InvalidArgument(
+                            "$setField requires `field` to be a constant string".to_string(),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(QueryError::InvalidArgument(
+                        "$setField requires `field` to be a constant string".to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(QueryError::InvalidArgument(
+                "$setField requires `field` to be a constant string".to_string(),
+            ));
+        }
+    };
+
+    validate_object_key(&value)?;
+    Ok(value)
+}
+
+fn is_remove_expression(expression: &Bson) -> bool {
+    matches!(expression, Bson::String(value) if value == "$$REMOVE")
 }
 
 fn parse_filter_limit(

@@ -2796,10 +2796,10 @@
   "aggregation_expression_operators": {
     "total_upstream": 184,
     "public_upstream": 176,
-    "total_supported": 44,
-    "public_supported": 44,
-    "total_unsupported": 140,
-    "public_unsupported": 109,
+    "total_supported": 46,
+    "public_supported": 46,
+    "total_unsupported": 138,
+    "public_unsupported": 107,
     "public_ignored": 23,
     "items": [
       {
@@ -5157,8 +5157,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$setIntersection",
@@ -6057,8 +6057,8 @@
         "feature_flagged": false,
         "conditional": false,
         "ignored": false,
-        "status": "unsupported",
-        "validation": "rejection"
+        "status": "supported",
+        "validation": "positive"
       },
       {
         "name": "$week",

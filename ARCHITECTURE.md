@@ -198,7 +198,8 @@ Current cross-namespace aggregation behavior:
 - Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
   continue to work in nested stages.
 - Scoped aggregation expressions currently include `$let`, `$map`, `$filter` with optional
-  `limit`, and `$getField`, all executed in-process without a separate expression VM.
+  `limit`, plus literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
+  all executed in-process without a separate expression VM.
 - `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
   returns an empty cursor result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file

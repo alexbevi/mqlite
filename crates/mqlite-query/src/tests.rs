@@ -998,6 +998,42 @@ fn projection_preserves_missing_results_for_scoped_and_field_access_expressions(
 }
 
 #[test]
+fn projection_supports_field_mutation_expressions() {
+    let projected = apply_projection(
+        &doc! { "_id": 1, "base": { "keep": true } },
+        Some(&doc! {
+            "setSimple": { "$setField": { "field": "status", "input": { "a": 1 }, "value": 24 } },
+            "unsetSimple": { "$unsetField": { "field": "a", "input": { "a": 1, "b": 2 } } },
+            "removeWithSetField": { "$setField": { "field": "a", "input": { "a": 1, "b": 2 }, "value": "$$REMOVE" } },
+            "literalDot": { "$setField": { "field": { "$const": "a.b" }, "input": { "$const": { "a.b": 5 } }, "value": 12345 } },
+            "literalDollar": { "$setField": { "field": { "$const": "$price" }, "input": { "$const": { "$price": 5 } }, "value": 9 } },
+            "nullInput": { "$unsetField": { "field": "a", "input": Bson::Null } },
+            "nestedGet": {
+                "$getField": {
+                    "field": "foo",
+                    "input": { "$setField": { "field": "foo", "input": "$$ROOT", "value": 1234 } }
+                }
+            }
+        }),
+    )
+    .expect("apply projection");
+
+    assert_eq!(
+        projected,
+        doc! {
+            "_id": 1,
+            "setSimple": { "a": 1, "status": 24 },
+            "unsetSimple": { "b": 2 },
+            "removeWithSetField": { "b": 2 },
+            "literalDot": { "a.b": 12345 },
+            "literalDollar": { "$price": 9 },
+            "nullInput": Bson::Null,
+            "nestedGet": 1234
+        }
+    );
+}
+
+#[test]
 fn projection_preserves_missing_expression_results() {
     let projected = apply_projection(
         &doc! { "_id": 1, "array": [1, 2, 3], "object": { "a": 1 } },
@@ -1077,6 +1113,48 @@ fn scoped_expressions_reject_invalid_variables_and_shapes() {
     )
     .expect_err("non-string getField");
     assert!(matches!(invalid_get_field, QueryError::InvalidArgument(_)));
+}
+
+#[test]
+fn field_mutation_expressions_reject_invalid_arguments() {
+    let field_path = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$setField": { "field": "$field_path", "input": {}, "value": 0 } }
+        }),
+    )
+    .expect_err("field path is not a literal");
+    assert!(matches!(field_path, QueryError::InvalidArgument(_)));
+
+    let dynamic_field = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$setField": { "field": { "$concat": ["a", "b"] }, "input": {}, "value": 0 } }
+        }),
+    )
+    .expect_err("dynamic field expression");
+    assert!(matches!(dynamic_field, QueryError::InvalidArgument(_)));
+
+    let invalid_input = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$setField": { "field": "a", "input": true, "value": 0 } }
+        }),
+    )
+    .expect_err("non-object input");
+    assert!(matches!(invalid_input, QueryError::InvalidArgument(_)));
+
+    let unexpected_unset_value = apply_projection(
+        &doc! { "_id": 1 },
+        Some(&doc! {
+            "out": { "$unsetField": { "field": "a", "input": {}, "value": 0 } }
+        }),
+    )
+    .expect_err("unexpected unsetField value");
+    assert!(matches!(
+        unexpected_unset_value,
+        QueryError::InvalidStructure
+    ));
 }
 
 #[test]

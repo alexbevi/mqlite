@@ -2684,6 +2684,134 @@ fn command_aggregate_project_rejects_invalid_scoped_expression() {
 }
 
 #[test]
+fn command_aggregate_project_supports_field_mutation_expressions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("field-mutation-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let aggregate_command = json!({
+        "aggregate": "widgets",
+        "pipeline": [
+            {
+                "$project": {
+                    "_id": 0,
+                    "setSimple": { "$setField": { "field": "status", "input": { "a": 1 }, "value": 24 } },
+                    "unsetSimple": { "$unsetField": { "field": "a", "input": { "a": 1, "b": 2 } } },
+                    "removeWithSetField": { "$setField": { "field": "a", "input": { "a": 1, "b": 2 }, "value": "$$REMOVE" } },
+                    "literalDot": { "$setField": { "field": { "$const": "a.b" }, "input": { "$const": { "a.b": 5 } }, "value": 12345 } },
+                    "literalDollar": { "$setField": { "field": { "$const": "$price" }, "input": { "$const": { "$price": 5 } }, "value": 9 } },
+                    "nestedGet": {
+                        "$getField": {
+                            "field": "foo",
+                            "input": { "$setField": { "field": "foo", "input": "$$ROOT", "value": 1234 } }
+                        }
+                    }
+                }
+            }
+        ],
+        "cursor": {}
+    })
+    .to_string();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(&aggregate_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let first_batch = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("first batch");
+    assert_eq!(
+        first_batch,
+        &vec![json!({
+            "setSimple": { "a": 1, "status": 24 },
+            "unsetSimple": { "b": 2 },
+            "removeWithSetField": { "b": 2 },
+            "literalDot": { "a.b": 12345 },
+            "literalDollar": { "$price": 9 },
+            "nestedGet": 1234
+        })]
+    );
+}
+
+#[test]
+fn command_aggregate_project_rejects_invalid_field_mutation_expression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir
+        .path()
+        .join("invalid-field-mutation-expression.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut aggregate = Command::cargo_bin("mqlite").expect("binary");
+    let output = aggregate
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"aggregate":"widgets","pipeline":[{"$project":{"_id":0,"out":{"$setField":{"field":"$field_path","input":{},"value":0}}}}],"cursor":{}}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["codeName"], "BadValue");
+}
+
+#[test]
 fn command_aggregate_supports_facet_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-facet.mongodb");
