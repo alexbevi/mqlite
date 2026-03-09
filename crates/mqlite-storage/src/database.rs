@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -560,23 +560,8 @@ impl DatabaseFile {
         self.state.file_format_version = FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
-        let pages_start = self.wal_end_offset.max(DATA_START_OFFSET);
         let encoded_catalog =
             encode_snapshot_catalog(&self.state.catalog, &self.state.change_events)?;
-
-        let mut page_refs = Vec::with_capacity(encoded_catalog.pages.len());
-        let mut page_offset = pages_start;
-        for page in &encoded_catalog.pages {
-            page_refs.push(PageRef {
-                page_id: page.page_id,
-                offset: page_offset,
-                checksum: page.checksum,
-                page_len: page.bytes.len() as u32,
-                entry_count: page.entry_count,
-            });
-            page_offset += page.bytes.len() as u64;
-        }
-
         let EncodedSnapshotCatalog {
             catalog,
             change_event_page_ids,
@@ -589,6 +574,33 @@ impl DatabaseFile {
             change_event_count,
         } = encoded_catalog;
 
+        let page_bytes_len = pages
+            .iter()
+            .map(|page| page.bytes.len() as u64)
+            .sum::<u64>();
+        let provisional_page_refs = checkpoint_page_refs(DATA_START_OFFSET, &pages);
+        let provisional_snapshot_catalog =
+            resolve_snapshot_catalog(catalog.clone(), &provisional_page_refs)?;
+        let provisional_snapshot = bson::to_vec(&SnapshotState {
+            file_format_version: FILE_FORMAT_VERSION,
+            last_applied_sequence: self.state.last_applied_sequence,
+            last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
+            catalog: provisional_snapshot_catalog,
+            change_event_pages: resolve_page_id_refs(
+                &change_event_page_ids,
+                &provisional_page_refs,
+            )?,
+            change_event_count: self.state.change_events.len(),
+            plan_cache_entries: self.state.plan_cache_entries.clone(),
+        })?;
+
+        let next_slot = (self.active_slot + 1) % SUPERBLOCK_COUNT;
+        let pages_start = self.checkpoint_pages_start(
+            next_slot,
+            page_bytes_len + provisional_snapshot.len() as u64,
+        )?;
+        let page_refs = checkpoint_page_refs(pages_start, &pages);
+        let snapshot_offset = pages_start + page_bytes_len;
         let snapshot_catalog = resolve_snapshot_catalog(catalog, &page_refs)?;
         let snapshot_state = SnapshotState {
             file_format_version: FILE_FORMAT_VERSION,
@@ -600,7 +612,6 @@ impl DatabaseFile {
             plan_cache_entries: self.state.plan_cache_entries.clone(),
         };
         let snapshot = bson::to_vec(&snapshot_state)?;
-        let snapshot_offset = page_offset;
 
         self.file.seek(SeekFrom::Start(pages_start))?;
         for page in &pages {
@@ -610,14 +621,16 @@ impl DatabaseFile {
         self.file.flush()?;
         self.file.sync_data()?;
 
-        let next_slot = (self.active_slot + 1) % SUPERBLOCK_COUNT;
+        let wal_offset = self
+            .wal_end_offset
+            .max(snapshot_offset + snapshot.len() as u64);
         let superblock = Superblock {
             generation: self.active_superblock.generation + 1,
             last_applied_sequence: self.state.last_applied_sequence,
             last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
             snapshot_offset,
             snapshot_len: snapshot.len() as u64,
-            wal_offset: snapshot_offset + snapshot.len() as u64,
+            wal_offset,
             snapshot_checksum: hash_bytes(&snapshot),
         };
 
@@ -628,7 +641,7 @@ impl DatabaseFile {
         self.active_slot = next_slot;
         self.active_superblock = superblock;
         self.valid_superblocks = self.valid_superblocks.max(1);
-        self.wal_end_offset = self.active_superblock.wal_offset;
+        self.wal_end_offset = wal_offset;
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
         self.truncated_wal_tail = false;
@@ -642,6 +655,29 @@ impl DatabaseFile {
             change_event_count,
         };
         Ok(())
+    }
+
+    fn checkpoint_pages_start(&mut self, next_slot: usize, required_len: u64) -> Result<u64> {
+        if let Ok(Some(inactive_superblock)) = read_superblock(&mut self.file, next_slot) {
+            if inactive_superblock.snapshot_offset >= DATA_START_OFFSET
+                && inactive_superblock.snapshot_offset != self.active_superblock.snapshot_offset
+                && inactive_superblock.snapshot_offset < self.active_superblock.wal_offset
+            {
+                let reusable_end = if inactive_superblock.snapshot_offset
+                    < self.active_superblock.snapshot_offset
+                {
+                    self.active_superblock.snapshot_offset
+                } else {
+                    self.active_superblock.wal_offset
+                };
+                if required_len <= reusable_end.saturating_sub(inactive_superblock.snapshot_offset)
+                {
+                    return Ok(inactive_superblock.snapshot_offset);
+                }
+            }
+        }
+
+        Ok(self.wal_end_offset.max(DATA_START_OFFSET))
     }
 }
 
@@ -1093,21 +1129,17 @@ fn validate_collection_changes(
     create_options: Option<&bson::Document>,
     changes: &[CollectionChange],
 ) -> Result<()> {
-    let mut collection_state = match state.catalog.get_collection(database, collection) {
-        Ok(collection_state) => collection_state.clone(),
-        Err(CatalogError::NamespaceNotFound(_, _)) => {
-            let Some(options) = create_options else {
-                return Err(CatalogError::NamespaceNotFound(
-                    database.to_string(),
-                    collection.to_string(),
-                )
-                .into());
-            };
-            CollectionCatalog::new(options.clone())
-        }
+    let collection_state = match state.catalog.get_collection(database, collection) {
+        Ok(collection_state) => Some(collection_state),
+        Err(CatalogError::NamespaceNotFound(_, _)) => None,
         Err(error) => return Err(error.into()),
     };
-    apply_collection_change_set(&mut collection_state, changes)
+    let mut overlay =
+        CollectionValidationOverlay::new(collection_state, create_options, database, collection)?;
+    for change in changes {
+        overlay.apply(change)?;
+    }
+    Ok(())
 }
 
 fn apply_collection_change_set(
@@ -1163,6 +1195,233 @@ fn resolved_collection_changes(
         .chain(updates.iter().cloned().map(CollectionChange::Update))
         .chain(deletes.iter().copied().map(CollectionChange::Delete))
         .collect()
+}
+
+fn checkpoint_page_refs(pages_start: u64, pages: &[EncodedPage]) -> Vec<PageRef> {
+    let mut page_offset = pages_start;
+    let mut page_refs = Vec::with_capacity(pages.len());
+    for page in pages {
+        page_refs.push(PageRef {
+            page_id: page.page_id,
+            offset: page_offset,
+            checksum: page.checksum,
+            page_len: page.bytes.len() as u32,
+            entry_count: page.entry_count,
+        });
+        page_offset += page.bytes.len() as u64;
+    }
+    page_refs
+}
+
+struct UniqueIndexValidator {
+    name: String,
+    key: bson::Document,
+    entries: HashMap<Vec<u8>, u64>,
+}
+
+struct CollectionValidationOverlay<'a> {
+    base_records: HashMap<u64, &'a bson::Document>,
+    overlay_records: HashMap<u64, bson::Document>,
+    deleted_record_ids: HashSet<u64>,
+    unique_indexes: Vec<UniqueIndexValidator>,
+}
+
+impl<'a> CollectionValidationOverlay<'a> {
+    fn new(
+        collection: Option<&'a CollectionCatalog>,
+        create_options: Option<&bson::Document>,
+        database: &str,
+        collection_name: &str,
+    ) -> Result<Self> {
+        let unique_indexes = match collection {
+            Some(collection) => collection
+                .indexes
+                .values()
+                .filter(|index| index.unique)
+                .map(UniqueIndexValidator::from_catalog)
+                .collect::<Result<Vec<_>>>()?,
+            None => {
+                if create_options.is_none() {
+                    return Err(CatalogError::NamespaceNotFound(
+                        database.to_string(),
+                        collection_name.to_string(),
+                    )
+                    .into());
+                }
+                vec![UniqueIndexValidator::default_id_index()]
+            }
+        };
+
+        Ok(Self {
+            base_records: collection.map_or_else(HashMap::new, |collection| {
+                collection
+                    .records
+                    .iter()
+                    .map(|record| (record.record_id, &record.document))
+                    .collect()
+            }),
+            overlay_records: HashMap::new(),
+            deleted_record_ids: HashSet::new(),
+            unique_indexes,
+        })
+    }
+
+    fn apply(&mut self, change: &CollectionChange) -> Result<()> {
+        match change {
+            CollectionChange::Insert(record) => self.insert(record),
+            CollectionChange::Update(record) => self.update(record),
+            CollectionChange::Delete(record_id) => self.delete(*record_id),
+        }
+    }
+
+    fn insert(&mut self, record: &CollectionRecord) -> Result<()> {
+        if self.current_document(record.record_id).is_some() {
+            return Err(CatalogError::InvalidIndexState(format!(
+                "duplicate record id {}",
+                record.record_id
+            ))
+            .into());
+        }
+
+        let keys = self.unique_keys(&record.document)?;
+        self.validate_unique_keys(record.record_id, &keys)?;
+        self.deleted_record_ids.remove(&record.record_id);
+        self.overlay_records
+            .insert(record.record_id, record.document.clone());
+        self.install_unique_keys(record.record_id, &keys);
+        Ok(())
+    }
+
+    fn update(&mut self, record: &CollectionRecord) -> Result<()> {
+        let current_keys = {
+            let Some(current_document) = self.current_document(record.record_id) else {
+                return Err(CatalogError::InvalidIndexState(format!(
+                    "record id {} is missing for update",
+                    record.record_id
+                ))
+                .into());
+            };
+            if current_document == &record.document {
+                return Ok(());
+            }
+            self.unique_keys(current_document)?
+        };
+        let new_keys = self.unique_keys(&record.document)?;
+        self.validate_unique_keys(record.record_id, &new_keys)?;
+        self.remove_unique_keys(record.record_id, &current_keys);
+        self.install_unique_keys(record.record_id, &new_keys);
+        self.overlay_records
+            .insert(record.record_id, record.document.clone());
+        self.deleted_record_ids.remove(&record.record_id);
+        Ok(())
+    }
+
+    fn delete(&mut self, record_id: u64) -> Result<()> {
+        let Some(keys) = self
+            .current_document(record_id)
+            .map(|document| self.unique_keys(document))
+            .transpose()?
+        else {
+            return Ok(());
+        };
+        self.remove_unique_keys(record_id, &keys);
+        self.overlay_records.remove(&record_id);
+        if self.base_records.contains_key(&record_id) {
+            self.deleted_record_ids.insert(record_id);
+        } else {
+            self.deleted_record_ids.remove(&record_id);
+        }
+        Ok(())
+    }
+
+    fn current_document(&self, record_id: u64) -> Option<&bson::Document> {
+        if self.deleted_record_ids.contains(&record_id) {
+            return None;
+        }
+        self.overlay_records
+            .get(&record_id)
+            .or_else(|| self.base_records.get(&record_id).copied())
+    }
+
+    fn unique_keys(&self, document: &bson::Document) -> Result<Vec<(usize, Vec<u8>)>> {
+        self.unique_indexes
+            .iter()
+            .enumerate()
+            .map(|(index_position, index)| {
+                Ok((
+                    index_position,
+                    encode_unique_index_key(document, &index.key)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn validate_unique_keys(&self, record_id: u64, keys: &[(usize, Vec<u8>)]) -> Result<()> {
+        for (index_position, key) in keys {
+            if let Some(existing_record_id) = self.unique_indexes[*index_position].entries.get(key)
+            {
+                if *existing_record_id != record_id {
+                    return Err(CatalogError::DuplicateKey(
+                        self.unique_indexes[*index_position].name.clone(),
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn install_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
+        for (index_position, key) in keys {
+            self.unique_indexes[*index_position]
+                .entries
+                .insert(key.clone(), record_id);
+        }
+    }
+
+    fn remove_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
+        for (index_position, key) in keys {
+            if self.unique_indexes[*index_position]
+                .entries
+                .get(key)
+                .is_some_and(|existing_record_id| *existing_record_id == record_id)
+            {
+                self.unique_indexes[*index_position].entries.remove(key);
+            }
+        }
+    }
+}
+
+impl UniqueIndexValidator {
+    fn from_catalog(index: &IndexCatalog) -> Result<Self> {
+        Ok(Self {
+            name: index.name.clone(),
+            key: index.key.clone(),
+            entries: index
+                .entries
+                .iter()
+                .map(|entry| Ok((bson::to_vec(&entry.key)?, entry.record_id)))
+                .collect::<Result<HashMap<_, _>>>()?,
+        })
+    }
+
+    fn default_id_index() -> Self {
+        Self {
+            name: "_id_".to_string(),
+            key: bson::doc! { "_id": 1 },
+            entries: HashMap::new(),
+        }
+    }
+}
+
+fn encode_unique_index_key(
+    document: &bson::Document,
+    key_pattern: &bson::Document,
+) -> Result<Vec<u8>> {
+    Ok(bson::to_vec(&mqlite_catalog::index_key_for_document(
+        document,
+        key_pattern,
+    ))?)
 }
 
 fn encode_snapshot_catalog(
@@ -2296,6 +2555,65 @@ mod tests {
                 .get("flag"),
             Some(&bson::Bson::Null)
         );
+    }
+
+    #[test]
+    fn checkpoints_reuse_inactive_snapshot_region_when_space_allows() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("checkpoint-reuse.mongodb");
+
+        let size_before_reused_checkpoint = {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection.clone(),
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database.checkpoint().expect("first data checkpoint");
+
+            collection
+                .update_record_at(0, doc! { "_id": 1, "sku": "omega" })
+                .expect("update record");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("second mutation");
+            database.checkpoint().expect("second data checkpoint");
+
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("third mutation");
+            std::fs::metadata(&path)
+                .expect("metadata before reused checkpoint")
+                .len()
+        };
+
+        {
+            let mut database =
+                DatabaseFile::open_or_create(&path).expect("reopen before checkpoint");
+            database.checkpoint().expect("reused checkpoint");
+        }
+
+        let size_after_reused_checkpoint = std::fs::metadata(&path)
+            .expect("metadata after reused checkpoint")
+            .len();
+        assert_eq!(size_after_reused_checkpoint, size_before_reused_checkpoint);
     }
 
     #[test]

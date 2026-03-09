@@ -255,6 +255,7 @@ Mutations are durable through an append-only WAL.
 - Collection replacement and drop operations are still written as collection-level WAL frames.
 - WAL frames include a sequence number and checksum.
 - The broker applies the mutation to in-memory state only after the WAL append succeeds.
+- Checkpoints can reuse the inactive superblock slot's preserved snapshot or stale WAL region when the next snapshot fits there, while keeping new WAL appends after the preserved fallback checkpoint region.
 - Recovery loads the newest valid checkpoint, then replays WAL frames with sequence numbers greater than the checkpoint sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.
 - If the newest checkpoint is corrupt, recovery can fall back to the older superblock and continue from there.

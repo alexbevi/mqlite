@@ -5825,6 +5825,17 @@ fn ok_response(mut body: Document) -> Document {
 }
 
 fn internal_error(error: anyhow::Error) -> CommandError {
+    if let Some(catalog_error) = error.downcast_ref::<CatalogError>() {
+        match catalog_error {
+            CatalogError::DuplicateKey(_) => {
+                return CommandError::new(11000, "DuplicateKey", catalog_error.to_string());
+            }
+            CatalogError::InvalidIndexState(_) => {
+                return CommandError::new(8, "UnknownError", catalog_error.to_string());
+            }
+            _ => {}
+        }
+    }
     if let Some(storage_error) = error.downcast_ref::<StorageError>() {
         match storage_error {
             StorageError::DuplicateKey(name) => {

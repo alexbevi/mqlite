@@ -126,7 +126,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas and collection-level replacement or drop frames.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
 - Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
-- Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged.
+- Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged. When the inactive checkpoint region is large enough, new checkpoints reuse that preserved snapshot/WAL space instead of appending another full snapshot to the end of the file.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and persistent index state.
 
