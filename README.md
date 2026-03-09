@@ -123,7 +123,7 @@ file:///absolute/path/to/database.mongodb?db=app
 ### Storage and catalog
 - One durable `.mongodb` file per broker.
 - Fixed file header and rotating superblocks.
-- Append-only WAL for typed collection mutations, with per-record CRUD deltas and collection-level replacement or drop frames.
+- Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas and collection-level replacement or drop frames.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
 - Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
 - Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged.
@@ -452,4 +452,4 @@ If the goal is to make `mqlite` feel closer to `sqlite3` without losing the Mong
 
 ## Notes
 
-This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability with incremental CRUD deltas, slotted record pages, persisted B-tree index pages, stable `RecordId`s, persisted plan-cache snapshots, stats-backed and plan-cached compound `find` planning, branch-union `OR` planning, covered null-vs-missing index execution, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.
+This baseline intentionally favors a stable executable slice over speculative completeness. The current file format now implements fixed metadata, rotating superblocks, WAL-backed mutation durability with ordered incremental CRUD deltas, slotted record pages, persisted B-tree index pages, stable `RecordId`s, persisted plan-cache snapshots, stats-backed and plan-cached compound `find` planning, branch-union `OR` planning, covered null-vs-missing index execution, and replay on open. The next storage steps are page reuse/compaction and more incremental page-splitting and reuse policies so runtime tree maintenance does not need to reconstruct from the persisted entry set.

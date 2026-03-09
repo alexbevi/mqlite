@@ -27,8 +27,8 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    DatabaseFile, PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry,
-    WalMutation,
+    CollectionChange, DatabaseFile, PersistedChangeEvent, PersistedPlanCacheChoice,
+    PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Mutex, RwLock};
@@ -902,6 +902,7 @@ impl Broker {
                 database: database.clone(),
                 collection: collection.to_string(),
                 create_options: Some(options),
+                changes: Vec::new(),
                 inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
@@ -1332,71 +1333,76 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
-        let collection_exists = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .is_ok();
-        let mut collection_state = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .cloned()
-            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
-        let create_options = (!collection_exists).then_some(Document::new());
-        let inserted_total = documents.len() as i32;
         let sequence = storage.last_applied_sequence() + 1;
-        let mut change_events = Vec::new();
-        let mut inserts = Vec::with_capacity(documents.len());
-        if !collection_exists {
-            change_events.push(change_stream_event(
-                sequence,
-                change_events.len(),
-                &database,
-                Some(collection_name),
-                "create",
-                None,
-                None,
-                None,
-                None,
-                true,
-                doc! {
-                    "operationDescription": {
-                        "idIndex": { "name": "_id_", "key": { "_id": 1 } }
-                    }
-                },
-            ));
-        }
+        let inserted_total = documents.len() as i32;
+        let (create_options, changes, change_events) = {
+            let collection = storage
+                .catalog()
+                .get_collection(&database, collection_name)
+                .ok();
+            let collection_exists = collection.is_some();
+            let mut next_record_id = next_record_id(collection);
+            let mut change_events = Vec::new();
+            let mut changes = Vec::with_capacity(documents.len());
 
-        for mut document in documents {
-            ensure_object_id(&mut document);
-            let record_id = collection_state.next_record_id();
-            let document_key = document_key_for_change_stream(&document);
-            let full_document = document.clone();
-            let record = CollectionRecord {
-                record_id,
-                document,
-            };
-            collection_state.insert_record(record.clone())?;
-            inserts.push(record);
-            change_events.push(change_stream_event(
-                sequence,
-                change_events.len(),
-                &database,
-                Some(collection_name),
-                "insert",
-                document_key,
-                Some(full_document),
-                None,
-                None,
-                false,
-                Document::new(),
-            ));
-        }
+            if !collection_exists {
+                change_events.push(change_stream_event(
+                    sequence,
+                    change_events.len(),
+                    &database,
+                    Some(collection_name),
+                    "create",
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    doc! {
+                        "operationDescription": {
+                            "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                        }
+                    },
+                ));
+            }
+
+            for mut document in documents {
+                ensure_object_id(&mut document);
+                let record = CollectionRecord {
+                    record_id: next_record_id,
+                    document,
+                };
+                next_record_id += 1;
+                let document_key = document_key_for_change_stream(&record.document);
+                let full_document = record.document.clone();
+                changes.push(CollectionChange::Insert(record));
+                change_events.push(change_stream_event(
+                    sequence,
+                    change_events.len(),
+                    &database,
+                    Some(collection_name),
+                    "insert",
+                    document_key,
+                    Some(full_document),
+                    None,
+                    None,
+                    false,
+                    Document::new(),
+                ));
+            }
+
+            (
+                (!collection_exists).then_some(Document::new()),
+                changes,
+                change_events,
+            )
+        };
         storage
             .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options,
-                inserts,
+                changes,
+                inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
                 change_events,
@@ -1554,165 +1560,171 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
-        let collection_exists = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .is_ok();
-        let mut collection_state = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .cloned()
-            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
-
-        let mut matched = 0_i32;
-        let mut modified = 0_i32;
-        let mut upserted = Vec::new();
         let sequence = storage.last_applied_sequence() + 1;
-        let mut change_events = Vec::new();
-        let create_options = (!collection_exists).then_some(Document::new());
-        let mut inserts = Vec::new();
-        let mut updates = Vec::new();
+        let (create_options, changes, change_events, matched, modified, upserted) = {
+            let collection = storage
+                .catalog()
+                .get_collection(&database, collection_name)
+                .ok();
+            let collection_exists = collection.is_some();
+            let create_options = (!collection_exists).then_some(Document::new());
+            let mut next_record_id = next_record_id(collection);
+            let mut visible_updates = BTreeMap::new();
+            let mut inserted_records = Vec::new();
+            let deleted_record_ids = BTreeSet::new();
+            let mut matched = 0_i32;
+            let mut modified = 0_i32;
+            let mut upserted = Vec::new();
+            let mut change_events = Vec::new();
+            let mut changes = Vec::new();
 
-        for (operation_index, operation) in operations.iter().enumerate() {
-            let query = operation.get_document("q").map_err(|_| {
-                CommandError::new(9, "FailedToParse", "update operations require `q`")
-            })?;
-            let update = operation.get("u").ok_or_else(|| {
-                CommandError::new(9, "FailedToParse", "update operations require `u`")
-            })?;
-            let update_spec = parse_update_value(update)?;
-            let multi = operation.get_bool("multi").unwrap_or(false);
-            let upsert = operation.get_bool("upsert").unwrap_or(false);
+            for (operation_index, operation) in operations.iter().enumerate() {
+                let query = operation.get_document("q").map_err(|_| {
+                    CommandError::new(9, "FailedToParse", "update operations require `q`")
+                })?;
+                let update = operation.get("u").ok_or_else(|| {
+                    CommandError::new(9, "FailedToParse", "update operations require `u`")
+                })?;
+                let update_spec = parse_update_value(update)?;
+                let multi = operation.get_bool("multi").unwrap_or(false);
+                let upsert = operation.get_bool("upsert").unwrap_or(false);
 
-            let matching_indexes = collection_state
-                .records
-                .iter()
-                .enumerate()
-                .filter_map(|(index, record)| {
-                    document_matches(&record.document, query)
-                        .ok()
-                        .and_then(|matches| matches.then_some(index))
-                })
+                let matching_records = current_records(
+                    collection,
+                    &inserted_records,
+                    &visible_updates,
+                    &deleted_record_ids,
+                )
+                .filter(|record| document_matches(record.document(), query).unwrap_or(false))
+                .map(|record| (record.record_id(), record.document().clone()))
                 .collect::<Vec<_>>();
 
-            if matching_indexes.is_empty() {
-                if upsert {
-                    if !collection_exists && change_events.is_empty() {
+                if matching_records.is_empty() {
+                    if upsert {
+                        if !collection_exists && change_events.is_empty() {
+                            change_events.push(change_stream_event(
+                                sequence,
+                                change_events.len(),
+                                &database,
+                                Some(collection_name),
+                                "create",
+                                None,
+                                None,
+                                None,
+                                None,
+                                true,
+                                doc! {
+                                    "operationDescription": {
+                                        "idIndex": { "name": "_id_", "key": { "_id": 1 } }
+                                    }
+                                },
+                            ));
+                        }
+                        let mut document = upsert_seed_from_query(query);
+                        apply_update(&mut document, &update_spec)?;
+                        let upserted_id = ensure_object_id(&mut document);
+                        let record = CollectionRecord {
+                            record_id: next_record_id,
+                            document,
+                        };
+                        next_record_id += 1;
+                        let full_document = record.document.clone();
+                        inserted_records.push(record.clone());
+                        changes.push(CollectionChange::Insert(record));
+                        upserted.push(doc! {
+                            "index": operation_index as i32,
+                            "_id": upserted_id.clone()
+                        });
                         change_events.push(change_stream_event(
                             sequence,
                             change_events.len(),
                             &database,
                             Some(collection_name),
-                            "create",
+                            "insert",
+                            Some(doc! { "_id": upserted_id.clone() }),
+                            Some(full_document),
                             None,
                             None,
-                            None,
-                            None,
-                            true,
-                            doc! {
-                                "operationDescription": {
-                                    "idIndex": { "name": "_id_", "key": { "_id": 1 } }
-                                }
-                            },
+                            false,
+                            Document::new(),
                         ));
                     }
-                    let mut document = upsert_seed_from_query(query);
-                    apply_update(&mut document, &update_spec)?;
-                    let upserted_id = ensure_object_id(&mut document);
-                    let record_id = collection_state.next_record_id();
-                    let full_document = document.clone();
-                    let record = CollectionRecord {
-                        record_id,
-                        document,
-                    };
-                    collection_state.insert_record(record.clone())?;
-                    inserts.push(record);
-                    upserted
-                        .push(doc! { "index": operation_index as i32, "_id": upserted_id.clone() });
-                    change_events.push(change_stream_event(
-                        sequence,
-                        change_events.len(),
-                        &database,
-                        Some(collection_name),
-                        "insert",
-                        Some(doc! { "_id": upserted_id.clone() }),
-                        Some(full_document),
-                        None,
-                        None,
-                        false,
-                        Document::new(),
-                    ));
+                    continue;
                 }
-                continue;
-            }
 
-            let mut touched = 0;
-            for document_index in matching_indexes {
-                let record_id = collection_state.records[document_index].record_id;
-                let original = collection_state.records[document_index].document.clone();
-                let mut updated = original.clone();
-                apply_update(&mut updated, &update_spec)?;
-                matched += 1;
-                if updated != original
-                    && collection_state.update_record_at(document_index, updated)?
-                {
-                    modified += 1;
-                    let updated_document =
-                        collection_state.records[document_index].document.clone();
-                    updates.push(CollectionRecord {
-                        record_id,
-                        document: updated_document.clone(),
-                    });
-                    let document_key = document_key_for_change_stream(&updated_document);
-                    match &update_spec {
-                        mqlite_query::UpdateSpec::Replacement(_) => {
-                            change_events.push(change_stream_event(
-                                sequence,
-                                change_events.len(),
-                                &database,
-                                Some(collection_name),
-                                "replace",
-                                document_key,
-                                Some(updated_document),
-                                Some(original),
-                                None,
-                                false,
-                                Document::new(),
-                            ));
-                        }
-                        _ => {
-                            let update_description =
-                                build_update_description(&original, &updated_document);
-                            change_events.push(change_stream_event(
-                                sequence,
-                                change_events.len(),
-                                &database,
-                                Some(collection_name),
-                                "update",
-                                document_key,
-                                Some(updated_document),
-                                Some(original),
-                                Some(update_description),
-                                false,
-                                Document::new(),
-                            ));
+                let mut touched = 0;
+                for (record_id, original) in matching_records {
+                    let mut updated = original.clone();
+                    apply_update(&mut updated, &update_spec)?;
+                    matched += 1;
+                    if updated != original {
+                        modified += 1;
+                        visible_updates.insert(record_id, updated.clone());
+                        changes.push(CollectionChange::Update(CollectionRecord {
+                            record_id,
+                            document: updated.clone(),
+                        }));
+                        let document_key = document_key_for_change_stream(&updated);
+                        match &update_spec {
+                            mqlite_query::UpdateSpec::Replacement(_) => {
+                                change_events.push(change_stream_event(
+                                    sequence,
+                                    change_events.len(),
+                                    &database,
+                                    Some(collection_name),
+                                    "replace",
+                                    document_key,
+                                    Some(updated),
+                                    Some(original),
+                                    None,
+                                    false,
+                                    Document::new(),
+                                ));
+                            }
+                            _ => {
+                                let update_description =
+                                    build_update_description(&original, &updated);
+                                change_events.push(change_stream_event(
+                                    sequence,
+                                    change_events.len(),
+                                    &database,
+                                    Some(collection_name),
+                                    "update",
+                                    document_key,
+                                    Some(updated),
+                                    Some(original),
+                                    Some(update_description),
+                                    false,
+                                    Document::new(),
+                                ));
+                            }
                         }
                     }
-                }
-                touched += 1;
-                if !multi && touched >= 1 {
-                    break;
+                    touched += 1;
+                    if !multi && touched >= 1 {
+                        break;
+                    }
                 }
             }
-        }
+
+            Ok::<_, CommandError>((
+                create_options,
+                changes,
+                change_events,
+                matched,
+                modified,
+                upserted,
+            ))?
+        };
 
         storage
             .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options,
-                inserts,
-                updates,
+                changes,
+                inserts: Vec::new(),
+                updates: Vec::new(),
                 deletes: Vec::new(),
                 change_events,
             })
@@ -1753,53 +1765,61 @@ impl Broker {
             .collect::<Result<Vec<_>, CommandError>>()?;
 
         let mut storage = self.storage.write();
-        let mut collection_state =
-            match storage.catalog().get_collection(&database, collection_name) {
-                Ok(collection) => collection.clone(),
+        let sequence = storage.last_applied_sequence() + 1;
+        let (changes, change_events, deleted) = {
+            let collection = match storage.catalog().get_collection(&database, collection_name) {
+                Ok(collection) => collection,
                 Err(CatalogError::NamespaceNotFound(_, _)) => return Ok(doc! { "n": 0 }),
                 Err(error) => return Err(error.into()),
             };
-        let mut deleted = 0_i32;
-        let sequence = storage.last_applied_sequence() + 1;
-        let mut change_events = Vec::new();
-        let mut deletes = Vec::new();
+            let mut deleted_record_ids = BTreeSet::new();
+            let visible_updates = BTreeMap::new();
+            let mut change_events = Vec::new();
+            let mut changes = Vec::new();
+            let mut deleted = 0_i32;
 
-        for (query, limit) in validated_operations {
-            let mut removed_record_ids = BTreeSet::new();
-            for record in &collection_state.records {
-                if !document_matches(&record.document, &query).unwrap_or(false) {
-                    continue;
-                }
-                removed_record_ids.insert(record.record_id);
-                change_events.push(change_stream_event(
-                    sequence,
-                    change_events.len(),
-                    &database,
-                    Some(collection_name),
-                    "delete",
-                    document_key_for_change_stream(&record.document),
-                    None,
-                    Some(record.document.clone()),
-                    None,
-                    false,
-                    Document::new(),
-                ));
-                if limit == 1 {
-                    break;
+            for (query, limit) in validated_operations {
+                let matches =
+                    current_records(Some(collection), &[], &visible_updates, &deleted_record_ids)
+                        .filter(|record| {
+                            document_matches(record.document(), &query).unwrap_or(false)
+                        })
+                        .map(|record| (record.record_id(), record.document().clone()))
+                        .collect::<Vec<_>>();
+                let limit = if limit == 1 { 1 } else { usize::MAX };
+                for (record_id, document) in matches.into_iter().take(limit) {
+                    if deleted_record_ids.insert(record_id) {
+                        deleted += 1;
+                        changes.push(CollectionChange::Delete(record_id));
+                        change_events.push(change_stream_event(
+                            sequence,
+                            change_events.len(),
+                            &database,
+                            Some(collection_name),
+                            "delete",
+                            document_key_for_change_stream(&document),
+                            None,
+                            Some(document),
+                            None,
+                            false,
+                            Document::new(),
+                        ));
+                    }
                 }
             }
-            deleted += collection_state.delete_records(&removed_record_ids) as i32;
-            deletes.extend(removed_record_ids.iter().copied());
-        }
+
+            (changes, change_events, deleted)
+        };
 
         storage
             .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options: None,
+                changes,
                 inserts: Vec::new(),
                 updates: Vec::new(),
-                deletes,
+                deletes: Vec::new(),
                 change_events,
             })
             .map_err(internal_error)?;
@@ -5805,7 +5825,94 @@ fn ok_response(mut body: Document) -> Document {
 }
 
 fn internal_error(error: anyhow::Error) -> CommandError {
+    if let Some(storage_error) = error.downcast_ref::<StorageError>() {
+        match storage_error {
+            StorageError::DuplicateKey(name) => {
+                return CommandError::new(
+                    11000,
+                    "DuplicateKey",
+                    format!("duplicate key error on index `{name}`"),
+                );
+            }
+            StorageError::InvalidIndexState => {
+                return CommandError::new(8, "UnknownError", storage_error.to_string());
+            }
+            _ => {}
+        }
+    }
     CommandError::new(8, "UnknownError", error.to_string())
+}
+
+enum CurrentRecordRef<'a> {
+    Base(&'a CollectionRecord),
+    Overlay {
+        record_id: u64,
+        document: &'a Document,
+    },
+}
+
+impl CurrentRecordRef<'_> {
+    fn record_id(&self) -> u64 {
+        match self {
+            Self::Base(record) => record.record_id,
+            Self::Overlay { record_id, .. } => *record_id,
+        }
+    }
+
+    fn document(&self) -> &Document {
+        match self {
+            Self::Base(record) => &record.document,
+            Self::Overlay { document, .. } => document,
+        }
+    }
+}
+
+fn current_records<'a>(
+    collection: Option<&'a CollectionCatalog>,
+    inserted_records: &'a [CollectionRecord],
+    visible_updates: &'a BTreeMap<u64, Document>,
+    deleted_record_ids: &'a BTreeSet<u64>,
+) -> impl Iterator<Item = CurrentRecordRef<'a>> + 'a {
+    let base_records = collection.into_iter().flat_map(move |collection| {
+        collection.records.iter().filter_map(move |record| {
+            if deleted_record_ids.contains(&record.record_id) {
+                return None;
+            }
+            Some(match visible_updates.get(&record.record_id) {
+                Some(document) => CurrentRecordRef::Overlay {
+                    record_id: record.record_id,
+                    document,
+                },
+                None => CurrentRecordRef::Base(record),
+            })
+        })
+    });
+    let inserted_records = inserted_records.iter().filter_map(move |record| {
+        if deleted_record_ids.contains(&record.record_id) {
+            return None;
+        }
+        Some(match visible_updates.get(&record.record_id) {
+            Some(document) => CurrentRecordRef::Overlay {
+                record_id: record.record_id,
+                document,
+            },
+            None => CurrentRecordRef::Base(record),
+        })
+    });
+    base_records.chain(inserted_records)
+}
+
+fn next_record_id(collection: Option<&CollectionCatalog>) -> u64 {
+    collection
+        .and_then(|collection| {
+            collection
+                .records
+                .iter()
+                .map(|record| record.record_id)
+                .max()
+        })
+        .unwrap_or(0)
+        + 1
 }
 
 #[cfg(all(test, unix))]
@@ -7523,6 +7630,97 @@ mod tests {
         .await;
         assert_eq!(duplicate.get_f64("ok").expect("ok"), 0.0);
         assert_eq!(duplicate.get_i32("code").expect("code"), 11000);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_ordered_update_and_upsert_changes_across_broker_restart() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("ordered-delta.mongodb");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let create_indexes = send_command(
+            &mut stream,
+            doc! {
+                "createIndexes": "widgets",
+                "indexes": [
+                    { "key": { "sku": 1 }, "name": "sku_1", "unique": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(create_indexes.get_f64("ok").expect("ok"), 1.0);
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "alpha" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let update = send_command(
+            &mut stream,
+            doc! {
+                "update": "widgets",
+                "updates": [
+                    { "q": { "_id": 1 }, "u": { "$set": { "sku": "beta" } } },
+                    { "q": { "sku": "alpha" }, "u": { "$set": { "qty": 1 } }, "upsert": true }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(update.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(update.get_i32("nModified").expect("nModified"), 1);
+        assert_eq!(update.get_i32("nUpserted").expect("nUpserted"), 1);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+        let find = send_command(
+            &mut stream,
+            doc! {
+                "find": "widgets",
+                "projection": { "_id": 0, "sku": 1, "qty": 1 },
+                "sort": { "sku": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("first batch");
+        assert_eq!(first_batch.len(), 2);
+        let alpha = first_batch[0].as_document().expect("alpha document");
+        assert_eq!(alpha.get_str("sku").expect("sku"), "alpha");
+        assert_eq!(alpha.get_i32("qty").expect("qty"), 1);
+        let beta = first_batch[1].as_document().expect("beta document");
+        assert_eq!(beta.get_str("sku").expect("sku"), "beta");
+        assert!(!beta.contains_key("qty"));
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

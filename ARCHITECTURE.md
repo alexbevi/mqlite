@@ -251,7 +251,7 @@ Current cross-namespace aggregation behavior:
 
 Mutations are durable through an append-only WAL.
 
-- CRUD writes append typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
+- CRUD writes append ordered typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
 - Collection replacement and drop operations are still written as collection-level WAL frames.
 - WAL frames include a sequence number and checksum.
 - The broker applies the mutation to in-memory state only after the WAL append succeeds.

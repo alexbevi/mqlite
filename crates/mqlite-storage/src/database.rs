@@ -81,6 +81,13 @@ pub enum PersistedPlanCacheChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CollectionChange {
+    Insert(CollectionRecord),
+    Update(CollectionRecord),
+    Delete(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalMutation {
     ReplaceCollection {
         database: String,
@@ -94,6 +101,9 @@ pub enum WalMutation {
         collection: String,
         #[serde(default)]
         create_options: Option<bson::Document>,
+        #[serde(default)]
+        changes: Vec<CollectionChange>,
+        // Retained for WAL backward compatibility with pre-ordered delta frames.
         #[serde(default)]
         inserts: Vec<CollectionRecord>,
         #[serde(default)]
@@ -201,6 +211,8 @@ pub enum StorageError {
     InvalidPage,
     #[error("invalid page reference")]
     InvalidPageReference,
+    #[error("duplicate key error on index `{0}`")]
+    DuplicateKey(String),
     #[error("invalid persisted index state")]
     InvalidIndexState,
 }
@@ -982,19 +994,19 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
             database,
             collection,
             create_options,
+            changes,
             inserts,
             updates,
             deletes,
             change_events,
         } => {
+            let changes = resolved_collection_changes(changes, inserts, updates, deletes);
             apply_collection_changes(
                 state,
                 database,
                 collection,
                 create_options.as_ref(),
-                inserts,
-                updates,
-                deletes,
+                &changes,
             )?;
             state.change_events.extend(change_events.iter().cloned());
         }
@@ -1024,19 +1036,19 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
             database,
             collection,
             create_options,
+            changes,
             inserts,
             updates,
             deletes,
             ..
         } => {
+            let changes = resolved_collection_changes(changes, inserts, updates, deletes);
             validate_collection_changes(
                 state,
                 database,
                 collection,
                 create_options.as_ref(),
-                inserts,
-                updates,
-                deletes,
+                &changes,
             )?;
         }
         WalMutation::DropCollection {
@@ -1055,9 +1067,7 @@ fn apply_collection_changes(
     database: &str,
     collection: &str,
     create_options: Option<&bson::Document>,
-    inserts: &[CollectionRecord],
-    updates: &[CollectionRecord],
-    deletes: &[u64],
+    changes: &[CollectionChange],
 ) -> Result<()> {
     if state.catalog.get_collection(database, collection).is_err() {
         let Some(options) = create_options else {
@@ -1073,7 +1083,7 @@ fn apply_collection_changes(
     }
 
     let collection_state = state.catalog.get_collection_mut(database, collection)?;
-    apply_collection_change_set(collection_state, inserts, updates, deletes)
+    apply_collection_change_set(collection_state, changes)
 }
 
 fn validate_collection_changes(
@@ -1081,9 +1091,7 @@ fn validate_collection_changes(
     database: &str,
     collection: &str,
     create_options: Option<&bson::Document>,
-    inserts: &[CollectionRecord],
-    updates: &[CollectionRecord],
-    deletes: &[u64],
+    changes: &[CollectionChange],
 ) -> Result<()> {
     let mut collection_state = match state.catalog.get_collection(database, collection) {
         Ok(collection_state) => collection_state.clone(),
@@ -1099,48 +1107,62 @@ fn validate_collection_changes(
         }
         Err(error) => return Err(error.into()),
     };
-    apply_collection_change_set(&mut collection_state, inserts, updates, deletes)
+    apply_collection_change_set(&mut collection_state, changes)
 }
 
 fn apply_collection_change_set(
     collection_state: &mut CollectionCatalog,
-    inserts: &[CollectionRecord],
-    updates: &[CollectionRecord],
-    deletes: &[u64],
+    changes: &[CollectionChange],
 ) -> Result<()> {
-    for record in inserts {
-        collection_state
-            .insert_record(record.clone())
-            .map_err(map_catalog_error)?;
-    }
-
-    if !updates.is_empty() {
-        let positions = collection_state
-            .records
-            .iter()
-            .enumerate()
-            .map(|(position, record)| (record.record_id, position))
-            .collect::<BTreeMap<_, _>>();
-        for record in updates {
-            let Some(&position) = positions.get(&record.record_id) else {
-                return Err(CatalogError::InvalidIndexState(format!(
-                    "record id {} is missing for update",
-                    record.record_id
-                ))
-                .into());
-            };
-            collection_state
-                .update_record_at(position, record.document.clone())
-                .map_err(map_catalog_error)?;
+    for change in changes {
+        match change {
+            CollectionChange::Insert(record) => {
+                collection_state
+                    .insert_record(record.clone())
+                    .map_err(map_catalog_error)?;
+            }
+            CollectionChange::Update(record) => {
+                let Some(position) = collection_state
+                    .records
+                    .iter()
+                    .position(|existing| existing.record_id == record.record_id)
+                else {
+                    return Err(CatalogError::InvalidIndexState(format!(
+                        "record id {} is missing for update",
+                        record.record_id
+                    ))
+                    .into());
+                };
+                collection_state
+                    .update_record_at(position, record.document.clone())
+                    .map_err(map_catalog_error)?;
+            }
+            CollectionChange::Delete(record_id) => {
+                collection_state.delete_records(&BTreeSet::from([*record_id]));
+            }
         }
     }
 
-    if !deletes.is_empty() {
-        let removed = deletes.iter().copied().collect::<BTreeSet<_>>();
-        collection_state.delete_records(&removed);
+    Ok(())
+}
+
+fn resolved_collection_changes(
+    changes: &[CollectionChange],
+    inserts: &[CollectionRecord],
+    updates: &[CollectionRecord],
+    deletes: &[u64],
+) -> Vec<CollectionChange> {
+    if !changes.is_empty() {
+        return changes.to_vec();
     }
 
-    Ok(())
+    inserts
+        .iter()
+        .cloned()
+        .map(CollectionChange::Insert)
+        .chain(updates.iter().cloned().map(CollectionChange::Update))
+        .chain(deletes.iter().copied().map(CollectionChange::Delete))
+        .collect()
 }
 
 fn encode_snapshot_catalog(
@@ -1778,9 +1800,8 @@ fn placeholder_page_refs(page_ids: Vec<u64>) -> Vec<PageRef> {
 
 fn map_catalog_error(error: CatalogError) -> anyhow::Error {
     match error {
-        CatalogError::DuplicateKey(_) | CatalogError::InvalidIndexState(_) => {
-            StorageError::InvalidIndexState.into()
-        }
+        CatalogError::DuplicateKey(name) => StorageError::DuplicateKey(name).into(),
+        CatalogError::InvalidIndexState(_) => StorageError::InvalidIndexState.into(),
         other => anyhow::Error::new(other),
     }
 }
@@ -1813,9 +1834,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE,
-        PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, SnapshotState,
-        VerifyReport, WalMutation, decode_page, read_superblock,
+        CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION,
+        PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE, PersistedChangeEvent, PersistedPlanCacheChoice,
+        PersistedPlanCacheEntry, SnapshotState, VerifyReport, WalMutation, decode_page,
+        read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -1898,6 +1920,10 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     create_options: Some(doc! { "validator": { "qty": { "$gte": 0 } } }),
+                    changes: vec![CollectionChange::Insert(CollectionRecord {
+                        record_id: 1,
+                        document: doc! { "_id": 1, "sku": "alpha", "qty": 4 },
+                    })],
                     inserts: vec![CollectionRecord {
                         record_id: 1,
                         document: doc! { "_id": 1, "sku": "alpha", "qty": 4 },
@@ -1978,6 +2004,17 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     create_options: None,
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord {
+                            record_id: 3,
+                            document: doc! { "_id": 3, "sku": "charlie", "qty": 3 },
+                        }),
+                        CollectionChange::Update(CollectionRecord {
+                            record_id: 1,
+                            document: doc! { "_id": 1, "sku": "delta", "qty": 9 },
+                        }),
+                        CollectionChange::Delete(2),
+                    ],
                     inserts: vec![CollectionRecord {
                         record_id: 3,
                         document: doc! { "_id": 3, "sku": "charlie", "qty": 3 },
@@ -2028,6 +2065,66 @@ mod tests {
             vec![(3, "charlie".to_string()), (1, "delta".to_string())]
         );
         assert_eq!(reopened.change_events(), change_events.as_slice());
+    }
+
+    #[test]
+    fn replays_ordered_update_then_insert_changes_without_false_duplicate_key_failures() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-ordered-delta-recovery.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![
+                        CollectionChange::Update(CollectionRecord {
+                            record_id: 1,
+                            document: doc! { "_id": 1, "sku": "beta" },
+                        }),
+                        CollectionChange::Insert(CollectionRecord {
+                            record_id: 2,
+                            document: doc! { "_id": 2, "sku": "alpha" },
+                        }),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("ordered mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(
+            collection
+                .records
+                .iter()
+                .map(|record| record.document.get_str("sku").expect("sku"))
+                .collect::<Vec<_>>(),
+            vec!["beta", "alpha"]
+        );
     }
 
     #[test]
