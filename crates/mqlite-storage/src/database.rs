@@ -11,7 +11,7 @@ use blake3::Hasher;
 use fs4::FileExt;
 use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionRecord, DatabaseCatalog, IndexCatalog,
-    IndexEntry, validate_collection_indexes,
+    IndexEntry, build_index_specs, validate_collection_indexes, validate_drop_indexes,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -113,6 +113,22 @@ pub enum WalMutation {
         #[serde(default)]
         change_events: Vec<PersistedChangeEvent>,
     },
+    CreateIndexes {
+        database: String,
+        collection: String,
+        #[serde(default)]
+        create_options: Option<bson::Document>,
+        specs: Vec<bson::Document>,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
+    },
+    DropIndexes {
+        database: String,
+        collection: String,
+        target: String,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
+    },
     DropCollection {
         database: String,
         collection: String,
@@ -126,10 +142,13 @@ pub struct DatabaseFile {
     path: PathBuf,
     file: File,
     state: PersistedState,
+    checkpoint_snapshot: SnapshotState,
     active_slot: usize,
     active_superblock: Superblock,
     valid_superblocks: usize,
     wal_end_offset: u64,
+    dirty_collections: BTreeSet<(String, String)>,
+    change_events_dirty: bool,
     wal_records_since_checkpoint: usize,
     wal_bytes_since_checkpoint: u64,
     truncated_wal_tail: bool,
@@ -234,17 +253,26 @@ struct WalEntry {
     mutation: WalMutation,
 }
 
+#[derive(Serialize)]
+struct WalEntryRef<'a> {
+    sequence: u64,
+    mutation: &'a WalMutation,
+}
+
 #[derive(Debug, Default)]
 struct WalRecovery {
     records: usize,
     bytes: u64,
     truncated_tail: bool,
     last_sequence: Option<u64>,
+    dirty_collections: BTreeSet<(String, String)>,
+    change_events_dirty: bool,
 }
 
 #[derive(Debug)]
 struct LoadedState {
     state: PersistedState,
+    checkpoint_snapshot: SnapshotState,
     active_slot: usize,
     active_superblock: Superblock,
     valid_superblocks: usize,
@@ -265,6 +293,20 @@ struct SnapshotState {
     change_event_count: usize,
     #[serde(default)]
     plan_cache_entries: Vec<PersistedPlanCacheEntry>,
+}
+
+impl Default for SnapshotState {
+    fn default() -> Self {
+        Self {
+            file_format_version: FILE_FORMAT_VERSION,
+            last_applied_sequence: 0,
+            last_checkpoint_unix_ms: 0,
+            catalog: SnapshotCatalog::default(),
+            change_event_pages: Vec::new(),
+            change_event_count: 0,
+            plan_cache_entries: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -295,7 +337,7 @@ struct SnapshotIndexCatalog {
     entry_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PageRef {
     page_id: u64,
     offset: u64,
@@ -316,6 +358,7 @@ struct EncodedPage {
 struct EncodedSnapshotCatalog {
     catalog: SnapshotCatalog,
     change_event_page_ids: Vec<u64>,
+    reused_page_refs: Vec<PageRef>,
     pages: Vec<EncodedPage>,
     record_page_count: usize,
     index_page_count: usize,
@@ -393,10 +436,13 @@ impl DatabaseFile {
                 change_events: Vec::new(),
                 plan_cache_entries: Vec::new(),
             },
+            checkpoint_snapshot: SnapshotState::default(),
             active_slot: 0,
             active_superblock: Superblock::default(),
             valid_superblocks: 0,
             wal_end_offset: DATA_START_OFFSET,
+            dirty_collections: BTreeSet::new(),
+            change_events_dirty: false,
             wal_records_since_checkpoint: 0,
             wal_bytes_since_checkpoint: 0,
             truncated_wal_tail: false,
@@ -442,16 +488,15 @@ impl DatabaseFile {
         let sequence = self.state.last_applied_sequence + 1;
         validate_mutation(&self.state, &mutation)?;
 
-        let appended_bytes = append_wal_entry(
-            &mut self.file,
-            self.wal_end_offset,
-            &WalEntry {
-                sequence,
-                mutation: mutation.clone(),
-            },
-        )?;
+        let appended_bytes =
+            append_wal_entry(&mut self.file, self.wal_end_offset, sequence, &mutation)?;
 
-        apply_mutation(&mut self.state, sequence, &mutation)?;
+        mark_mutation_dirty(
+            &mut self.dirty_collections,
+            &mut self.change_events_dirty,
+            &mutation,
+        );
+        apply_owned_mutation(&mut self.state, sequence, mutation)?;
         self.wal_end_offset += appended_bytes;
         self.wal_records_since_checkpoint += 1;
         self.wal_bytes_since_checkpoint += appended_bytes;
@@ -543,16 +588,28 @@ impl DatabaseFile {
     }
 
     fn reload_from_disk(&mut self) -> Result<()> {
-        let loaded = load_state(&mut self.file)?;
-        self.state = loaded.state;
-        self.active_slot = loaded.active_slot;
-        self.active_superblock = loaded.active_superblock;
-        self.valid_superblocks = loaded.valid_superblocks;
-        self.wal_end_offset = loaded.file_size.max(DATA_START_OFFSET);
-        self.wal_records_since_checkpoint = loaded.wal_recovery.records;
-        self.wal_bytes_since_checkpoint = loaded.wal_recovery.bytes;
-        self.truncated_wal_tail = loaded.wal_recovery.truncated_tail;
-        self.checkpoint_counts = loaded.checkpoint_counts;
+        let LoadedState {
+            state,
+            checkpoint_snapshot,
+            active_slot,
+            active_superblock,
+            valid_superblocks,
+            wal_recovery,
+            file_size,
+            checkpoint_counts,
+        } = load_state(&mut self.file)?;
+        self.state = state;
+        self.checkpoint_snapshot = checkpoint_snapshot;
+        self.active_slot = active_slot;
+        self.active_superblock = active_superblock;
+        self.valid_superblocks = valid_superblocks;
+        self.wal_end_offset = file_size.max(DATA_START_OFFSET);
+        self.dirty_collections = wal_recovery.dirty_collections;
+        self.change_events_dirty = wal_recovery.change_events_dirty;
+        self.wal_records_since_checkpoint = wal_recovery.records;
+        self.wal_bytes_since_checkpoint = wal_recovery.bytes;
+        self.truncated_wal_tail = wal_recovery.truncated_tail;
+        self.checkpoint_counts = checkpoint_counts;
         Ok(())
     }
 
@@ -560,11 +617,17 @@ impl DatabaseFile {
         self.state.file_format_version = FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
-        let encoded_catalog =
-            encode_snapshot_catalog(&self.state.catalog, &self.state.change_events)?;
+        let encoded_catalog = encode_snapshot_catalog(
+            &self.state.catalog,
+            &self.state.change_events,
+            &self.checkpoint_snapshot,
+            &self.dirty_collections,
+            self.change_events_dirty,
+        )?;
         let EncodedSnapshotCatalog {
             catalog,
             change_event_page_ids,
+            reused_page_refs,
             pages,
             record_page_count,
             index_page_count,
@@ -578,7 +641,11 @@ impl DatabaseFile {
             .iter()
             .map(|page| page.bytes.len() as u64)
             .sum::<u64>();
-        let provisional_page_refs = checkpoint_page_refs(DATA_START_OFFSET, &pages);
+        let provisional_page_refs = reused_page_refs
+            .iter()
+            .cloned()
+            .chain(checkpoint_page_refs(DATA_START_OFFSET, &pages))
+            .collect::<Vec<_>>();
         let provisional_snapshot_catalog =
             resolve_snapshot_catalog(catalog.clone(), &provisional_page_refs)?;
         let provisional_snapshot = bson::to_vec(&SnapshotState {
@@ -599,7 +666,11 @@ impl DatabaseFile {
             next_slot,
             page_bytes_len + provisional_snapshot.len() as u64,
         )?;
-        let page_refs = checkpoint_page_refs(pages_start, &pages);
+        let page_refs = reused_page_refs
+            .iter()
+            .cloned()
+            .chain(checkpoint_page_refs(pages_start, &pages))
+            .collect::<Vec<_>>();
         let snapshot_offset = pages_start + page_bytes_len;
         let snapshot_catalog = resolve_snapshot_catalog(catalog, &page_refs)?;
         let snapshot_state = SnapshotState {
@@ -641,6 +712,9 @@ impl DatabaseFile {
         self.active_slot = next_slot;
         self.active_superblock = superblock;
         self.valid_superblocks = self.valid_superblocks.max(1);
+        self.checkpoint_snapshot = snapshot_state;
+        self.dirty_collections.clear();
+        self.change_events_dirty = false;
         self.wal_end_offset = wal_offset;
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
@@ -671,6 +745,11 @@ impl DatabaseFile {
                     self.active_superblock.wal_offset
                 };
                 if required_len <= reusable_end.saturating_sub(inactive_superblock.snapshot_offset)
+                    && !snapshot_references_range(
+                        &self.checkpoint_snapshot,
+                        inactive_superblock.snapshot_offset,
+                        reusable_end.saturating_sub(inactive_superblock.snapshot_offset),
+                    )
                 {
                     return Ok(inactive_superblock.snapshot_offset);
                 }
@@ -679,6 +758,19 @@ impl DatabaseFile {
 
         Ok(self.wal_end_offset.max(DATA_START_OFFSET))
     }
+}
+
+fn snapshot_references_range(
+    snapshot_state: &SnapshotState,
+    range_start: u64,
+    range_len: u64,
+) -> bool {
+    let range_end = range_start.saturating_add(range_len);
+    snapshot_page_refs(snapshot_state).any(|page_ref| {
+        let page_start = page_ref.offset;
+        let page_end = page_ref.offset + u64::from(page_ref.page_len);
+        page_start < range_end && range_start < page_end
+    })
 }
 
 impl SlottedPageBuilder {
@@ -803,18 +895,26 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
             Err(error) if is_skippable_checkpoint_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        let (state, checkpoint_counts) = match read_snapshot(file, &superblock) {
+        let (state, checkpoint_snapshot, checkpoint_counts) = match read_snapshot(file, &superblock)
+        {
             Ok(loaded) => loaded,
             Err(error) if is_skippable_checkpoint_error(&error) => continue,
             Err(error) => return Err(error),
         };
         valid_superblocks += 1;
-        candidates.push((slot, superblock, state, checkpoint_counts));
+        candidates.push((
+            slot,
+            superblock,
+            state,
+            checkpoint_snapshot,
+            checkpoint_counts,
+        ));
     }
 
-    let Some((active_slot, active_superblock, mut state, checkpoint_counts)) = candidates
-        .into_iter()
-        .max_by_key(|(_, superblock, _, _)| superblock.generation)
+    let Some((active_slot, active_superblock, mut state, checkpoint_snapshot, checkpoint_counts)) =
+        candidates
+            .into_iter()
+            .max_by_key(|(_, superblock, _, _, _)| superblock.generation)
     else {
         return Err(StorageError::NoValidSuperblock.into());
     };
@@ -826,6 +926,7 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
 
     Ok(LoadedState {
         state,
+        checkpoint_snapshot,
         active_slot,
         active_superblock,
         valid_superblocks,
@@ -894,7 +995,7 @@ fn encode_superblock(superblock: &Superblock) -> [u8; SUPERBLOCK_LEN] {
 fn read_snapshot(
     file: &mut File,
     superblock: &Superblock,
-) -> Result<(PersistedState, CheckpointCounts)> {
+) -> Result<(PersistedState, SnapshotState, CheckpointCounts)> {
     if superblock.snapshot_offset < DATA_START_OFFSET
         || superblock.wal_offset < superblock.snapshot_offset
     {
@@ -926,8 +1027,9 @@ fn read_snapshot(
             last_checkpoint_unix_ms: snapshot_state.last_checkpoint_unix_ms,
             catalog,
             change_events,
-            plan_cache_entries: snapshot_state.plan_cache_entries,
+            plan_cache_entries: snapshot_state.plan_cache_entries.clone(),
         },
+        snapshot_state.clone(),
         CheckpointCounts {
             page_count: checkpoint_counts.page_count + snapshot_state.change_event_pages.len(),
             change_event_page_count: snapshot_state.change_event_pages.len(),
@@ -937,8 +1039,13 @@ fn read_snapshot(
     ))
 }
 
-fn append_wal_entry(file: &mut File, frame_offset: u64, entry: &WalEntry) -> Result<u64> {
-    let payload = bson::to_vec(entry)?;
+fn append_wal_entry(
+    file: &mut File,
+    frame_offset: u64,
+    sequence: u64,
+    mutation: &WalMutation,
+) -> Result<u64> {
+    let payload = bson::to_vec(&WalEntryRef { sequence, mutation })?;
     let payload_checksum = hash_bytes(&payload);
     let frame_len = (WAL_HEADER_LEN + payload.len()) as u64;
 
@@ -997,6 +1104,11 @@ fn replay_wal(
 
         let entry = bson::from_slice::<WalEntry>(&payload)?;
         if entry.sequence > last_applied_sequence {
+            mark_mutation_dirty(
+                &mut recovery.dirty_collections,
+                &mut recovery.change_events_dirty,
+                &entry.mutation,
+            );
             apply_mutation(state, entry.sequence, &entry.mutation)?;
             last_applied_sequence = entry.sequence;
             recovery.last_sequence = Some(entry.sequence);
@@ -1019,7 +1131,7 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
             change_events,
         } => {
             let mut hydrated = collection_state.clone();
-            hydrated.hydrate_indexes();
+            ensure_collection_indexes_hydrated(&mut hydrated);
             validate_collection_indexes(&hydrated).map_err(map_catalog_error)?;
             state
                 .catalog
@@ -1046,6 +1158,25 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
             )?;
             state.change_events.extend(change_events.iter().cloned());
         }
+        WalMutation::CreateIndexes {
+            database,
+            collection,
+            create_options,
+            specs,
+            change_events,
+        } => {
+            apply_create_indexes(state, database, collection, create_options.as_ref(), specs)?;
+            state.change_events.extend(change_events.iter().cloned());
+        }
+        WalMutation::DropIndexes {
+            database,
+            collection,
+            target,
+            change_events,
+        } => {
+            state.catalog.drop_indexes(database, collection, target)?;
+            state.change_events.extend(change_events.iter().cloned());
+        }
         WalMutation::DropCollection {
             database,
             collection,
@@ -1059,14 +1190,154 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
     Ok(())
 }
 
+fn apply_owned_mutation(
+    state: &mut PersistedState,
+    sequence: u64,
+    owned_mutation: WalMutation,
+) -> Result<()> {
+    match owned_mutation {
+        WalMutation::ReplaceCollection {
+            database,
+            collection,
+            mut collection_state,
+            change_events,
+        } => {
+            ensure_collection_indexes_hydrated(&mut collection_state);
+            validate_collection_indexes(&collection_state).map_err(map_catalog_error)?;
+            state
+                .catalog
+                .replace_collection(&database, &collection, collection_state);
+            state.change_events.extend(change_events);
+        }
+        WalMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            create_options,
+            changes,
+            inserts,
+            updates,
+            deletes,
+            change_events,
+        } => {
+            let changes = if changes.is_empty() {
+                inserts
+                    .into_iter()
+                    .map(CollectionChange::Insert)
+                    .chain(updates.into_iter().map(CollectionChange::Update))
+                    .chain(deletes.into_iter().map(CollectionChange::Delete))
+                    .collect::<Vec<_>>()
+            } else {
+                changes
+            };
+            apply_collection_changes(
+                state,
+                &database,
+                &collection,
+                create_options.as_ref(),
+                &changes,
+            )?;
+            state.change_events.extend(change_events);
+        }
+        WalMutation::CreateIndexes {
+            database,
+            collection,
+            create_options,
+            specs,
+            change_events,
+        } => {
+            apply_create_indexes(
+                state,
+                &database,
+                &collection,
+                create_options.as_ref(),
+                &specs,
+            )?;
+            state.change_events.extend(change_events);
+        }
+        WalMutation::DropIndexes {
+            database,
+            collection,
+            target,
+            change_events,
+        } => {
+            state
+                .catalog
+                .drop_indexes(&database, &collection, &target)?;
+            state.change_events.extend(change_events);
+        }
+        WalMutation::DropCollection {
+            database,
+            collection,
+            change_events,
+        } => {
+            state.catalog.drop_collection(&database, &collection)?;
+            state.change_events.extend(change_events);
+        }
+    }
+    state.last_applied_sequence = sequence;
+    Ok(())
+}
+
+fn ensure_collection_indexes_hydrated(collection_state: &mut CollectionCatalog) {
+    for index in collection_state.indexes.values_mut() {
+        if index.stats.entry_count != index.entries.len()
+            || (!index.entries.is_empty() && index.tree.root.is_none())
+            || (index.entries.is_empty() && index.tree.root.is_some())
+        {
+            index.rebuild_tree();
+        }
+    }
+}
+
+fn mark_mutation_dirty(
+    dirty_collections: &mut BTreeSet<(String, String)>,
+    change_events_dirty: &mut bool,
+    mutation: &WalMutation,
+) {
+    match mutation {
+        WalMutation::ReplaceCollection {
+            database,
+            collection,
+            change_events,
+            ..
+        }
+        | WalMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            change_events,
+            ..
+        }
+        | WalMutation::CreateIndexes {
+            database,
+            collection,
+            change_events,
+            ..
+        }
+        | WalMutation::DropIndexes {
+            database,
+            collection,
+            change_events,
+            ..
+        }
+        | WalMutation::DropCollection {
+            database,
+            collection,
+            change_events,
+        } => {
+            dirty_collections.insert((database.clone(), collection.clone()));
+            if !change_events.is_empty() {
+                *change_events_dirty = true;
+            }
+        }
+    }
+}
+
 fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<()> {
     match mutation {
         WalMutation::ReplaceCollection {
             collection_state, ..
         } => {
-            let mut hydrated = collection_state.clone();
-            hydrated.hydrate_indexes();
-            validate_collection_indexes(&hydrated).map_err(map_catalog_error)?;
+            validate_collection_indexes(collection_state).map_err(map_catalog_error)?;
         }
         WalMutation::ApplyCollectionChanges {
             database,
@@ -1087,6 +1358,24 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
                 &changes,
             )?;
         }
+        WalMutation::CreateIndexes {
+            database,
+            collection,
+            create_options,
+            specs,
+            ..
+        } => {
+            validate_create_indexes(state, database, collection, create_options.as_ref(), specs)?;
+        }
+        WalMutation::DropIndexes {
+            database,
+            collection,
+            target,
+            ..
+        } => {
+            let collection_state = state.catalog.get_collection(database, collection)?;
+            validate_drop_indexes(collection_state, target)?;
+        }
         WalMutation::DropCollection {
             database,
             collection,
@@ -1096,6 +1385,57 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
         }
     }
     Ok(())
+}
+
+fn apply_create_indexes(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    specs: &[bson::Document],
+) -> Result<()> {
+    if state.catalog.get_collection(database, collection).is_err() {
+        let Some(options) = create_options else {
+            return Err(CatalogError::NamespaceNotFound(
+                database.to_string(),
+                collection.to_string(),
+            )
+            .into());
+        };
+        state
+            .catalog
+            .create_collection(database, collection, options.clone())?;
+    }
+
+    state.catalog.create_indexes(database, collection, specs)?;
+    Ok(())
+}
+
+fn validate_create_indexes(
+    state: &PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    specs: &[bson::Document],
+) -> Result<Vec<IndexCatalog>> {
+    let preview_collection;
+    let collection_state = match state.catalog.get_collection(database, collection) {
+        Ok(collection_state) => collection_state,
+        Err(CatalogError::NamespaceNotFound(_, _)) => {
+            let Some(options) = create_options else {
+                return Err(CatalogError::NamespaceNotFound(
+                    database.to_string(),
+                    collection.to_string(),
+                )
+                .into());
+            };
+            preview_collection = CollectionCatalog::new(options.clone());
+            &preview_collection
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    build_index_specs(collection_state, specs).map_err(Into::into)
 }
 
 fn apply_collection_changes(
@@ -1427,9 +1767,12 @@ fn encode_unique_index_key(
 fn encode_snapshot_catalog(
     catalog: &Catalog,
     change_events: &[PersistedChangeEvent],
+    checkpoint_snapshot: &SnapshotState,
+    dirty_collections: &BTreeSet<(String, String)>,
+    change_events_dirty: bool,
 ) -> Result<EncodedSnapshotCatalog> {
     let mut encoded_catalog = EncodedSnapshotCatalog::default();
-    let mut next_page_id = 1_u64;
+    let mut next_page_id = next_snapshot_page_id(checkpoint_snapshot);
 
     for (database_name, database) in &catalog.databases {
         let mut snapshot_database = SnapshotDatabaseCatalog {
@@ -1437,7 +1780,31 @@ fn encode_snapshot_catalog(
         };
 
         for (collection_name, collection) in &database.collections {
-            validate_collection_indexes(collection).map_err(map_catalog_error)?;
+            if !dirty_collections.contains(&(database_name.clone(), collection_name.clone())) {
+                if let Some(snapshot_collection) = checkpoint_snapshot
+                    .catalog
+                    .databases
+                    .get(database_name)
+                    .and_then(|database| database.collections.get(collection_name))
+                {
+                    encoded_catalog.record_page_count += snapshot_collection.record_pages.len();
+                    encoded_catalog.record_count += snapshot_collection.record_count;
+                    encoded_catalog
+                        .reused_page_refs
+                        .extend(snapshot_collection.record_pages.iter().cloned());
+                    for index in snapshot_collection.indexes.values() {
+                        encoded_catalog.index_page_count += index.pages.len();
+                        encoded_catalog.index_entry_count += index.entry_count;
+                        encoded_catalog
+                            .reused_page_refs
+                            .extend(index.pages.iter().cloned());
+                    }
+                    snapshot_database
+                        .collections
+                        .insert(collection_name.clone(), snapshot_collection.clone());
+                    continue;
+                }
+            }
 
             let record_pages = encode_collection_pages(&collection.records, &mut next_page_id)?;
             let record_page_count_before = encoded_catalog.pages.len();
@@ -1490,17 +1857,55 @@ fn encode_snapshot_catalog(
             .insert(database_name.clone(), snapshot_database);
     }
 
-    let change_event_page_count_before = encoded_catalog.pages.len();
-    let change_event_pages = encode_change_event_pages(change_events, &mut next_page_id)?;
-    encoded_catalog.change_event_page_count = change_event_pages.len();
-    encoded_catalog.change_event_count = change_events.len();
-    encoded_catalog.pages.extend(change_event_pages);
-    encoded_catalog.change_event_page_ids = (change_event_page_count_before
-        ..encoded_catalog.pages.len())
-        .map(|index| encoded_catalog.pages[index].page_id)
-        .collect();
+    if !change_events_dirty && change_events.len() == checkpoint_snapshot.change_event_count {
+        encoded_catalog.change_event_page_count = checkpoint_snapshot.change_event_pages.len();
+        encoded_catalog.change_event_count = checkpoint_snapshot.change_event_count;
+        encoded_catalog
+            .reused_page_refs
+            .extend(checkpoint_snapshot.change_event_pages.iter().cloned());
+        encoded_catalog.change_event_page_ids = checkpoint_snapshot
+            .change_event_pages
+            .iter()
+            .map(|page_ref| page_ref.page_id)
+            .collect();
+    } else {
+        let change_event_page_count_before = encoded_catalog.pages.len();
+        let change_event_pages = encode_change_event_pages(change_events, &mut next_page_id)?;
+        encoded_catalog.change_event_page_count = change_event_pages.len();
+        encoded_catalog.change_event_count = change_events.len();
+        encoded_catalog.pages.extend(change_event_pages);
+        encoded_catalog.change_event_page_ids = (change_event_page_count_before
+            ..encoded_catalog.pages.len())
+            .map(|index| encoded_catalog.pages[index].page_id)
+            .collect();
+    }
 
     Ok(encoded_catalog)
+}
+
+fn next_snapshot_page_id(snapshot_state: &SnapshotState) -> u64 {
+    snapshot_page_refs(snapshot_state)
+        .map(|page_ref| page_ref.page_id)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn snapshot_page_refs(snapshot_state: &SnapshotState) -> impl Iterator<Item = &PageRef> {
+    snapshot_state
+        .catalog
+        .databases
+        .values()
+        .flat_map(|database| database.collections.values())
+        .flat_map(|collection| {
+            collection.record_pages.iter().chain(
+                collection
+                    .indexes
+                    .values()
+                    .flat_map(|index| index.pages.iter()),
+            )
+        })
+        .chain(snapshot_state.change_event_pages.iter())
 }
 
 fn resolve_snapshot_catalog(
@@ -2095,8 +2500,8 @@ mod tests {
     use super::{
         CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION,
         PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE, PersistedChangeEvent, PersistedPlanCacheChoice,
-        PersistedPlanCacheEntry, SnapshotState, VerifyReport, WalMutation, decode_page,
-        read_superblock,
+        PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, VerifyReport, WalMutation,
+        decode_page, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -2323,6 +2728,106 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, "charlie".to_string()), (1, "delta".to_string())]
         );
+        assert_eq!(reopened.change_events(), change_events.as_slice());
+    }
+
+    #[test]
+    fn recovers_create_indexes_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-create-index-recovery.mongodb");
+        let change_events = vec![sample_change_event(2, "createIndexes")];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            insert_record(&mut collection, 2, doc! { "_id": 2, "sku": "beta" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! {
+                        "key": { "sku": 1 },
+                        "name": "sku_1",
+                        "unique": true,
+                    }],
+                    change_events: change_events.clone(),
+                })
+                .expect("create index mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let index = collection.indexes.get("sku_1").expect("sku index");
+        assert_eq!(
+            index
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.record_id,
+                        entry.key.get_str("sku").expect("sku").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(1, "alpha".to_string()), (2, "beta".to_string())]
+        );
+        assert_eq!(reopened.change_events(), change_events.as_slice());
+    }
+
+    #[test]
+    fn recovers_drop_indexes_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-drop-index-recovery.mongodb");
+        let change_events = vec![sample_change_event(2, "dropIndexes")];
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database.checkpoint().expect("checkpoint");
+            database
+                .commit_mutation(WalMutation::DropIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    target: "sku_1".to_string(),
+                    change_events: change_events.clone(),
+                })
+                .expect("drop index mutation");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert!(!collection.indexes.contains_key("sku_1"));
+        assert!(collection.indexes.contains_key("_id_"));
         assert_eq!(reopened.change_events(), change_events.as_slice());
     }
 
@@ -2561,8 +3066,7 @@ mod tests {
     fn checkpoints_reuse_inactive_snapshot_region_when_space_allows() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("checkpoint-reuse.mongodb");
-
-        let size_before_reused_checkpoint = {
+        let (size_before_reused_checkpoint, reused_snapshot_offset) = {
             let mut database = DatabaseFile::open_or_create(&path).expect("create database");
             let mut collection = CollectionCatalog::new(doc! {});
             insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
@@ -2570,27 +3074,35 @@ mod tests {
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
-                    collection_state: collection.clone(),
+                    collection_state: collection,
                     change_events: Vec::new(),
                 })
                 .expect("base mutation");
-            database.checkpoint().expect("first data checkpoint");
+            database.checkpoint().expect("first checkpoint");
 
-            collection
-                .update_record_at(0, doc! { "_id": 1, "sku": "omega" })
-                .expect("update record");
+            let mut large_collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=96 {
+                insert_record(
+                    &mut large_collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("widget-{record_id}"),
+                        "payload": "x".repeat(128),
+                    },
+                );
+            }
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
-                    collection_state: collection,
+                    collection_state: large_collection,
                     change_events: Vec::new(),
                 })
                 .expect("second mutation");
-            database.checkpoint().expect("second data checkpoint");
 
             let mut collection = CollectionCatalog::new(doc! {});
-            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "beta" });
             database
                 .commit_mutation(WalMutation::ReplaceCollection {
                     database: "app".to_string(),
@@ -2599,9 +3111,34 @@ mod tests {
                     change_events: Vec::new(),
                 })
                 .expect("third mutation");
-            std::fs::metadata(&path)
-                .expect("metadata before reused checkpoint")
-                .len()
+            database.checkpoint().expect("small checkpoint");
+
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: CollectionCatalog::new(doc! {}),
+                    change_events: Vec::new(),
+                })
+                .expect("fourth mutation");
+            database.checkpoint().expect("empty checkpoint");
+
+            let inspect = DatabaseFile::inspect(&path).expect("inspect");
+            let inactive_slot = (inspect.active_superblock_slot + 1) % SUPERBLOCK_COUNT;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .expect("open file");
+            let inactive_superblock = read_superblock(&mut file, inactive_slot)
+                .expect("read inactive superblock")
+                .expect("inactive superblock");
+            assert!(inactive_superblock.snapshot_offset < inspect.snapshot_offset);
+            (
+                std::fs::metadata(&path)
+                    .expect("metadata before reused checkpoint")
+                    .len(),
+                inactive_superblock.snapshot_offset,
+            )
         };
 
         {
@@ -2610,10 +3147,88 @@ mod tests {
             database.checkpoint().expect("reused checkpoint");
         }
 
+        let inspect = DatabaseFile::inspect(&path).expect("inspect after reused checkpoint");
         let size_after_reused_checkpoint = std::fs::metadata(&path)
             .expect("metadata after reused checkpoint")
             .len();
+        assert_eq!(inspect.snapshot_offset, reused_snapshot_offset);
         assert_eq!(size_after_reused_checkpoint, size_before_reused_checkpoint);
+    }
+
+    #[test]
+    fn checkpoints_reuse_unchanged_collection_and_index_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("checkpoint-page-reuse.mongodb");
+        let plan_cache_entries = vec![PersistedPlanCacheEntry {
+            namespace: "app.widgets".to_string(),
+            filter_shape: "sku:eq".to_string(),
+            sort_shape: "-".to_string(),
+            projection_shape: "-".to_string(),
+            sequence: 1,
+            choice: PersistedPlanCacheChoice::Index("sku_1".to_string()),
+        }];
+
+        let (first_record_pages, first_index_pages) = {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("first checkpoint");
+
+            let inspect = DatabaseFile::inspect(&path).expect("inspect");
+            let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+            let collection = snapshot
+                .catalog
+                .databases
+                .get("app")
+                .expect("database")
+                .collections
+                .get("widgets")
+                .expect("collection");
+            (
+                collection.record_pages.clone(),
+                collection
+                    .indexes
+                    .get("sku_1")
+                    .expect("index")
+                    .pages
+                    .clone(),
+            )
+        };
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("reopen");
+            database.set_persisted_plan_cache_entries(plan_cache_entries);
+            database.checkpoint().expect("second checkpoint");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let collection = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection");
+        assert_eq!(collection.record_pages, first_record_pages);
+        assert_eq!(
+            collection.indexes.get("sku_1").expect("index").pages,
+            first_index_pages
+        );
     }
 
     #[test]
@@ -2637,6 +3252,65 @@ mod tests {
 
         let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
         assert_eq!(reopened.persisted_plan_cache_entries(), entries.as_slice());
+    }
+
+    #[test]
+    fn checkpoints_replayed_replace_collection_after_reopen() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("replayed-replace-checkpoint.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection.clone(),
+                    change_events: Vec::new(),
+                })
+                .expect("base mutation");
+            database.checkpoint().expect("base checkpoint");
+
+            collection
+                .update_record_at(0, doc! { "_id": 1, "sku": "beta" })
+                .expect("update record");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("wal mutation");
+        }
+
+        {
+            let mut reopened = DatabaseFile::open_or_create(&path).expect("reopen with wal");
+            let collection = reopened
+                .catalog()
+                .get_collection("app", "widgets")
+                .expect("collection");
+            assert_eq!(collection.records.len(), 1);
+            assert_eq!(
+                collection.records[0].document.get_str("sku").expect("sku"),
+                "beta"
+            );
+            reopened.checkpoint().expect("checkpoint replayed state");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen after checkpoint");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(
+            collection.records[0].document.get_str("sku").expect("sku"),
+            "beta"
+        );
+        assert!(!reopened.has_pending_wal());
     }
 
     #[test]

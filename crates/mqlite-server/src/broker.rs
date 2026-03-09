@@ -14,7 +14,7 @@ use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
-    IndexCatalog, IndexEntry, apply_index_specs, drop_indexes_from_collection,
+    IndexCatalog, IndexEntry, build_index_specs, validate_drop_indexes,
 };
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
@@ -1202,17 +1202,20 @@ impl Broker {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut storage = self.storage.write();
+        let preview_collection;
+        let collection_state = match storage.catalog().get_collection(&database, collection) {
+            Ok(collection_state) => collection_state,
+            Err(_) => {
+                preview_collection = CollectionCatalog::new(Document::new());
+                &preview_collection
+            }
+        };
         let collection_exists = storage
             .catalog()
             .get_collection(&database, collection)
             .is_ok();
-        let mut collection_state = storage
-            .catalog()
-            .get_collection(&database, collection)
-            .cloned()
-            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
         let before = collection_state.indexes.len() as i32;
-        let created = apply_index_specs(&mut collection_state, &specs)?;
+        let created = build_index_specs(collection_state, &specs)?;
         let sequence = storage.last_applied_sequence() + 1;
         let mut change_events = Vec::new();
         if !collection_exists {
@@ -1259,10 +1262,11 @@ impl Broker {
             ));
         }
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::CreateIndexes {
                 database,
                 collection: collection.to_string(),
-                collection_state,
+                create_options: (!collection_exists).then(Document::new),
+                specs,
                 change_events,
             })
             .map_err(internal_error)?;
@@ -1283,17 +1287,16 @@ impl Broker {
         })?;
 
         let mut storage = self.storage.write();
-        let mut collection_state = storage
-            .catalog()
-            .get_collection(&database, collection)?
-            .clone();
-        let removed = drop_indexes_from_collection(&mut collection_state, target)?;
+        let removed = validate_drop_indexes(
+            storage.catalog().get_collection(&database, collection)?,
+            target,
+        )?;
         let sequence = storage.last_applied_sequence() + 1;
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation(WalMutation::DropIndexes {
                 database: database.clone(),
                 collection: collection.to_string(),
-                collection_state,
+                target: target.to_string(),
                 change_events: vec![change_stream_event(
                     sequence,
                     0,

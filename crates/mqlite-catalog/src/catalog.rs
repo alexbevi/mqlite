@@ -581,7 +581,19 @@ pub fn apply_index_specs(
     collection: &mut CollectionCatalog,
     specs: &[Document],
 ) -> Result<Vec<IndexCatalog>, CatalogError> {
+    let created = build_index_specs(collection, specs)?;
+    for index in &created {
+        collection.indexes.insert(index.name.clone(), index.clone());
+    }
+    Ok(created)
+}
+
+pub fn build_index_specs(
+    collection: &CollectionCatalog,
+    specs: &[Document],
+) -> Result<Vec<IndexCatalog>, CatalogError> {
     let mut created = Vec::new();
+    let mut pending_names = collection.indexes.keys().cloned().collect::<BTreeSet<_>>();
 
     for spec in specs {
         let key = spec
@@ -591,7 +603,7 @@ pub fn apply_index_specs(
             .get_str("name")
             .map(|value| value.to_string())
             .unwrap_or_else(|_| default_index_name(key));
-        if collection.indexes.contains_key(&name) {
+        if !pending_names.insert(name.clone()) {
             return Err(CatalogError::IndexExists(name));
         }
         let unique = spec.get_bool("unique").unwrap_or(false);
@@ -610,7 +622,6 @@ pub fn apply_index_specs(
             );
         }
         index.rebuild_tree();
-        collection.indexes.insert(name, index.clone());
         created.push(index);
     }
 
@@ -634,9 +645,9 @@ pub fn drop_indexes_from_collection(
     collection: &mut CollectionCatalog,
     target: &str,
 ) -> Result<usize, CatalogError> {
+    let removed = validate_drop_indexes(collection, target)?;
     if target == "*" {
         let retained = collection.indexes.remove("_id_");
-        let removed = collection.indexes.len();
         collection.indexes.clear();
         if let Some(id_index) = retained {
             collection.indexes.insert(id_index.name.clone(), id_index);
@@ -648,9 +659,26 @@ pub fn drop_indexes_from_collection(
         return Ok(0);
     }
 
-    match collection.indexes.remove(target) {
-        Some(_) => Ok(1),
-        None => Err(CatalogError::IndexNotFound(target.to_string())),
+    collection.indexes.remove(target);
+    Ok(removed)
+}
+
+pub fn validate_drop_indexes(
+    collection: &CollectionCatalog,
+    target: &str,
+) -> Result<usize, CatalogError> {
+    if target == "*" {
+        return Ok(collection.indexes.len().saturating_sub(1));
+    }
+
+    if target == "_id_" {
+        return Ok(0);
+    }
+
+    if collection.indexes.contains_key(target) {
+        Ok(1)
+    } else {
+        Err(CatalogError::IndexNotFound(target.to_string()))
     }
 }
 

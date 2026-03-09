@@ -252,9 +252,10 @@ Current cross-namespace aggregation behavior:
 Mutations are durable through an append-only WAL.
 
 - CRUD writes append ordered typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
-- Collection replacement and drop operations are still written as collection-level WAL frames.
+- Ordered CRUD deltas and index create/drop operations use typed WAL frames; collection replacement and drop remain collection-level WAL frames for full-namespace rewrites.
 - WAL frames include a sequence number and checksum.
 - The broker applies the mutation to in-memory state only after the WAL append succeeds.
+- Checkpoints carry forward unchanged record, index, and change-event pages from the active snapshot so only dirty namespaces need new page encoding.
 - Checkpoints can reuse the inactive superblock slot's preserved snapshot or stale WAL region when the next snapshot fits there, while keeping new WAL appends after the preserved fallback checkpoint region.
 - Recovery loads the newest valid checkpoint, then replays WAL frames with sequence numbers greater than the checkpoint sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.
