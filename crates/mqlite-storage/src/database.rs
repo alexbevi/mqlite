@@ -1858,7 +1858,7 @@ impl CompactIndexCatalog {
             unique: index.unique,
             expire_after_seconds: index.expire_after_seconds,
             entries: index
-                .entries
+                .entries_snapshot()
                 .iter()
                 .map(CompactIndexEntry::from_index_entry)
                 .collect::<Result<Vec<_>>>()?,
@@ -1872,11 +1872,12 @@ impl CompactIndexCatalog {
             self.unique,
         );
         index.expire_after_seconds = self.expire_after_seconds;
-        index.entries = self
-            .entries
-            .into_iter()
-            .map(CompactIndexEntry::into_index_entry)
-            .collect::<Result<Vec<_>>>()?;
+        index.load_entries(
+            self.entries
+                .into_iter()
+                .map(CompactIndexEntry::into_index_entry)
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         Ok(index)
     }
 }
@@ -2771,14 +2772,15 @@ impl<'a> CollectionValidationOverlay<'a> {
 
 impl UniqueIndexValidator {
     fn from_catalog(index: &IndexCatalog) -> Result<Self> {
+        let mut entries = HashMap::with_capacity(index.entry_count());
+        index.for_each_entry(|entry| {
+            let key = bson::to_vec(&entry.key).expect("index key BSON encoding");
+            entries.insert(key, entry.record_id);
+        });
         Ok(Self {
             name: index.name.clone(),
             key: index.key.clone(),
-            entries: index
-                .entries
-                .iter()
-                .map(|entry| Ok((bson::to_vec(&entry.key)?, entry.record_id)))
-                .collect::<Result<HashMap<_, _>>>()?,
+            entries,
         })
     }
 
@@ -2907,11 +2909,12 @@ fn encode_snapshot_catalog(
                     }
                 }
 
+                let index_entries = index.entries_snapshot();
                 let encoded_index_tree =
-                    encode_index_tree_pages(&index.entries, &mut next_page_id)?;
+                    encode_index_tree_pages(&index_entries, &mut next_page_id)?;
                 let index_page_count_before = encoded_catalog.pages.len();
                 encoded_catalog.index_page_count += encoded_index_tree.pages.len();
-                encoded_catalog.index_entry_count += index.entries.len();
+                encoded_catalog.index_entry_count += index.entry_count();
                 encoded_catalog.pages.extend(encoded_index_tree.pages);
                 let index_page_ids = (index_page_count_before..encoded_catalog.pages.len())
                     .map(|position| encoded_catalog.pages[position].page_id)
@@ -2925,7 +2928,7 @@ fn encode_snapshot_catalog(
                         expire_after_seconds: index.expire_after_seconds,
                         root_page_id: encoded_index_tree.root_page_id,
                         pages: placeholder_page_refs(index_page_ids),
-                        entry_count: index.entries.len(),
+                        entry_count: index.entry_count(),
                     },
                 );
             }
@@ -3064,13 +3067,13 @@ fn snapshot_index_matches(
     if current_index.key != snapshot_index.key
         || current_index.unique != snapshot_index.unique
         || current_index.expire_after_seconds != snapshot_index.expire_after_seconds
-        || current_index.entries.len() != snapshot_index.entry_count
+        || current_index.entry_count() != snapshot_index.entry_count
     {
         return Ok(false);
     }
 
     let restored_index = restore_index(file, index_name, snapshot_index)?;
-    Ok(restored_index.entries == current_index.entries)
+    Ok(restored_index.entries_snapshot() == current_index.entries_snapshot())
 }
 
 fn next_snapshot_page_id(snapshot_state: &SnapshotState) -> u64 {
@@ -3369,7 +3372,7 @@ fn restore_catalog(
             counts.index_entry_count += collection_state
                 .indexes
                 .values()
-                .map(|index| index.entries.len())
+                .map(IndexCatalog::entry_count)
                 .sum::<usize>();
             restored_database
                 .collections
@@ -3429,17 +3432,16 @@ fn restore_index(
             .map(|page_ref| (page_ref.page_id, page_ref))
             .collect::<BTreeMap<_, _>>();
         let mut visited = BTreeSet::new();
-        index.entries = read_index_tree(file, root_page_id, &page_ref_by_id, &mut visited)?;
+        let entries = read_index_tree(file, root_page_id, &page_ref_by_id, &mut visited)?;
         if visited.len() != snapshot_index.pages.len()
-            || index.entries.len() != snapshot_index.entry_count
+            || entries.len() != snapshot_index.entry_count
         {
             return Err(StorageError::InvalidPage.into());
         }
+        index.load_entries(entries).map_err(map_catalog_error)?;
     } else if !snapshot_index.pages.is_empty() || snapshot_index.entry_count != 0 {
         return Err(StorageError::InvalidPage.into());
     }
-
-    index.rebuild_tree();
     Ok(index)
 }
 
@@ -3645,7 +3647,7 @@ fn index_entry_count(catalog: &Catalog) -> usize {
         .values()
         .flat_map(|database| database.collections.values())
         .flat_map(|collection| collection.indexes.values())
-        .map(|index| index.entries.len())
+        .map(IndexCatalog::entry_count)
         .sum()
 }
 
@@ -4004,9 +4006,9 @@ mod tests {
             "charlie"
         );
         let index = collection.indexes.get("sku_1").expect("sku index");
+        let entries = index.entries_snapshot();
         assert_eq!(
-            index
-                .entries
+            entries
                 .iter()
                 .map(|entry| {
                     (
@@ -4060,9 +4062,9 @@ mod tests {
             .get_collection("app", "widgets")
             .expect("collection");
         let index = collection.indexes.get("sku_1").expect("sku index");
+        let entries = index.entries_snapshot();
         assert_eq!(
-            index
-                .entries
+            entries
                 .iter()
                 .map(|entry| {
                     (
@@ -4223,9 +4225,10 @@ mod tests {
         assert_eq!(collection.records[0].record_id, 7);
         assert_eq!(collection.records[1].record_id, 12);
         let sku_index = collection.indexes.get("sku_1").expect("sku index");
-        assert_eq!(sku_index.entries.len(), 2);
-        assert_eq!(sku_index.entries[0].record_id, 7);
-        assert_eq!(sku_index.entries[1].record_id, 12);
+        let entries = sku_index.entries_snapshot();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_id, 7);
+        assert_eq!(entries[1].record_id, 12);
         assert_eq!(
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
@@ -4349,8 +4352,8 @@ mod tests {
             .get("flag_1_sku_1")
             .expect("compound index");
         let entries_by_record = index
-            .entries
-            .iter()
+            .entries_snapshot()
+            .into_iter()
             .map(|entry| (entry.record_id, entry))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
@@ -4865,7 +4868,7 @@ mod tests {
             .expect("compound index");
         assert_eq!(
             index
-                .entries
+                .entries_snapshot()
                 .iter()
                 .map(|entry| entry.record_id)
                 .collect::<Vec<_>>(),

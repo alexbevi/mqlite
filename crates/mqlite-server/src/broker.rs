@@ -3130,7 +3130,7 @@ fn build_coll_stats_result(
 
 fn approximate_index_size(index: &IndexCatalog) -> i64 {
     index
-        .entries
+        .entries_snapshot()
         .iter()
         .map(|entry| bson::to_vec(&entry.key).unwrap_or_default().len() as i64 + 8)
         .sum()

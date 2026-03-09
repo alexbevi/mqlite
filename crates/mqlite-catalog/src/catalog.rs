@@ -4,15 +4,22 @@ use std::{
 };
 
 use bson::{Bson, Document, doc};
-use mqlite_bson::{compare_bson, compare_documents, lookup_path_owned};
+use mqlite_bson::{compare_bson, lookup_path_owned};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const INDEX_TREE_LEAF_CAPACITY: usize = 64;
 const INDEX_TREE_BRANCH_CAPACITY: usize = 64;
+const INDEX_PAGE_BYTES: usize = 4096;
+const INDEX_PAGE_HEADER_BYTES: usize = 32;
+const INDEX_PAGE_SLOT_BYTES: usize = 16;
 
 fn default_next_record_id() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,6 +92,47 @@ struct NodeSummary {
     max_key: Document,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RuntimeIndexPage {
+    entries: Vec<IndexEntry>,
+    used_bytes: usize,
+}
+
+impl RuntimeIndexPage {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            used_bytes: INDEX_PAGE_HEADER_BYTES,
+        }
+    }
+
+    fn first_entry(&self) -> Option<&IndexEntry> {
+        self.entries.first()
+    }
+
+    fn last_entry(&self) -> Option<&IndexEntry> {
+        self.entries.last()
+    }
+
+    fn can_fit_entry(&self, entry: &IndexEntry) -> Result<bool, CatalogError> {
+        Ok(self.used_bytes + encoded_index_entry_storage_len(entry)? <= INDEX_PAGE_BYTES)
+    }
+
+    fn insert_entry(
+        &mut self,
+        entry: IndexEntry,
+        key_pattern: &Document,
+    ) -> Result<(), CatalogError> {
+        let position = self
+            .entries
+            .binary_search_by(|existing| compare_index_entries(existing, &entry, key_pattern))
+            .unwrap_or_else(|position| position);
+        self.used_bytes += encoded_index_entry_storage_len(&entry)?;
+        self.entries.insert(position, entry);
+        Ok(())
+    }
+}
+
 impl CollectionCatalog {
     pub fn new(options: Document) -> Self {
         let mut collection = Self {
@@ -151,9 +199,7 @@ impl CollectionCatalog {
         validate_record_against_indexes(&self.indexes, &record.document, None)?;
         for index in self.indexes.values_mut() {
             let entry = index_entry_for_document(record.record_id, &record.document, &index.key);
-            insert_index_entry(&mut index.entries, entry, &index.key);
-            index.refresh_stats();
-            index.invalidate_tree();
+            index.append_entries(vec![entry])?;
         }
         self.record_positions
             .insert(record.record_id, self.records.len());
@@ -180,11 +226,11 @@ impl CollectionCatalog {
         validate_record_against_indexes(&self.indexes, &document, Some(record_id))?;
 
         for index in self.indexes.values_mut() {
-            index.entries.retain(|entry| entry.record_id != record_id);
+            let mut entries = index.entries_snapshot();
+            entries.retain(|entry| entry.record_id != record_id);
             let entry = index_entry_for_document(record_id, &document, &index.key);
-            insert_index_entry(&mut index.entries, entry, &index.key);
-            index.refresh_stats();
-            index.invalidate_tree();
+            insert_index_entry(&mut entries, entry, &index.key);
+            index.replace_entries(entries)?;
         }
         self.records[position].document = document;
         Ok(true)
@@ -200,11 +246,11 @@ impl CollectionCatalog {
             .retain(|record| !record_ids.contains(&record.record_id));
         self.rebuild_runtime_state();
         for index in self.indexes.values_mut() {
+            let mut entries = index.entries_snapshot();
+            entries.retain(|entry| !record_ids.contains(&entry.record_id));
             index
-                .entries
-                .retain(|entry| !record_ids.contains(&entry.record_id));
-            index.refresh_stats();
-            index.invalidate_tree();
+                .replace_entries(entries)
+                .expect("existing index entries must remain encodable");
         }
         before - self.records.len()
     }
@@ -245,7 +291,7 @@ impl CollectionCatalog {
                 .indexes
                 .get_mut(&name)
                 .expect("staged index must exist");
-            index.replace_entries(entries);
+            index.replace_entries(entries)?;
         }
         Ok(())
     }
@@ -468,7 +514,11 @@ pub struct IndexCatalog {
     pub key: Document,
     pub unique: bool,
     pub expire_after_seconds: Option<i64>,
-    pub entries: Vec<IndexEntry>,
+    entries: Vec<IndexEntry>,
+    #[serde(skip, default)]
+    runtime_pages: Vec<RuntimeIndexPage>,
+    #[serde(skip, default = "default_true")]
+    entries_materialized: bool,
     #[serde(skip, default)]
     pub tree: IndexTree,
     #[serde(skip, default)]
@@ -483,27 +533,49 @@ impl IndexCatalog {
             unique,
             expire_after_seconds: None,
             entries: Vec::new(),
+            runtime_pages: Vec::new(),
+            entries_materialized: true,
             tree: IndexTree::default(),
             stats: IndexStats::default(),
         }
     }
 
     pub fn rebuild_tree(&mut self) {
-        self.tree = IndexTree::build(&self.entries);
-        self.stats = IndexStats::build(&self.entries, &self.key);
+        let entries = self.materialized_entries().to_vec();
+        self.tree = IndexTree::build(&entries);
+        self.stats = IndexStats::build(&entries, &self.key);
     }
 
     pub fn scan_entries(&self, bounds: &IndexBounds) -> Vec<IndexEntry> {
-        let start = bounds.lower.as_ref().map_or(0, |bound| {
-            lower_bound_index(&self.entries, bound, &self.key)
-        });
-        let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
-            upper_bound_index(&self.entries, bound, &self.key)
-        });
-        if start >= end {
-            return Vec::new();
+        let mut matched = Vec::new();
+        if self.runtime_pages.is_empty() {
+            let start = bounds.lower.as_ref().map_or(0, |bound| {
+                lower_bound_index(&self.entries, bound, &self.key)
+            });
+            let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
+                upper_bound_index(&self.entries, bound, &self.key)
+            });
+            if start < end {
+                matched.extend(self.entries[start..end].iter().cloned());
+            }
+            return matched;
         }
-        self.entries[start..end].to_vec()
+
+        for page in &self.runtime_pages {
+            if page.entries.is_empty() || !page_overlaps_bounds(page, bounds, &self.key) {
+                continue;
+            }
+            let start = bounds.lower.as_ref().map_or(0, |bound| {
+                lower_bound_index(&page.entries, bound, &self.key)
+            });
+            let end = bounds.upper.as_ref().map_or(page.entries.len(), |bound| {
+                upper_bound_index(&page.entries, bound, &self.key)
+            });
+            if start < end {
+                matched.extend(page.entries[start..end].iter().cloned());
+            }
+        }
+        matched
     }
 
     pub fn scan_bounds(&self, bounds: &IndexBounds) -> Vec<u64> {
@@ -518,13 +590,31 @@ impl IndexCatalog {
     }
 
     pub fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
-        let start = bounds.lower.as_ref().map_or(0, |bound| {
-            lower_bound_index(&self.entries, bound, &self.key)
-        });
-        let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
-            upper_bound_index(&self.entries, bound, &self.key)
-        });
-        end.saturating_sub(start)
+        if self.runtime_pages.is_empty() {
+            let start = bounds.lower.as_ref().map_or(0, |bound| {
+                lower_bound_index(&self.entries, bound, &self.key)
+            });
+            let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
+                upper_bound_index(&self.entries, bound, &self.key)
+            });
+            return end.saturating_sub(start);
+        }
+
+        self.runtime_pages
+            .iter()
+            .filter(|page| {
+                !page.entries.is_empty() && page_overlaps_bounds(page, bounds, &self.key)
+            })
+            .map(|page| {
+                let start = bounds.lower.as_ref().map_or(0, |bound| {
+                    lower_bound_index(&page.entries, bound, &self.key)
+                });
+                let end = bounds.upper.as_ref().map_or(page.entries.len(), |bound| {
+                    upper_bound_index(&page.entries, bound, &self.key)
+                });
+                end.saturating_sub(start)
+            })
+            .sum()
     }
 
     pub fn covers_paths(&self, paths: &BTreeSet<String>) -> bool {
@@ -577,24 +667,72 @@ impl IndexCatalog {
         self.stats.present_fields.get(field).copied()
     }
 
+    pub fn entry_count(&self) -> usize {
+        if self.runtime_pages.is_empty() {
+            self.entries.len()
+        } else {
+            self.runtime_pages
+                .iter()
+                .map(|page| page.entries.len())
+                .sum::<usize>()
+        }
+    }
+
+    pub fn entries_snapshot(&self) -> Vec<IndexEntry> {
+        if self.entries_materialized {
+            return self.entries.clone();
+        }
+
+        self.runtime_pages
+            .iter()
+            .flat_map(|page| page.entries.iter().cloned())
+            .collect()
+    }
+
+    pub fn for_each_entry(&self, mut visit: impl FnMut(&IndexEntry)) {
+        if self.runtime_pages.is_empty() {
+            for entry in &self.entries {
+                visit(entry);
+            }
+            return;
+        }
+
+        for page in &self.runtime_pages {
+            for entry in &page.entries {
+                visit(entry);
+            }
+        }
+    }
+
+    pub fn load_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
+        self.replace_entries(entries)
+    }
+
     pub fn stats_hydrated(&self) -> bool {
-        self.stats.entry_count == self.entries.len()
+        self.stats.entry_count == self.entry_count()
             && self.stats.present_fields.len() == self.key.len()
             && self.stats.value_frequencies.len() == self.key.len()
     }
 
     fn refresh_stats(&mut self) {
-        self.stats = IndexStats::build(&self.entries, &self.key);
+        self.stats = if self.runtime_pages.is_empty() {
+            IndexStats::build(&self.entries, &self.key)
+        } else {
+            IndexStats::build_pages(self.runtime_pages.iter(), &self.key)
+        };
     }
 
     fn invalidate_tree(&mut self) {
         self.tree = IndexTree::default();
     }
 
-    fn replace_entries(&mut self, entries: Vec<IndexEntry>) {
+    fn replace_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
         self.entries = entries;
+        self.runtime_pages = build_runtime_index_pages(&self.entries, &self.key)?;
+        self.entries_materialized = true;
         self.refresh_stats();
         self.invalidate_tree();
+        Ok(())
     }
 
     fn append_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
@@ -602,24 +740,105 @@ impl IndexCatalog {
             return Ok(());
         }
 
+        self.ensure_runtime_pages()?;
         if self.stats_hydrated() {
             for entry in &entries {
                 self.stats.insert_entry(entry, &self.key);
             }
         }
 
-        self.entries = merge_index_entries(
-            std::mem::take(&mut self.entries),
-            entries,
-            &self.key,
-            self.unique,
-            &self.name,
-        )?;
+        for entry in entries {
+            self.insert_entry_page_local(entry)?;
+        }
         if !self.stats_hydrated() {
             self.refresh_stats();
         }
+        self.invalidate_entries();
         self.invalidate_tree();
         Ok(())
+    }
+
+    fn contains_unique_key(&self, candidate_key: &Document, skip_record_id: Option<u64>) -> bool {
+        if self.runtime_pages.is_empty() {
+            let start = self.entries.partition_point(|entry| {
+                compare_index_keys(&entry.key, candidate_key, &self.key).is_lt()
+            });
+            return self.entries[start..]
+                .iter()
+                .take_while(|entry| {
+                    compare_index_keys(&entry.key, candidate_key, &self.key).is_eq()
+                })
+                .any(|entry| Some(entry.record_id) != skip_record_id);
+        }
+
+        let page_index = self.runtime_pages.partition_point(|page| {
+            page.last_entry()
+                .is_some_and(|last| compare_index_keys(&last.key, candidate_key, &self.key).is_lt())
+        });
+        let Some(page) = self.runtime_pages.get(page_index) else {
+            return false;
+        };
+        let Some(first) = page.first_entry() else {
+            return false;
+        };
+        if compare_index_keys(&first.key, candidate_key, &self.key).is_gt() {
+            return false;
+        }
+
+        let start = page.entries.partition_point(|entry| {
+            compare_index_keys(&entry.key, candidate_key, &self.key).is_lt()
+        });
+        page.entries[start..]
+            .iter()
+            .take_while(|entry| compare_index_keys(&entry.key, candidate_key, &self.key).is_eq())
+            .any(|entry| Some(entry.record_id) != skip_record_id)
+    }
+
+    fn ensure_runtime_pages(&mut self) -> Result<(), CatalogError> {
+        if self.runtime_pages.is_empty() && !self.entries.is_empty() {
+            self.runtime_pages = build_runtime_index_pages(&self.entries, &self.key)?;
+        }
+        Ok(())
+    }
+
+    fn insert_entry_page_local(&mut self, entry: IndexEntry) -> Result<(), CatalogError> {
+        if self.runtime_pages.is_empty() {
+            let mut page = RuntimeIndexPage::new();
+            page.insert_entry(entry, &self.key)?;
+            self.runtime_pages.push(page);
+            return Ok(());
+        }
+
+        let page_index = self.runtime_pages.partition_point(|page| {
+            page.last_entry()
+                .is_some_and(|last| compare_index_entries(last, &entry, &self.key).is_lt())
+        });
+        let page_index = page_index.min(self.runtime_pages.len().saturating_sub(1));
+        self.runtime_pages[page_index].insert_entry(entry, &self.key)?;
+        if self.runtime_pages[page_index].used_bytes > INDEX_PAGE_BYTES {
+            let replacement =
+                build_runtime_index_pages(&self.runtime_pages[page_index].entries, &self.key)?;
+            self.runtime_pages
+                .splice(page_index..=page_index, replacement.into_iter());
+        }
+        Ok(())
+    }
+
+    fn materialized_entries(&mut self) -> &[IndexEntry] {
+        if !self.entries_materialized {
+            self.entries = self
+                .runtime_pages
+                .iter()
+                .flat_map(|page| page.entries.iter().cloned())
+                .collect();
+            self.entries_materialized = true;
+        }
+        &self.entries
+    }
+
+    fn invalidate_entries(&mut self) {
+        self.entries.clear();
+        self.entries_materialized = false;
     }
 }
 
@@ -727,6 +946,17 @@ impl IndexStats {
             frequencies.sort_by(|left, right| compare_bson(&left.value, &right.value));
         }
         stats
+    }
+
+    fn build_pages<'a, I>(pages: I, key_pattern: &Document) -> Self
+    where
+        I: IntoIterator<Item = &'a RuntimeIndexPage>,
+    {
+        let entries = pages
+            .into_iter()
+            .flat_map(|page| page.entries.iter().cloned())
+            .collect::<Vec<_>>();
+        Self::build(&entries, key_pattern)
     }
 
     fn insert_entry(&mut self, entry: &IndexEntry, key_pattern: &Document) {
@@ -974,15 +1204,23 @@ pub fn build_index_specs(
             .transpose()?;
         let mut index = IndexCatalog::new(name.clone(), key.clone(), unique);
         index.expire_after_seconds = expire_after_seconds;
+        let mut entries = Vec::with_capacity(collection.records.len());
         for record in &collection.records {
             validate_record_against_index(&index, &record.document, None)?;
             insert_index_entry(
-                &mut index.entries,
+                &mut entries,
                 index_entry_for_document(record.record_id, &record.document, &index.key),
                 &index.key,
             );
         }
-        index.rebuild_tree();
+        if unique {
+            for pair in entries.windows(2) {
+                if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
+                    return Err(CatalogError::DuplicateKey(name.clone()));
+                }
+            }
+        }
+        index.replace_entries(entries)?;
         created.push(index);
     }
 
@@ -1086,18 +1324,19 @@ pub fn validate_collection_indexes(collection: &CollectionCatalog) -> Result<(),
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     for index in collection.indexes.values() {
-        if index.entries.len() != collection.records.len() {
+        let entries = index.entries_snapshot();
+        if entries.len() != collection.records.len() {
             return Err(CatalogError::InvalidIndexState(format!(
                 "index `{}` entry count {} does not match record count {}",
                 index.name,
-                index.entries.len(),
+                entries.len(),
                 collection.records.len()
             )));
         }
 
         let mut previous: Option<&IndexEntry> = None;
         let mut indexed_record_ids = BTreeSet::new();
-        for entry in &index.entries {
+        for entry in &entries {
             let Some(document) = record_by_id.get(&entry.record_id) else {
                 return Err(CatalogError::InvalidIndexState(format!(
                     "index `{}` references missing record id {}",
@@ -1174,11 +1413,7 @@ fn validate_record_against_index(
     }
 
     let candidate_key = index_key_for_document(document, &index.key);
-    let conflict = index.entries.iter().any(|entry| {
-        Some(entry.record_id) != skip_record_id
-            && compare_documents(&entry.key, &candidate_key) == Ordering::Equal
-    });
-    if conflict {
+    if index.contains_unique_key(&candidate_key, skip_record_id) {
         return Err(CatalogError::DuplicateKey(index.name.clone()));
     }
     Ok(())
@@ -1207,6 +1442,71 @@ fn insert_index_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry, key_patt
         .binary_search_by(|existing| compare_index_entries(existing, &entry, key_pattern))
         .unwrap_or_else(|position| position);
     entries.insert(position, entry);
+}
+
+fn build_runtime_index_pages(
+    entries: &[IndexEntry],
+    key_pattern: &Document,
+) -> Result<Vec<RuntimeIndexPage>, CatalogError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pages = Vec::new();
+    let mut page = RuntimeIndexPage::new();
+    for entry in entries {
+        if !page.entries.is_empty() && !page.can_fit_entry(entry)? {
+            pages.push(page);
+            page = RuntimeIndexPage::new();
+        }
+        page.insert_entry(entry.clone(), key_pattern)?;
+    }
+    if !page.entries.is_empty() {
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+fn page_overlaps_bounds(
+    page: &RuntimeIndexPage,
+    bounds: &IndexBounds,
+    key_pattern: &Document,
+) -> bool {
+    let Some(first) = page.first_entry() else {
+        return false;
+    };
+    let Some(last) = page.last_entry() else {
+        return false;
+    };
+
+    if let Some(lower) = bounds.lower.as_ref() {
+        let ordering = compare_index_keys(&last.key, &lower.key, key_pattern);
+        if ordering.is_lt() {
+            return false;
+        }
+    }
+
+    if let Some(upper) = bounds.upper.as_ref() {
+        let ordering = compare_index_keys(&first.key, &upper.key, key_pattern);
+        if ordering.is_gt() || (!upper.inclusive && ordering.is_eq()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn encoded_index_entry_storage_len(entry: &IndexEntry) -> Result<usize, CatalogError> {
+    let payload_len = bson::to_vec(entry)
+        .map_err(|error| CatalogError::InvalidIndexState(error.to_string()))?
+        .len();
+    let storage_len = INDEX_PAGE_HEADER_BYTES + INDEX_PAGE_SLOT_BYTES + payload_len;
+    if storage_len > INDEX_PAGE_BYTES {
+        return Err(CatalogError::InvalidIndexState(
+            "index entry exceeds runtime page capacity".to_string(),
+        ));
+    }
+    Ok(INDEX_PAGE_SLOT_BYTES + payload_len)
 }
 
 fn insert_batch_mutations<'a>(
@@ -1243,12 +1543,7 @@ fn stage_insert_entries(
     }
 
     for entry in &entries {
-        let position = index.entries.partition_point(|existing| {
-            compare_index_keys(&existing.key, &entry.key, &index.key).is_lt()
-        });
-        if index.entries.get(position).is_some_and(|existing| {
-            compare_index_keys(&existing.key, &entry.key, &index.key) == Ordering::Equal
-        }) {
+        if index.contains_unique_key(&entry.key, None) {
             return Err(CatalogError::DuplicateKey(index.name.clone()));
         }
     }
@@ -1301,10 +1596,9 @@ fn stage_index_entries(
 
     replacements.sort_by(|left, right| compare_index_entries(left, right, &index.key));
     let retained = index
-        .entries
-        .iter()
+        .entries_snapshot()
+        .into_iter()
         .filter(|entry| !affected_record_ids.contains(&entry.record_id))
-        .cloned()
         .collect::<Vec<_>>();
     Ok(Some(merge_index_entries(
         retained,
