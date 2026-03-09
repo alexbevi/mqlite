@@ -123,7 +123,7 @@ file:///absolute/path/to/database.mongodb?db=app
 ### Storage and catalog
 - One durable `.mongodb` file per broker.
 - Fixed file header and rotating superblocks.
-- Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas, typed index create/drop frames, and collection-level replacement or drop frames where a whole-collection rewrite is still required. Concurrent broker writes append and apply those WAL mutations under the storage lock, then share a short group-commit `fsync` barrier before success is returned.
+- Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas, typed index create/drop frames, fresh-collection rewrite frames for `$out`-style namespace replacement, and collection-level replacement or drop frames where a full collection image still has to move as one unit. Concurrent broker writes append and apply those WAL mutations under the storage lock, then share a short group-commit `fsync` barrier before success is returned.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
 - Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
 - Incremental CRUD apply batches touched record and index-entry updates in memory, merging only affected index entry vectors and rebuilding each affected B-tree once per committed mutation.
@@ -228,7 +228,7 @@ file:///absolute/path/to/database.mongodb?db=app
   - `$replaceWith`
 - Same-file cross-namespace aggregation via `$unionWith` and `$lookup`, including collection-backed namespace resolution and collectionless `$documents` subpipelines for both stages.
 - Same-file aggregation write stages via `$out`, including string targets and `{ db, coll }` targets within the same `.mongodb` file.
-- Same-file aggregation write stages via `$merge`, including string targets or `{ db, coll }` targets, `on` fields, and the currently supported string mode combinations for `whenMatched` and `whenNotMatched`.
+- Same-file aggregation write stages via `$merge`, including string targets or `{ db, coll }` targets, `on` fields, and the currently supported string mode combinations for `whenMatched` and `whenNotMatched`. `$merge` now persists ordered collection deltas against the live target namespace instead of cloning and replacing the whole collection image.
 - Collectionless aggregation via `aggregate: 1` when the pipeline begins with `$documents` or `$changeStream`.
 - Collectionless `$currentOp` aggregation with `localOps: true` on `admin`, including follow-on pipeline stages such as `$project` and `$match`.
 - Collection-backed `$collStats` metadata aggregation as a first stage, currently supporting `count` and `storageStats` output against the local file-backed namespace.

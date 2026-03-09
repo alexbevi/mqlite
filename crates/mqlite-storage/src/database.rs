@@ -97,6 +97,15 @@ pub enum WalMutation {
         #[serde(default)]
         change_events: Vec<PersistedChangeEvent>,
     },
+    RewriteCollection {
+        database: String,
+        collection: String,
+        options: bson::Document,
+        #[serde(default)]
+        changes: Vec<CollectionChange>,
+        #[serde(default)]
+        change_events: Vec<PersistedChangeEvent>,
+    },
     ApplyCollectionChanges {
         database: String,
         collection: String,
@@ -1182,6 +1191,16 @@ fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutat
                 .replace_collection(database, collection, hydrated);
             state.change_events.extend(change_events.iter().cloned());
         }
+        WalMutation::RewriteCollection {
+            database,
+            collection,
+            options,
+            changes,
+            change_events,
+        } => {
+            rewrite_collection(state, database, collection, options, changes)?;
+            state.change_events.extend(change_events.iter().cloned());
+        }
         WalMutation::ApplyCollectionChanges {
             database,
             collection,
@@ -1251,6 +1270,16 @@ fn apply_owned_mutation(
             state
                 .catalog
                 .replace_collection(&database, &collection, collection_state);
+            state.change_events.extend(change_events);
+        }
+        WalMutation::RewriteCollection {
+            database,
+            collection,
+            options,
+            changes,
+            change_events,
+        } => {
+            rewrite_collection(state, &database, &collection, &options, &changes)?;
             state.change_events.extend(change_events);
         }
         WalMutation::ApplyCollectionChanges {
@@ -1346,6 +1375,12 @@ fn mark_mutation_dirty(
             change_events,
             ..
         }
+        | WalMutation::RewriteCollection {
+            database,
+            collection,
+            change_events,
+            ..
+        }
         | WalMutation::ApplyCollectionChanges {
             database,
             collection,
@@ -1383,6 +1418,11 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
             collection_state, ..
         } => {
             validate_collection_indexes(collection_state).map_err(map_catalog_error)?;
+        }
+        WalMutation::RewriteCollection {
+            options, changes, ..
+        } => {
+            validate_rewrite_collection(options, changes)?;
         }
         WalMutation::ApplyCollectionChanges {
             database,
@@ -1507,6 +1547,21 @@ fn apply_collection_changes(
     apply_collection_change_set(collection_state, changes)
 }
 
+fn rewrite_collection(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    options: &bson::Document,
+    changes: &[CollectionChange],
+) -> Result<()> {
+    let mut collection_state = CollectionCatalog::new(options.clone());
+    apply_collection_change_set(&mut collection_state, changes)?;
+    state
+        .catalog
+        .replace_collection(database, collection, collection_state);
+    Ok(())
+}
+
 fn validate_collection_changes(
     state: &PersistedState,
     database: &str,
@@ -1525,6 +1580,14 @@ fn validate_collection_changes(
         overlay.apply(change)?;
     }
     Ok(())
+}
+
+fn validate_rewrite_collection(
+    options: &bson::Document,
+    changes: &[CollectionChange],
+) -> Result<()> {
+    let mut preview_collection = CollectionCatalog::new(options.clone());
+    apply_collection_change_set(&mut preview_collection, changes)
 }
 
 fn apply_collection_change_set(
@@ -2635,6 +2698,57 @@ mod tests {
         assert_eq!(inspect.last_applied_sequence, 1);
         assert_eq!(inspect.wal_records_since_checkpoint, 1);
         assert_eq!(inspect.databases, vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn recovers_rewrite_collection_from_wal_without_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-rewrite-recovery.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection =
+                CollectionCatalog::new(doc! { "validator": { "qty": { "$gte": 0 } } });
+            insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "a", "qty": 4 });
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("commit mutation");
+            database
+                .commit_mutation(WalMutation::RewriteCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    options: doc! { "validator": { "qty": { "$gte": 0 } } },
+                    changes: vec![CollectionChange::Insert(CollectionRecord {
+                        record_id: 1,
+                        document: doc! { "_id": 2, "sku": "b", "qty": 7 },
+                    })],
+                    change_events: Vec::new(),
+                })
+                .expect("rewrite collection");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(
+            collection.records[0].document.get_i32("qty").expect("qty"),
+            7
+        );
+        assert_eq!(collection.indexes.len(), 1);
+        assert!(collection.indexes.contains_key("_id_"));
     }
 
     #[test]

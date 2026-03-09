@@ -3449,26 +3449,28 @@ impl Broker {
         results: Vec<Document>,
     ) -> Result<(), CommandError> {
         let mut storage = self.storage.write();
-        let existing_options = storage
+        let options = storage
             .catalog()
             .get_collection(database, collection)
             .ok()
             .map(|catalog| catalog.options.clone())
             .unwrap_or_default();
-        let mut collection_state = CollectionCatalog::new(existing_options);
+        let mut changes = Vec::with_capacity(results.len());
+        let mut next_record_id = 1_u64;
         for mut document in results {
             ensure_object_id(&mut document);
-            let record_id = collection_state.next_record_id();
-            collection_state.insert_record(CollectionRecord {
-                record_id,
+            changes.push(CollectionChange::Insert(CollectionRecord {
+                record_id: next_record_id,
                 document,
-            })?;
+            }));
+            next_record_id += 1;
         }
         let sequence = storage
-            .commit_mutation_unflushed(WalMutation::ReplaceCollection {
+            .commit_mutation_unflushed(WalMutation::RewriteCollection {
                 database: database.to_string(),
                 collection: collection.to_string(),
-                collection_state,
+                options,
+                changes,
                 change_events: Vec::new(),
             })
             .map_err(internal_error)?;
@@ -3484,11 +3486,15 @@ impl Broker {
     ) -> Result<(), CommandError> {
         let database = target.database.as_deref().unwrap_or(default_database);
         let mut storage = self.storage.write();
-        let mut collection_state = storage
+        let collection = storage
             .catalog()
             .get_collection(database, &target.collection)
-            .cloned()
-            .unwrap_or_else(|_| CollectionCatalog::new(Document::new()));
+            .ok();
+        let create_options = collection.is_none().then_some(Document::new());
+        let mut next_record_id = next_record_id(collection);
+        let mut visible_updates = BTreeMap::new();
+        let mut inserted_records = Vec::new();
+        let mut changes = Vec::new();
         let mut deferred_error = None;
 
         for mut document in results {
@@ -3496,15 +3502,13 @@ impl Broker {
                 ensure_object_id(&mut document);
             }
 
-            let matches = collection_state
-                .records
-                .iter()
-                .enumerate()
-                .filter(|(_, record)| {
-                    merge_fields_match(&record.document, &document, &target.on_fields)
-                })
-                .map(|(position, _)| position)
-                .collect::<Vec<_>>();
+            let matches = merge_matching_records(
+                collection,
+                &document,
+                &target.on_fields,
+                &inserted_records,
+                &visible_updates,
+            );
 
             if matches.len() > 1 {
                 deferred_error.get_or_insert_with(|| {
@@ -3517,20 +3521,31 @@ impl Broker {
                 continue;
             }
 
-            if let Some(position) = matches.first().copied() {
-                let existing = collection_state.records[position].document.clone();
+            if let Some((record_id, existing)) = matches.into_iter().next() {
                 let outcome = match target.when_matched {
-                    MergeWhenMatched::Replace => collection_state
-                        .update_record_at(position, document)
-                        .map(|_| ()),
+                    MergeWhenMatched::Replace => {
+                        if document != existing {
+                            visible_updates.insert(record_id, document.clone());
+                            changes.push(CollectionChange::Update(CollectionRecord {
+                                record_id,
+                                document,
+                            }));
+                        }
+                        Ok(())
+                    }
                     MergeWhenMatched::Merge => {
-                        let mut merged = existing;
+                        let mut merged = existing.clone();
                         for (field, value) in document {
                             merged.insert(field, value);
                         }
-                        collection_state
-                            .update_record_at(position, merged)
-                            .map(|_| ())
+                        if merged != existing {
+                            visible_updates.insert(record_id, merged.clone());
+                            changes.push(CollectionChange::Update(CollectionRecord {
+                                record_id,
+                                document: merged,
+                            }));
+                        }
+                        Ok(())
                     }
                     MergeWhenMatched::KeepExisting => Ok(()),
                     MergeWhenMatched::Fail => Err(CatalogError::DuplicateKey(
@@ -3550,10 +3565,16 @@ impl Broker {
             }
 
             let outcome = match target.when_not_matched {
-                MergeWhenNotMatched::Insert => collection_state.insert_record(CollectionRecord {
-                    record_id: collection_state.next_record_id(),
-                    document,
-                }),
+                MergeWhenNotMatched::Insert => {
+                    let record = CollectionRecord {
+                        record_id: next_record_id,
+                        document,
+                    };
+                    next_record_id += 1;
+                    inserted_records.push(record.clone());
+                    changes.push(CollectionChange::Insert(record));
+                    Ok(())
+                }
                 MergeWhenNotMatched::Discard => Ok(()),
                 MergeWhenNotMatched::Fail => Err(CatalogError::InvalidIndexState(
                     "merge did not find a matching target document".to_string(),
@@ -3573,10 +3594,14 @@ impl Broker {
         }
 
         let sequence = storage
-            .commit_mutation_unflushed(WalMutation::ReplaceCollection {
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
                 database: database.to_string(),
                 collection: target.collection.clone(),
-                collection_state,
+                create_options,
+                changes,
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
                 change_events: Vec::new(),
             })
             .map_err(internal_error)?;
@@ -3832,6 +3857,46 @@ fn merge_fields_match(left: &Document, right: &Document, on_fields: &[String]) -
         let right_value = lookup_path_owned(right, field).unwrap_or(Bson::Null);
         compare_bson(&left_value, &right_value).is_eq()
     })
+}
+
+fn merge_matching_records(
+    collection: Option<&CollectionCatalog>,
+    document: &Document,
+    on_fields: &[String],
+    inserted_records: &[CollectionRecord],
+    visible_updates: &BTreeMap<u64, Document>,
+) -> Vec<(u64, Document)> {
+    let mut matches = Vec::new();
+
+    if let Some(collection) = collection {
+        for (position, record) in collection.records.iter().enumerate() {
+            let visible_document = visible_updates
+                .get(&record.record_id)
+                .cloned()
+                .unwrap_or_else(|| record.document.clone());
+            if merge_fields_match(&visible_document, document, on_fields) {
+                matches.push((position, usize::MAX, record.record_id, visible_document));
+            }
+        }
+    }
+
+    for (position, record) in inserted_records.iter().enumerate() {
+        let visible_document = visible_updates
+            .get(&record.record_id)
+            .cloned()
+            .unwrap_or_else(|| record.document.clone());
+        if merge_fields_match(&visible_document, document, on_fields) {
+            matches.push((usize::MAX, position, record.record_id, visible_document));
+        }
+    }
+
+    matches.sort_by_key(|(base_position, inserted_position, record_id, _)| {
+        (*base_position, *inserted_position, *record_id)
+    });
+    matches
+        .into_iter()
+        .map(|(_, _, record_id, visible_document)| (record_id, visible_document))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6480,6 +6545,108 @@ mod tests {
                 .expect("sku"),
             "a"
         );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aggregate_merge_updates_target_and_persists_across_restart() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("aggregate-merge.mongodb");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert_source = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "_id": 1, "sku": "a", "qty": 2 },
+                    { "_id": 2, "sku": "b", "qty": 1 }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert_source.get_f64("ok").expect("ok"), 1.0);
+
+        let insert_target = send_command(
+            &mut stream,
+            doc! {
+                "insert": "report",
+                "documents": [
+                    { "_id": 99, "sku": "a", "qty": 1, "tag": "old" }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert_target.get_f64("ok").expect("ok"), 1.0);
+
+        let merge = send_command(
+            &mut stream,
+            doc! {
+                "aggregate": "widgets",
+                "pipeline": [
+                    { "$project": { "_id": 1, "sku": 1, "qty": 1, "flag": { "$literal": "new" } } },
+                    {
+                        "$merge": {
+                            "into": "report",
+                            "on": ["sku"],
+                            "whenMatched": "merge",
+                            "whenNotMatched": "insert"
+                        }
+                    }
+                ],
+                "cursor": {},
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(merge.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let (serve_task, manifest) = start_broker_at(&database_path).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+        let report = send_command(
+            &mut stream,
+            doc! {
+                "find": "report",
+                "sort": { "sku": 1 },
+                "$db": "app"
+            },
+        )
+        .await;
+        let report_batch = report
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert_eq!(report_batch.len(), 2);
+
+        let first = report_batch[0].as_document().expect("first document");
+        assert_eq!(first.get_str("sku").expect("sku"), "a");
+        assert_eq!(first.get_i32("qty").expect("qty"), 2);
+        assert_eq!(first.get_str("tag").expect("tag"), "old");
+        assert_eq!(first.get_str("flag").expect("flag"), "new");
+
+        let second = report_batch[1].as_document().expect("second document");
+        assert_eq!(second.get_str("sku").expect("sku"), "b");
+        assert_eq!(second.get_i32("qty").expect("qty"), 1);
+        assert_eq!(second.get_str("flag").expect("flag"), "new");
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

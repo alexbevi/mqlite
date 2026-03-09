@@ -240,11 +240,14 @@ Current cross-namespace aggregation behavior:
   `$convert` currently supports the core scalar target families plus `onError` and `onNull`;
   feature-flagged or BinData-oriented variants such as `base`, `format`, `byteOrder`, and subtype
   conversions are still rejected explicitly.
-- `$out` is a broker-backed terminal write stage that replaces a same-file target namespace and
-  returns an empty cursor result to the client.
+- `$out` is a broker-backed terminal write stage that replaces a same-file target namespace
+  through a fresh-collection rewrite WAL frame, preserving collection options but resetting the
+  namespace to a new `_id_` index plus the pipeline output documents, and returns an empty cursor
+  result to the client.
 - `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file
   target namespace using supported `whenMatched` and `whenNotMatched` string modes plus optional
-  `on` fields.
+  `on` fields. It reuses the same ordered delta persistence path as CRUD writes instead of
+  replacing the whole target collection image.
 - The current implementation does not federate across files or processes.
 
 ## WAL And Recovery
@@ -252,7 +255,7 @@ Current cross-namespace aggregation behavior:
 Mutations are durable through an append-only WAL.
 
 - CRUD writes append ordered typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
-- Ordered CRUD deltas and index create/drop operations use typed WAL frames; collection replacement and drop remain collection-level WAL frames for full-namespace rewrites.
+- Ordered CRUD deltas and index create/drop operations use typed WAL frames. `$out`-style namespace resets use a fresh-collection rewrite frame that rebuilds the target from collection options plus ordered inserts, while collection replacement and drop remain collection-level WAL frames where a full collection image still has to move as one unit.
 - WAL frames include a sequence number and checksum.
 - The broker applies the mutation to in-memory state immediately after the WAL append succeeds, then waits for a shared WAL sync barrier before acknowledging command success.
 - Read paths borrow storage only after the visible sequence is durable, so queries and metadata commands do not observe broker-local writes that are still waiting on the shared WAL sync.
