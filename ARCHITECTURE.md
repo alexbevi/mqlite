@@ -54,6 +54,7 @@ The broker is the only writer for a database file.
 - CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
 - The attach or spawn path treats the manifest as the readiness signal, but if `serve` exits before publishing it the caller reports that startup error directly instead of waiting out the manifest timeout.
+- Auto-spawned brokers can also receive a watched parent pid; once that launcher process has died and the broker has no active IPC connections left, the broker exits immediately instead of waiting for the normal idle timeout.
 
 ## Durable File Layout
 

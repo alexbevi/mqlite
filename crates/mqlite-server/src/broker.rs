@@ -51,8 +51,11 @@ pub struct BrokerConfig {
     pub database_path: PathBuf,
     pub idle_shutdown_secs: u64,
     pub checkpoint_interval_secs: u64,
+    pub watch_parent_pid: Option<u32>,
     #[cfg(test)]
     pub checkpoint_test_delay_ms: u64,
+    #[cfg(test)]
+    pub watch_parent_pid_alive_override: Option<fn(u32) -> bool>,
 }
 
 impl BrokerConfig {
@@ -61,8 +64,11 @@ impl BrokerConfig {
             database_path: database_path.as_ref().to_path_buf(),
             idle_shutdown_secs,
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            watch_parent_pid: None,
             #[cfg(test)]
             checkpoint_test_delay_ms: 0,
+            #[cfg(test)]
+            watch_parent_pid_alive_override: None,
         }
     }
 }
@@ -291,6 +297,11 @@ impl Broker {
                                 .map_err(|error| anyhow!("background checkpoint task failed: {error}"))?,
                         )?;
                     }
+                    let watched_parent_exited = self.watched_parent_has_exited();
+                    if watched_parent_exited && self.active_connections.load(Ordering::SeqCst) == 0
+                    {
+                        break;
+                    }
                     if checkpoint_task.is_none()
                         && self.active_connections.load(Ordering::SeqCst) == 0
                         && self.last_activity.lock().elapsed() >= idle_timeout
@@ -298,6 +309,7 @@ impl Broker {
                         break;
                     }
                     if checkpoint_task.is_none()
+                        && !watched_parent_exited
                         && last_checkpoint.elapsed() >= checkpoint_interval
                         && self.active_commands.load(Ordering::SeqCst) == 0
                         && self.last_activity.lock().elapsed() >= CHECKPOINT_QUIET_PERIOD
@@ -329,6 +341,13 @@ impl Broker {
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
         Ok(())
+    }
+
+    fn watched_parent_has_exited(&self) -> bool {
+        let Some(parent_pid) = self.config.watch_parent_pid else {
+            return false;
+        };
+        !watched_parent_is_alive(&self.config, parent_pid)
     }
 
     fn checkpoint_if_needed(&self) -> Result<bool> {
@@ -3082,6 +3101,65 @@ fn background_checkpoint_test_delay_ms(config: &BrokerConfig) -> u64 {
 #[cfg(not(test))]
 fn background_checkpoint_test_delay_ms(_config: &BrokerConfig) -> u64 {
     0
+}
+
+#[cfg(test)]
+fn watched_parent_is_alive(config: &BrokerConfig, parent_pid: u32) -> bool {
+    if let Some(override_fn) = config.watch_parent_pid_alive_override {
+        return override_fn(parent_pid);
+    }
+    process_is_alive(parent_pid)
+}
+
+#[cfg(not(test))]
+fn watched_parent_is_alive(_config: &BrokerConfig, parent_pid: u32) -> bool {
+    process_is_alive(parent_pid)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, STILL_ACTIVE, WAIT_TIMEOUT},
+        System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+            WaitForSingleObject,
+        },
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+
+        let wait_status = WaitForSingleObject(handle, 0);
+        let mut exit_code = 0;
+        let exit_code_status = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+
+        wait_status == WAIT_TIMEOUT && exit_code_status != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6310,7 +6388,10 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::Path,
-        sync::{Arc, Barrier},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -6324,6 +6405,12 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{Broker, BrokerConfig, matching_records_for_write};
+
+    static TEST_WATCHED_PARENT_ALIVE: AtomicBool = AtomicBool::new(true);
+
+    fn test_watched_parent_is_alive(_pid: u32) -> bool {
+        TEST_WATCHED_PARENT_ALIVE.load(Ordering::SeqCst)
+    }
 
     #[test]
     fn write_matching_records_include_overlay_updates_and_inserts() {
@@ -6688,6 +6775,44 @@ mod tests {
         let inspect = DatabaseFile::inspect(&database_path).expect("inspect after shutdown");
         assert_eq!(inspect.current_record_count, 3);
         assert_eq!(inspect.wal_records_since_checkpoint, 0);
+    }
+
+    #[tokio::test]
+    async fn exits_after_watched_parent_terminates_once_connections_close() {
+        TEST_WATCHED_PARENT_ALIVE.store(true, Ordering::SeqCst);
+
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("watched-parent.mongodb");
+        let mut config = BrokerConfig::new(&database_path, 60);
+        config.watch_parent_pid = Some(4242);
+        config.watch_parent_pid_alive_override = Some(test_watched_parent_is_alive);
+
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let stream = connect(&manifest.endpoint).await.expect("connect");
+
+        TEST_WATCHED_PARENT_ALIVE.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !serve_task.is_finished(),
+            "broker should not exit until the last active connection closes"
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+        assert!(
+            !manifest_path.exists(),
+            "manifest should be removed on shutdown"
+        );
+
+        TEST_WATCHED_PARENT_ALIVE.store(true, Ordering::SeqCst);
     }
 
     #[cfg(unix)]

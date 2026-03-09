@@ -48,11 +48,11 @@ Local durable-file compression is internal to `mqlite` and does not change the `
 ### Broker lifecycle
 - Compute the manifest path adjacent to the target `.mongodb` file.
 - If the manifest exists and the broker is alive, attach to the advertised endpoint.
-- If no live broker exists, spawn `mqlite serve --file <path>`.
+- If no live broker exists, spawn `mqlite serve --file <path> --watch-parent-pid <launcher-pid>`.
 - Re-read the manifest and connect once the endpoint is ready.
 - If the spawned broker exits before writing the manifest, surface that startup error instead of reporting only a manifest timeout.
 - Once the broker is running, it checkpoints automatically after about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. That periodic checkpoint is handed off to a background worker so later commands can keep running; if the broker cannot safely reuse inactive checkpoint space for that rewrite, it leaves the WAL in place and still checkpoints on idle shutdown.
-- Brokers are shared per file and may shut down after an idle timeout.
+- Brokers are shared per file and may shut down after an idle timeout, but launcher-owned brokers should also exit promptly once their spawning process is gone and their active IPC connections have drained.
 
 ### Transport
 - On POSIX, connect with a Unix domain socket.

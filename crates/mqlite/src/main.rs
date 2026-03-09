@@ -30,6 +30,8 @@ enum Command {
         file: PathBuf,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
+        #[arg(long)]
+        watch_parent_pid: Option<u32>,
     },
     Checkpoint {
         #[arg(long)]
@@ -84,8 +86,11 @@ async fn main() -> Result<()> {
         Command::Serve {
             file,
             idle_shutdown_secs,
+            watch_parent_pid,
         } => {
-            let broker = Broker::new(BrokerConfig::new(file, idle_shutdown_secs))?;
+            let mut config = BrokerConfig::new(file, idle_shutdown_secs);
+            config.watch_parent_pid = watch_parent_pid;
+            let broker = Broker::new(config)?;
             broker.serve().await?;
         }
         Command::Checkpoint { file } => {
@@ -224,6 +229,7 @@ fn spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<Child> {
     let child = ProcessCommand::new(current_executable)
         .args(["serve", "--file"])
         .arg(file)
+        .args(["--watch-parent-pid", &std::process::id().to_string()])
         .args(["--idle-shutdown-secs", &idle_shutdown_secs.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

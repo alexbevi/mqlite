@@ -2,6 +2,7 @@ use std::{fs, thread, time::Duration};
 
 use assert_cmd::Command;
 use bson::{Binary, Bson, doc, spec::BinarySubtype};
+use mqlite_ipc::broker_paths;
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -109,6 +110,41 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
     assert_eq!(first_batch.len(), 1);
     assert_eq!(first_batch[0]["sku"], "alpha");
     assert_eq!(first_batch[0]["qty"], 2);
+}
+
+#[test]
+fn command_auto_spawned_broker_exits_when_launcher_process_ends() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("launcher-owned.mongodb");
+    let manifest_path = broker_paths(&database_path)
+        .expect("broker paths")
+        .manifest_path;
+
+    let mut create = Command::cargo_bin("mqlite").expect("binary");
+    create
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "60",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while manifest_path.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !manifest_path.exists(),
+        "auto-spawned broker should exit after the launcher process ends"
+    );
 }
 
 #[test]
