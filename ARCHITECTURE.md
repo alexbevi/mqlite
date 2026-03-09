@@ -258,6 +258,7 @@ Mutations are durable through an append-only WAL.
 - Ordered CRUD deltas and index create/drop operations use typed WAL frames. `$out`-style namespace resets use a fresh-collection rewrite frame that rebuilds the target from collection options plus ordered inserts, while collection replacement and drop remain collection-level WAL frames where a full collection image still has to move as one unit.
 - WAL frames include a sequence number and checksum.
 - WAL frames and checkpoint snapshots encode their control metadata in a compact CBOR envelope while preserving embedded MongoDB documents as raw BSON bytes, so exact BSON typing survives recovery without paying BSON-document overhead for the whole envelope.
+- When the broker already hands storage pre-encoded change-event byte fields, WAL append serialization borrows those byte slices directly into the compact CBOR frame instead of cloning a second owned copy before the write.
 - Persisted change events also keep `documentKey`, `fullDocument`, `fullDocumentBeforeChange`, `updateDescription`, `extraFields`, and the resume-token document as raw BSON blobs, materializing nested `Document`s only when a `$changeStream` reader asks for them.
 - The broker applies the mutation to in-memory state immediately after the WAL append succeeds, then waits for a shared WAL sync barrier before acknowledging command success.
 - Read paths borrow storage only after the visible sequence is durable, so queries and metadata commands do not observe broker-local writes that are still waiting on the shared WAL sync.

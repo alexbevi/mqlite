@@ -401,6 +401,12 @@ struct CompactWalEntry {
     mutation: CompactWalMutation,
 }
 
+#[derive(Debug, Serialize)]
+struct EncodedWalEntry<'a> {
+    sequence: u64,
+    mutation: EncodedWalMutation<'a>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum CompactWalMutation {
     ReplaceCollection {
@@ -443,6 +449,51 @@ enum CompactWalMutation {
         database: String,
         collection: String,
         change_events: Vec<CompactPersistedChangeEvent>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+enum EncodedWalMutation<'a> {
+    ReplaceCollection {
+        database: &'a str,
+        collection: &'a str,
+        collection_state: CompactCollectionCatalog,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
+    },
+    RewriteCollection {
+        database: &'a str,
+        collection: &'a str,
+        options: Vec<u8>,
+        changes: Vec<CompactCollectionChange>,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
+    },
+    ApplyCollectionChanges {
+        database: &'a str,
+        collection: &'a str,
+        create_options: Option<Vec<u8>>,
+        changes: Vec<CompactCollectionChange>,
+        inserts: Vec<CompactCollectionRecord>,
+        updates: Vec<CompactCollectionRecord>,
+        deletes: Vec<u64>,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
+    },
+    CreateIndexes {
+        database: &'a str,
+        collection: &'a str,
+        create_options: Option<Vec<u8>>,
+        specs: Vec<Vec<u8>>,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
+    },
+    DropIndexes {
+        database: &'a str,
+        collection: &'a str,
+        target: &'a str,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
+    },
+    DropCollection {
+        database: &'a str,
+        collection: &'a str,
+        change_events: Vec<EncodedPersistedChangeEvent<'a>>,
     },
 }
 
@@ -490,6 +541,23 @@ struct CompactPersistedChangeEvent {
     update_description: Option<Vec<u8>>,
     expanded: bool,
     extra_fields: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct EncodedPersistedChangeEvent<'a> {
+    token: &'a [u8],
+    cluster_time_time: u32,
+    cluster_time_increment: u32,
+    wall_time_millis: i64,
+    database: &'a str,
+    collection: Option<&'a str>,
+    operation_type: &'a str,
+    document_key: Option<&'a [u8]>,
+    full_document: Option<&'a [u8]>,
+    full_document_before_change: Option<&'a [u8]>,
+    update_description: Option<&'a [u8]>,
+    expanded: bool,
+    extra_fields: &'a [u8],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1548,13 +1616,6 @@ impl CompactSnapshotIndexCatalog {
 }
 
 impl CompactWalEntry {
-    fn from_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Self> {
-        Ok(Self {
-            sequence,
-            mutation: CompactWalMutation::from_wal_mutation(mutation)?,
-        })
-    }
-
     fn into_wal_entry(self) -> Result<WalEntry> {
         Ok(WalEntry {
             sequence: self.sequence,
@@ -1563,123 +1624,16 @@ impl CompactWalEntry {
     }
 }
 
-impl CompactWalMutation {
-    fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
-        Ok(match mutation {
-            WalMutation::ReplaceCollection {
-                database,
-                collection,
-                collection_state,
-                change_events,
-            } => Self::ReplaceCollection {
-                database: database.clone(),
-                collection: collection.clone(),
-                collection_state: CompactCollectionCatalog::from_collection_catalog(
-                    collection_state,
-                )?,
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
-            WalMutation::RewriteCollection {
-                database,
-                collection,
-                options,
-                changes,
-                change_events,
-            } => Self::RewriteCollection {
-                database: database.clone(),
-                collection: collection.clone(),
-                options: encode_document_bytes(options)?,
-                changes: changes
-                    .iter()
-                    .map(CompactCollectionChange::from_collection_change)
-                    .collect::<Result<Vec<_>>>()?,
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
-            WalMutation::ApplyCollectionChanges {
-                database,
-                collection,
-                create_options,
-                changes,
-                inserts,
-                updates,
-                deletes,
-                change_events,
-            } => Self::ApplyCollectionChanges {
-                database: database.clone(),
-                collection: collection.clone(),
-                create_options: encode_optional_document_bytes(create_options.as_ref())?,
-                changes: changes
-                    .iter()
-                    .map(CompactCollectionChange::from_collection_change)
-                    .collect::<Result<Vec<_>>>()?,
-                inserts: inserts
-                    .iter()
-                    .map(CompactCollectionRecord::from_collection_record)
-                    .collect::<Result<Vec<_>>>()?,
-                updates: updates
-                    .iter()
-                    .map(CompactCollectionRecord::from_collection_record)
-                    .collect::<Result<Vec<_>>>()?,
-                deletes: deletes.clone(),
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
-            WalMutation::CreateIndexes {
-                database,
-                collection,
-                create_options,
-                specs,
-                change_events,
-            } => Self::CreateIndexes {
-                database: database.clone(),
-                collection: collection.clone(),
-                create_options: encode_optional_document_bytes(create_options.as_ref())?,
-                specs: specs
-                    .iter()
-                    .map(encode_document_bytes)
-                    .collect::<Result<Vec<_>>>()?,
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
-            WalMutation::DropIndexes {
-                database,
-                collection,
-                target,
-                change_events,
-            } => Self::DropIndexes {
-                database: database.clone(),
-                collection: collection.clone(),
-                target: target.clone(),
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
-            WalMutation::DropCollection {
-                database,
-                collection,
-                change_events,
-            } => Self::DropCollection {
-                database: database.clone(),
-                collection: collection.clone(),
-                change_events: change_events
-                    .iter()
-                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
-                    .collect::<Result<Vec<_>>>()?,
-            },
+impl<'a> EncodedWalEntry<'a> {
+    fn from_wal_entry(sequence: u64, mutation: &'a WalMutation) -> Result<Self> {
+        Ok(Self {
+            sequence,
+            mutation: EncodedWalMutation::from_wal_mutation(mutation)?,
         })
     }
+}
 
+impl CompactWalMutation {
     fn into_wal_mutation(self) -> Result<WalMutation> {
         Ok(match self {
             Self::ReplaceCollection {
@@ -1790,6 +1744,124 @@ impl CompactWalMutation {
                     .into_iter()
                     .map(CompactPersistedChangeEvent::into_persisted_change_event)
                     .collect::<Result<Vec<_>>>()?,
+            },
+        })
+    }
+}
+
+impl<'a> EncodedWalMutation<'a> {
+    fn from_wal_mutation(mutation: &'a WalMutation) -> Result<Self> {
+        Ok(match mutation {
+            WalMutation::ReplaceCollection {
+                database,
+                collection,
+                collection_state,
+                change_events,
+            } => Self::ReplaceCollection {
+                database,
+                collection,
+                collection_state: CompactCollectionCatalog::from_collection_catalog(
+                    collection_state,
+                )?,
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
+            },
+            WalMutation::RewriteCollection {
+                database,
+                collection,
+                options,
+                changes,
+                change_events,
+            } => Self::RewriteCollection {
+                database,
+                collection,
+                options: encode_document_bytes(options)?,
+                changes: changes
+                    .iter()
+                    .map(CompactCollectionChange::from_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
+            },
+            WalMutation::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options,
+                changes,
+                inserts,
+                updates,
+                deletes,
+                change_events,
+            } => Self::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options: encode_optional_document_bytes(create_options.as_ref())?,
+                changes: changes
+                    .iter()
+                    .map(CompactCollectionChange::from_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                inserts: inserts
+                    .iter()
+                    .map(CompactCollectionRecord::from_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                updates: updates
+                    .iter()
+                    .map(CompactCollectionRecord::from_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                deletes: deletes.clone(),
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
+            },
+            WalMutation::CreateIndexes {
+                database,
+                collection,
+                create_options,
+                specs,
+                change_events,
+            } => Self::CreateIndexes {
+                database,
+                collection,
+                create_options: encode_optional_document_bytes(create_options.as_ref())?,
+                specs: specs
+                    .iter()
+                    .map(encode_document_bytes)
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
+            },
+            WalMutation::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events,
+            } => Self::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
+            },
+            WalMutation::DropCollection {
+                database,
+                collection,
+                change_events,
+            } => Self::DropCollection {
+                database,
+                collection,
+                change_events: change_events
+                    .iter()
+                    .map(EncodedPersistedChangeEvent::from_persisted_change_event)
+                    .collect(),
             },
         })
     }
@@ -1906,24 +1978,6 @@ impl CompactIndexEntry {
 }
 
 impl CompactPersistedChangeEvent {
-    fn from_persisted_change_event(event: &PersistedChangeEvent) -> Result<Self> {
-        Ok(Self {
-            token: event.token.clone(),
-            cluster_time_time: event.cluster_time.time,
-            cluster_time_increment: event.cluster_time.increment,
-            wall_time_millis: event.wall_time.timestamp_millis(),
-            database: event.database.clone(),
-            collection: event.collection.clone(),
-            operation_type: event.operation_type.clone(),
-            document_key: event.document_key.clone(),
-            full_document: event.full_document.clone(),
-            full_document_before_change: event.full_document_before_change.clone(),
-            update_description: event.update_description.clone(),
-            expanded: event.expanded,
-            extra_fields: event.extra_fields.clone(),
-        })
-    }
-
     fn into_persisted_change_event(self) -> Result<PersistedChangeEvent> {
         Ok(PersistedChangeEvent {
             token: self.token,
@@ -1942,6 +1996,26 @@ impl CompactPersistedChangeEvent {
             expanded: self.expanded,
             extra_fields: self.extra_fields,
         })
+    }
+}
+
+impl<'a> EncodedPersistedChangeEvent<'a> {
+    fn from_persisted_change_event(event: &'a PersistedChangeEvent) -> Self {
+        Self {
+            token: &event.token,
+            cluster_time_time: event.cluster_time.time,
+            cluster_time_increment: event.cluster_time.increment,
+            wall_time_millis: event.wall_time.timestamp_millis(),
+            database: &event.database,
+            collection: event.collection.as_deref(),
+            operation_type: &event.operation_type,
+            document_key: event.document_key.as_deref(),
+            full_document: event.full_document.as_deref(),
+            full_document_before_change: event.full_document_before_change.as_deref(),
+            update_description: event.update_description.as_deref(),
+            expanded: event.expanded,
+            extra_fields: &event.extra_fields,
+        }
     }
 }
 
@@ -1984,7 +2058,7 @@ fn decode_snapshot_state(bytes: &[u8]) -> Result<SnapshotState> {
 }
 
 fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
-    let compact_wal_entry = CompactWalEntry::from_wal_entry(sequence, mutation)?;
+    let compact_wal_entry = EncodedWalEntry::from_wal_entry(sequence, mutation)?;
     let mut bytes = Vec::new();
     cbor_ser::into_writer(&compact_wal_entry, &mut bytes)?;
     Ok(bytes)
