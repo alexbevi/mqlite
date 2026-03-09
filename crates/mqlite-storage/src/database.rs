@@ -2387,7 +2387,9 @@ fn validate_mutation(
         WalMutation::RewriteCollection {
             database,
             collection,
-            options, changes, ..
+            options,
+            changes,
+            ..
         } => {
             validate_rewrite_collection(options, changes)?;
             ValidationPlan::RebuildCollection {
@@ -2558,27 +2560,26 @@ fn rewrite_collection(
     Ok(())
 }
 
-fn validate_collection_changes(
-    state: &PersistedState,
-    validation_state: &ValidationState,
+fn validate_collection_changes<'a>(
+    state: &'a PersistedState,
+    validation_state: &'a ValidationState,
     database: &str,
     collection: &str,
-    create_options: Option<&bson::Document>,
-    changes: &[CollectionChange],
+    create_options: Option<&'a bson::Document>,
+    changes: &'a [CollectionChange],
 ) -> Result<CollectionValidationDelta> {
     let collection_state = match state.catalog.get_collection(database, collection) {
         Ok(collection_state) => Some(collection_state),
         Err(CatalogError::NamespaceNotFound(_, _)) => None,
         Err(error) => return Err(error.into()),
     };
-    let mut overlay =
-        CollectionValidationOverlay::new(
-            collection_state,
-            validation_state.collection(database, collection),
-            create_options,
-            database,
-            collection,
-        )?;
+    let mut overlay = CollectionValidationOverlay::new(
+        collection_state,
+        validation_state.collection(database, collection),
+        create_options,
+        database,
+        collection,
+    )?;
     for change in changes {
         overlay.apply(change)?;
     }
@@ -2645,11 +2646,13 @@ fn checkpoint_page_refs(pages_start: u64, pages: &[EncodedPage]) -> Vec<PageRef>
     page_refs
 }
 
+type UniqueIndexKey = bson::Document;
+
 #[derive(Debug, Clone)]
 struct UniqueIndexValidator {
     name: String,
     key: bson::Document,
-    entries: HashMap<Vec<u8>, u64>,
+    entries: HashMap<UniqueIndexKey, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -2664,8 +2667,14 @@ struct CollectionValidationState {
 
 #[derive(Debug)]
 enum ValidationPlan {
-    RebuildCollection { database: String, collection: String },
-    RemoveCollection { database: String, collection: String },
+    RebuildCollection {
+        database: String,
+        collection: String,
+    },
+    RemoveCollection {
+        database: String,
+        collection: String,
+    },
     ApplyCollectionDelta {
         database: String,
         collection: String,
@@ -2681,13 +2690,13 @@ struct CollectionValidationDelta {
 #[derive(Debug, Default)]
 struct UniqueIndexDelta {
     name: String,
-    additions: HashMap<Vec<u8>, u64>,
-    removals: HashSet<Vec<u8>>,
+    additions: HashMap<UniqueIndexKey, u64>,
+    removals: HashSet<UniqueIndexKey>,
 }
 
 struct CollectionValidationOverlay<'a> {
     base_collection: Option<&'a CollectionCatalog>,
-    overlay_records: HashMap<u64, bson::Document>,
+    overlay_records: HashMap<u64, &'a bson::Document>,
     deleted_record_ids: HashSet<u64>,
     unique_indexes: Vec<UniqueIndexOverlay<'a>>,
 }
@@ -2695,9 +2704,9 @@ struct CollectionValidationOverlay<'a> {
 struct UniqueIndexOverlay<'a> {
     name: String,
     key: bson::Document,
-    base_entries: Option<&'a HashMap<Vec<u8>, u64>>,
-    pending_entries: HashMap<Vec<u8>, u64>,
-    removed_keys: HashSet<Vec<u8>>,
+    base_entries: Option<&'a HashMap<UniqueIndexKey, u64>>,
+    pending_entries: HashMap<UniqueIndexKey, u64>,
+    removed_keys: HashSet<UniqueIndexKey>,
 }
 
 impl<'a> CollectionValidationOverlay<'a> {
@@ -2735,7 +2744,7 @@ impl<'a> CollectionValidationOverlay<'a> {
         })
     }
 
-    fn apply(&mut self, change: &CollectionChange) -> Result<()> {
+    fn apply(&mut self, change: &'a CollectionChange) -> Result<()> {
         match change {
             CollectionChange::Insert(record) => self.insert(record),
             CollectionChange::Update(record) => self.update(record),
@@ -2743,7 +2752,7 @@ impl<'a> CollectionValidationOverlay<'a> {
         }
     }
 
-    fn insert(&mut self, record: &CollectionRecord) -> Result<()> {
+    fn insert(&mut self, record: &'a CollectionRecord) -> Result<()> {
         if self.current_document(record.record_id).is_some() {
             return Err(CatalogError::InvalidIndexState(format!(
                 "duplicate record id {}",
@@ -2756,12 +2765,12 @@ impl<'a> CollectionValidationOverlay<'a> {
         self.validate_unique_keys(record.record_id, &keys)?;
         self.deleted_record_ids.remove(&record.record_id);
         self.overlay_records
-            .insert(record.record_id, record.document.clone());
+            .insert(record.record_id, &record.document);
         self.install_unique_keys(record.record_id, &keys);
         Ok(())
     }
 
-    fn update(&mut self, record: &CollectionRecord) -> Result<()> {
+    fn update(&mut self, record: &'a CollectionRecord) -> Result<()> {
         let current_keys = {
             let Some(current_document) = self.current_document(record.record_id) else {
                 return Err(CatalogError::InvalidIndexState(format!(
@@ -2780,7 +2789,7 @@ impl<'a> CollectionValidationOverlay<'a> {
         self.remove_unique_keys(record.record_id, &current_keys);
         self.install_unique_keys(record.record_id, &new_keys);
         self.overlay_records
-            .insert(record.record_id, record.document.clone());
+            .insert(record.record_id, &record.document);
         self.deleted_record_ids.remove(&record.record_id);
         Ok(())
     }
@@ -2807,38 +2816,37 @@ impl<'a> CollectionValidationOverlay<'a> {
         Ok(())
     }
 
-    fn current_document(&self, record_id: u64) -> Option<&bson::Document> {
+    fn current_document(&self, record_id: u64) -> Option<&'a bson::Document> {
         if self.deleted_record_ids.contains(&record_id) {
             return None;
         }
-        self.overlay_records
-            .get(&record_id)
-            .or_else(|| {
-                self.base_collection.and_then(|collection| {
-                    collection
-                        .record_position(record_id)
-                        .and_then(|position| collection.records.get(position))
-                        .map(|record| &record.document)
-                })
+        self.overlay_records.get(&record_id).copied().or_else(|| {
+            self.base_collection.and_then(|collection| {
+                collection
+                    .record_position(record_id)
+                    .and_then(|position| collection.records.get(position))
+                    .map(|record| &record.document)
             })
+        })
     }
 
-    fn unique_keys(&self, document: &bson::Document) -> Result<Vec<(usize, Vec<u8>)>> {
+    fn unique_keys(&self, document: &bson::Document) -> Result<Vec<(usize, UniqueIndexKey)>> {
         self.unique_indexes
             .iter()
             .enumerate()
             .map(|(index_position, index)| {
                 Ok((
                     index_position,
-                    encode_unique_index_key(document, &index.key)?,
+                    mqlite_catalog::index_key_for_document(document, &index.key),
                 ))
             })
             .collect()
     }
 
-    fn validate_unique_keys(&self, record_id: u64, keys: &[(usize, Vec<u8>)]) -> Result<()> {
+    fn validate_unique_keys(&self, record_id: u64, keys: &[(usize, UniqueIndexKey)]) -> Result<()> {
         for (index_position, key) in keys {
-            if let Some(existing_record_id) = self.unique_indexes[*index_position].record_for_key(key)
+            if let Some(existing_record_id) =
+                self.unique_indexes[*index_position].record_for_key(key)
             {
                 if existing_record_id != record_id {
                     return Err(CatalogError::DuplicateKey(
@@ -2851,13 +2859,13 @@ impl<'a> CollectionValidationOverlay<'a> {
         Ok(())
     }
 
-    fn install_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
+    fn install_unique_keys(&mut self, record_id: u64, keys: &[(usize, UniqueIndexKey)]) {
         for (index_position, key) in keys {
             self.unique_indexes[*index_position].insert_key(key.clone(), record_id);
         }
     }
 
-    fn remove_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
+    fn remove_unique_keys(&mut self, record_id: u64, keys: &[(usize, UniqueIndexKey)]) {
         for (index_position, key) in keys {
             self.unique_indexes[*index_position].remove_key(key, record_id);
         }
@@ -2878,9 +2886,8 @@ impl UniqueIndexValidator {
     fn from_catalog(index: &IndexCatalog) -> Result<Self> {
         let mut entries = HashMap::with_capacity(index.entry_count());
         index.try_for_each_entry(|entry| {
-            let key = bson::to_vec(&entry.key)?;
-            entries.insert(key, entry.record_id);
-            Ok::<(), bson::ser::Error>(())
+            entries.insert(entry.key.clone(), entry.record_id);
+            Ok::<(), CatalogError>(())
         })?;
         Ok(Self {
             name: index.name.clone(),
@@ -2906,7 +2913,9 @@ impl ValidationState {
     }
 
     fn collection(&self, database: &str, collection: &str) -> Option<&CollectionValidationState> {
-        self.databases.get(database).and_then(|db| db.get(collection))
+        self.databases
+            .get(database)
+            .and_then(|db| db.get(collection))
     }
 
     fn apply_plan(&mut self, catalog: &Catalog, plan: ValidationPlan) -> Result<()> {
@@ -2930,7 +2939,12 @@ impl ValidationState {
         }
     }
 
-    fn rebuild_collection(&mut self, catalog: &Catalog, database: &str, collection: &str) -> Result<()> {
+    fn rebuild_collection(
+        &mut self,
+        catalog: &Catalog,
+        database: &str,
+        collection: &str,
+    ) -> Result<()> {
         let collection_state = catalog.get_collection(database, collection)?;
         self.insert_collection(
             database.to_string(),
@@ -2995,7 +3009,12 @@ impl CollectionValidationState {
             .indexes
             .values()
             .filter(|index| index.unique)
-            .map(|index| Ok((index.name.clone(), UniqueIndexValidator::from_catalog(index)?)))
+            .map(|index| {
+                Ok((
+                    index.name.clone(),
+                    UniqueIndexValidator::from_catalog(index)?,
+                ))
+            })
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { unique_indexes })
     }
@@ -3022,22 +3041,23 @@ impl<'a> UniqueIndexOverlay<'a> {
         }
     }
 
-    fn record_for_key(&self, key: &[u8]) -> Option<u64> {
+    fn record_for_key(&self, key: &UniqueIndexKey) -> Option<u64> {
         if let Some(record_id) = self.pending_entries.get(key) {
             return Some(*record_id);
         }
         if self.removed_keys.contains(key) {
             return None;
         }
-        self.base_entries.and_then(|entries| entries.get(key).copied())
+        self.base_entries
+            .and_then(|entries| entries.get(key).copied())
     }
 
-    fn insert_key(&mut self, key: Vec<u8>, record_id: u64) {
+    fn insert_key(&mut self, key: UniqueIndexKey, record_id: u64) {
         self.removed_keys.remove(&key);
         self.pending_entries.insert(key, record_id);
     }
 
-    fn remove_key(&mut self, key: &[u8], record_id: u64) {
+    fn remove_key(&mut self, key: &UniqueIndexKey, record_id: u64) {
         if self
             .pending_entries
             .get(key)
@@ -3050,7 +3070,7 @@ impl<'a> UniqueIndexOverlay<'a> {
             .and_then(|entries| entries.get(key))
             .is_some_and(|existing_record_id| *existing_record_id == record_id)
         {
-            self.removed_keys.insert(key.to_vec());
+            self.removed_keys.insert(key.clone());
         }
     }
 
@@ -3061,16 +3081,6 @@ impl<'a> UniqueIndexOverlay<'a> {
             removals: self.removed_keys,
         }
     }
-}
-
-fn encode_unique_index_key(
-    document: &bson::Document,
-    key_pattern: &bson::Document,
-) -> Result<Vec<u8>> {
-    Ok(bson::to_vec(&mqlite_catalog::index_key_for_document(
-        document,
-        key_pattern,
-    ))?)
 }
 
 fn encode_snapshot_catalog(
@@ -4038,13 +4048,7 @@ mod tests {
         let mut keys = validation_index
             .entries
             .keys()
-            .map(|bytes| {
-                bson::from_slice::<bson::Document>(bytes)
-                    .expect("key document")
-                    .get_str("sku")
-                    .expect("sku")
-                    .to_string()
-            })
+            .map(|key| key.get_str("sku").expect("sku").to_string())
             .collect::<Vec<_>>();
         keys.sort();
         keys
@@ -4423,6 +4427,32 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
         );
 
+        let error = database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: None,
+                changes: vec![CollectionChange::Insert(CollectionRecord {
+                    record_id: 4,
+                    document: doc! { "_id": 4, "sku": "gamma" },
+                })],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect_err("duplicate insert should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate key error on index `sku_1`"),
+            "unexpected duplicate error: {error:#}"
+        );
+        assert_eq!(
+            validation_index_keys(&database, "app", "widgets", "sku_1"),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+
         database
             .commit_mutation(WalMutation::ApplyCollectionChanges {
                 database: "app".to_string(),
@@ -4440,7 +4470,11 @@ mod tests {
             .expect("update");
         assert_eq!(
             validation_index_keys(&database, "app", "widgets", "sku_1"),
-            vec!["alpha".to_string(), "delta".to_string(), "gamma".to_string()]
+            vec![
+                "alpha".to_string(),
+                "delta".to_string(),
+                "gamma".to_string()
+            ]
         );
 
         database

@@ -1466,8 +1466,6 @@ impl Broker {
                 };
                 next_record_id += 1;
                 let document_key = document_key_for_change_stream(&record.document);
-                let full_document = record.document.clone();
-                changes.push(CollectionChange::Insert(record));
                 change_events.push(change_stream_event(
                     sequence,
                     change_events.len(),
@@ -1475,12 +1473,13 @@ impl Broker {
                     Some(collection_name),
                     "insert",
                     document_key.as_ref(),
-                    Some(&full_document),
+                    Some(&record.document),
                     None,
                     None,
                     false,
                     &Document::new(),
                 ));
+                changes.push(CollectionChange::Insert(record));
             }
 
             (
@@ -1721,9 +1720,6 @@ impl Broker {
                             document,
                         };
                         next_record_id += 1;
-                        let full_document = record.document.clone();
-                        inserted_records.push(record.clone());
-                        changes.push(CollectionChange::Insert(record));
                         upserted.push(doc! {
                             "index": operation_index as i32,
                             "_id": upserted_id.clone()
@@ -1735,12 +1731,14 @@ impl Broker {
                             Some(collection_name),
                             "insert",
                             Some(&doc! { "_id": upserted_id.clone() }),
-                            Some(&full_document),
+                            Some(&record.document),
                             None,
                             None,
                             false,
                             &Document::new(),
                         ));
+                        inserted_records.push(record.clone());
+                        changes.push(CollectionChange::Insert(record));
                     }
                     continue;
                 }
