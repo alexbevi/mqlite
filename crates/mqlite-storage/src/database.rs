@@ -50,19 +50,18 @@ pub struct PersistedState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedChangeEvent {
-    pub token: bson::Document,
+    token: Vec<u8>,
     pub cluster_time: bson::Timestamp,
     pub wall_time: bson::DateTime,
     pub database: String,
     pub collection: Option<String>,
     pub operation_type: String,
-    pub document_key: Option<bson::Document>,
-    pub full_document: Option<bson::Document>,
-    pub full_document_before_change: Option<bson::Document>,
-    pub update_description: Option<bson::Document>,
+    document_key: Option<Vec<u8>>,
+    full_document: Option<Vec<u8>>,
+    full_document_before_change: Option<Vec<u8>>,
+    update_description: Option<Vec<u8>>,
     pub expanded: bool,
-    #[serde(default)]
-    pub extra_fields: bson::Document,
+    extra_fields: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1206,6 +1205,195 @@ fn decode_optional_document_bytes(bytes: Option<Vec<u8>>) -> Result<Option<bson:
     bytes.as_deref().map(decode_document_bytes).transpose()
 }
 
+impl PersistedChangeEvent {
+    pub fn new(
+        token: &bson::Document,
+        cluster_time: bson::Timestamp,
+        wall_time: bson::DateTime,
+        database: String,
+        collection: Option<String>,
+        operation_type: String,
+        document_key: Option<&bson::Document>,
+        full_document: Option<&bson::Document>,
+        full_document_before_change: Option<&bson::Document>,
+        update_description: Option<&bson::Document>,
+        expanded: bool,
+        extra_fields: &bson::Document,
+    ) -> Result<Self> {
+        Ok(Self {
+            token: encode_document_bytes(token)?,
+            cluster_time,
+            wall_time,
+            database,
+            collection,
+            operation_type,
+            document_key: encode_optional_document_bytes(document_key)?,
+            full_document: encode_optional_document_bytes(full_document)?,
+            full_document_before_change: encode_optional_document_bytes(
+                full_document_before_change,
+            )?,
+            update_description: encode_optional_document_bytes(update_description)?,
+            expanded,
+            extra_fields: encode_document_bytes(extra_fields)?,
+        })
+    }
+
+    pub fn token_document(&self) -> Result<bson::Document> {
+        decode_document_bytes(&self.token)
+    }
+
+    pub fn document_key_document(&self) -> Result<Option<bson::Document>> {
+        decode_optional_document_bytes(self.document_key.clone())
+    }
+
+    pub fn full_document_document(&self) -> Result<Option<bson::Document>> {
+        decode_optional_document_bytes(self.full_document.clone())
+    }
+
+    pub fn full_document_before_change_document(&self) -> Result<Option<bson::Document>> {
+        decode_optional_document_bytes(self.full_document_before_change.clone())
+    }
+
+    pub fn update_description_document(&self) -> Result<Option<bson::Document>> {
+        decode_optional_document_bytes(self.update_description.clone())
+    }
+
+    pub fn extra_fields_document(&self) -> Result<bson::Document> {
+        decode_document_bytes(&self.extra_fields)
+    }
+
+    pub fn to_change_stream_document(&self) -> Result<bson::Document> {
+        let mut document = bson::doc! {
+            "token": bson::Bson::Document(self.token_document()?),
+            "clusterTime": bson::Bson::Timestamp(self.cluster_time),
+            "wallTime": bson::Bson::DateTime(self.wall_time),
+            "database": self.database.clone(),
+            "operationType": self.operation_type.clone(),
+            "expanded": self.expanded,
+            "extraFields": bson::Bson::Document(self.extra_fields_document()?),
+        };
+        if let Some(collection) = &self.collection {
+            document.insert("collection", collection.clone());
+        }
+        if let Some(document_key) = self.document_key_document()? {
+            document.insert("documentKey", bson::Bson::Document(document_key));
+        }
+        if let Some(full_document) = self.full_document_document()? {
+            document.insert("fullDocument", bson::Bson::Document(full_document));
+        }
+        if let Some(full_document_before_change) = self.full_document_before_change_document()? {
+            document.insert(
+                "fullDocumentBeforeChange",
+                bson::Bson::Document(full_document_before_change),
+            );
+        }
+        if let Some(update_description) = self.update_description_document()? {
+            document.insert(
+                "updateDescription",
+                bson::Bson::Document(update_description),
+            );
+        }
+        Ok(document)
+    }
+
+    fn to_persisted_document(&self) -> Result<bson::Document> {
+        let mut document = bson::doc! {
+            "token": bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: self.token.clone(),
+            }),
+            "clusterTime": bson::Bson::Timestamp(self.cluster_time),
+            "wallTime": bson::Bson::DateTime(self.wall_time),
+            "database": self.database.clone(),
+            "operationType": self.operation_type.clone(),
+            "expanded": self.expanded,
+            "extraFields": bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: self.extra_fields.clone(),
+            }),
+        };
+        if let Some(collection) = &self.collection {
+            document.insert("collection", collection.clone());
+        }
+        insert_change_event_document_field(&mut document, "documentKey", &self.document_key);
+        insert_change_event_document_field(&mut document, "fullDocument", &self.full_document);
+        insert_change_event_document_field(
+            &mut document,
+            "fullDocumentBeforeChange",
+            &self.full_document_before_change,
+        );
+        insert_change_event_document_field(
+            &mut document,
+            "updateDescription",
+            &self.update_description,
+        );
+        Ok(document)
+    }
+
+    fn from_persisted_document(document: bson::Document) -> Result<Self> {
+        let token = decode_change_event_document_field(&document, "token")?
+            .ok_or(StorageError::InvalidPage)?;
+        let extra_fields = decode_change_event_document_field(&document, "extraFields")?
+            .ok_or(StorageError::InvalidPage)?;
+        Ok(Self {
+            token,
+            cluster_time: document
+                .get_timestamp("clusterTime")
+                .map_err(|_| StorageError::InvalidPage)?,
+            wall_time: document
+                .get_datetime("wallTime")
+                .map_err(|_| StorageError::InvalidPage)?
+                .to_owned(),
+            database: document
+                .get_str("database")
+                .map_err(|_| StorageError::InvalidPage)?
+                .to_string(),
+            collection: document.get_str("collection").ok().map(ToString::to_string),
+            operation_type: document
+                .get_str("operationType")
+                .map_err(|_| StorageError::InvalidPage)?
+                .to_string(),
+            document_key: decode_change_event_document_field(&document, "documentKey")?,
+            full_document: decode_change_event_document_field(&document, "fullDocument")?,
+            full_document_before_change: decode_change_event_document_field(
+                &document,
+                "fullDocumentBeforeChange",
+            )?,
+            update_description: decode_change_event_document_field(&document, "updateDescription")?,
+            expanded: document.get_bool("expanded").unwrap_or(false),
+            extra_fields,
+        })
+    }
+}
+
+fn insert_change_event_document_field(
+    document: &mut bson::Document,
+    field: &str,
+    encoded: &Option<Vec<u8>>,
+) {
+    if let Some(encoded) = encoded {
+        document.insert(
+            field,
+            bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: encoded.clone(),
+            }),
+        );
+    }
+}
+
+fn decode_change_event_document_field(
+    document: &bson::Document,
+    field: &str,
+) -> Result<Option<Vec<u8>>> {
+    match document.get(field) {
+        Some(bson::Bson::Binary(binary)) => Ok(Some(binary.bytes.clone())),
+        Some(bson::Bson::Document(document)) => Ok(Some(encode_document_bytes(document)?)),
+        Some(bson::Bson::Null) | None => Ok(None),
+        _ => Err(StorageError::InvalidPage.into()),
+    }
+}
+
 impl CompactSnapshotState {
     fn from_snapshot_state(snapshot_state: &SnapshotState) -> Result<Self> {
         Ok(Self {
@@ -1714,27 +1902,25 @@ impl CompactIndexEntry {
 impl CompactPersistedChangeEvent {
     fn from_persisted_change_event(event: &PersistedChangeEvent) -> Result<Self> {
         Ok(Self {
-            token: encode_document_bytes(&event.token)?,
+            token: event.token.clone(),
             cluster_time_time: event.cluster_time.time,
             cluster_time_increment: event.cluster_time.increment,
             wall_time_millis: event.wall_time.timestamp_millis(),
             database: event.database.clone(),
             collection: event.collection.clone(),
             operation_type: event.operation_type.clone(),
-            document_key: encode_optional_document_bytes(event.document_key.as_ref())?,
-            full_document: encode_optional_document_bytes(event.full_document.as_ref())?,
-            full_document_before_change: encode_optional_document_bytes(
-                event.full_document_before_change.as_ref(),
-            )?,
-            update_description: encode_optional_document_bytes(event.update_description.as_ref())?,
+            document_key: event.document_key.clone(),
+            full_document: event.full_document.clone(),
+            full_document_before_change: event.full_document_before_change.clone(),
+            update_description: event.update_description.clone(),
             expanded: event.expanded,
-            extra_fields: encode_document_bytes(&event.extra_fields)?,
+            extra_fields: event.extra_fields.clone(),
         })
     }
 
     fn into_persisted_change_event(self) -> Result<PersistedChangeEvent> {
         Ok(PersistedChangeEvent {
-            token: decode_document_bytes(&self.token)?,
+            token: self.token,
             cluster_time: bson::Timestamp {
                 time: self.cluster_time_time,
                 increment: self.cluster_time_increment,
@@ -1743,14 +1929,12 @@ impl CompactPersistedChangeEvent {
             database: self.database,
             collection: self.collection,
             operation_type: self.operation_type,
-            document_key: decode_optional_document_bytes(self.document_key)?,
-            full_document: decode_optional_document_bytes(self.full_document)?,
-            full_document_before_change: decode_optional_document_bytes(
-                self.full_document_before_change,
-            )?,
-            update_description: decode_optional_document_bytes(self.update_description)?,
+            document_key: self.document_key,
+            full_document: self.full_document,
+            full_document_before_change: self.full_document_before_change,
+            update_description: self.update_description,
             expanded: self.expanded,
-            extra_fields: decode_document_bytes(&self.extra_fields)?,
+            extra_fields: self.extra_fields,
         })
     }
 }
@@ -3225,7 +3409,7 @@ fn decode_change_event_page(
 
     page.entries
         .into_iter()
-        .map(|(_, document)| Ok(bson::from_document(document)?))
+        .map(|(_, document)| PersistedChangeEvent::from_persisted_document(document))
         .collect()
 }
 
@@ -3280,7 +3464,7 @@ fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<Collect
 }
 
 fn change_event_as_document(event: &PersistedChangeEvent) -> Result<bson::Document> {
-    Ok(bson::to_document(event)?)
+    event.to_persisted_document()
 }
 
 fn resolve_page_id_refs(page_ids: &[u64], page_refs: &[PageRef]) -> Result<Vec<PageRef>> {
@@ -3549,23 +3733,24 @@ mod tests {
     }
 
     fn sample_change_event(sequence: i64, operation_type: &str) -> PersistedChangeEvent {
-        PersistedChangeEvent {
-            token: doc! { "sequence": sequence, "event": 1_i32 },
-            cluster_time: Timestamp {
+        PersistedChangeEvent::new(
+            &doc! { "sequence": sequence, "event": 1_i32 },
+            Timestamp {
                 time: sequence as u32,
                 increment: 1,
             },
-            wall_time: DateTime::from_millis(sequence),
-            database: "app".to_string(),
-            collection: Some("widgets".to_string()),
-            operation_type: operation_type.to_string(),
-            document_key: Some(doc! { "_id": sequence }),
-            full_document: Some(doc! { "_id": sequence, "qty": sequence }),
-            full_document_before_change: None,
-            update_description: None,
-            expanded: false,
-            extra_fields: Document::new(),
-        }
+            DateTime::from_millis(sequence),
+            "app".to_string(),
+            Some("widgets".to_string()),
+            operation_type.to_string(),
+            Some(&doc! { "_id": sequence }),
+            Some(&doc! { "_id": sequence, "qty": sequence }),
+            None,
+            None,
+            false,
+            &Document::new(),
+        )
+        .expect("sample change event")
     }
 
     #[test]

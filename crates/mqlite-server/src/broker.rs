@@ -990,7 +990,7 @@ impl Broker {
                     None,
                     None,
                     true,
-                    doc! {
+                    &doc! {
                         "operationDescription": {
                             "idIndex": { "name": "_id_", "key": { "_id": 1 } }
                         }
@@ -1030,7 +1030,7 @@ impl Broker {
                     None,
                     None,
                     false,
-                    Document::new(),
+                    &Document::new(),
                 ),
                 change_stream_event(
                     sequence,
@@ -1043,7 +1043,7 @@ impl Broker {
                     None,
                     None,
                     false,
-                    Document::new(),
+                    &Document::new(),
                 ),
             ];
             if index + 1 == collection_count {
@@ -1058,7 +1058,7 @@ impl Broker {
                     None,
                     None,
                     false,
-                    Document::new(),
+                    &Document::new(),
                 ));
             }
             last_sequence = Some(
@@ -1107,7 +1107,7 @@ impl Broker {
                         None,
                         None,
                         false,
-                        Document::new(),
+                        &Document::new(),
                     ),
                     change_stream_event(
                         sequence,
@@ -1120,7 +1120,7 @@ impl Broker {
                         None,
                         None,
                         false,
-                        Document::new(),
+                        &Document::new(),
                     ),
                 ],
             })
@@ -1191,7 +1191,7 @@ impl Broker {
                             None,
                             None,
                             false,
-                            Document::new(),
+                            &Document::new(),
                         ),
                         change_stream_event(
                             sequence,
@@ -1204,7 +1204,7 @@ impl Broker {
                             None,
                             None,
                             false,
-                            Document::new(),
+                            &Document::new(),
                         ),
                     ],
                 })
@@ -1236,7 +1236,7 @@ impl Broker {
                         None,
                         None,
                         false,
-                        doc! {
+                        &doc! {
                             "to": { "db": target_database, "coll": target_collection }
                         },
                     ),
@@ -1251,7 +1251,7 @@ impl Broker {
                         None,
                         None,
                         false,
-                        Document::new(),
+                        &Document::new(),
                     ),
                 ],
             })
@@ -1316,7 +1316,7 @@ impl Broker {
                 None,
                 None,
                 true,
-                doc! {
+                &doc! {
                     "operationDescription": {
                         "idIndex": { "name": "_id_", "key": { "_id": 1 } }
                     }
@@ -1335,7 +1335,7 @@ impl Broker {
                 None,
                 None,
                 true,
-                doc! {
+                &doc! {
                     "operationDescription": {
                         "indexes": created
                             .iter()
@@ -1396,7 +1396,7 @@ impl Broker {
                     None,
                     None,
                     true,
-                    doc! {
+                    &doc! {
                         "operationDescription": {
                             "index": target
                         }
@@ -1450,7 +1450,7 @@ impl Broker {
                     None,
                     None,
                     true,
-                    doc! {
+                    &doc! {
                         "operationDescription": {
                             "idIndex": { "name": "_id_", "key": { "_id": 1 } }
                         }
@@ -1474,12 +1474,12 @@ impl Broker {
                     &database,
                     Some(collection_name),
                     "insert",
-                    document_key,
-                    Some(full_document),
+                    document_key.as_ref(),
+                    Some(&full_document),
                     None,
                     None,
                     false,
-                    Document::new(),
+                    &Document::new(),
                 ));
             }
 
@@ -1706,7 +1706,7 @@ impl Broker {
                                 None,
                                 None,
                                 true,
-                                doc! {
+                                &doc! {
                                     "operationDescription": {
                                         "idIndex": { "name": "_id_", "key": { "_id": 1 } }
                                     }
@@ -1734,12 +1734,12 @@ impl Broker {
                             &database,
                             Some(collection_name),
                             "insert",
-                            Some(doc! { "_id": upserted_id.clone() }),
-                            Some(full_document),
+                            Some(&doc! { "_id": upserted_id.clone() }),
+                            Some(&full_document),
                             None,
                             None,
                             false,
-                            Document::new(),
+                            &Document::new(),
                         ));
                     }
                     continue;
@@ -1766,12 +1766,12 @@ impl Broker {
                                     &database,
                                     Some(collection_name),
                                     "replace",
-                                    document_key,
-                                    Some(updated),
-                                    Some(original),
+                                    document_key.as_ref(),
+                                    Some(&updated),
+                                    Some(&original),
                                     None,
                                     false,
-                                    Document::new(),
+                                    &Document::new(),
                                 ));
                             }
                             _ => {
@@ -1783,12 +1783,12 @@ impl Broker {
                                     &database,
                                     Some(collection_name),
                                     "update",
-                                    document_key,
-                                    Some(updated),
-                                    Some(original),
-                                    Some(update_description),
+                                    document_key.as_ref(),
+                                    Some(&updated),
+                                    Some(&original),
+                                    Some(&update_description),
                                     false,
-                                    Document::new(),
+                                    &Document::new(),
                                 ));
                             }
                         }
@@ -1886,18 +1886,19 @@ impl Broker {
                     if deleted_record_ids.insert(record_id) {
                         deleted += 1;
                         changes.push(CollectionChange::Delete(record_id));
+                        let document_key = document_key_for_change_stream(&document);
                         change_events.push(change_stream_event(
                             sequence,
                             change_events.len(),
                             &database,
                             Some(collection_name),
                             "delete",
-                            document_key_for_change_stream(&document),
+                            document_key.as_ref(),
                             None,
-                            Some(document),
+                            Some(&document),
                             None,
                             false,
-                            Document::new(),
+                            &Document::new(),
                         ));
                     }
                 }
@@ -3906,33 +3907,34 @@ fn change_stream_event(
     database: &str,
     collection: Option<&str>,
     operation_type: &str,
-    document_key: Option<Document>,
-    full_document: Option<Document>,
-    full_document_before_change: Option<Document>,
-    update_description: Option<Document>,
+    document_key: Option<&Document>,
+    full_document: Option<&Document>,
+    full_document_before_change: Option<&Document>,
+    update_description: Option<&Document>,
     expanded: bool,
-    extra_fields: Document,
+    extra_fields: &Document,
 ) -> PersistedChangeEvent {
-    PersistedChangeEvent {
-        token: doc! {
+    PersistedChangeEvent::new(
+        &doc! {
             "sequence": sequence as i64,
             "event": event_index as i32 + 1,
         },
-        cluster_time: bson::Timestamp {
+        bson::Timestamp {
             time: sequence.min(u64::from(u32::MAX)) as u32,
             increment: event_index as u32 + 1,
         },
-        wall_time: bson::DateTime::now(),
-        database: database.to_string(),
-        collection: collection.map(ToString::to_string),
-        operation_type: operation_type.to_string(),
+        bson::DateTime::now(),
+        database.to_string(),
+        collection.map(ToString::to_string),
+        operation_type.to_string(),
         document_key,
         full_document,
         full_document_before_change,
         update_description,
         expanded,
         extra_fields,
-    }
+    )
+    .expect("encode persisted change event")
 }
 
 fn document_key_for_change_stream(document: &Document) -> Option<Document> {
@@ -4007,37 +4009,9 @@ impl CollectionResolver for BrokerCollectionResolver<'_> {
         self.change_events
             .iter()
             .map(|event| {
-                let mut document = doc! {
-                    "token": Bson::Document(event.token.clone()),
-                    "clusterTime": Bson::Timestamp(event.cluster_time),
-                    "wallTime": Bson::DateTime(event.wall_time),
-                    "database": event.database.clone(),
-                    "operationType": event.operation_type.clone(),
-                    "expanded": event.expanded,
-                    "extraFields": Bson::Document(event.extra_fields.clone()),
-                };
-                if let Some(collection) = &event.collection {
-                    document.insert("collection", collection.clone());
-                }
-                if let Some(document_key) = &event.document_key {
-                    document.insert("documentKey", Bson::Document(document_key.clone()));
-                }
-                if let Some(full_document) = &event.full_document {
-                    document.insert("fullDocument", Bson::Document(full_document.clone()));
-                }
-                if let Some(full_document_before_change) = &event.full_document_before_change {
-                    document.insert(
-                        "fullDocumentBeforeChange",
-                        Bson::Document(full_document_before_change.clone()),
-                    );
-                }
-                if let Some(update_description) = &event.update_description {
-                    document.insert(
-                        "updateDescription",
-                        Bson::Document(update_description.clone()),
-                    );
-                }
-                document
+                event
+                    .to_change_stream_document()
+                    .expect("decode persisted change event")
             })
             .collect()
     }
