@@ -906,7 +906,7 @@ impl IndexCatalog {
             let replacement =
                 build_runtime_index_pages(&self.runtime_pages[page_index].entries, &self.key)?;
             self.runtime_pages
-                .splice(page_index..=page_index, replacement.into_iter());
+                .splice(page_index..=page_index, replacement);
         }
         Ok(())
     }

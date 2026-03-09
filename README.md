@@ -37,6 +37,7 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 ```
 
 `mqlite command` will reuse an existing broker for that file or auto-spawn one if needed.
+If the auto-spawned broker exits before it publishes its manifest, the command reports that startup failure instead of collapsing it into a generic manifest timeout.
 
 If you want a broker to stay up explicitly, run:
 

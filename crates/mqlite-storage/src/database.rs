@@ -1089,7 +1089,7 @@ impl SlottedPageBuilder {
         }
 
         self.free_end -= payload.len();
-        self.bytes[self.free_end..self.free_end + payload.len()].copy_from_slice(&payload);
+        self.bytes[self.free_end..self.free_end + payload.len()].copy_from_slice(payload);
 
         let slot_offset = self.free_start;
         self.bytes[slot_offset..slot_offset + 8].copy_from_slice(&entry_id.to_le_bytes());
@@ -1325,6 +1325,7 @@ impl PersistedChangeEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: &bson::Document,
         cluster_time: bson::Timestamp,

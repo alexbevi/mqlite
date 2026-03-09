@@ -1,7 +1,8 @@
-use std::{thread, time::Duration};
+use std::{fs, thread, time::Duration};
 
 use assert_cmd::Command;
 use bson::{Binary, Bson, doc, spec::BinarySubtype};
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -108,6 +109,34 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
     assert_eq!(first_batch.len(), 1);
     assert_eq!(first_batch[0]["sku"], "alpha");
     assert_eq!(first_batch[0]["qty"], 2);
+}
+
+#[test]
+fn command_reports_broker_startup_failure_for_invalid_existing_file() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("invalid-existing.mongodb");
+    fs::write(&database_path, b"not-a-valid-mqlite-file").expect("write invalid file");
+
+    let mut command = Command::cargo_bin("mqlite").expect("binary");
+    command
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"ping":1}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "mqlite broker exited before writing its manifest",
+        ))
+        .stderr(predicates::str::contains("Error: file is truncated"))
+        .stderr(predicates::str::contains("timed out waiting for mqlite broker manifest").not());
 }
 
 #[test]

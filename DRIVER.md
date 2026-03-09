@@ -50,6 +50,7 @@ Local durable-file compression is internal to `mqlite` and does not change the `
 - If the manifest exists and the broker is alive, attach to the advertised endpoint.
 - If no live broker exists, spawn `mqlite serve --file <path>`.
 - Re-read the manifest and connect once the endpoint is ready.
+- If the spawned broker exits before writing the manifest, surface that startup error instead of reporting only a manifest timeout.
 - Brokers are shared per file and may shut down after an idle timeout.
 
 ### Transport

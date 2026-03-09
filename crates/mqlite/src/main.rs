@@ -1,7 +1,7 @@
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
     time::SystemTime,
     time::{Duration, Instant},
 };
@@ -144,14 +144,16 @@ async fn main() -> Result<()> {
         } => {
             let report = run_benchmark(
                 &file,
-                &db,
-                &collection_prefix,
-                writes,
-                reads,
-                write_batch_size,
-                index_field.as_deref(),
-                unique_index,
-                idle_shutdown_secs,
+                BenchmarkOptions {
+                    db: &db,
+                    collection_prefix: &collection_prefix,
+                    writes,
+                    reads,
+                    write_batch_size,
+                    index_field: index_field.as_deref(),
+                    unique_index,
+                    idle_shutdown_secs,
+                },
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -190,8 +192,8 @@ async fn connect_or_spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result
         return Ok(stream);
     }
 
-    spawn_broker(&paths.database_path, idle_shutdown_secs)?;
-    wait_for_broker(&paths, Duration::from_secs(5)).await
+    let child = spawn_broker(&paths.database_path, idle_shutdown_secs)?;
+    wait_for_broker(&paths, child, Duration::from_secs(5)).await
 }
 
 async fn try_connect_existing(paths: &BrokerPaths) -> Result<Option<BoxedStream>> {
@@ -216,28 +218,39 @@ async fn try_connect_existing(paths: &BrokerPaths) -> Result<Option<BoxedStream>
     }
 }
 
-fn spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<()> {
+fn spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<Child> {
     let current_executable =
         std::env::current_exe().context("failed to locate mqlite executable")?;
-    ProcessCommand::new(current_executable)
+    let child = ProcessCommand::new(current_executable)
         .args(["serve", "--file"])
         .arg(file)
         .args(["--idle-shutdown-secs", &idle_shutdown_secs.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn mqlite broker")?;
-    Ok(())
+    Ok(child)
 }
 
-async fn wait_for_broker(paths: &BrokerPaths, timeout: Duration) -> Result<BoxedStream> {
+async fn wait_for_broker(
+    paths: &BrokerPaths,
+    mut child: Child,
+    timeout: Duration,
+) -> Result<BoxedStream> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(manifest) = read_manifest(&paths.manifest_path) {
             if let Ok(stream) = connect(&manifest.endpoint).await {
                 return Ok(stream);
             }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to observe mqlite broker startup")?
+        {
+            return Err(broker_startup_error(paths, &mut child, status));
         }
 
         if Instant::now() >= deadline {
@@ -248,6 +261,34 @@ async fn wait_for_broker(paths: &BrokerPaths, timeout: Duration) -> Result<Boxed
         }
 
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn broker_startup_error(
+    paths: &BrokerPaths,
+    child: &mut Child,
+    status: ExitStatus,
+) -> anyhow::Error {
+    let mut stderr = String::new();
+    if let Some(mut broker_stderr) = child.stderr.take() {
+        let _ = broker_stderr.read_to_string(&mut stderr);
+    }
+
+    let startup_message = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    if startup_message.is_empty() {
+        anyhow!(
+            "mqlite broker exited before writing its manifest at {} with status {status}",
+            paths.manifest_path.display()
+        )
+    } else {
+        anyhow!(
+            "mqlite broker exited before writing its manifest at {}: {startup_message}",
+            paths.manifest_path.display()
+        )
     }
 }
 
@@ -274,17 +315,29 @@ async fn send_checked_command(stream: &mut BoxedStream, body: Document) -> Resul
     Ok(response)
 }
 
-async fn run_benchmark(
-    file: &Path,
-    db: &str,
-    collection_prefix: &str,
+struct BenchmarkOptions<'a> {
+    db: &'a str,
+    collection_prefix: &'a str,
     writes: u32,
     reads: u32,
     write_batch_size: u32,
-    index_field: Option<&str>,
+    index_field: Option<&'a str>,
     unique_index: bool,
     idle_shutdown_secs: u64,
-) -> Result<serde_json::Value> {
+}
+
+async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<serde_json::Value> {
+    let BenchmarkOptions {
+        db,
+        collection_prefix,
+        writes,
+        reads,
+        write_batch_size,
+        index_field,
+        unique_index,
+        idle_shutdown_secs,
+    } = options;
+
     if write_batch_size == 0 {
         bail!("--write-batch-size must be greater than 0");
     }
