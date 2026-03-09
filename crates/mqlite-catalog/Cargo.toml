@@ -13,4 +13,9 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 pretty_assertions.workspace = true
+
+[[bench]]
+name = "insert_many_unique"
+harness = false

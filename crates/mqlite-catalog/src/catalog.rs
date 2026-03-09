@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
 use bson::{Bson, Document, doc};
@@ -32,6 +32,13 @@ pub struct CollectionCatalog {
 pub struct CollectionRecord {
     pub record_id: u64,
     pub document: Document,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CollectionMutation<'a> {
+    Insert(&'a CollectionRecord),
+    Update(&'a CollectionRecord),
+    Delete(u64),
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -170,8 +177,192 @@ impl CollectionCatalog {
         before - self.records.len()
     }
 
+    pub fn apply_mutations(
+        &mut self,
+        mutations: &[CollectionMutation<'_>],
+    ) -> Result<(), CatalogError> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        let base_positions = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(position, record)| (record.record_id, position))
+            .collect::<HashMap<_, _>>();
+        let plan = CollectionMutationPlan::build(mutations, &self.records, &base_positions)?;
+        if plan.states.is_empty() {
+            return Ok(());
+        }
+
+        let staged_indexes = self
+            .indexes
+            .values()
+            .filter_map(|index| {
+                stage_index_entries(index, &self.records, &base_positions, &plan)
+                    .transpose()
+                    .map(|entries| entries.map(|entries| (index.name.clone(), entries)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let original_records = std::mem::take(&mut self.records);
+        self.records = plan.materialize_records(original_records);
+        for (name, entries) in staged_indexes {
+            let index = self
+                .indexes
+                .get_mut(&name)
+                .expect("staged index must exist");
+            index.entries = entries;
+            index.rebuild_tree();
+        }
+        Ok(())
+    }
+
     pub fn validate_indexes(&self) -> Result<(), CatalogError> {
         validate_collection_indexes(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum StagedRecordState {
+    Present { document: Document, appended: bool },
+    Deleted,
+}
+
+#[derive(Debug, Default)]
+struct CollectionMutationPlan {
+    states: HashMap<u64, StagedRecordState>,
+    insert_order: HashMap<u64, usize>,
+    next_insert_order: usize,
+}
+
+impl CollectionMutationPlan {
+    fn build(
+        mutations: &[CollectionMutation<'_>],
+        base_records: &[CollectionRecord],
+        base_positions: &HashMap<u64, usize>,
+    ) -> Result<Self, CatalogError> {
+        let mut plan = Self::default();
+        for mutation in mutations {
+            match mutation {
+                CollectionMutation::Insert(record) => {
+                    if plan
+                        .current_document(base_records, base_positions, record.record_id)
+                        .is_some()
+                    {
+                        return Err(CatalogError::InvalidIndexState(format!(
+                            "duplicate record id {}",
+                            record.record_id
+                        )));
+                    }
+                    plan.next_insert_order += 1;
+                    plan.insert_order
+                        .insert(record.record_id, plan.next_insert_order);
+                    plan.states.insert(
+                        record.record_id,
+                        StagedRecordState::Present {
+                            document: record.document.clone(),
+                            appended: true,
+                        },
+                    );
+                }
+                CollectionMutation::Update(record) => {
+                    let Some(current_document) =
+                        plan.current_document(base_records, base_positions, record.record_id)
+                    else {
+                        return Err(CatalogError::InvalidIndexState(format!(
+                            "record id {} is missing for update",
+                            record.record_id
+                        )));
+                    };
+                    if current_document == &record.document {
+                        continue;
+                    }
+                    let appended = matches!(
+                        plan.states.get(&record.record_id),
+                        Some(StagedRecordState::Present { appended: true, .. })
+                    );
+                    plan.states.insert(
+                        record.record_id,
+                        StagedRecordState::Present {
+                            document: record.document.clone(),
+                            appended,
+                        },
+                    );
+                }
+                CollectionMutation::Delete(record_id) => {
+                    if plan
+                        .current_document(base_records, base_positions, *record_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    plan.states.insert(*record_id, StagedRecordState::Deleted);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    fn current_document<'a>(
+        &'a self,
+        base_records: &'a [CollectionRecord],
+        base_positions: &HashMap<u64, usize>,
+        record_id: u64,
+    ) -> Option<&'a Document> {
+        match self.states.get(&record_id) {
+            Some(StagedRecordState::Present { document, .. }) => Some(document),
+            Some(StagedRecordState::Deleted) => None,
+            None => base_positions
+                .get(&record_id)
+                .map(|position| &base_records[*position].document),
+        }
+    }
+
+    fn materialize_records(
+        &self,
+        original_records: Vec<CollectionRecord>,
+    ) -> Vec<CollectionRecord> {
+        let mut next_records = Vec::with_capacity(original_records.len());
+        for mut record in original_records {
+            match self.states.get(&record.record_id) {
+                Some(StagedRecordState::Present {
+                    document,
+                    appended: false,
+                }) => {
+                    record.document = document.clone();
+                    next_records.push(record);
+                }
+                Some(StagedRecordState::Present { appended: true, .. })
+                | Some(StagedRecordState::Deleted) => {}
+                None => next_records.push(record),
+            }
+        }
+
+        let mut appended_records = self
+            .states
+            .iter()
+            .filter_map(|(record_id, state)| match state {
+                StagedRecordState::Present {
+                    document,
+                    appended: true,
+                } => Some((
+                    *self
+                        .insert_order
+                        .get(record_id)
+                        .expect("appended records must have an insert order"),
+                    CollectionRecord {
+                        record_id: *record_id,
+                        document: document.clone(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        appended_records.sort_by_key(|(order, _)| *order);
+        next_records.extend(appended_records.into_iter().map(|(_, record)| record));
+        next_records
     }
 }
 
@@ -848,6 +1039,113 @@ fn insert_index_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry, key_patt
     entries.insert(position, entry);
 }
 
+fn stage_index_entries(
+    index: &IndexCatalog,
+    base_records: &[CollectionRecord],
+    base_positions: &HashMap<u64, usize>,
+    plan: &CollectionMutationPlan,
+) -> Result<Option<Vec<IndexEntry>>, CatalogError> {
+    let mut affected_record_ids = HashSet::new();
+    let mut replacements = Vec::new();
+
+    for (record_id, state) in &plan.states {
+        let base_document = base_positions
+            .get(record_id)
+            .map(|position| &base_records[*position].document);
+        match state {
+            StagedRecordState::Present { document, .. } => {
+                let new_entry = index_entry_for_document(*record_id, document, &index.key);
+                match base_document {
+                    Some(base_document) => {
+                        let previous_entry =
+                            index_entry_for_document(*record_id, base_document, &index.key);
+                        if previous_entry != new_entry {
+                            affected_record_ids.insert(*record_id);
+                            replacements.push(new_entry);
+                        }
+                    }
+                    None => {
+                        affected_record_ids.insert(*record_id);
+                        replacements.push(new_entry);
+                    }
+                }
+            }
+            StagedRecordState::Deleted => {
+                if base_document.is_some() {
+                    affected_record_ids.insert(*record_id);
+                }
+            }
+        }
+    }
+
+    if affected_record_ids.is_empty() {
+        return Ok(None);
+    }
+
+    replacements.sort_by(|left, right| compare_index_entries(left, right, &index.key));
+    let retained = index
+        .entries
+        .iter()
+        .filter(|entry| !affected_record_ids.contains(&entry.record_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Some(merge_index_entries(
+        retained,
+        replacements,
+        &index.key,
+        index.unique,
+        &index.name,
+    )?))
+}
+
+fn merge_index_entries(
+    retained: Vec<IndexEntry>,
+    replacements: Vec<IndexEntry>,
+    key_pattern: &Document,
+    unique: bool,
+    index_name: &str,
+) -> Result<Vec<IndexEntry>, CatalogError> {
+    let mut merged = Vec::with_capacity(retained.len() + replacements.len());
+    let mut retained = retained.into_iter().peekable();
+    let mut replacements = replacements.into_iter().peekable();
+
+    while retained.peek().is_some() || replacements.peek().is_some() {
+        let next = match (retained.peek(), replacements.peek()) {
+            (Some(left), Some(right)) => {
+                if compare_index_entries(left, right, key_pattern).is_le() {
+                    retained.next().expect("peeked retained entry")
+                } else {
+                    replacements.next().expect("peeked replacement entry")
+                }
+            }
+            (Some(_), None) => retained.next().expect("peeked retained entry"),
+            (None, Some(_)) => replacements.next().expect("peeked replacement entry"),
+            (None, None) => break,
+        };
+        push_index_entry(&mut merged, next, key_pattern, unique, index_name)?;
+    }
+
+    Ok(merged)
+}
+
+fn push_index_entry(
+    merged: &mut Vec<IndexEntry>,
+    entry: IndexEntry,
+    key_pattern: &Document,
+    unique: bool,
+    index_name: &str,
+) -> Result<(), CatalogError> {
+    if unique
+        && merged.last().is_some_and(|previous| {
+            compare_index_keys(&previous.key, &entry.key, key_pattern).is_eq()
+        })
+    {
+        return Err(CatalogError::DuplicateKey(index_name.to_string()));
+    }
+    merged.push(entry);
+    Ok(())
+}
+
 fn compare_index_entries(
     left: &IndexEntry,
     right: &IndexEntry,
@@ -1010,8 +1308,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::{
-        Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
-        default_index_name,
+        Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBound,
+        IndexBounds, default_index_name,
     };
 
     #[test]
@@ -1165,6 +1463,111 @@ mod tests {
         let entries = &collection.indexes.get("sku_1").expect("index").entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].record_id, 2);
+    }
+
+    #[test]
+    fn applies_batched_mutations_and_updates_indexes_once() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 1,
+                document: doc! { "_id": 1, "sku": "alpha", "qty": 1 },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 2,
+                document: doc! { "_id": 2, "sku": "beta", "qty": 2 },
+            })
+            .expect("insert");
+        super::apply_index_specs(
+            &mut collection,
+            &[
+                doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true },
+                doc! { "key": { "qty": 1 }, "name": "qty_1" },
+            ],
+        )
+        .expect("create indexes");
+
+        let inserted = CollectionRecord {
+            record_id: 3,
+            document: doc! { "_id": 3, "sku": "gamma", "qty": 7 },
+        };
+        let updated = CollectionRecord {
+            record_id: 1,
+            document: doc! { "_id": 1, "sku": "alpha-2", "qty": 4 },
+        };
+        collection
+            .apply_mutations(&[
+                CollectionMutation::Update(&updated),
+                CollectionMutation::Delete(2),
+                CollectionMutation::Insert(&inserted),
+            ])
+            .expect("apply mutations");
+
+        collection.validate_indexes().expect("validate");
+        assert_eq!(collection.records.len(), 2);
+        assert_eq!(collection.records[0].record_id, 1);
+        assert_eq!(
+            collection.records[0]
+                .document
+                .get_str("sku")
+                .expect("updated sku"),
+            "alpha-2"
+        );
+        assert_eq!(collection.records[1].record_id, 3);
+        assert_eq!(
+            collection.records[1]
+                .document
+                .get_str("sku")
+                .expect("inserted sku"),
+            "gamma"
+        );
+
+        let sku_entries = &collection.indexes.get("sku_1").expect("sku index").entries;
+        assert_eq!(sku_entries.len(), 2);
+        assert_eq!(sku_entries[0].key, doc! { "sku": "alpha-2" });
+        assert_eq!(sku_entries[0].record_id, 1);
+        assert_eq!(sku_entries[1].key, doc! { "sku": "gamma" });
+        assert_eq!(sku_entries[1].record_id, 3);
+
+        let qty_entries = &collection.indexes.get("qty_1").expect("qty index").entries;
+        assert_eq!(qty_entries.len(), 2);
+        assert_eq!(qty_entries[0].record_id, 1);
+        assert_eq!(qty_entries[1].record_id, 3);
+    }
+
+    #[test]
+    fn batched_mutations_reject_duplicate_unique_keys_without_partial_updates() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 1,
+                document: doc! { "_id": 1, "sku": "alpha" },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 2,
+                document: doc! { "_id": 2, "sku": "beta" },
+            })
+            .expect("insert");
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let duplicate = CollectionRecord {
+            record_id: 1,
+            document: doc! { "_id": 1, "sku": "beta" },
+        };
+        let original = collection.clone();
+        let error = collection
+            .apply_mutations(&[CollectionMutation::Update(&duplicate)])
+            .expect_err("duplicate key should fail");
+        assert!(matches!(error, CatalogError::DuplicateKey(name) if name == "sku_1"));
+        assert_eq!(collection, original);
     }
 
     #[test]

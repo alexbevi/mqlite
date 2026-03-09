@@ -126,6 +126,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas, typed index create/drop frames, and collection-level replacement or drop frames where a whole-collection rewrite is still required.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
 - Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
+- Incremental CRUD apply batches touched record and index-entry updates in memory, merging only affected index entry vectors and rebuilding each affected B-tree once per committed mutation.
 - Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged. Checkpoints also carry forward unchanged collection, index, and change-event pages from the active snapshot instead of re-encoding them, and when the inactive checkpoint region is large enough they reuse that preserved snapshot/WAL space instead of appending another full snapshot to the end of the file.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and persistent index state.
@@ -306,6 +307,7 @@ Test coverage is a release gate:
 - Unit tests cover BSON helpers, wire framing, query semantics, catalog rules, and storage primitives.
 - Integration tests exercise broker behavior through real local IPC using `OP_MSG`.
 - Storage tests cover WAL recovery, superblock rotation, slotted-page persistence, stable `RecordId` reopening, multi-page spill for records, B-tree indexes, and persisted change-event pages, truncated-tail handling, fallback to older checkpoints when newer record or index pages are corrupted, reopened compound descending index order checks, and persisted index-entry presence metadata for explicit `null` versus missing fields.
+- `cargo bench -p mqlite-catalog --bench insert_many_unique` compares the legacy per-row insert path with the batched unique-index apply path for a 1000-document `insertMany`-style workload.
 - Regression tests accompany each bug fix.
 - CI runs on macOS, Linux, and Windows.
 - Coverage reporting is wired into CI for the Linux job.

@@ -10,8 +10,9 @@ use anyhow::Result;
 use blake3::Hasher;
 use fs4::FileExt;
 use mqlite_catalog::{
-    Catalog, CatalogError, CollectionCatalog, CollectionRecord, DatabaseCatalog, IndexCatalog,
-    IndexEntry, build_index_specs, validate_collection_indexes, validate_drop_indexes,
+    Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord,
+    DatabaseCatalog, IndexCatalog, IndexEntry, build_index_specs, validate_collection_indexes,
+    validate_drop_indexes,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1486,36 +1487,17 @@ fn apply_collection_change_set(
     collection_state: &mut CollectionCatalog,
     changes: &[CollectionChange],
 ) -> Result<()> {
-    for change in changes {
-        match change {
-            CollectionChange::Insert(record) => {
-                collection_state
-                    .insert_record(record.clone())
-                    .map_err(map_catalog_error)?;
-            }
-            CollectionChange::Update(record) => {
-                let Some(position) = collection_state
-                    .records
-                    .iter()
-                    .position(|existing| existing.record_id == record.record_id)
-                else {
-                    return Err(CatalogError::InvalidIndexState(format!(
-                        "record id {} is missing for update",
-                        record.record_id
-                    ))
-                    .into());
-                };
-                collection_state
-                    .update_record_at(position, record.document.clone())
-                    .map_err(map_catalog_error)?;
-            }
-            CollectionChange::Delete(record_id) => {
-                collection_state.delete_records(&BTreeSet::from([*record_id]));
-            }
-        }
-    }
-
-    Ok(())
+    let mutations = changes
+        .iter()
+        .map(|change| match change {
+            CollectionChange::Insert(record) => CollectionMutation::Insert(record),
+            CollectionChange::Update(record) => CollectionMutation::Update(record),
+            CollectionChange::Delete(record_id) => CollectionMutation::Delete(*record_id),
+        })
+        .collect::<Vec<_>>();
+    collection_state
+        .apply_mutations(&mutations)
+        .map_err(map_catalog_error)
 }
 
 fn resolved_collection_changes(
