@@ -257,6 +257,7 @@ Mutations are durable through an append-only WAL.
 - CRUD writes append ordered typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
 - Ordered CRUD deltas and index create/drop operations use typed WAL frames. `$out`-style namespace resets use a fresh-collection rewrite frame that rebuilds the target from collection options plus ordered inserts, while collection replacement and drop remain collection-level WAL frames where a full collection image still has to move as one unit.
 - WAL frames include a sequence number and checksum.
+- WAL frames and checkpoint snapshots encode their control metadata in a compact CBOR envelope while preserving embedded MongoDB documents as raw BSON bytes, so exact BSON typing survives recovery without paying BSON-document overhead for the whole envelope.
 - The broker applies the mutation to in-memory state immediately after the WAL append succeeds, then waits for a shared WAL sync barrier before acknowledging command success.
 - Read paths borrow storage only after the visible sequence is durable, so queries and metadata commands do not observe broker-local writes that are still waiting on the shared WAL sync.
 - Applying CRUD deltas batches touched record state and index-entry maintenance in memory, merges only the affected index entry vectors, and rebuilds each affected runtime B-tree once per mutation instead of once per row.

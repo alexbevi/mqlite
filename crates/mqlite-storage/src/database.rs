@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use blake3::Hasher;
+use ciborium::{de as cbor_de, ser as cbor_ser};
 use fs4::FileExt;
 use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord,
@@ -265,12 +266,6 @@ struct WalEntry {
     mutation: WalMutation,
 }
 
-#[derive(Serialize)]
-struct WalEntryRef<'a> {
-    sequence: u64,
-    mutation: &'a WalMutation,
-}
-
 #[derive(Debug, Default)]
 struct WalRecovery {
     records: usize,
@@ -358,6 +353,150 @@ struct PageRef {
     checksum: [u8; 32],
     page_len: u32,
     entry_count: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactSnapshotState {
+    file_format_version: u32,
+    last_applied_sequence: u64,
+    last_checkpoint_unix_ms: u64,
+    catalog: CompactSnapshotCatalog,
+    change_event_pages: Vec<PageRef>,
+    change_event_count: usize,
+    plan_cache_entries: Vec<PersistedPlanCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CompactSnapshotCatalog {
+    databases: BTreeMap<String, CompactSnapshotDatabaseCatalog>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CompactSnapshotDatabaseCatalog {
+    collections: BTreeMap<String, CompactSnapshotCollectionCatalog>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactSnapshotCollectionCatalog {
+    options: Vec<u8>,
+    indexes: BTreeMap<String, CompactSnapshotIndexCatalog>,
+    record_pages: Vec<PageRef>,
+    record_count: usize,
+    next_record_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactSnapshotIndexCatalog {
+    key: Vec<u8>,
+    unique: bool,
+    expire_after_seconds: Option<i64>,
+    root_page_id: Option<u64>,
+    pages: Vec<PageRef>,
+    entry_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactWalEntry {
+    sequence: u64,
+    mutation: CompactWalMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CompactWalMutation {
+    ReplaceCollection {
+        database: String,
+        collection: String,
+        collection_state: CompactCollectionCatalog,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+    RewriteCollection {
+        database: String,
+        collection: String,
+        options: Vec<u8>,
+        changes: Vec<CompactCollectionChange>,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+    ApplyCollectionChanges {
+        database: String,
+        collection: String,
+        create_options: Option<Vec<u8>>,
+        changes: Vec<CompactCollectionChange>,
+        inserts: Vec<CompactCollectionRecord>,
+        updates: Vec<CompactCollectionRecord>,
+        deletes: Vec<u64>,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+    CreateIndexes {
+        database: String,
+        collection: String,
+        create_options: Option<Vec<u8>>,
+        specs: Vec<Vec<u8>>,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+    DropIndexes {
+        database: String,
+        collection: String,
+        target: String,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+    DropCollection {
+        database: String,
+        collection: String,
+        change_events: Vec<CompactPersistedChangeEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactCollectionCatalog {
+    options: Vec<u8>,
+    indexes: BTreeMap<String, CompactIndexCatalog>,
+    records: Vec<CompactCollectionRecord>,
+    next_record_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactCollectionRecord {
+    record_id: u64,
+    document: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactIndexCatalog {
+    key: Vec<u8>,
+    unique: bool,
+    expire_after_seconds: Option<i64>,
+    entries: Vec<CompactIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactIndexEntry {
+    record_id: u64,
+    key: Vec<u8>,
+    present_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactPersistedChangeEvent {
+    token: Vec<u8>,
+    cluster_time_time: u32,
+    cluster_time_increment: u32,
+    wall_time_millis: i64,
+    database: String,
+    collection: Option<String>,
+    operation_type: String,
+    document_key: Option<Vec<u8>>,
+    full_document: Option<Vec<u8>>,
+    full_document_before_change: Option<Vec<u8>>,
+    update_description: Option<Vec<u8>>,
+    expanded: bool,
+    extra_fields: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CompactCollectionChange {
+    Insert(CompactCollectionRecord),
+    Update(CompactCollectionRecord),
+    Delete(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -706,7 +845,7 @@ impl DatabaseFile {
             .collect::<Vec<_>>();
         let provisional_snapshot_catalog =
             resolve_snapshot_catalog(catalog.clone(), &provisional_page_refs)?;
-        let provisional_snapshot = bson::to_vec(&SnapshotState {
+        let provisional_snapshot = encode_snapshot_state(&SnapshotState {
             file_format_version: FILE_FORMAT_VERSION,
             last_applied_sequence: self.state.last_applied_sequence,
             last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
@@ -740,7 +879,7 @@ impl DatabaseFile {
             change_event_count: self.state.change_events.len(),
             plan_cache_entries: self.state.plan_cache_entries.clone(),
         };
-        let snapshot = bson::to_vec(&snapshot_state)?;
+        let snapshot = encode_snapshot_state(&snapshot_state)?;
 
         self.file.seek(SeekFrom::Start(pages_start))?;
         for page in &pages {
@@ -1051,6 +1190,625 @@ fn encode_superblock(superblock: &Superblock) -> [u8; SUPERBLOCK_LEN] {
     bytes
 }
 
+fn encode_document_bytes(document: &bson::Document) -> Result<Vec<u8>> {
+    Ok(bson::to_vec(document)?)
+}
+
+fn decode_document_bytes(bytes: &[u8]) -> Result<bson::Document> {
+    Ok(bson::from_slice(bytes)?)
+}
+
+fn encode_optional_document_bytes(document: Option<&bson::Document>) -> Result<Option<Vec<u8>>> {
+    document.map(encode_document_bytes).transpose()
+}
+
+fn decode_optional_document_bytes(bytes: Option<Vec<u8>>) -> Result<Option<bson::Document>> {
+    bytes.as_deref().map(decode_document_bytes).transpose()
+}
+
+impl CompactSnapshotState {
+    fn from_snapshot_state(snapshot_state: &SnapshotState) -> Result<Self> {
+        Ok(Self {
+            file_format_version: snapshot_state.file_format_version,
+            last_applied_sequence: snapshot_state.last_applied_sequence,
+            last_checkpoint_unix_ms: snapshot_state.last_checkpoint_unix_ms,
+            catalog: CompactSnapshotCatalog::from_snapshot_catalog(&snapshot_state.catalog)?,
+            change_event_pages: snapshot_state.change_event_pages.clone(),
+            change_event_count: snapshot_state.change_event_count,
+            plan_cache_entries: snapshot_state.plan_cache_entries.clone(),
+        })
+    }
+
+    fn into_snapshot_state(self) -> Result<SnapshotState> {
+        Ok(SnapshotState {
+            file_format_version: self.file_format_version,
+            last_applied_sequence: self.last_applied_sequence,
+            last_checkpoint_unix_ms: self.last_checkpoint_unix_ms,
+            catalog: self.catalog.into_snapshot_catalog()?,
+            change_event_pages: self.change_event_pages,
+            change_event_count: self.change_event_count,
+            plan_cache_entries: self.plan_cache_entries,
+        })
+    }
+}
+
+impl CompactSnapshotCatalog {
+    fn from_snapshot_catalog(snapshot_catalog: &SnapshotCatalog) -> Result<Self> {
+        Ok(Self {
+            databases: snapshot_catalog
+                .databases
+                .iter()
+                .map(|(database_name, database)| {
+                    Ok((
+                        database_name.clone(),
+                        CompactSnapshotDatabaseCatalog::from_snapshot_database_catalog(database)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        })
+    }
+
+    fn into_snapshot_catalog(self) -> Result<SnapshotCatalog> {
+        Ok(SnapshotCatalog {
+            databases: self
+                .databases
+                .into_iter()
+                .map(|(database_name, database)| {
+                    Ok((database_name, database.into_snapshot_database_catalog()?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        })
+    }
+}
+
+impl CompactSnapshotDatabaseCatalog {
+    fn from_snapshot_database_catalog(database: &SnapshotDatabaseCatalog) -> Result<Self> {
+        Ok(Self {
+            collections: database
+                .collections
+                .iter()
+                .map(|(collection_name, collection)| {
+                    Ok((
+                        collection_name.clone(),
+                        CompactSnapshotCollectionCatalog::from_snapshot_collection_catalog(
+                            collection,
+                        )?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        })
+    }
+
+    fn into_snapshot_database_catalog(self) -> Result<SnapshotDatabaseCatalog> {
+        Ok(SnapshotDatabaseCatalog {
+            collections: self
+                .collections
+                .into_iter()
+                .map(|(collection_name, collection)| {
+                    Ok((
+                        collection_name,
+                        collection.into_snapshot_collection_catalog()?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        })
+    }
+}
+
+impl CompactSnapshotCollectionCatalog {
+    fn from_snapshot_collection_catalog(collection: &SnapshotCollectionCatalog) -> Result<Self> {
+        Ok(Self {
+            options: encode_document_bytes(&collection.options)?,
+            indexes: collection
+                .indexes
+                .iter()
+                .map(|(index_name, index)| {
+                    Ok((
+                        index_name.clone(),
+                        CompactSnapshotIndexCatalog::from_snapshot_index_catalog(index)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+            record_pages: collection.record_pages.clone(),
+            record_count: collection.record_count,
+            next_record_id: collection.next_record_id,
+        })
+    }
+
+    fn into_snapshot_collection_catalog(self) -> Result<SnapshotCollectionCatalog> {
+        Ok(SnapshotCollectionCatalog {
+            options: decode_document_bytes(&self.options)?,
+            indexes: self
+                .indexes
+                .into_iter()
+                .map(|(index_name, index)| Ok((index_name, index.into_snapshot_index_catalog()?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+            record_pages: self.record_pages,
+            record_count: self.record_count,
+            next_record_id: self.next_record_id,
+        })
+    }
+}
+
+impl CompactSnapshotIndexCatalog {
+    fn from_snapshot_index_catalog(index: &SnapshotIndexCatalog) -> Result<Self> {
+        Ok(Self {
+            key: encode_document_bytes(&index.key)?,
+            unique: index.unique,
+            expire_after_seconds: index.expire_after_seconds,
+            root_page_id: index.root_page_id,
+            pages: index.pages.clone(),
+            entry_count: index.entry_count,
+        })
+    }
+
+    fn into_snapshot_index_catalog(self) -> Result<SnapshotIndexCatalog> {
+        Ok(SnapshotIndexCatalog {
+            key: decode_document_bytes(&self.key)?,
+            unique: self.unique,
+            expire_after_seconds: self.expire_after_seconds,
+            root_page_id: self.root_page_id,
+            pages: self.pages,
+            entry_count: self.entry_count,
+        })
+    }
+}
+
+impl CompactWalEntry {
+    fn from_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Self> {
+        Ok(Self {
+            sequence,
+            mutation: CompactWalMutation::from_wal_mutation(mutation)?,
+        })
+    }
+
+    fn into_wal_entry(self) -> Result<WalEntry> {
+        Ok(WalEntry {
+            sequence: self.sequence,
+            mutation: self.mutation.into_wal_mutation()?,
+        })
+    }
+}
+
+impl CompactWalMutation {
+    fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
+        Ok(match mutation {
+            WalMutation::ReplaceCollection {
+                database,
+                collection,
+                collection_state,
+                change_events,
+            } => Self::ReplaceCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                collection_state: CompactCollectionCatalog::from_collection_catalog(
+                    collection_state,
+                )?,
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            WalMutation::RewriteCollection {
+                database,
+                collection,
+                options,
+                changes,
+                change_events,
+            } => Self::RewriteCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                options: encode_document_bytes(options)?,
+                changes: changes
+                    .iter()
+                    .map(CompactCollectionChange::from_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            WalMutation::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options,
+                changes,
+                inserts,
+                updates,
+                deletes,
+                change_events,
+            } => Self::ApplyCollectionChanges {
+                database: database.clone(),
+                collection: collection.clone(),
+                create_options: encode_optional_document_bytes(create_options.as_ref())?,
+                changes: changes
+                    .iter()
+                    .map(CompactCollectionChange::from_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                inserts: inserts
+                    .iter()
+                    .map(CompactCollectionRecord::from_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                updates: updates
+                    .iter()
+                    .map(CompactCollectionRecord::from_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                deletes: deletes.clone(),
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            WalMutation::CreateIndexes {
+                database,
+                collection,
+                create_options,
+                specs,
+                change_events,
+            } => Self::CreateIndexes {
+                database: database.clone(),
+                collection: collection.clone(),
+                create_options: encode_optional_document_bytes(create_options.as_ref())?,
+                specs: specs
+                    .iter()
+                    .map(encode_document_bytes)
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            WalMutation::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events,
+            } => Self::DropIndexes {
+                database: database.clone(),
+                collection: collection.clone(),
+                target: target.clone(),
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            WalMutation::DropCollection {
+                database,
+                collection,
+                change_events,
+            } => Self::DropCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                change_events: change_events
+                    .iter()
+                    .map(CompactPersistedChangeEvent::from_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        })
+    }
+
+    fn into_wal_mutation(self) -> Result<WalMutation> {
+        Ok(match self {
+            Self::ReplaceCollection {
+                database,
+                collection,
+                collection_state,
+                change_events,
+            } => WalMutation::ReplaceCollection {
+                database,
+                collection,
+                collection_state: collection_state.into_collection_catalog()?,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::RewriteCollection {
+                database,
+                collection,
+                options,
+                changes,
+                change_events,
+            } => WalMutation::RewriteCollection {
+                database,
+                collection,
+                options: decode_document_bytes(&options)?,
+                changes: changes
+                    .into_iter()
+                    .map(CompactCollectionChange::into_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options,
+                changes,
+                inserts,
+                updates,
+                deletes,
+                change_events,
+            } => WalMutation::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options: decode_optional_document_bytes(create_options)?,
+                changes: changes
+                    .into_iter()
+                    .map(CompactCollectionChange::into_collection_change)
+                    .collect::<Result<Vec<_>>>()?,
+                inserts: inserts
+                    .into_iter()
+                    .map(CompactCollectionRecord::into_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                updates: updates
+                    .into_iter()
+                    .map(CompactCollectionRecord::into_collection_record)
+                    .collect::<Result<Vec<_>>>()?,
+                deletes,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::CreateIndexes {
+                database,
+                collection,
+                create_options,
+                specs,
+                change_events,
+            } => WalMutation::CreateIndexes {
+                database,
+                collection,
+                create_options: decode_optional_document_bytes(create_options)?,
+                specs: specs
+                    .iter()
+                    .map(|bytes| decode_document_bytes(bytes))
+                    .collect::<Result<Vec<_>>>()?,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events,
+            } => WalMutation::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::DropCollection {
+                database,
+                collection,
+                change_events,
+            } => WalMutation::DropCollection {
+                database,
+                collection,
+                change_events: change_events
+                    .into_iter()
+                    .map(CompactPersistedChangeEvent::into_persisted_change_event)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        })
+    }
+}
+
+impl CompactCollectionCatalog {
+    fn from_collection_catalog(collection: &CollectionCatalog) -> Result<Self> {
+        Ok(Self {
+            options: encode_document_bytes(&collection.options)?,
+            indexes: collection
+                .indexes
+                .iter()
+                .map(|(index_name, index)| {
+                    Ok((
+                        index_name.clone(),
+                        CompactIndexCatalog::from_index_catalog(index)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+            records: collection
+                .records
+                .iter()
+                .map(CompactCollectionRecord::from_collection_record)
+                .collect::<Result<Vec<_>>>()?,
+            next_record_id: collection.next_record_id(),
+        })
+    }
+
+    fn into_collection_catalog(self) -> Result<CollectionCatalog> {
+        let indexes = self
+            .indexes
+            .into_iter()
+            .map(|(index_name, index)| {
+                Ok((index_name.clone(), index.into_index_catalog(&index_name)?))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let records = self
+            .records
+            .into_iter()
+            .map(CompactCollectionRecord::into_collection_record)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CollectionCatalog::from_parts(
+            decode_document_bytes(&self.options)?,
+            indexes,
+            records,
+            self.next_record_id,
+        ))
+    }
+}
+
+impl CompactCollectionRecord {
+    fn from_collection_record(record: &CollectionRecord) -> Result<Self> {
+        Ok(Self {
+            record_id: record.record_id,
+            document: encode_document_bytes(&record.document)?,
+        })
+    }
+
+    fn into_collection_record(self) -> Result<CollectionRecord> {
+        Ok(CollectionRecord {
+            record_id: self.record_id,
+            document: decode_document_bytes(&self.document)?,
+        })
+    }
+}
+
+impl CompactIndexCatalog {
+    fn from_index_catalog(index: &IndexCatalog) -> Result<Self> {
+        Ok(Self {
+            key: encode_document_bytes(&index.key)?,
+            unique: index.unique,
+            expire_after_seconds: index.expire_after_seconds,
+            entries: index
+                .entries
+                .iter()
+                .map(CompactIndexEntry::from_index_entry)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    fn into_index_catalog(self, index_name: &str) -> Result<IndexCatalog> {
+        let mut index = IndexCatalog::new(
+            index_name.to_string(),
+            decode_document_bytes(&self.key)?,
+            self.unique,
+        );
+        index.expire_after_seconds = self.expire_after_seconds;
+        index.entries = self
+            .entries
+            .into_iter()
+            .map(CompactIndexEntry::into_index_entry)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(index)
+    }
+}
+
+impl CompactIndexEntry {
+    fn from_index_entry(entry: &IndexEntry) -> Result<Self> {
+        Ok(Self {
+            record_id: entry.record_id,
+            key: encode_document_bytes(&entry.key)?,
+            present_fields: entry.present_fields.clone(),
+        })
+    }
+
+    fn into_index_entry(self) -> Result<IndexEntry> {
+        Ok(IndexEntry {
+            record_id: self.record_id,
+            key: decode_document_bytes(&self.key)?,
+            present_fields: self.present_fields,
+        })
+    }
+}
+
+impl CompactPersistedChangeEvent {
+    fn from_persisted_change_event(event: &PersistedChangeEvent) -> Result<Self> {
+        Ok(Self {
+            token: encode_document_bytes(&event.token)?,
+            cluster_time_time: event.cluster_time.time,
+            cluster_time_increment: event.cluster_time.increment,
+            wall_time_millis: event.wall_time.timestamp_millis(),
+            database: event.database.clone(),
+            collection: event.collection.clone(),
+            operation_type: event.operation_type.clone(),
+            document_key: encode_optional_document_bytes(event.document_key.as_ref())?,
+            full_document: encode_optional_document_bytes(event.full_document.as_ref())?,
+            full_document_before_change: encode_optional_document_bytes(
+                event.full_document_before_change.as_ref(),
+            )?,
+            update_description: encode_optional_document_bytes(event.update_description.as_ref())?,
+            expanded: event.expanded,
+            extra_fields: encode_document_bytes(&event.extra_fields)?,
+        })
+    }
+
+    fn into_persisted_change_event(self) -> Result<PersistedChangeEvent> {
+        Ok(PersistedChangeEvent {
+            token: decode_document_bytes(&self.token)?,
+            cluster_time: bson::Timestamp {
+                time: self.cluster_time_time,
+                increment: self.cluster_time_increment,
+            },
+            wall_time: bson::DateTime::from_millis(self.wall_time_millis),
+            database: self.database,
+            collection: self.collection,
+            operation_type: self.operation_type,
+            document_key: decode_optional_document_bytes(self.document_key)?,
+            full_document: decode_optional_document_bytes(self.full_document)?,
+            full_document_before_change: decode_optional_document_bytes(
+                self.full_document_before_change,
+            )?,
+            update_description: decode_optional_document_bytes(self.update_description)?,
+            expanded: self.expanded,
+            extra_fields: decode_document_bytes(&self.extra_fields)?,
+        })
+    }
+}
+
+impl CompactCollectionChange {
+    fn from_collection_change(change: &CollectionChange) -> Result<Self> {
+        Ok(match change {
+            CollectionChange::Insert(record) => {
+                Self::Insert(CompactCollectionRecord::from_collection_record(record)?)
+            }
+            CollectionChange::Update(record) => {
+                Self::Update(CompactCollectionRecord::from_collection_record(record)?)
+            }
+            CollectionChange::Delete(record_id) => Self::Delete(*record_id),
+        })
+    }
+
+    fn into_collection_change(self) -> Result<CollectionChange> {
+        Ok(match self {
+            Self::Insert(record) => CollectionChange::Insert(record.into_collection_record()?),
+            Self::Update(record) => CollectionChange::Update(record.into_collection_record()?),
+            Self::Delete(record_id) => CollectionChange::Delete(record_id),
+        })
+    }
+}
+
+fn encode_snapshot_state(snapshot_state: &SnapshotState) -> Result<Vec<u8>> {
+    let compact_snapshot_state = CompactSnapshotState::from_snapshot_state(snapshot_state)?;
+    let mut bytes = Vec::new();
+    cbor_ser::into_writer(&compact_snapshot_state, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn decode_snapshot_state(bytes: &[u8]) -> Result<SnapshotState> {
+    let mut cursor = Cursor::new(bytes);
+    let compact_snapshot_state: CompactSnapshotState = cbor_de::from_reader(&mut cursor)?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(StorageError::InvalidHeader.into());
+    }
+    compact_snapshot_state.into_snapshot_state()
+}
+
+fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
+    let compact_wal_entry = CompactWalEntry::from_wal_entry(sequence, mutation)?;
+    let mut bytes = Vec::new();
+    cbor_ser::into_writer(&compact_wal_entry, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn decode_wal_entry(bytes: &[u8]) -> Result<WalEntry> {
+    let mut cursor = Cursor::new(bytes);
+    let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(StorageError::InvalidWalFrame.into());
+    }
+    compact_wal_entry.into_wal_entry()
+}
+
 fn read_snapshot(
     file: &mut File,
     superblock: &Superblock,
@@ -1069,7 +1827,7 @@ fn read_snapshot(
         return Err(StorageError::InvalidSnapshotChecksum.into());
     }
 
-    let snapshot_state = bson::from_slice::<SnapshotState>(&snapshot)?;
+    let snapshot_state = decode_snapshot_state(&snapshot)?;
     if snapshot_state.file_format_version != FILE_FORMAT_VERSION {
         return Err(StorageError::UnsupportedVersion(snapshot_state.file_format_version).into());
     }
@@ -1105,7 +1863,7 @@ fn append_wal_entry(
     mutation: &WalMutation,
     sync: bool,
 ) -> Result<u64> {
-    let payload = bson::to_vec(&WalEntryRef { sequence, mutation })?;
+    let payload = encode_wal_entry(sequence, mutation)?;
     let payload_checksum = hash_bytes(&payload);
     let frame_len = (WAL_HEADER_LEN + payload.len()) as u64;
 
@@ -1164,7 +1922,7 @@ fn replay_wal(
             return Err(StorageError::InvalidWalChecksum.into());
         }
 
-        let entry = bson::from_slice::<WalEntry>(&payload)?;
+        let entry = decode_wal_entry(&payload)?;
         if entry.sequence > last_applied_sequence {
             mark_mutation_dirty(
                 &mut recovery.dirty_collections,
@@ -2766,7 +3524,7 @@ mod tests {
         CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION,
         PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE, PersistedChangeEvent, PersistedPlanCacheChoice,
         PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, VerifyReport, WalMutation,
-        decode_page, read_superblock,
+        decode_page, decode_snapshot_state, read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -2787,7 +3545,7 @@ mod tests {
             .expect("seek snapshot");
         let mut snapshot = vec![0_u8; superblock.snapshot_len as usize];
         file.read_exact(&mut snapshot).expect("read snapshot");
-        bson::from_slice::<SnapshotState>(&snapshot).expect("decode snapshot")
+        decode_snapshot_state(&snapshot).expect("decode snapshot")
     }
 
     fn sample_change_event(sequence: i64, operation_type: &str) -> PersistedChangeEvent {

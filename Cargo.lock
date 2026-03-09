@@ -924,10 +924,10 @@ dependencies = [
  "anyhow",
  "blake3",
  "bson",
+ "ciborium",
  "fs4",
  "mqlite-catalog",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
 ]
