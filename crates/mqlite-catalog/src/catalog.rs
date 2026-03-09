@@ -704,6 +704,25 @@ impl IndexCatalog {
         }
     }
 
+    pub fn try_for_each_entry<E>(
+        &self,
+        mut visit: impl FnMut(&IndexEntry) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.runtime_pages.is_empty() {
+            for entry in &self.entries {
+                visit(entry)?;
+            }
+            return Ok(());
+        }
+
+        for page in &self.runtime_pages {
+            for entry in &page.entries {
+                visit(entry)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
         self.replace_entries(entries)
     }

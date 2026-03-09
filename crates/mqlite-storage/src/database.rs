@@ -2773,10 +2773,11 @@ impl<'a> CollectionValidationOverlay<'a> {
 impl UniqueIndexValidator {
     fn from_catalog(index: &IndexCatalog) -> Result<Self> {
         let mut entries = HashMap::with_capacity(index.entry_count());
-        index.for_each_entry(|entry| {
-            let key = bson::to_vec(&entry.key).expect("index key BSON encoding");
+        index.try_for_each_entry(|entry| {
+            let key = bson::to_vec(&entry.key)?;
             entries.insert(key, entry.record_id);
-        });
+            Ok::<(), bson::ser::Error>(())
+        })?;
         Ok(Self {
             name: index.name.clone(),
             key: index.key.clone(),
