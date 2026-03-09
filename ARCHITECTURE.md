@@ -70,7 +70,7 @@ The file is versioned and self-describing.
 - Data region:
   - slotted record pages
   - slotted index leaf and internal pages
-  - BSON snapshot metadata
+  - selectively zstd-compressed checkpoint pages and snapshot metadata when the stored bytes shrink materially
   - append-only WAL frames after the active snapshot
 
 The current format version is encoded in the header and checkpoint snapshot. Recovery rejects unsupported versions.
@@ -258,6 +258,7 @@ Mutations are durable through an append-only WAL.
 - Ordered CRUD deltas and index create/drop operations use typed WAL frames. `$out`-style namespace resets use a fresh-collection rewrite frame that rebuilds the target from collection options plus ordered inserts, while collection replacement and drop remain collection-level WAL frames where a full collection image still has to move as one unit.
 - WAL frames include a sequence number and checksum.
 - WAL frames and checkpoint snapshots encode their control metadata in a compact CBOR envelope while preserving embedded MongoDB documents as raw BSON bytes, so exact BSON typing survives recovery without paying BSON-document overhead for the whole envelope.
+- Checkpoint pages, snapshot metadata, and large WAL payloads can be wrapped in a small zstd envelope when low-level compression saves meaningful space. Logical record and index pages still decode back to fixed 4 KiB pages, and checksums always cover the stored bytes on disk.
 - When the broker already hands storage pre-encoded change-event byte fields, WAL append serialization borrows those byte slices directly into the compact CBOR frame instead of cloning a second owned copy before the write.
 - Persisted change events also keep `documentKey`, `fullDocument`, `fullDocumentBeforeChange`, `updateDescription`, `extraFields`, and the resume-token document as raw BSON blobs, materializing nested `Document`s only when a `$changeStream` reader asks for them.
 - The broker applies the mutation to in-memory state immediately after the WAL append succeeds, then waits for a shared WAL sync barrier before acknowledging command success.

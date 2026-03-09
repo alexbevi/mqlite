@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
@@ -31,6 +32,15 @@ const WAL_HEADER_LEN: usize = 40;
 const PAGE_MAGIC: &[u8; 8] = b"MQLTPG07";
 const PAGE_HEADER_LEN: usize = 32;
 const SLOT_ENTRY_LEN: usize = 16;
+const ZSTD_BLOB_MAGIC: &[u8; 8] = b"MQLTZST1";
+const ZSTD_BLOB_HEADER_LEN: usize = 16;
+const ZSTD_COMPRESSION_LEVEL: i32 = 1;
+const COMPRESSION_MIN_SAVINGS_DIVISOR: usize = 8;
+const PAGE_COMPRESSION_MIN_SAVINGS: usize = 128;
+const SNAPSHOT_COMPRESSION_MIN_LEN: usize = 1024;
+const SNAPSHOT_COMPRESSION_MIN_SAVINGS: usize = 256;
+const WAL_COMPRESSION_MIN_LEN: usize = PAGE_SIZE;
+const WAL_COMPRESSION_MIN_SAVINGS: usize = 512;
 const PAGE_KIND_RECORD: u16 = 1;
 const PAGE_KIND_INDEX_LEAF: u16 = 2;
 const PAGE_KIND_INDEX_INTERNAL: u16 = 3;
@@ -2041,17 +2051,91 @@ impl CompactCollectionChange {
     }
 }
 
+fn required_compression_savings(raw_len: usize, min_savings: usize) -> usize {
+    raw_len
+        .div_ceil(COMPRESSION_MIN_SAVINGS_DIVISOR)
+        .max(min_savings)
+}
+
+fn maybe_encode_zstd_blob(
+    bytes: &[u8],
+    min_input_len: usize,
+    min_savings: usize,
+) -> Result<Vec<u8>> {
+    if bytes.len() < min_input_len {
+        return Ok(bytes.to_vec());
+    }
+
+    let compressed = zstd::bulk::compress(bytes, ZSTD_COMPRESSION_LEVEL)?;
+    let stored_len = ZSTD_BLOB_HEADER_LEN + compressed.len();
+    if stored_len + required_compression_savings(bytes.len(), min_savings) > bytes.len() {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut stored = Vec::with_capacity(stored_len);
+    stored.extend_from_slice(ZSTD_BLOB_MAGIC);
+    stored.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    stored.extend_from_slice(&compressed);
+    Ok(stored)
+}
+
+fn maybe_decode_zstd_blob(bytes: &[u8]) -> std::result::Result<Option<Vec<u8>>, ()> {
+    if !bytes.starts_with(ZSTD_BLOB_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() < ZSTD_BLOB_HEADER_LEN {
+        return Err(());
+    }
+
+    let expected_len = u64::from_le_bytes(
+        bytes[8..ZSTD_BLOB_HEADER_LEN]
+            .try_into()
+            .expect("zstd blob len"),
+    );
+    let expected_len = usize::try_from(expected_len).map_err(|_| ())?;
+    let decoded =
+        zstd::bulk::decompress(&bytes[ZSTD_BLOB_HEADER_LEN..], expected_len).map_err(|_| ())?;
+    if decoded.len() != expected_len {
+        return Err(());
+    }
+    Ok(Some(decoded))
+}
+
+fn maybe_decode_stored_blob<'a>(bytes: &'a [u8]) -> std::result::Result<Cow<'a, [u8]>, ()> {
+    match maybe_decode_zstd_blob(bytes)? {
+        Some(decoded) => Ok(Cow::Owned(decoded)),
+        None => Ok(Cow::Borrowed(bytes)),
+    }
+}
+
+fn compress_encoded_pages(pages: &mut [EncodedPage]) -> Result<()> {
+    for page in pages {
+        let compressed =
+            maybe_encode_zstd_blob(&page.bytes, PAGE_SIZE, PAGE_COMPRESSION_MIN_SAVINGS)?;
+        if compressed.len() != page.bytes.len() {
+            page.bytes = compressed;
+            page.checksum = hash_bytes(&page.bytes);
+        }
+    }
+    Ok(())
+}
+
 fn encode_snapshot_state(snapshot_state: &SnapshotState) -> Result<Vec<u8>> {
     let compact_snapshot_state = CompactSnapshotState::from_snapshot_state(snapshot_state)?;
     let mut bytes = Vec::new();
     cbor_ser::into_writer(&compact_snapshot_state, &mut bytes)?;
-    Ok(bytes)
+    maybe_encode_zstd_blob(
+        &bytes,
+        SNAPSHOT_COMPRESSION_MIN_LEN,
+        SNAPSHOT_COMPRESSION_MIN_SAVINGS,
+    )
 }
 
 fn decode_snapshot_state(bytes: &[u8]) -> Result<SnapshotState> {
-    let mut cursor = Cursor::new(bytes);
+    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidHeader)?;
+    let mut cursor = Cursor::new(bytes.as_ref());
     let compact_snapshot_state: CompactSnapshotState = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != bytes.len() as u64 {
+    if cursor.position() != bytes.as_ref().len() as u64 {
         return Err(StorageError::InvalidHeader.into());
     }
     compact_snapshot_state.into_snapshot_state()
@@ -2061,13 +2145,14 @@ fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
     let compact_wal_entry = EncodedWalEntry::from_wal_entry(sequence, mutation)?;
     let mut bytes = Vec::new();
     cbor_ser::into_writer(&compact_wal_entry, &mut bytes)?;
-    Ok(bytes)
+    maybe_encode_zstd_blob(&bytes, WAL_COMPRESSION_MIN_LEN, WAL_COMPRESSION_MIN_SAVINGS)
 }
 
 fn decode_wal_entry(bytes: &[u8]) -> Result<WalEntry> {
-    let mut cursor = Cursor::new(bytes);
+    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let mut cursor = Cursor::new(bytes.as_ref());
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != bytes.len() as u64 {
+    if cursor.position() != bytes.as_ref().len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     compact_wal_entry.into_wal_entry()
@@ -3399,6 +3484,7 @@ fn encode_snapshot_catalog(
             .collect();
     }
 
+    compress_encoded_pages(&mut encoded_catalog.pages)?;
     Ok(encoded_catalog)
 }
 
@@ -3921,7 +4007,7 @@ fn read_index_tree(
 }
 
 fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<DecodedPage> {
-    if page_ref.page_len as usize != PAGE_SIZE || page_ref.offset < DATA_START_OFFSET {
+    if page_ref.page_len == 0 || page_ref.offset < DATA_START_OFFSET {
         return Err(StorageError::InvalidPageReference.into());
     }
 
@@ -3932,6 +4018,11 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<DecodedPage> {
 
     if hash_bytes(&page) != page_ref.checksum {
         return Err(StorageError::InvalidPageChecksum.into());
+    }
+    let page = maybe_decode_stored_blob(&page).map_err(|_| StorageError::InvalidPage)?;
+    let page = page.as_ref();
+    if page.len() != PAGE_SIZE {
+        return Err(StorageError::InvalidPage.into());
     }
     if &page[..8] != PAGE_MAGIC {
         return Err(StorageError::InvalidPage.into());
@@ -4101,8 +4192,9 @@ mod tests {
     use super::{
         CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION,
         PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE, PersistedChangeEvent, PersistedPlanCacheChoice,
-        PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, VerifyReport, WalMutation,
-        decode_page, decode_snapshot_state, read_superblock,
+        PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, VerifyReport, WAL_FRAME_MAGIC,
+        WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC, decode_page, decode_snapshot_state,
+        read_superblock,
     };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -4124,6 +4216,34 @@ mod tests {
         let mut snapshot = vec![0_u8; superblock.snapshot_len as usize];
         file.read_exact(&mut snapshot).expect("read snapshot");
         decode_snapshot_state(&snapshot).expect("decode snapshot")
+    }
+
+    fn latest_snapshot_bytes(path: &std::path::Path, slot: usize) -> Vec<u8> {
+        let mut file = OpenOptions::new().read(true).open(path).expect("open file");
+        let superblock = read_superblock(&mut file, slot)
+            .expect("read superblock")
+            .expect("superblock");
+        file.seek(SeekFrom::Start(superblock.snapshot_offset))
+            .expect("seek snapshot");
+        let mut snapshot = vec![0_u8; superblock.snapshot_len as usize];
+        file.read_exact(&mut snapshot).expect("read snapshot");
+        snapshot
+    }
+
+    fn first_wal_payload(path: &std::path::Path) -> Vec<u8> {
+        let inspect = DatabaseFile::inspect(path).expect("inspect");
+        let mut file = OpenOptions::new().read(true).open(path).expect("open file");
+        file.seek(SeekFrom::Start(inspect.wal_offset))
+            .expect("seek wal frame");
+
+        let mut header = [0_u8; WAL_HEADER_LEN];
+        file.read_exact(&mut header).expect("read wal header");
+        assert_eq!(&header[..4], WAL_FRAME_MAGIC);
+
+        let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+        let mut payload = vec![0_u8; payload_len as usize];
+        file.read_exact(&mut payload).expect("read wal payload");
+        payload
     }
 
     fn sample_change_event(sequence: i64, operation_type: &str) -> PersistedChangeEvent {
@@ -5472,6 +5592,69 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_compress_snapshot_and_record_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("compressed-checkpoint.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=18_u64 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "category": "compressible",
+                        "payload": "x".repeat(PAGE_SIZE / 3),
+                    },
+                );
+            }
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "category": 1 }, "name": "category_1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        let snapshot_bytes = latest_snapshot_bytes(&path, inspect.active_superblock_slot);
+        assert!(snapshot_bytes.starts_with(ZSTD_BLOB_MAGIC));
+
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let collection = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection");
+        assert!(
+            collection
+                .record_pages
+                .iter()
+                .any(|page_ref| (page_ref.page_len as usize) < PAGE_SIZE)
+        );
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let reopened_collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(reopened_collection.records.len(), 18);
+    }
+
+    #[test]
     fn spills_large_index_entries_across_multiple_pages() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("index-pages.mongodb");
@@ -5529,6 +5712,45 @@ mod tests {
             .expect("open file");
         let root_page = decode_page(&mut file, root_page_ref).expect("decode page");
         assert_eq!(root_page.page_kind, PAGE_KIND_INDEX_INTERNAL);
+    }
+
+    #[test]
+    fn replays_compressed_wal_frames() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("compressed-wal.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=20_u64 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "payload": "z".repeat(PAGE_SIZE / 3),
+                    },
+                );
+            }
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+        }
+
+        let payload = first_wal_payload(&path);
+        assert!(payload.starts_with(ZSTD_BLOB_MAGIC));
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(collection.records.len(), 20);
     }
 
     #[test]

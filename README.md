@@ -82,6 +82,7 @@ printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongo
 
 At a high level, the current engine already covers:
 - single-file durable storage with WAL, checkpoints, recovery, and persisted secondary indexes
+- selective zstd compression for checkpoint pages, snapshot metadata, and large WAL frames when the stored bytes shrink materially
 - page-local in-memory secondary-index maintenance so bulk inserts only rewrite touched index leaves
 - incrementally maintained in-memory unique-index validation caches that keep structured BSON keys and borrow per-batch write documents so writes do not rebuild duplicate-key state or duplicate full documents during validation
 - storage commits apply already-validated CRUD deltas through the catalog without repeating the same unique-index duplicate probes on the hot path

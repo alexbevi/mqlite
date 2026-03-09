@@ -43,6 +43,8 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
   - monitoring toggles
   - Node-only broker spawn controls such as `mqliteSpawnPath`, `mqliteSpawnTimeoutMS`, and `mqliteIdleShutdownSecs`
 
+Local durable-file compression is internal to `mqlite` and does not change the `OP_MSG` wire behavior for drivers.
+
 ### Broker lifecycle
 - Compute the manifest path adjacent to the target `.mongodb` file.
 - If the manifest exists and the broker is alive, attach to the advertised endpoint.
