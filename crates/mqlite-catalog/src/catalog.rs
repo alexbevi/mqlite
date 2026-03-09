@@ -1,6 +1,8 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
 };
 
 use bson::{Bson, Document, doc};
@@ -43,10 +45,12 @@ pub struct CollectionCatalog {
     record_positions: HashMap<u64, usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionRecord {
     pub record_id: u64,
     pub document: Document,
+    #[serde(skip, default)]
+    encoded_document: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +58,39 @@ pub enum CollectionMutation<'a> {
     Insert(&'a CollectionRecord),
     Update(&'a CollectionRecord),
     Delete(u64),
+}
+
+impl CollectionRecord {
+    pub fn new(record_id: u64, document: Document) -> Self {
+        Self {
+            record_id,
+            document,
+            encoded_document: None,
+        }
+    }
+
+    pub fn from_encoded(record_id: u64, document: Document, encoded_document: Vec<u8>) -> Self {
+        Self {
+            record_id,
+            document,
+            encoded_document: Some(Arc::from(encoded_document)),
+        }
+    }
+
+    pub fn encoded_document_bytes(&self) -> Result<Cow<'_, [u8]>, CatalogError> {
+        match self.encoded_document.as_deref() {
+            Some(bytes) => Ok(Cow::Borrowed(bytes)),
+            None => bson::to_vec(&self.document)
+                .map(Cow::Owned)
+                .map_err(|error| CatalogError::InvalidIndexState(error.to_string())),
+        }
+    }
+}
+
+impl PartialEq for CollectionRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.record_id == other.record_id && self.document == other.document
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,10 +565,7 @@ impl CollectionMutationPlan {
                         .insert_order
                         .get(record_id)
                         .expect("appended records must have an insert order"),
-                    CollectionRecord {
-                        record_id: *record_id,
-                        document: document.clone(),
-                    },
+                    CollectionRecord::new(*record_id, document.clone()),
                 )),
                 _ => None,
             })
@@ -1951,16 +1985,10 @@ mod tests {
     fn builds_index_entries_for_existing_records() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "b" },
-            })
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "b" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "a" },
-            })
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "a" }))
             .expect("insert");
 
         let created = super::apply_index_specs(
@@ -1973,6 +2001,30 @@ mod tests {
         assert_eq!(index.entries.len(), 2);
         assert_eq!(index.entries[0].record_id, 1);
         assert_eq!(index.entries[1].record_id, 2);
+    }
+
+    #[test]
+    fn collection_records_can_reuse_cached_bson_bytes() {
+        let document = doc! { "_id": 1, "sku": "alpha", "qty": 3 };
+        let encoded = bson::to_vec(&document).expect("encode document");
+
+        let cached = CollectionRecord::from_encoded(1, document.clone(), encoded.clone());
+        assert_eq!(
+            cached
+                .encoded_document_bytes()
+                .expect("cached bytes")
+                .as_ref(),
+            encoded.as_slice()
+        );
+
+        let uncached = CollectionRecord::new(1, document);
+        assert_eq!(
+            uncached
+                .encoded_document_bytes()
+                .expect("encoded bytes")
+                .as_ref(),
+            encoded.as_slice()
+        );
     }
 
     #[test]
@@ -2004,16 +2056,10 @@ mod tests {
     fn rejects_duplicate_keys_for_unique_index() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "dup" },
-            })
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "dup" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "dup" },
-            })
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "dup" }))
             .expect("insert");
 
         let error = super::apply_index_specs(
@@ -2028,16 +2074,10 @@ mod tests {
     fn updates_and_deletes_index_entries_incrementally() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "a" },
-            })
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "a" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "b" },
-            })
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "b" }))
             .expect("insert");
         super::apply_index_specs(
             &mut collection,
@@ -2065,16 +2105,16 @@ mod tests {
     fn applies_batched_mutations_and_updates_indexes_once() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "alpha", "qty": 1 },
-            })
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1, "sku": "alpha", "qty": 1 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "beta", "qty": 2 },
-            })
+            .insert_record(CollectionRecord::new(
+                2,
+                doc! { "_id": 2, "sku": "beta", "qty": 2 },
+            ))
             .expect("insert");
         super::apply_index_specs(
             &mut collection,
@@ -2085,14 +2125,8 @@ mod tests {
         )
         .expect("create indexes");
 
-        let inserted = CollectionRecord {
-            record_id: 3,
-            document: doc! { "_id": 3, "sku": "gamma", "qty": 7 },
-        };
-        let updated = CollectionRecord {
-            record_id: 1,
-            document: doc! { "_id": 1, "sku": "alpha-2", "qty": 4 },
-        };
+        let inserted = CollectionRecord::new(3, doc! { "_id": 3, "sku": "gamma", "qty": 7 });
+        let updated = CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha-2", "qty": 4 });
         collection
             .apply_mutations(&[
                 CollectionMutation::Update(&updated),
@@ -2137,16 +2171,10 @@ mod tests {
     fn batched_mutations_reject_duplicate_unique_keys_without_partial_updates() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "alpha" },
-            })
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "beta" },
-            })
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "beta" }))
             .expect("insert");
         super::apply_index_specs(
             &mut collection,
@@ -2154,10 +2182,7 @@ mod tests {
         )
         .expect("create index");
 
-        let duplicate = CollectionRecord {
-            record_id: 1,
-            document: doc! { "_id": 1, "sku": "beta" },
-        };
+        let duplicate = CollectionRecord::new(1, doc! { "_id": 1, "sku": "beta" });
         let original = collection.clone();
         let error = collection
             .apply_mutations(&[CollectionMutation::Update(&duplicate)])
@@ -2170,16 +2195,10 @@ mod tests {
     fn tracks_next_record_id_and_record_positions_without_scanning() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 7,
-                document: doc! { "_id": 1, "sku": "alpha" },
-            })
+            .insert_record(CollectionRecord::new(7, doc! { "_id": 1, "sku": "alpha" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 12,
-                document: doc! { "_id": 2, "sku": "beta" },
-            })
+            .insert_record(CollectionRecord::new(12, doc! { "_id": 2, "sku": "beta" }))
             .expect("insert");
         assert_eq!(collection.next_record_id(), 13);
         assert_eq!(collection.record_position(7), Some(0));
@@ -2192,10 +2211,10 @@ mod tests {
         assert_eq!(collection.record_position(12), None);
 
         collection
-            .insert_record(CollectionRecord {
-                record_id: collection.next_record_id(),
-                document: doc! { "_id": 3, "sku": "gamma" },
-            })
+            .insert_record(CollectionRecord::new(
+                collection.next_record_id(),
+                doc! { "_id": 3, "sku": "gamma" },
+            ))
             .expect("insert");
         assert_eq!(collection.record_position(13), Some(1));
         assert_eq!(collection.next_record_id(), 14);
@@ -2206,13 +2225,13 @@ mod tests {
         let mut collection = CollectionCatalog::new(doc! {});
         for record_id in 1..=200_u64 {
             collection
-                .insert_record(CollectionRecord {
+                .insert_record(CollectionRecord::new(
                     record_id,
-                    document: doc! {
+                    doc! {
                         "_id": record_id as i64,
                         "sku": format!("sku-{record_id:03}"),
                     },
-                })
+                ))
                 .expect("insert");
         }
         super::apply_index_specs(
@@ -2242,13 +2261,13 @@ mod tests {
         let mut collection = CollectionCatalog::new(doc! {});
         for record_id in 1..=64_u64 {
             collection
-                .insert_record(CollectionRecord {
+                .insert_record(CollectionRecord::new(
                     record_id,
-                    document: doc! {
+                    doc! {
                         "_id": record_id as i64,
                         "sku": format!("sku-{record_id:03}"),
                     },
-                })
+                ))
                 .expect("insert");
         }
         super::apply_index_specs(
@@ -2258,12 +2277,14 @@ mod tests {
         .expect("create index");
 
         let inserted = (65..=128_u64)
-            .map(|record_id| CollectionRecord {
-                record_id,
-                document: doc! {
-                    "_id": record_id as i64,
-                    "sku": format!("sku-{record_id:03}"),
-                },
+            .map(|record_id| {
+                CollectionRecord::new(
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                )
             })
             .collect::<Vec<_>>();
         let mutations = inserted
@@ -2302,13 +2323,13 @@ mod tests {
         let mut collection = CollectionCatalog::new(doc! {});
         for record_id in 1..=64_u64 {
             collection
-                .insert_record(CollectionRecord {
+                .insert_record(CollectionRecord::new(
                     record_id,
-                    document: doc! {
+                    doc! {
                         "_id": record_id as i64,
                         "sku": format!("sku-{record_id:03}"),
                     },
-                })
+                ))
                 .expect("insert");
         }
         super::apply_index_specs(
@@ -2318,12 +2339,14 @@ mod tests {
         .expect("create index");
 
         let inserted = (65..=128_u64)
-            .map(|record_id| CollectionRecord {
-                record_id,
-                document: doc! {
-                    "_id": record_id as i64,
-                    "sku": format!("sku-{record_id:03}"),
-                },
+            .map(|record_id| {
+                CollectionRecord::new(
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                )
             })
             .collect::<Vec<_>>();
         let mutations = inserted
@@ -2358,28 +2381,28 @@ mod tests {
     fn orders_compound_descending_index_entries_by_key_pattern() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "category": "tools", "qty": 9 },
-            })
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1, "category": "tools", "qty": 9 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "category": "tools", "qty": 3 },
-            })
+            .insert_record(CollectionRecord::new(
+                2,
+                doc! { "_id": 2, "category": "tools", "qty": 3 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 3,
-                document: doc! { "_id": 3, "category": "tools", "qty": 5 },
-            })
+            .insert_record(CollectionRecord::new(
+                3,
+                doc! { "_id": 3, "category": "tools", "qty": 5 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 4,
-                document: doc! { "_id": 4, "category": "garden", "qty": 1 },
-            })
+            .insert_record(CollectionRecord::new(
+                4,
+                doc! { "_id": 4, "category": "garden", "qty": 1 },
+            ))
             .expect("insert");
 
         super::apply_index_specs(
@@ -2406,22 +2429,22 @@ mod tests {
     fn scans_compound_descending_bounds_in_index_order() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "category": "tools", "qty": 9 },
-            })
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1, "category": "tools", "qty": 9 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "category": "tools", "qty": 3 },
-            })
+            .insert_record(CollectionRecord::new(
+                2,
+                doc! { "_id": 2, "category": "tools", "qty": 3 },
+            ))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 3,
-                document: doc! { "_id": 3, "category": "tools", "qty": 5 },
-            })
+            .insert_record(CollectionRecord::new(
+                3,
+                doc! { "_id": 3, "category": "tools", "qty": 5 },
+            ))
             .expect("insert");
 
         super::apply_index_specs(

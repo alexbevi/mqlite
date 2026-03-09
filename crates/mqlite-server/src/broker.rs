@@ -28,8 +28,8 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    CollectionChange, DatabaseFile, PersistedChangeEvent, PersistedPlanCacheChoice,
-    PersistedPlanCacheEntry, StorageError, WalMutation,
+    CollectionChange, DatabaseFile, EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent,
+    PersistedPlanCacheChoice, PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -1460,24 +1460,22 @@ impl Broker {
 
             for mut document in documents {
                 ensure_object_id(&mut document);
-                let record = CollectionRecord {
-                    record_id: next_record_id,
-                    document,
-                };
+                let (record, encoded_document) =
+                    encoded_collection_record(next_record_id, document);
                 next_record_id += 1;
-                let document_key = document_key_for_change_stream(&record.document);
-                change_events.push(change_stream_event(
+                let document_key = encoded_document_key_for_change_stream(&record.document);
+                change_events.push(change_stream_event_from_encoded(
                     sequence,
                     change_events.len(),
                     &database,
                     Some(collection_name),
                     "insert",
-                    document_key.as_ref(),
-                    Some(&record.document),
+                    document_key,
+                    Some(encoded_document),
                     None,
                     None,
                     false,
-                    &Document::new(),
+                    EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                 ));
                 changes.push(CollectionChange::Insert(record));
             }
@@ -1715,27 +1713,27 @@ impl Broker {
                         let mut document = upsert_seed_from_query(query);
                         apply_update(&mut document, &update_spec)?;
                         let upserted_id = ensure_object_id(&mut document);
-                        let record = CollectionRecord {
-                            record_id: next_record_id,
-                            document,
-                        };
+                        let (record, encoded_document) =
+                            encoded_collection_record(next_record_id, document);
                         next_record_id += 1;
                         upserted.push(doc! {
                             "index": operation_index as i32,
                             "_id": upserted_id.clone()
                         });
-                        change_events.push(change_stream_event(
+                        change_events.push(change_stream_event_from_encoded(
                             sequence,
                             change_events.len(),
                             &database,
                             Some(collection_name),
                             "insert",
-                            Some(&doc! { "_id": upserted_id.clone() }),
-                            Some(&record.document),
+                            Some(encode_bson_document_bytes(
+                                &doc! { "_id": upserted_id.clone() },
+                            )),
+                            Some(encoded_document),
                             None,
                             None,
                             false,
-                            &Document::new(),
+                            EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                         ));
                         inserted_records.push(record.clone());
                         changes.push(CollectionChange::Insert(record));
@@ -1751,42 +1749,41 @@ impl Broker {
                     if updated != original {
                         modified += 1;
                         visible_updates.insert(record_id, updated.clone());
-                        changes.push(CollectionChange::Update(CollectionRecord {
-                            record_id,
-                            document: updated.clone(),
-                        }));
-                        let document_key = document_key_for_change_stream(&updated);
+                        let (updated_record, encoded_updated) =
+                            encoded_collection_record(record_id, updated.clone());
+                        changes.push(CollectionChange::Update(updated_record));
+                        let document_key = encoded_document_key_for_change_stream(&updated);
                         match &update_spec {
                             mqlite_query::UpdateSpec::Replacement(_) => {
-                                change_events.push(change_stream_event(
+                                change_events.push(change_stream_event_from_encoded(
                                     sequence,
                                     change_events.len(),
                                     &database,
                                     Some(collection_name),
                                     "replace",
-                                    document_key.as_ref(),
-                                    Some(&updated),
-                                    Some(&original),
+                                    document_key,
+                                    Some(encoded_updated),
+                                    Some(encode_bson_document_bytes(&original)),
                                     None,
                                     false,
-                                    &Document::new(),
+                                    EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                                 ));
                             }
                             _ => {
                                 let update_description =
                                     build_update_description(&original, &updated);
-                                change_events.push(change_stream_event(
+                                change_events.push(change_stream_event_from_encoded(
                                     sequence,
                                     change_events.len(),
                                     &database,
                                     Some(collection_name),
                                     "update",
-                                    document_key.as_ref(),
-                                    Some(&updated),
-                                    Some(&original),
-                                    Some(&update_description),
+                                    document_key,
+                                    Some(encoded_updated),
+                                    Some(encode_bson_document_bytes(&original)),
+                                    Some(encode_bson_document_bytes(&update_description)),
                                     false,
-                                    &Document::new(),
+                                    EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                                 ));
                             }
                         }
@@ -1884,19 +1881,19 @@ impl Broker {
                     if deleted_record_ids.insert(record_id) {
                         deleted += 1;
                         changes.push(CollectionChange::Delete(record_id));
-                        let document_key = document_key_for_change_stream(&document);
-                        change_events.push(change_stream_event(
+                        let document_key = encoded_document_key_for_change_stream(&document);
+                        change_events.push(change_stream_event_from_encoded(
                             sequence,
                             change_events.len(),
                             &database,
                             Some(collection_name),
                             "delete",
-                            document_key.as_ref(),
+                            document_key,
                             None,
-                            Some(&document),
+                            Some(encode_bson_document_bytes(&document)),
                             None,
                             false,
-                            &Document::new(),
+                            EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                         ));
                     }
                 }
@@ -3458,10 +3455,10 @@ impl Broker {
         let mut next_record_id = 1_u64;
         for mut document in results {
             ensure_object_id(&mut document);
-            changes.push(CollectionChange::Insert(CollectionRecord {
-                record_id: next_record_id,
+            changes.push(CollectionChange::Insert(CollectionRecord::new(
+                next_record_id,
                 document,
-            }));
+            )));
             next_record_id += 1;
         }
         let sequence = storage
@@ -3525,10 +3522,9 @@ impl Broker {
                     MergeWhenMatched::Replace => {
                         if document != existing {
                             visible_updates.insert(record_id, document.clone());
-                            changes.push(CollectionChange::Update(CollectionRecord {
-                                record_id,
-                                document,
-                            }));
+                            changes.push(CollectionChange::Update(CollectionRecord::new(
+                                record_id, document,
+                            )));
                         }
                         Ok(())
                     }
@@ -3539,10 +3535,9 @@ impl Broker {
                         }
                         if merged != existing {
                             visible_updates.insert(record_id, merged.clone());
-                            changes.push(CollectionChange::Update(CollectionRecord {
-                                record_id,
-                                document: merged,
-                            }));
+                            changes.push(CollectionChange::Update(CollectionRecord::new(
+                                record_id, merged,
+                            )));
                         }
                         Ok(())
                     }
@@ -3565,10 +3560,7 @@ impl Broker {
 
             let outcome = match target.when_not_matched {
                 MergeWhenNotMatched::Insert => {
-                    let record = CollectionRecord {
-                        record_id: next_record_id,
-                        document,
-                    };
+                    let record = CollectionRecord::new(next_record_id, document);
                     next_record_id += 1;
                     inserted_records.push(record.clone());
                     changes.push(CollectionChange::Insert(record));
@@ -3912,11 +3904,40 @@ fn change_stream_event(
     expanded: bool,
     extra_fields: &Document,
 ) -> PersistedChangeEvent {
-    PersistedChangeEvent::new(
-        &doc! {
+    change_stream_event_from_encoded(
+        sequence,
+        event_index,
+        database,
+        collection,
+        operation_type,
+        document_key.map(encode_bson_document_bytes),
+        full_document.map(encode_bson_document_bytes),
+        full_document_before_change.map(encode_bson_document_bytes),
+        update_description.map(encode_bson_document_bytes),
+        expanded,
+        encode_bson_document_bytes(extra_fields),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn change_stream_event_from_encoded(
+    sequence: u64,
+    event_index: usize,
+    database: &str,
+    collection: Option<&str>,
+    operation_type: &str,
+    document_key: Option<Vec<u8>>,
+    full_document: Option<Vec<u8>>,
+    full_document_before_change: Option<Vec<u8>>,
+    update_description: Option<Vec<u8>>,
+    expanded: bool,
+    extra_fields: Vec<u8>,
+) -> PersistedChangeEvent {
+    PersistedChangeEvent::from_encoded_fields(
+        encode_bson_document_bytes(&doc! {
             "sequence": sequence as i64,
             "event": event_index as i32 + 1,
-        },
+        }),
         bson::Timestamp {
             time: sequence.min(u64::from(u32::MAX)) as u32,
             increment: event_index as u32 + 1,
@@ -3932,14 +3953,26 @@ fn change_stream_event(
         expanded,
         extra_fields,
     )
-    .expect("encode persisted change event")
 }
 
-fn document_key_for_change_stream(document: &Document) -> Option<Document> {
-    document
-        .get("_id")
-        .cloned()
-        .map(|value| doc! { "_id": value })
+fn encode_bson_document_bytes(document: &Document) -> Vec<u8> {
+    bson::to_vec(document).expect("encode bson document")
+}
+
+fn encoded_document_key_for_change_stream(document: &Document) -> Option<Vec<u8>> {
+    document.get("_id").cloned().map(|value| {
+        encode_bson_document_bytes(&doc! {
+            "_id": value,
+        })
+    })
+}
+
+fn encoded_collection_record(record_id: u64, document: Document) -> (CollectionRecord, Vec<u8>) {
+    let encoded = encode_bson_document_bytes(&document);
+    (
+        CollectionRecord::from_encoded(record_id, document, encoded.clone()),
+        encoded,
+    )
 }
 
 fn build_update_description(before: &Document, after: &Document) -> Document {
@@ -6156,16 +6189,10 @@ mod tests {
     fn write_matching_records_include_overlay_updates_and_inserts() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
-            .insert_record(CollectionRecord {
-                record_id: 1,
-                document: doc! { "_id": 1, "sku": "alpha" },
-            })
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }))
             .expect("insert");
         collection
-            .insert_record(CollectionRecord {
-                record_id: 2,
-                document: doc! { "_id": 2, "sku": "beta" },
-            })
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "beta" }))
             .expect("insert");
         apply_index_specs(
             &mut collection,
@@ -6175,10 +6202,10 @@ mod tests {
 
         let visible_updates =
             BTreeMap::from([(2_u64, doc! { "_id": 2, "sku": "gamma", "qty": 5 })]);
-        let inserted_records = vec![CollectionRecord {
-            record_id: 3,
-            document: doc! { "_id": 3, "sku": "gamma", "qty": 7 },
-        }];
+        let inserted_records = vec![CollectionRecord::new(
+            3,
+            doc! { "_id": 3, "sku": "gamma", "qty": 7 },
+        )];
         let matches = matching_records_for_write(
             Some(&collection),
             &doc! { "sku": "gamma" },

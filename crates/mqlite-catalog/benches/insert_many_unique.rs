@@ -87,14 +87,14 @@ fn build_records(start_record_id: u64, count: u64, prefix: &str) -> Vec<Collecti
     (0..count)
         .map(|offset| {
             let record_id = start_record_id + offset;
-            CollectionRecord {
+            CollectionRecord::new(
                 record_id,
-                document: doc! {
+                doc! {
                     "_id": record_id as i64,
                     "sku": format!("{prefix}-{record_id:05}"),
                     "qty": record_id as i64,
                 },
-            }
+            )
         })
         .collect()
 }

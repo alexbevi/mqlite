@@ -41,6 +41,7 @@ const SNAPSHOT_COMPRESSION_MIN_LEN: usize = 1024;
 const SNAPSHOT_COMPRESSION_MIN_SAVINGS: usize = 256;
 const WAL_COMPRESSION_MIN_LEN: usize = PAGE_SIZE;
 const WAL_COMPRESSION_MIN_SAVINGS: usize = 512;
+pub const EMPTY_BSON_DOCUMENT_BYTES: &[u8; 5] = &[5, 0, 0, 0, 0];
 const PAGE_KIND_RECORD: u16 = 1;
 const PAGE_KIND_INDEX_LEAF: u16 = 2;
 const PAGE_KIND_INDEX_INTERNAL: u16 = 3;
@@ -1076,6 +1077,10 @@ impl SlottedPageBuilder {
 
     fn insert(&mut self, entry_id: u64, payload_document: &bson::Document) -> Result<()> {
         let payload = bson::to_vec(payload_document)?;
+        self.insert_bytes(entry_id, &payload)
+    }
+
+    fn insert_bytes(&mut self, entry_id: u64, payload: &[u8]) -> Result<()> {
         if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
             return Err(StorageError::RecordTooLarge.into());
         }
@@ -1289,6 +1294,37 @@ fn decode_optional_document_bytes(bytes: Option<Vec<u8>>) -> Result<Option<bson:
 }
 
 impl PersistedChangeEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_encoded_fields(
+        token: Vec<u8>,
+        cluster_time: bson::Timestamp,
+        wall_time: bson::DateTime,
+        database: String,
+        collection: Option<String>,
+        operation_type: String,
+        document_key: Option<Vec<u8>>,
+        full_document: Option<Vec<u8>>,
+        full_document_before_change: Option<Vec<u8>>,
+        update_description: Option<Vec<u8>>,
+        expanded: bool,
+        extra_fields: Vec<u8>,
+    ) -> Self {
+        Self {
+            token,
+            cluster_time,
+            wall_time,
+            database,
+            collection,
+            operation_type,
+            document_key,
+            full_document,
+            full_document_before_change,
+            update_description,
+            expanded,
+            extra_fields,
+        }
+    }
+
     pub fn new(
         token: &bson::Document,
         cluster_time: bson::Timestamp,
@@ -1303,22 +1339,20 @@ impl PersistedChangeEvent {
         expanded: bool,
         extra_fields: &bson::Document,
     ) -> Result<Self> {
-        Ok(Self {
-            token: encode_document_bytes(token)?,
+        Ok(Self::from_encoded_fields(
+            encode_document_bytes(token)?,
             cluster_time,
             wall_time,
             database,
             collection,
             operation_type,
-            document_key: encode_optional_document_bytes(document_key)?,
-            full_document: encode_optional_document_bytes(full_document)?,
-            full_document_before_change: encode_optional_document_bytes(
-                full_document_before_change,
-            )?,
-            update_description: encode_optional_document_bytes(update_description)?,
+            encode_optional_document_bytes(document_key)?,
+            encode_optional_document_bytes(full_document)?,
+            encode_optional_document_bytes(full_document_before_change)?,
+            encode_optional_document_bytes(update_description)?,
             expanded,
-            extra_fields: encode_document_bytes(extra_fields)?,
-        })
+            encode_document_bytes(extra_fields)?,
+        ))
     }
 
     pub fn token_document(&self) -> Result<bson::Document> {
@@ -1926,15 +1960,16 @@ impl CompactCollectionRecord {
     fn from_collection_record(record: &CollectionRecord) -> Result<Self> {
         Ok(Self {
             record_id: record.record_id,
-            document: encode_document_bytes(&record.document)?,
+            document: record.encoded_document_bytes()?.into_owned(),
         })
     }
 
     fn into_collection_record(self) -> Result<CollectionRecord> {
-        Ok(CollectionRecord {
-            record_id: self.record_id,
-            document: decode_document_bytes(&self.document)?,
-        })
+        Ok(CollectionRecord::from_encoded(
+            self.record_id,
+            decode_document_bytes(&self.document)?,
+            self.document,
+        ))
     }
 }
 
@@ -3625,14 +3660,28 @@ fn encode_collection_pages(
     records: &[CollectionRecord],
     next_page_id: &mut u64,
 ) -> Result<Vec<EncodedPage>> {
-    encode_document_pages(
-        records
-            .iter()
-            .map(|record| (record.record_id, &record.document)),
-        PAGE_KIND_RECORD,
-        0,
-        next_page_id,
-    )
+    let mut pages = Vec::new();
+    let mut builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_RECORD, 0);
+
+    for record in records {
+        let payload = record.encoded_document_bytes()?;
+        if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
+            return Err(StorageError::RecordTooLarge.into());
+        }
+        if !builder.can_fit(payload.len()) && !builder.is_empty() {
+            pages.push(builder.finish());
+            *next_page_id += 1;
+            builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_RECORD, 0);
+        }
+        builder.insert_bytes(record.record_id, payload.as_ref())?;
+    }
+
+    if !builder.is_empty() {
+        pages.push(builder.finish());
+        *next_page_id += 1;
+    }
+
+    Ok(pages)
 }
 
 fn encode_change_event_pages(
@@ -3653,40 +3702,7 @@ fn encode_change_event_pages(
             *next_page_id += 1;
             builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_CHANGE_EVENT, 0);
         }
-        builder.insert(index as u64, &document)?;
-    }
-
-    if !builder.is_empty() {
-        pages.push(builder.finish());
-        *next_page_id += 1;
-    }
-
-    Ok(pages)
-}
-
-fn encode_document_pages<'a, I>(
-    entries: I,
-    page_kind: u16,
-    page_extra: u64,
-    next_page_id: &mut u64,
-) -> Result<Vec<EncodedPage>>
-where
-    I: IntoIterator<Item = (u64, &'a bson::Document)>,
-{
-    let mut pages = Vec::new();
-    let mut builder = SlottedPageBuilder::new(*next_page_id, page_kind, page_extra);
-
-    for (entry_id, document) in entries {
-        let payload = bson::to_vec(document)?;
-        if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
-            return Err(StorageError::RecordTooLarge.into());
-        }
-        if !builder.can_fit(payload.len()) {
-            pages.push(builder.finish());
-            *next_page_id += 1;
-            builder = SlottedPageBuilder::new(*next_page_id, page_kind, page_extra);
-        }
-        builder.insert(entry_id, document)?;
+        builder.insert_bytes(index as u64, &payload)?;
     }
 
     if !builder.is_empty() {
@@ -3732,7 +3748,7 @@ fn build_leaf_index_pages(
     let mut page_entries = Vec::<IndexEntry>::new();
 
     for entry in entries {
-        let payload = bson::to_vec(&encode_index_entry_payload(entry)?)?;
+        let payload = encode_index_entry_payload_bytes(entry)?;
         if PAGE_HEADER_LEN + SLOT_ENTRY_LEN + payload.len() > PAGE_SIZE {
             return Err(StorageError::RecordTooLarge.into());
         }
@@ -3742,7 +3758,7 @@ fn build_leaf_index_pages(
             builder = SlottedPageBuilder::new(*next_page_id, PAGE_KIND_INDEX_LEAF, 0);
             page_entries.clear();
         }
-        builder.insert(entry.record_id, &encode_index_entry_payload(entry)?)?;
+        builder.insert_bytes(entry.record_id, &payload)?;
         page_entries.push(entry.clone());
     }
 
@@ -3934,12 +3950,7 @@ fn decode_record_page(file: &mut File, page_ref: &PageRef) -> Result<Vec<Collect
 
     page.entries
         .into_iter()
-        .map(|(record_id, document)| {
-            Ok(CollectionRecord {
-                record_id,
-                document,
-            })
-        })
+        .map(|(record_id, document)| Ok(CollectionRecord::new(record_id, document)))
         .collect()
 }
 
@@ -4087,8 +4098,8 @@ fn decode_page(file: &mut File, page_ref: &PageRef) -> Result<DecodedPage> {
     })
 }
 
-fn encode_index_entry_payload(entry: &IndexEntry) -> Result<bson::Document> {
-    bson::to_document(entry).map_err(Into::into)
+fn encode_index_entry_payload_bytes(entry: &IndexEntry) -> Result<Vec<u8>> {
+    Ok(bson::to_vec(entry)?)
 }
 
 fn decode_index_entry_payload(record_id: u64, payload: bson::Document) -> Result<IndexEntry> {
@@ -4199,10 +4210,7 @@ mod tests {
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
         collection
-            .insert_record(CollectionRecord {
-                record_id,
-                document,
-            })
+            .insert_record(CollectionRecord::new(record_id, document))
             .expect("insert record");
     }
 
@@ -4300,10 +4308,10 @@ mod tests {
                 database: "app".to_string(),
                 collection: "widgets".to_string(),
                 create_options: Some(Document::new()),
-                changes: vec![CollectionChange::Insert(CollectionRecord {
-                    record_id: 1,
-                    document: doc! { "_id": 1, "sku": "alpha" },
-                })],
+                changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1, "sku": "alpha" },
+                ))],
                 inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
@@ -4377,10 +4385,10 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     options: doc! { "validator": { "qty": { "$gte": 0 } } },
-                    changes: vec![CollectionChange::Insert(CollectionRecord {
-                        record_id: 1,
-                        document: doc! { "_id": 2, "sku": "b", "qty": 7 },
-                    })],
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        1,
+                        doc! { "_id": 2, "sku": "b", "qty": 7 },
+                    ))],
                     change_events: Vec::new(),
                 })
                 .expect("rewrite collection");
@@ -4412,14 +4420,14 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     create_options: Some(doc! { "validator": { "qty": { "$gte": 0 } } }),
-                    changes: vec![CollectionChange::Insert(CollectionRecord {
-                        record_id: 1,
-                        document: doc! { "_id": 1, "sku": "alpha", "qty": 4 },
-                    })],
-                    inserts: vec![CollectionRecord {
-                        record_id: 1,
-                        document: doc! { "_id": 1, "sku": "alpha", "qty": 4 },
-                    }],
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        1,
+                        doc! { "_id": 1, "sku": "alpha", "qty": 4 },
+                    ))],
+                    inserts: vec![CollectionRecord::new(
+                        1,
+                        doc! { "_id": 1, "sku": "alpha", "qty": 4 },
+                    )],
                     updates: Vec::new(),
                     deletes: Vec::new(),
                     change_events: vec![sample_change_event(1, "insert")],
@@ -4497,24 +4505,24 @@ mod tests {
                     collection: "widgets".to_string(),
                     create_options: None,
                     changes: vec![
-                        CollectionChange::Insert(CollectionRecord {
-                            record_id: 3,
-                            document: doc! { "_id": 3, "sku": "charlie", "qty": 3 },
-                        }),
-                        CollectionChange::Update(CollectionRecord {
-                            record_id: 1,
-                            document: doc! { "_id": 1, "sku": "delta", "qty": 9 },
-                        }),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            3,
+                            doc! { "_id": 3, "sku": "charlie", "qty": 3 },
+                        )),
+                        CollectionChange::Update(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1, "sku": "delta", "qty": 9 },
+                        )),
                         CollectionChange::Delete(2),
                     ],
-                    inserts: vec![CollectionRecord {
-                        record_id: 3,
-                        document: doc! { "_id": 3, "sku": "charlie", "qty": 3 },
-                    }],
-                    updates: vec![CollectionRecord {
-                        record_id: 1,
-                        document: doc! { "_id": 1, "sku": "delta", "qty": 9 },
-                    }],
+                    inserts: vec![CollectionRecord::new(
+                        3,
+                        doc! { "_id": 3, "sku": "charlie", "qty": 3 },
+                    )],
+                    updates: vec![CollectionRecord::new(
+                        1,
+                        doc! { "_id": 1, "sku": "delta", "qty": 9 },
+                    )],
                     deletes: vec![2],
                     change_events: change_events.clone(),
                 })
@@ -4647,10 +4655,10 @@ mod tests {
                 database: "app".to_string(),
                 collection: "widgets".to_string(),
                 create_options: None,
-                changes: vec![CollectionChange::Insert(CollectionRecord {
-                    record_id: 3,
-                    document: doc! { "_id": 3, "sku": "gamma" },
-                })],
+                changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                    3,
+                    doc! { "_id": 3, "sku": "gamma" },
+                ))],
                 inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
@@ -4667,10 +4675,10 @@ mod tests {
                 database: "app".to_string(),
                 collection: "widgets".to_string(),
                 create_options: None,
-                changes: vec![CollectionChange::Insert(CollectionRecord {
-                    record_id: 4,
-                    document: doc! { "_id": 4, "sku": "gamma" },
-                })],
+                changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                    4,
+                    doc! { "_id": 4, "sku": "gamma" },
+                ))],
                 inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
@@ -4693,10 +4701,10 @@ mod tests {
                 database: "app".to_string(),
                 collection: "widgets".to_string(),
                 create_options: None,
-                changes: vec![CollectionChange::Update(CollectionRecord {
-                    record_id: 2,
-                    document: doc! { "_id": 2, "sku": "delta" },
-                })],
+                changes: vec![CollectionChange::Update(CollectionRecord::new(
+                    2,
+                    doc! { "_id": 2, "sku": "delta" },
+                ))],
                 inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: Vec::new(),
@@ -4819,14 +4827,14 @@ mod tests {
                     collection: "widgets".to_string(),
                     create_options: None,
                     changes: vec![
-                        CollectionChange::Update(CollectionRecord {
-                            record_id: 1,
-                            document: doc! { "_id": 1, "sku": "beta" },
-                        }),
-                        CollectionChange::Insert(CollectionRecord {
-                            record_id: 2,
-                            document: doc! { "_id": 2, "sku": "alpha" },
-                        }),
+                        CollectionChange::Update(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1, "sku": "beta" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2, "sku": "alpha" },
+                        )),
                     ],
                     inserts: Vec::new(),
                     updates: Vec::new(),
@@ -5292,15 +5300,15 @@ mod tests {
                     database: "app".to_string(),
                     collection: "widgets".to_string(),
                     create_options: None,
-                    changes: vec![CollectionChange::Update(CollectionRecord {
-                        record_id: 6,
-                        document: doc! {
+                    changes: vec![CollectionChange::Update(CollectionRecord::new(
+                        6,
+                        doc! {
                             "_id": 6_i64,
                             "sku": "sku-6",
                             "qty": 600_i32,
                             "payload": "x".repeat(700),
                         },
-                    })],
+                    ))],
                     inserts: Vec::new(),
                     updates: Vec::new(),
                     deletes: Vec::new(),
