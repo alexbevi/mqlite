@@ -38,7 +38,7 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 
 `mqlite command` will reuse an existing broker for that file or auto-spawn one if needed.
 If the auto-spawned broker exits before it publishes its manifest, the command reports that startup failure instead of collapsing it into a generic manifest timeout.
-Brokers also checkpoint automatically about every 60 seconds while they are running, which keeps WAL replay bounded for long-lived sessions instead of waiting only for idle shutdown.
+Brokers also checkpoint automatically after about 60 seconds once the broker reaches a brief quiet window with no command in flight. The broker snapshots that checkpoint into a background worker so later commands can keep running; if the current inactive checkpoint region is too small to rewrite safely in place, the broker leaves the WAL in place and falls back to the normal idle-shutdown checkpoint instead of blocking active work.
 
 If you want a broker to stay up explicitly, run:
 

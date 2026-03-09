@@ -49,7 +49,7 @@ The broker is the only writer for a database file.
 
 - Reads are served from in-process state loaded from the file plus any applied WAL mutations.
 - Writes append WAL records, update in-memory state, and become durable before command success. Concurrent writers share a short group-commit sync barrier so multiple acknowledged commands can ride the same `fsync`.
-- Running brokers checkpoint automatically about every 60 seconds when dirty so WAL replay stays bounded even during long-lived sessions.
+- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. The broker captures checkpoint state briefly under the storage lock, then writes the checkpoint on a background worker so later commands can keep running. If the inactive checkpoint region is not large enough for a safe concurrent rewrite, the broker leaves the WAL in place and relies on the idle-shutdown checkpoint instead of blocking active command execution.
 - Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
 - CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.

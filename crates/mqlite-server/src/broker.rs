@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
@@ -28,8 +28,9 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    CollectionChange, DatabaseFile, EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent,
-    PersistedPlanCacheChoice, PersistedPlanCacheEntry, StorageError, WalMutation,
+    CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
+    EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent, PersistedPlanCacheChoice,
+    PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -43,12 +44,15 @@ const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+const CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub database_path: PathBuf,
     pub idle_shutdown_secs: u64,
     pub checkpoint_interval_secs: u64,
+    #[cfg(test)]
+    pub checkpoint_test_delay_ms: u64,
 }
 
 impl BrokerConfig {
@@ -57,6 +61,8 @@ impl BrokerConfig {
             database_path: database_path.as_ref().to_path_buf(),
             idle_shutdown_secs,
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            #[cfg(test)]
+            checkpoint_test_delay_ms: 0,
         }
     }
 }
@@ -71,6 +77,7 @@ pub struct Broker {
     plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
     fail_command: Arc<Mutex<Option<FailCommandState>>>,
     active_connections: Arc<AtomicUsize>,
+    active_commands: Arc<AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
 }
 
@@ -230,6 +237,7 @@ impl Broker {
             plan_cache: Arc::new(Mutex::new(plan_cache)),
             fail_command: Arc::new(Mutex::new(None)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
     }
@@ -253,6 +261,9 @@ impl Broker {
         let idle_timeout = Duration::from_secs(self.config.idle_shutdown_secs.max(1));
         let checkpoint_interval = Duration::from_secs(self.config.checkpoint_interval_secs.max(1));
         let mut last_checkpoint = Instant::now();
+        let mut checkpoint_task: Option<
+            tokio::task::JoinHandle<Result<Option<CompletedConcurrentCheckpoint>>>,
+        > = None;
         loop {
             let sleep = tokio::time::sleep(Duration::from_millis(250));
             tokio::pin!(sleep);
@@ -270,19 +281,50 @@ impl Broker {
                     });
                 }
                 _ = &mut sleep => {
-                    if last_checkpoint.elapsed() >= checkpoint_interval {
-                        self.checkpoint_if_needed()?;
-                        last_checkpoint = Instant::now();
+                    if checkpoint_task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                    {
+                        let task = checkpoint_task.take().expect("finished checkpoint task");
+                        self.reconcile_background_checkpoint(
+                            task.await
+                                .map_err(|error| anyhow!("background checkpoint task failed: {error}"))?,
+                        )?;
                     }
-                    if self.active_connections.load(Ordering::SeqCst) == 0
+                    if checkpoint_task.is_none()
+                        && self.active_connections.load(Ordering::SeqCst) == 0
                         && self.last_activity.lock().elapsed() >= idle_timeout
                     {
                         break;
+                    }
+                    if checkpoint_task.is_none()
+                        && last_checkpoint.elapsed() >= checkpoint_interval
+                        && self.active_commands.load(Ordering::SeqCst) == 0
+                        && self.last_activity.lock().elapsed() >= CHECKPOINT_QUIET_PERIOD
+                    {
+                        if let Some(job) = self.prepare_background_checkpoint()? {
+                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
+                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
+                                if checkpoint_test_delay_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(
+                                        checkpoint_test_delay_ms,
+                                    ));
+                                }
+                                job.run()
+                            }));
+                            last_checkpoint = Instant::now();
+                        }
                     }
                 }
             }
         }
 
+        if let Some(task) = checkpoint_task.take() {
+            self.reconcile_background_checkpoint(
+                task.await
+                    .map_err(|error| anyhow!("background checkpoint task failed: {error}"))?,
+            )?;
+        }
         self.checkpoint_if_needed()?;
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
@@ -312,6 +354,42 @@ impl Broker {
             storage.checkpoint()?;
             return Ok(true);
         }
+    }
+
+    fn prepare_background_checkpoint(&self) -> Result<Option<ConcurrentCheckpointJob>> {
+        let persisted_cache = self.persisted_plan_cache_entries();
+        let mut storage = self.storage.write();
+        let visible_sequence = storage.last_applied_sequence();
+        let durable_sequence = self.wal_commit.state.lock().durable_sequence;
+        if durable_sequence < visible_sequence {
+            return Ok(None);
+        }
+        storage.set_persisted_plan_cache_entries(persisted_cache);
+        Ok(storage
+            .prepare_concurrent_checkpoint()
+            .map_err(internal_error)?)
+    }
+
+    fn reconcile_background_checkpoint(
+        &self,
+        result: Result<Option<CompletedConcurrentCheckpoint>>,
+    ) -> Result<()> {
+        let mut storage = self.storage.write();
+        match result {
+            Ok(Some(completed)) => {
+                storage
+                    .finish_concurrent_checkpoint(completed)
+                    .map_err(internal_error)?;
+            }
+            Ok(None) => {
+                storage.abort_concurrent_checkpoint();
+            }
+            Err(error) => {
+                storage.abort_concurrent_checkpoint();
+                eprintln!("mqlite background checkpoint failed: {error}");
+            }
+        }
+        Ok(())
     }
 
     fn cached_find_plan(
@@ -427,6 +505,10 @@ impl Broker {
             };
 
             let body = request.materialize_command()?;
+            let _command_guard = ActiveCommandGuard::new(
+                Arc::clone(&self.active_commands),
+                Arc::clone(&self.last_activity),
+            );
             let response_body = match self.maybe_apply_fail_command(&body).await {
                 Ok(FailCommandAction::Continue) => match self.dispatch(&body) {
                     Ok(document) => ok_response(document),
@@ -2990,6 +3072,16 @@ impl Broker {
             .open(namespace, results, batch_size, false);
         Ok(cursor_document(cursor, "firstBatch"))
     }
+}
+
+#[cfg(test)]
+fn background_checkpoint_test_delay_ms(config: &BrokerConfig) -> u64 {
+    config.checkpoint_test_delay_ms
+}
+
+#[cfg(not(test))]
+fn background_checkpoint_test_delay_ms(_config: &BrokerConfig) -> u64 {
+    0
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5686,6 +5778,29 @@ fn tighten_upper(bounds: &mut FieldBounds, candidate: Bson, inclusive: bool) {
     }
 }
 
+struct ActiveCommandGuard {
+    active_commands: Arc<AtomicUsize>,
+    last_activity: Arc<Mutex<Instant>>,
+}
+
+impl ActiveCommandGuard {
+    fn new(active_commands: Arc<AtomicUsize>, last_activity: Arc<Mutex<Instant>>) -> Self {
+        active_commands.fetch_add(1, Ordering::SeqCst);
+        *last_activity.lock() = Instant::now();
+        Self {
+            active_commands,
+            last_activity,
+        }
+    }
+}
+
+impl Drop for ActiveCommandGuard {
+    fn drop(&mut self) {
+        self.active_commands.fetch_sub(1, Ordering::SeqCst);
+        *self.last_activity.lock() = Instant::now();
+    }
+}
+
 fn command_name(body: &Document) -> Option<String> {
     body.keys().find(|key| !key.starts_with('$')).cloned()
 }
@@ -6203,7 +6318,7 @@ mod tests {
     use bson::{Bson, doc, oid::ObjectId};
     use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
     use mqlite_ipc::{connect, read_manifest};
-    use mqlite_storage::DatabaseFile;
+    use mqlite_storage::{DatabaseFile, WalMutation};
     use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
@@ -6357,6 +6472,65 @@ mod tests {
         (serve_task, temp_dir, manifest)
     }
 
+    fn seed_reusable_checkpoint_space(database_path: &Path) {
+        let mut database = DatabaseFile::open_or_create(database_path).expect("create");
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1_i64, "sku": "seed" },
+            ))
+            .expect("insert seed");
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: collection,
+                change_events: Vec::new(),
+            })
+            .expect("seed mutation");
+        database.checkpoint().expect("seed checkpoint");
+
+        let mut large_collection = CollectionCatalog::new(doc! {});
+        for record_id in 1..=96_u64 {
+            large_collection
+                .insert_record(CollectionRecord::new(
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id}"),
+                        "payload": "x".repeat(128),
+                    },
+                ))
+                .expect("insert large");
+        }
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: large_collection,
+                change_events: Vec::new(),
+            })
+            .expect("large mutation");
+
+        let mut compact_collection = CollectionCatalog::new(doc! {});
+        compact_collection
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1_i64, "sku": "alpha", "payload": "x".repeat(32) },
+            ))
+            .expect("insert compact");
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: compact_collection,
+                change_events: Vec::new(),
+            })
+            .expect("compact mutation");
+        database.checkpoint().expect("compact checkpoint");
+    }
+
     async fn assert_rejected(body: bson::Document, expected_code: i32) {
         let (serve_task, _temp_dir, manifest) = start_broker("unsupported.mongodb").await;
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
@@ -6372,12 +6546,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoints_pending_wal_during_live_serve_sessions() {
+    async fn defers_periodic_checkpoint_while_commands_are_active() {
         let temp_dir = tempdir().expect("tempdir");
         let database_path = temp_dir.path().join("periodic-checkpoint.mongodb");
+        seed_reusable_checkpoint_space(&database_path);
         let mut config = BrokerConfig::new(&database_path, 1);
         config.checkpoint_interval_secs = 1;
-        let (serve_task, manifest) = start_broker_with_config(config).await;
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
 
         let insert = send_command(
@@ -6393,14 +6572,110 @@ mod tests {
         .await;
         assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
 
+        let mut ping_stream = connect(&manifest.endpoint).await.expect("connect");
+        let ping_task = tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let ping = send_command(&mut ping_stream, doc! { "ping": 1, "$db": "admin" }).await;
+                assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let inspect = DatabaseFile::inspect(&database_path).expect("inspect");
-        assert_eq!(inspect.current_record_count, 1);
-        assert_eq!(inspect.wal_records_since_checkpoint, 0);
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect during activity");
+        assert_eq!(inspect.current_record_count, 2);
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
+        assert!(
+            !broker.storage.read().has_concurrent_checkpoint(),
+            "checkpoint handoff should be deferred while commands are still active"
+        );
         assert!(
             !serve_task.is_finished(),
-            "broker should remain running after a periodic checkpoint"
+            "broker should remain running while activity continues"
+        );
+
+        ping_task.await.expect("join ping task");
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn serves_commands_while_background_checkpoint_is_running() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("background-periodic-checkpoint.mongodb");
+        seed_reusable_checkpoint_space(&database_path);
+
+        let mut config = BrokerConfig::new(&database_path, 1);
+        config.checkpoint_interval_secs = 1;
+        config.checkpoint_test_delay_ms = 1_500;
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 2_i64, "sku": "beta" }],
+                "$db": "app",
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let capture_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !broker.storage.read().has_pending_wal() {
+                break;
+            }
+            assert!(
+                Instant::now() < capture_deadline,
+                "timed out waiting for the broker to hand off the background checkpoint"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            broker.storage.read().has_concurrent_checkpoint(),
+            "expected the broker to be holding an outstanding background checkpoint handoff"
+        );
+
+        let ping = tokio::time::timeout(
+            Duration::from_millis(250),
+            send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }),
+        )
+        .await
+        .expect("ping should not wait for the checkpoint task");
+        assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+
+        let second_insert = tokio::time::timeout(
+            Duration::from_millis(250),
+            send_command(
+                &mut stream,
+                doc! {
+                    "insert": "widgets",
+                    "documents": [{ "_id": 3_i64, "sku": "gamma" }],
+                    "$db": "app",
+                },
+            ),
+        )
+        .await
+        .expect("insert should not wait for the checkpoint task");
+        assert_eq!(second_insert.get_f64("ok").expect("ok"), 1.0);
+        assert!(
+            broker.storage.read().has_concurrent_checkpoint(),
+            "expected the background checkpoint to remain outstanding during the test delay"
         );
 
         drop(stream);
@@ -6409,6 +6684,10 @@ mod tests {
             .expect("shutdown timeout")
             .expect("join")
             .expect("serve");
+
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect after shutdown");
+        assert_eq!(inspect.current_record_count, 3);
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
     }
 
     #[cfg(unix)]

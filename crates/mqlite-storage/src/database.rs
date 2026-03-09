@@ -4,6 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -177,6 +178,7 @@ pub struct DatabaseFile {
     truncated_wal_tail: bool,
     checkpoint_counts: CheckpointCounts,
     wal_sync_count: usize,
+    concurrent_checkpoint: Option<PendingConcurrentCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -258,6 +260,10 @@ pub enum StorageError {
     DuplicateKey(String),
     #[error("invalid persisted index state")]
     InvalidIndexState,
+    #[error("a concurrent checkpoint is already in progress")]
+    ConcurrentCheckpointInProgress,
+    #[error("no reusable checkpoint space is available for a concurrent checkpoint")]
+    ConcurrentCheckpointNoReusableSpace,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -650,6 +656,51 @@ struct CheckpointCounts {
     change_event_count: usize,
 }
 
+#[derive(Debug)]
+struct PendingConcurrentCheckpoint {
+    sequence: u64,
+    dirty_collections: Arc<BTreeSet<(String, String)>>,
+    change_events_dirty: bool,
+    wal_records_since_checkpoint: usize,
+    wal_bytes_since_checkpoint: u64,
+}
+
+#[derive(Debug)]
+pub struct ConcurrentCheckpointJob {
+    path: PathBuf,
+    state: PersistedState,
+    checkpoint_snapshot: SnapshotState,
+    dirty_collections: Arc<BTreeSet<(String, String)>>,
+    change_events_dirty: bool,
+    active_slot: usize,
+    active_superblock: Superblock,
+    valid_superblocks: usize,
+    wal_end_offset: u64,
+}
+
+#[derive(Debug)]
+pub struct CompletedConcurrentCheckpoint {
+    sequence: u64,
+    last_checkpoint_unix_ms: u64,
+    active_slot: usize,
+    active_superblock: Superblock,
+    valid_superblocks: usize,
+    checkpoint_snapshot: SnapshotState,
+    checkpoint_counts: CheckpointCounts,
+}
+
+#[derive(Debug)]
+struct PreparedCheckpointWrite {
+    next_slot: usize,
+    pages_start: u64,
+    snapshot: Vec<u8>,
+    snapshot_state: SnapshotState,
+    superblock: Superblock,
+    pages: Vec<EncodedPage>,
+    checkpoint_counts: CheckpointCounts,
+    valid_superblocks: usize,
+}
+
 impl DatabaseFile {
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -690,6 +741,7 @@ impl DatabaseFile {
             truncated_wal_tail: false,
             checkpoint_counts: CheckpointCounts::default(),
             wal_sync_count: 0,
+            concurrent_checkpoint: None,
         };
 
         if database.file.metadata()?.len() == 0 {
@@ -719,6 +771,10 @@ impl DatabaseFile {
 
     pub fn has_pending_wal(&self) -> bool {
         self.wal_records_since_checkpoint > 0
+    }
+
+    pub fn has_concurrent_checkpoint(&self) -> bool {
+        self.concurrent_checkpoint.is_some()
     }
 
     pub fn persisted_plan_cache_entries(&self) -> &[PersistedPlanCacheEntry] {
@@ -781,7 +837,88 @@ impl DatabaseFile {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.concurrent_checkpoint.is_some() {
+            return Err(StorageError::ConcurrentCheckpointInProgress.into());
+        }
         self.write_checkpoint()
+    }
+
+    pub fn prepare_concurrent_checkpoint(&mut self) -> Result<Option<ConcurrentCheckpointJob>> {
+        if self.concurrent_checkpoint.is_some() {
+            return Ok(None);
+        }
+        if self.durable_sequence < self.state.last_applied_sequence {
+            return Ok(None);
+        }
+        if !self.has_pending_wal()
+            && self.checkpoint_snapshot.plan_cache_entries == self.state.plan_cache_entries
+        {
+            return Ok(None);
+        }
+
+        let last_checkpoint_unix_ms = current_unix_ms();
+        let mut state = self.state.clone();
+        state.file_format_version = FILE_FORMAT_VERSION;
+        state.last_checkpoint_unix_ms = last_checkpoint_unix_ms;
+
+        let dirty_collections = Arc::new(std::mem::take(&mut self.dirty_collections));
+        let pending = PendingConcurrentCheckpoint {
+            sequence: state.last_applied_sequence,
+            dirty_collections: Arc::clone(&dirty_collections),
+            change_events_dirty: self.change_events_dirty,
+            wal_records_since_checkpoint: self.wal_records_since_checkpoint,
+            wal_bytes_since_checkpoint: self.wal_bytes_since_checkpoint,
+        };
+        let change_events_dirty = self.change_events_dirty;
+        self.change_events_dirty = false;
+        self.wal_records_since_checkpoint = 0;
+        self.wal_bytes_since_checkpoint = 0;
+        self.concurrent_checkpoint = Some(pending);
+
+        Ok(Some(ConcurrentCheckpointJob {
+            path: self.path.clone(),
+            state,
+            checkpoint_snapshot: self.checkpoint_snapshot.clone(),
+            dirty_collections,
+            change_events_dirty,
+            active_slot: self.active_slot,
+            active_superblock: self.active_superblock.clone(),
+            valid_superblocks: self.valid_superblocks,
+            wal_end_offset: self.wal_end_offset,
+        }))
+    }
+
+    pub fn finish_concurrent_checkpoint(
+        &mut self,
+        completed: CompletedConcurrentCheckpoint,
+    ) -> Result<bool> {
+        let Some(pending) = self.concurrent_checkpoint.take() else {
+            return Ok(false);
+        };
+        if pending.sequence != completed.sequence {
+            self.concurrent_checkpoint = Some(pending);
+            return Ok(false);
+        }
+
+        self.active_slot = completed.active_slot;
+        self.active_superblock = completed.active_superblock;
+        self.valid_superblocks = completed.valid_superblocks.max(1);
+        self.checkpoint_snapshot = completed.checkpoint_snapshot;
+        self.checkpoint_counts = completed.checkpoint_counts;
+        self.state.last_checkpoint_unix_ms = completed.last_checkpoint_unix_ms;
+        Ok(true)
+    }
+
+    pub fn abort_concurrent_checkpoint(&mut self) -> bool {
+        let Some(pending) = self.concurrent_checkpoint.take() else {
+            return false;
+        };
+        self.dirty_collections
+            .extend(pending.dirty_collections.iter().cloned());
+        self.change_events_dirty |= pending.change_events_dirty;
+        self.wal_records_since_checkpoint += pending.wal_records_since_checkpoint;
+        self.wal_bytes_since_checkpoint += pending.wal_bytes_since_checkpoint;
+        true
     }
 
     pub fn path(&self) -> &Path {
@@ -889,6 +1026,7 @@ impl DatabaseFile {
         self.truncated_wal_tail = wal_recovery.truncated_tail;
         self.checkpoint_counts = checkpoint_counts;
         self.wal_sync_count = 0;
+        self.concurrent_checkpoint = None;
         Ok(())
     }
 
@@ -896,111 +1034,167 @@ impl DatabaseFile {
         self.state.file_format_version = FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
-        let encoded_catalog = encode_snapshot_catalog(
+        let Some(prepared) = prepare_checkpoint_write(
             &mut self.file,
-            &self.state.catalog,
-            &self.state.change_events,
+            &self.state,
             &self.checkpoint_snapshot,
             &self.dirty_collections,
             self.change_events_dirty,
-        )?;
-        let EncodedSnapshotCatalog {
-            catalog,
-            change_event_page_ids,
-            reused_page_refs,
-            pages,
-            record_page_count,
-            index_page_count,
-            change_event_page_count,
-            record_count,
-            index_entry_count,
-            change_event_count,
-        } = encoded_catalog;
-
-        let page_bytes_len = pages
-            .iter()
-            .map(|page| page.bytes.len() as u64)
-            .sum::<u64>();
-        let provisional_page_refs = reused_page_refs
-            .iter()
-            .cloned()
-            .chain(checkpoint_page_refs(DATA_START_OFFSET, &pages))
-            .collect::<Vec<_>>();
-        let provisional_snapshot_catalog =
-            resolve_snapshot_catalog(catalog.clone(), &provisional_page_refs)?;
-        let provisional_snapshot = encode_snapshot_state(&SnapshotState {
-            file_format_version: FILE_FORMAT_VERSION,
-            last_applied_sequence: self.state.last_applied_sequence,
-            last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
-            catalog: provisional_snapshot_catalog,
-            change_event_pages: resolve_page_id_refs(
-                &change_event_page_ids,
-                &provisional_page_refs,
-            )?,
-            change_event_count: self.state.change_events.len(),
-            plan_cache_entries: self.state.plan_cache_entries.clone(),
-        })?;
-
-        let next_slot = (self.active_slot + 1) % SUPERBLOCK_COUNT;
-        let pages_start = self.checkpoint_pages_start(
-            next_slot,
-            page_bytes_len + provisional_snapshot.len() as u64,
-        )?;
-        let page_refs = reused_page_refs
-            .iter()
-            .cloned()
-            .chain(checkpoint_page_refs(pages_start, &pages))
-            .collect::<Vec<_>>();
-        let snapshot_offset = pages_start + page_bytes_len;
-        let snapshot_catalog = resolve_snapshot_catalog(catalog, &page_refs)?;
-        let snapshot_state = SnapshotState {
-            file_format_version: FILE_FORMAT_VERSION,
-            last_applied_sequence: self.state.last_applied_sequence,
-            last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
-            catalog: snapshot_catalog,
-            change_event_pages: resolve_page_id_refs(&change_event_page_ids, &page_refs)?,
-            change_event_count: self.state.change_events.len(),
-            plan_cache_entries: self.state.plan_cache_entries.clone(),
+            self.active_slot,
+            &self.active_superblock,
+            self.valid_superblocks,
+            self.wal_end_offset,
+            true,
+        )?
+        else {
+            return Err(StorageError::ConcurrentCheckpointNoReusableSpace.into());
         };
-        let snapshot = encode_snapshot_state(&snapshot_state)?;
+        let completed = apply_prepared_checkpoint_write(&mut self.file, prepared)?;
 
-        self.file.seek(SeekFrom::Start(pages_start))?;
-        for page in &pages {
-            self.file.write_all(&page.bytes)?;
-        }
-        self.file.write_all(&snapshot)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
-
-        let wal_offset = self
-            .wal_end_offset
-            .max(snapshot_offset + snapshot.len() as u64);
-        let superblock = Superblock {
-            generation: self.active_superblock.generation + 1,
-            last_applied_sequence: self.state.last_applied_sequence,
-            last_checkpoint_unix_ms: self.state.last_checkpoint_unix_ms,
-            snapshot_offset,
-            snapshot_len: snapshot.len() as u64,
-            wal_offset,
-            snapshot_checksum: hash_bytes(&snapshot),
-        };
-
-        write_superblock(&mut self.file, next_slot, &superblock)?;
-        self.file.flush()?;
-        self.file.sync_all()?;
-
-        self.active_slot = next_slot;
-        self.active_superblock = superblock;
-        self.valid_superblocks = self.valid_superblocks.max(1);
-        self.checkpoint_snapshot = snapshot_state;
+        self.active_slot = completed.active_slot;
+        self.active_superblock = completed.active_superblock;
+        self.valid_superblocks = completed.valid_superblocks.max(1);
+        self.checkpoint_snapshot = completed.checkpoint_snapshot;
         self.dirty_collections.clear();
         self.change_events_dirty = false;
-        self.wal_end_offset = wal_offset;
+        self.wal_end_offset = self.active_superblock.wal_offset;
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
         self.truncated_wal_tail = false;
         self.durable_sequence = self.state.last_applied_sequence;
-        self.checkpoint_counts = CheckpointCounts {
+        self.checkpoint_counts = completed.checkpoint_counts;
+        Ok(())
+    }
+}
+
+impl ConcurrentCheckpointJob {
+    pub fn run(self) -> Result<Option<CompletedConcurrentCheckpoint>> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        let Some(prepared) = prepare_checkpoint_write(
+            &mut file,
+            &self.state,
+            &self.checkpoint_snapshot,
+            self.dirty_collections.as_ref(),
+            self.change_events_dirty,
+            self.active_slot,
+            &self.active_superblock,
+            self.valid_superblocks,
+            self.wal_end_offset,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        apply_prepared_checkpoint_write(&mut file, prepared).map(Some)
+    }
+}
+
+fn prepare_checkpoint_write(
+    file: &mut File,
+    state: &PersistedState,
+    checkpoint_snapshot: &SnapshotState,
+    dirty_collections: &BTreeSet<(String, String)>,
+    change_events_dirty: bool,
+    active_slot: usize,
+    active_superblock: &Superblock,
+    valid_superblocks: usize,
+    wal_end_offset: u64,
+    allow_append: bool,
+) -> Result<Option<PreparedCheckpointWrite>> {
+    let encoded_catalog = encode_snapshot_catalog(
+        file,
+        &state.catalog,
+        &state.change_events,
+        checkpoint_snapshot,
+        dirty_collections,
+        change_events_dirty,
+    )?;
+    let EncodedSnapshotCatalog {
+        catalog,
+        change_event_page_ids,
+        reused_page_refs,
+        pages,
+        record_page_count,
+        index_page_count,
+        change_event_page_count,
+        record_count,
+        index_entry_count,
+        change_event_count,
+    } = encoded_catalog;
+
+    let page_bytes_len = pages
+        .iter()
+        .map(|page| page.bytes.len() as u64)
+        .sum::<u64>();
+    let provisional_page_refs = reused_page_refs
+        .iter()
+        .cloned()
+        .chain(checkpoint_page_refs(DATA_START_OFFSET, &pages))
+        .collect::<Vec<_>>();
+    let provisional_snapshot_catalog =
+        resolve_snapshot_catalog(catalog.clone(), &provisional_page_refs)?;
+    let provisional_snapshot = encode_snapshot_state(&SnapshotState {
+        file_format_version: FILE_FORMAT_VERSION,
+        last_applied_sequence: state.last_applied_sequence,
+        last_checkpoint_unix_ms: state.last_checkpoint_unix_ms,
+        catalog: provisional_snapshot_catalog,
+        change_event_pages: resolve_page_id_refs(&change_event_page_ids, &provisional_page_refs)?,
+        change_event_count: state.change_events.len(),
+        plan_cache_entries: state.plan_cache_entries.clone(),
+    })?;
+
+    let next_slot = (active_slot + 1) % SUPERBLOCK_COUNT;
+    let Some(pages_start) = checkpoint_pages_start(
+        file,
+        next_slot,
+        page_bytes_len + provisional_snapshot.len() as u64,
+        checkpoint_snapshot,
+        active_superblock,
+        wal_end_offset,
+        allow_append,
+    )?
+    else {
+        return Ok(None);
+    };
+    let page_refs = reused_page_refs
+        .iter()
+        .cloned()
+        .chain(checkpoint_page_refs(pages_start, &pages))
+        .collect::<Vec<_>>();
+    let snapshot_offset = pages_start + page_bytes_len;
+    let snapshot_catalog = resolve_snapshot_catalog(catalog, &page_refs)?;
+    let snapshot_state = SnapshotState {
+        file_format_version: FILE_FORMAT_VERSION,
+        last_applied_sequence: state.last_applied_sequence,
+        last_checkpoint_unix_ms: state.last_checkpoint_unix_ms,
+        catalog: snapshot_catalog,
+        change_event_pages: resolve_page_id_refs(&change_event_page_ids, &page_refs)?,
+        change_event_count: state.change_events.len(),
+        plan_cache_entries: state.plan_cache_entries.clone(),
+    };
+    let snapshot = encode_snapshot_state(&snapshot_state)?;
+    let superblock = Superblock {
+        generation: active_superblock.generation + 1,
+        last_applied_sequence: state.last_applied_sequence,
+        last_checkpoint_unix_ms: state.last_checkpoint_unix_ms,
+        snapshot_offset,
+        snapshot_len: snapshot.len() as u64,
+        wal_offset: wal_end_offset.max(snapshot_offset + snapshot.len() as u64),
+        snapshot_checksum: hash_bytes(&snapshot),
+    };
+
+    Ok(Some(PreparedCheckpointWrite {
+        next_slot,
+        pages_start,
+        snapshot,
+        snapshot_state,
+        superblock,
+        pages,
+        checkpoint_counts: CheckpointCounts {
             page_count: page_refs.len(),
             record_page_count,
             index_page_count,
@@ -1008,36 +1202,73 @@ impl DatabaseFile {
             record_count,
             index_entry_count,
             change_event_count,
-        };
-        Ok(())
-    }
+        },
+        valid_superblocks: valid_superblocks.max(1),
+    }))
+}
 
-    fn checkpoint_pages_start(&mut self, next_slot: usize, required_len: u64) -> Result<u64> {
-        if let Ok(Some(inactive_superblock)) = read_superblock(&mut self.file, next_slot) {
-            if inactive_superblock.snapshot_offset >= DATA_START_OFFSET
-                && inactive_superblock.snapshot_offset != self.active_superblock.snapshot_offset
-                && inactive_superblock.snapshot_offset < self.active_superblock.wal_offset
-            {
-                let reusable_end = if inactive_superblock.snapshot_offset
-                    < self.active_superblock.snapshot_offset
-                {
-                    self.active_superblock.snapshot_offset
+fn apply_prepared_checkpoint_write(
+    file: &mut File,
+    prepared: PreparedCheckpointWrite,
+) -> Result<CompletedConcurrentCheckpoint> {
+    file.seek(SeekFrom::Start(prepared.pages_start))?;
+    for page in &prepared.pages {
+        file.write_all(&page.bytes)?;
+    }
+    file.write_all(&prepared.snapshot)?;
+    file.flush()?;
+    file.sync_data()?;
+    write_superblock(file, prepared.next_slot, &prepared.superblock)?;
+    file.flush()?;
+    file.sync_all()?;
+
+    Ok(CompletedConcurrentCheckpoint {
+        sequence: prepared.superblock.last_applied_sequence,
+        last_checkpoint_unix_ms: prepared.superblock.last_checkpoint_unix_ms,
+        active_slot: prepared.next_slot,
+        active_superblock: prepared.superblock,
+        valid_superblocks: prepared.valid_superblocks,
+        checkpoint_snapshot: prepared.snapshot_state,
+        checkpoint_counts: prepared.checkpoint_counts,
+    })
+}
+
+fn checkpoint_pages_start(
+    file: &mut File,
+    next_slot: usize,
+    required_len: u64,
+    checkpoint_snapshot: &SnapshotState,
+    active_superblock: &Superblock,
+    wal_end_offset: u64,
+    allow_append: bool,
+) -> Result<Option<u64>> {
+    if let Ok(Some(inactive_superblock)) = read_superblock(file, next_slot) {
+        if inactive_superblock.snapshot_offset >= DATA_START_OFFSET
+            && inactive_superblock.snapshot_offset != active_superblock.snapshot_offset
+            && inactive_superblock.snapshot_offset < active_superblock.wal_offset
+        {
+            let reusable_end =
+                if inactive_superblock.snapshot_offset < active_superblock.snapshot_offset {
+                    active_superblock.snapshot_offset
                 } else {
-                    self.active_superblock.wal_offset
+                    active_superblock.wal_offset
                 };
-                if required_len <= reusable_end.saturating_sub(inactive_superblock.snapshot_offset)
-                    && !snapshot_references_range(
-                        &self.checkpoint_snapshot,
-                        inactive_superblock.snapshot_offset,
-                        reusable_end.saturating_sub(inactive_superblock.snapshot_offset),
-                    )
-                {
-                    return Ok(inactive_superblock.snapshot_offset);
-                }
+            if required_len <= reusable_end.saturating_sub(inactive_superblock.snapshot_offset)
+                && !snapshot_references_range(
+                    checkpoint_snapshot,
+                    inactive_superblock.snapshot_offset,
+                    reusable_end.saturating_sub(inactive_superblock.snapshot_offset),
+                )
+            {
+                return Ok(Some(inactive_superblock.snapshot_offset));
             }
         }
+    }
 
-        Ok(self.wal_end_offset.max(DATA_START_OFFSET))
+    if allow_append {
+        Ok(Some(wal_end_offset.max(DATA_START_OFFSET)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -5940,5 +6171,178 @@ mod tests {
 
         let metadata = std::fs::metadata(&path).expect("metadata");
         assert!(metadata.len() >= DATA_START_OFFSET);
+    }
+
+    #[test]
+    fn concurrent_checkpoints_preserve_writes_committed_after_capture() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("concurrent-checkpoint.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1_i64, "sku": "seed" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed mutation");
+            database.checkpoint().expect("seed checkpoint");
+
+            let mut large_collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=96_u64 {
+                insert_record(
+                    &mut large_collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id}"),
+                        "payload": "x".repeat(128),
+                    },
+                );
+            }
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: large_collection,
+                    change_events: Vec::new(),
+                })
+                .expect("large mutation");
+
+            let mut compact_collection = CollectionCatalog::new(doc! {});
+            insert_record(
+                &mut compact_collection,
+                1,
+                doc! { "_id": 1_i64, "sku": "alpha", "payload": "x".repeat(32) },
+            );
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: compact_collection,
+                    change_events: Vec::new(),
+                })
+                .expect("compact mutation");
+            database.checkpoint().expect("compact checkpoint");
+
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: CollectionCatalog::new(doc! {}),
+                    change_events: Vec::new(),
+                })
+                .expect("empty mutation");
+            database.checkpoint().expect("empty checkpoint");
+
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        2,
+                        doc! { "_id": 2_i64, "sku": "beta", "payload": "y".repeat(32) },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("captured insert");
+            let job = database
+                .prepare_concurrent_checkpoint()
+                .expect("prepare concurrent checkpoint")
+                .expect("checkpoint job");
+
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        3,
+                        doc! { "_id": 3_i64, "sku": "gamma", "payload": "z".repeat(32) },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("post-capture insert");
+
+            let completed = job
+                .run()
+                .expect("run concurrent checkpoint")
+                .expect("completed checkpoint");
+            assert!(
+                database
+                    .finish_concurrent_checkpoint(completed)
+                    .expect("finish checkpoint"),
+                "expected checkpoint completion to apply"
+            );
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.current_record_count, 2);
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let ids = collection
+            .records
+            .iter()
+            .map(|record| record.document.get_i64("_id").expect("_id"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn concurrent_checkpoints_restore_dirty_tracking_when_no_reusable_space_exists() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("concurrent-checkpoint-no-space.mongodb");
+
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+        database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: Some(doc! {}),
+                changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1_i64, "sku": "alpha" },
+                ))],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect("mutation");
+
+        let job = database
+            .prepare_concurrent_checkpoint()
+            .expect("prepare concurrent checkpoint")
+            .expect("checkpoint job");
+        assert!(
+            job.run().expect("run concurrent checkpoint").is_none(),
+            "expected the concurrent checkpoint to skip when no reusable space exists"
+        );
+        assert!(
+            database.abort_concurrent_checkpoint(),
+            "expected dirty tracking to be restored"
+        );
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.current_record_count, 1);
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
     }
 }
