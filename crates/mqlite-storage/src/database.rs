@@ -326,6 +326,8 @@ struct SnapshotCollectionCatalog {
     indexes: BTreeMap<String, SnapshotIndexCatalog>,
     record_pages: Vec<PageRef>,
     record_count: usize,
+    #[serde(default = "default_next_record_id")]
+    next_record_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1280,6 +1282,7 @@ fn apply_owned_mutation(
 }
 
 fn ensure_collection_indexes_hydrated(collection_state: &mut CollectionCatalog) {
+    collection_state.refresh_runtime_state();
     for index in collection_state.indexes.values_mut() {
         if index.stats.entry_count != index.entries.len()
             || (!index.entries.is_empty() && index.tree.root.is_none())
@@ -1828,6 +1831,7 @@ fn encode_snapshot_catalog(
                     indexes: snapshot_indexes,
                     record_pages: placeholder_page_refs(record_page_ids),
                     record_count: collection.records.len(),
+                    next_record_id: collection.next_record_id(),
                 },
             );
             encoded_catalog.record_count += collection.records.len();
@@ -2149,11 +2153,12 @@ fn restore_catalog(
                 indexes.insert(index_name.clone(), restored_index);
             }
 
-            let mut collection_state = CollectionCatalog {
-                options: collection.options.clone(),
+            let mut collection_state = CollectionCatalog::from_parts(
+                collection.options.clone(),
                 indexes,
                 records,
-            };
+                collection.next_record_id,
+            );
             collection_state.hydrate_indexes();
             validate_collection_indexes(&collection_state).map_err(map_catalog_error)?;
             counts.record_count += collection_state.records.len();
@@ -2465,10 +2470,14 @@ fn current_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn default_next_record_id() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs::OpenOptions,
         io::{Read, Seek, SeekFrom, Write},
     };
@@ -2923,6 +2932,40 @@ mod tests {
             collection.records[1].document.get_str("sku").expect("sku"),
             "beta"
         );
+        assert_eq!(collection.next_record_id(), 13);
+    }
+
+    #[test]
+    fn checkpoints_persist_next_record_id_after_deleting_the_highest_record_id() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("next-record-id.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 7, doc! { "_id": 1, "sku": "alpha" });
+            insert_record(&mut collection, 12, doc! { "_id": 2, "sku": "beta" });
+            assert_eq!(collection.delete_records(&BTreeSet::from([12_u64])), 1);
+            assert_eq!(collection.next_record_id(), 13);
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(collection.records[0].record_id, 7);
+        assert_eq!(collection.next_record_id(), 13);
     }
 
     #[test]

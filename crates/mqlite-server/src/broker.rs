@@ -5993,15 +5993,8 @@ fn planned_base_write_matches(
 
 fn next_record_id(collection: Option<&CollectionCatalog>) -> u64 {
     collection
-        .and_then(|collection| {
-            collection
-                .records
-                .iter()
-                .map(|record| record.record_id)
-                .max()
-        })
-        .unwrap_or(0)
-        + 1
+        .map(CollectionCatalog::next_record_id)
+        .unwrap_or(1)
 }
 
 #[cfg(all(test, unix))]

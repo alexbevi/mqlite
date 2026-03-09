@@ -11,6 +11,10 @@ use thiserror::Error;
 const INDEX_TREE_LEAF_CAPACITY: usize = 64;
 const INDEX_TREE_BRANCH_CAPACITY: usize = 64;
 
+fn default_next_record_id() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Catalog {
     pub databases: BTreeMap<String, DatabaseCatalog>,
@@ -26,6 +30,10 @@ pub struct CollectionCatalog {
     pub options: Document,
     pub indexes: BTreeMap<String, IndexCatalog>,
     pub records: Vec<CollectionRecord>,
+    #[serde(default = "default_next_record_id")]
+    pub next_record_id: u64,
+    #[serde(skip, default)]
+    record_positions: HashMap<u64, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,23 +87,43 @@ struct NodeSummary {
 
 impl CollectionCatalog {
     pub fn new(options: Document) -> Self {
-        Self {
+        let mut collection = Self {
             options,
             indexes: BTreeMap::from([(
                 "_id_".to_string(),
                 IndexCatalog::new("_id_".to_string(), doc! { "_id": 1 }, true),
             )]),
             records: Vec::new(),
-        }
+            next_record_id: default_next_record_id(),
+            record_positions: HashMap::new(),
+        };
+        collection.rebuild_runtime_state();
+        collection
+    }
+
+    pub fn from_parts(
+        options: Document,
+        indexes: BTreeMap<String, IndexCatalog>,
+        records: Vec<CollectionRecord>,
+        next_record_id: u64,
+    ) -> Self {
+        let mut collection = Self {
+            options,
+            indexes,
+            records,
+            next_record_id,
+            record_positions: HashMap::new(),
+        };
+        collection.rebuild_runtime_state();
+        collection
     }
 
     pub fn next_record_id(&self) -> u64 {
-        self.records
-            .iter()
-            .map(|record| record.record_id)
-            .max()
-            .unwrap_or(0)
-            + 1
+        self.next_record_id
+    }
+
+    pub fn record_position(&self, record_id: u64) -> Option<usize> {
+        self.record_positions.get(&record_id).copied()
     }
 
     pub fn documents(&self) -> Vec<Document> {
@@ -106,17 +134,14 @@ impl CollectionCatalog {
     }
 
     pub fn hydrate_indexes(&mut self) {
+        self.rebuild_runtime_state();
         for index in self.indexes.values_mut() {
             index.rebuild_tree();
         }
     }
 
     pub fn insert_record(&mut self, record: CollectionRecord) -> Result<(), CatalogError> {
-        if self
-            .records
-            .iter()
-            .any(|existing| existing.record_id == record.record_id)
-        {
+        if self.record_positions.contains_key(&record.record_id) {
             return Err(CatalogError::InvalidIndexState(format!(
                 "duplicate record id {}",
                 record.record_id
@@ -129,6 +154,9 @@ impl CollectionCatalog {
             insert_index_entry(&mut index.entries, entry, &index.key);
             index.rebuild_tree();
         }
+        self.record_positions
+            .insert(record.record_id, self.records.len());
+        self.next_record_id = self.next_record_id.max(record.record_id.saturating_add(1));
         self.records.push(record);
         Ok(())
     }
@@ -168,6 +196,7 @@ impl CollectionCatalog {
         let before = self.records.len();
         self.records
             .retain(|record| !record_ids.contains(&record.record_id));
+        self.rebuild_runtime_state();
         for index in self.indexes.values_mut() {
             index
                 .entries
@@ -185,12 +214,7 @@ impl CollectionCatalog {
             return Ok(());
         }
 
-        let base_positions = self
-            .records
-            .iter()
-            .enumerate()
-            .map(|(position, record)| (record.record_id, position))
-            .collect::<HashMap<_, _>>();
+        let base_positions = self.record_positions.clone();
         let plan = CollectionMutationPlan::build(mutations, &self.records, &base_positions)?;
         if plan.states.is_empty() {
             return Ok(());
@@ -208,6 +232,7 @@ impl CollectionCatalog {
 
         let original_records = std::mem::take(&mut self.records);
         self.records = plan.materialize_records(original_records);
+        self.rebuild_runtime_state();
         for (name, entries) in staged_indexes {
             let index = self
                 .indexes
@@ -221,6 +246,27 @@ impl CollectionCatalog {
 
     pub fn validate_indexes(&self) -> Result<(), CatalogError> {
         validate_collection_indexes(self)
+    }
+
+    pub fn refresh_runtime_state(&mut self) {
+        self.rebuild_runtime_state();
+    }
+
+    fn rebuild_runtime_state(&mut self) {
+        self.record_positions = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(position, record)| (record.record_id, position))
+            .collect();
+        let computed_next_record_id = self
+            .records
+            .iter()
+            .map(|record| record.record_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_record_id = self.next_record_id.max(computed_next_record_id);
     }
 }
 
@@ -1568,6 +1614,41 @@ mod tests {
             .expect_err("duplicate key should fail");
         assert!(matches!(error, CatalogError::DuplicateKey(name) if name == "sku_1"));
         assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn tracks_next_record_id_and_record_positions_without_scanning() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 7,
+                document: doc! { "_id": 1, "sku": "alpha" },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 12,
+                document: doc! { "_id": 2, "sku": "beta" },
+            })
+            .expect("insert");
+        assert_eq!(collection.next_record_id(), 13);
+        assert_eq!(collection.record_position(7), Some(0));
+        assert_eq!(collection.record_position(12), Some(1));
+
+        let removed = collection.delete_records(&BTreeSet::from([12_u64]));
+        assert_eq!(removed, 1);
+        assert_eq!(collection.next_record_id(), 13);
+        assert_eq!(collection.record_position(7), Some(0));
+        assert_eq!(collection.record_position(12), None);
+
+        collection
+            .insert_record(CollectionRecord {
+                record_id: collection.next_record_id(),
+                document: doc! { "_id": 3, "sku": "gamma" },
+            })
+            .expect("insert");
+        assert_eq!(collection.record_position(13), Some(1));
+        assert_eq!(collection.next_record_id(), 14);
     }
 
     #[test]
