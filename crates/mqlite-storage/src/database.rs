@@ -143,6 +143,7 @@ pub struct DatabaseFile {
     path: PathBuf,
     file: File,
     state: PersistedState,
+    durable_sequence: u64,
     checkpoint_snapshot: SnapshotState,
     active_slot: usize,
     active_superblock: Superblock,
@@ -154,6 +155,7 @@ pub struct DatabaseFile {
     wal_bytes_since_checkpoint: u64,
     truncated_wal_tail: bool,
     checkpoint_counts: CheckpointCounts,
+    wal_sync_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -439,6 +441,7 @@ impl DatabaseFile {
                 change_events: Vec::new(),
                 plan_cache_entries: Vec::new(),
             },
+            durable_sequence: 0,
             checkpoint_snapshot: SnapshotState::default(),
             active_slot: 0,
             active_superblock: Superblock::default(),
@@ -450,6 +453,7 @@ impl DatabaseFile {
             wal_bytes_since_checkpoint: 0,
             truncated_wal_tail: false,
             checkpoint_counts: CheckpointCounts::default(),
+            wal_sync_count: 0,
         };
 
         if database.file.metadata()?.len() == 0 {
@@ -469,6 +473,10 @@ impl DatabaseFile {
         self.state.last_applied_sequence
     }
 
+    pub fn durable_sequence(&self) -> u64 {
+        self.durable_sequence
+    }
+
     pub fn change_events(&self) -> &[PersistedChangeEvent] {
         &self.state.change_events
     }
@@ -481,6 +489,10 @@ impl DatabaseFile {
         &self.state.plan_cache_entries
     }
 
+    pub fn wal_sync_count(&self) -> usize {
+        self.wal_sync_count
+    }
+
     pub fn set_persisted_plan_cache_entries(&mut self, mut entries: Vec<PersistedPlanCacheEntry>) {
         entries.sort();
         entries.dedup();
@@ -488,11 +500,22 @@ impl DatabaseFile {
     }
 
     pub fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
+        let sequence = self.commit_mutation_unflushed(mutation)?;
+        self.sync_pending_wal()?;
+        Ok(sequence)
+    }
+
+    pub fn commit_mutation_unflushed(&mut self, mutation: WalMutation) -> Result<u64> {
         let sequence = self.state.last_applied_sequence + 1;
         validate_mutation(&self.state, &mutation)?;
 
-        let appended_bytes =
-            append_wal_entry(&mut self.file, self.wal_end_offset, sequence, &mutation)?;
+        let appended_bytes = append_wal_entry(
+            &mut self.file,
+            self.wal_end_offset,
+            sequence,
+            &mutation,
+            false,
+        )?;
 
         mark_mutation_dirty(
             &mut self.dirty_collections,
@@ -505,6 +528,18 @@ impl DatabaseFile {
         self.wal_bytes_since_checkpoint += appended_bytes;
         self.truncated_wal_tail = false;
         Ok(sequence)
+    }
+
+    pub fn sync_pending_wal(&mut self) -> Result<u64> {
+        if self.durable_sequence >= self.state.last_applied_sequence {
+            return Ok(self.durable_sequence);
+        }
+
+        self.file.flush()?;
+        self.file.sync_data()?;
+        self.durable_sequence = self.state.last_applied_sequence;
+        self.wal_sync_count += 1;
+        Ok(self.durable_sequence)
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
@@ -602,6 +637,7 @@ impl DatabaseFile {
             checkpoint_counts,
         } = load_state(&mut self.file)?;
         self.state = state;
+        self.durable_sequence = self.state.last_applied_sequence;
         self.checkpoint_snapshot = checkpoint_snapshot;
         self.active_slot = active_slot;
         self.active_superblock = active_superblock;
@@ -613,6 +649,7 @@ impl DatabaseFile {
         self.wal_bytes_since_checkpoint = wal_recovery.bytes;
         self.truncated_wal_tail = wal_recovery.truncated_tail;
         self.checkpoint_counts = checkpoint_counts;
+        self.wal_sync_count = 0;
         Ok(())
     }
 
@@ -722,6 +759,7 @@ impl DatabaseFile {
         self.wal_records_since_checkpoint = 0;
         self.wal_bytes_since_checkpoint = 0;
         self.truncated_wal_tail = false;
+        self.durable_sequence = self.state.last_applied_sequence;
         self.checkpoint_counts = CheckpointCounts {
             page_count: page_refs.len(),
             record_page_count,
@@ -1047,6 +1085,7 @@ fn append_wal_entry(
     frame_offset: u64,
     sequence: u64,
     mutation: &WalMutation,
+    sync: bool,
 ) -> Result<u64> {
     let payload = bson::to_vec(&WalEntryRef { sequence, mutation })?;
     let payload_checksum = hash_bytes(&payload);
@@ -1057,8 +1096,10 @@ fn append_wal_entry(
     file.write_all(&(payload.len() as u32).to_le_bytes())?;
     file.write_all(&payload_checksum)?;
     file.write_all(&payload)?;
-    file.flush()?;
-    file.sync_data()?;
+    if sync {
+        file.flush()?;
+        file.sync_data()?;
+    }
     Ok(frame_len)
 }
 
@@ -2534,6 +2575,39 @@ mod tests {
             expanded: false,
             extra_fields: Document::new(),
         }
+    }
+
+    #[test]
+    fn unflushed_mutations_require_an_explicit_wal_sync() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-sync.mongodb");
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+
+        let sequence = database
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: Some(Document::new()),
+                changes: vec![CollectionChange::Insert(CollectionRecord {
+                    record_id: 1,
+                    document: doc! { "_id": 1, "sku": "alpha" },
+                })],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: vec![sample_change_event(1, "insert")],
+            })
+            .expect("commit mutation");
+
+        assert_eq!(sequence, 1);
+        assert_eq!(database.last_applied_sequence(), 1);
+        assert_eq!(database.durable_sequence(), 0);
+        assert_eq!(database.wal_sync_count(), 0);
+
+        let durable = database.sync_pending_wal().expect("sync wal");
+        assert_eq!(durable, 1);
+        assert_eq!(database.durable_sequence(), 1);
+        assert_eq!(database.wal_sync_count(), 1);
     }
 
     #[test]

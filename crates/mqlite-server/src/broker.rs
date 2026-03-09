@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -31,7 +32,7 @@ use mqlite_storage::{
     PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use thiserror::Error;
 
 const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
@@ -40,6 +41,7 @@ const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
 const MAX_OR_BRANCHES: usize = 32;
 const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
+const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -61,11 +63,36 @@ pub struct Broker {
     config: BrokerConfig,
     paths: BrokerPaths,
     storage: Arc<RwLock<DatabaseFile>>,
+    wal_commit: Arc<WalCommitCoordinator>,
     cursors: Arc<Mutex<CursorManager>>,
     plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
     fail_command: Arc<Mutex<Option<FailCommandState>>>,
     active_connections: Arc<AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
+}
+
+#[derive(Debug)]
+struct WalCommitCoordinator {
+    state: Mutex<WalCommitState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct WalCommitState {
+    durable_sequence: u64,
+    syncing: bool,
+}
+
+impl WalCommitCoordinator {
+    fn new(durable_sequence: u64) -> Self {
+        Self {
+            state: Mutex::new(WalCommitState {
+                durable_sequence,
+                syncing: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +207,7 @@ impl Broker {
     pub fn new(config: BrokerConfig) -> Result<Self> {
         let paths = broker_paths(&config.database_path)?;
         let storage = DatabaseFile::open_or_create(&paths.database_path)?;
+        let durable_sequence = storage.durable_sequence();
         let plan_cache = storage
             .persisted_plan_cache_entries()
             .iter()
@@ -194,6 +222,7 @@ impl Broker {
             config,
             paths,
             storage: Arc::new(RwLock::new(storage)),
+            wal_commit: Arc::new(WalCommitCoordinator::new(durable_sequence)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
             plan_cache: Arc::new(Mutex::new(plan_cache)),
             fail_command: Arc::new(Mutex::new(None)),
@@ -310,6 +339,50 @@ impl Broker {
                 choice: cached.choice.clone(),
             })
             .collect()
+    }
+
+    fn durable_storage_read(
+        &self,
+    ) -> Result<parking_lot::RwLockReadGuard<'_, DatabaseFile>, CommandError> {
+        loop {
+            let storage = self.storage.read();
+            let visible_sequence = storage.last_applied_sequence();
+            let durable_sequence = self.wal_commit.state.lock().durable_sequence;
+            if durable_sequence >= visible_sequence {
+                return Ok(storage);
+            }
+            drop(storage);
+            self.await_durable_sequence(visible_sequence)?;
+        }
+    }
+
+    fn await_durable_sequence(&self, sequence: u64) -> Result<(), CommandError> {
+        loop {
+            let mut state = self.wal_commit.state.lock();
+            if state.durable_sequence >= sequence {
+                return Ok(());
+            }
+            if state.syncing {
+                self.wal_commit.ready.wait(&mut state);
+                continue;
+            }
+            state.syncing = true;
+            drop(state);
+
+            thread::sleep(GROUP_COMMIT_WAIT);
+            let sync_result = {
+                let mut storage = self.storage.write();
+                storage.sync_pending_wal()
+            };
+
+            let mut state = self.wal_commit.state.lock();
+            state.syncing = false;
+            if let Ok(durable_sequence) = sync_result.as_ref() {
+                state.durable_sequence = state.durable_sequence.max(*durable_sequence);
+            }
+            self.wal_commit.ready.notify_all();
+            sync_result.map_err(internal_error)?;
+        }
     }
 
     async fn handle_connection(&self, mut stream: BoxedStream) -> Result<()> {
@@ -546,7 +619,7 @@ impl Broker {
     fn handle_list_databases(&self, body: &Document) -> Result<Document, CommandError> {
         let filter = body.get_document("filter").ok().cloned();
         let name_only = body.get_bool("nameOnly").unwrap_or(false);
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let databases = storage
             .catalog()
             .database_names()
@@ -575,7 +648,7 @@ impl Broker {
     fn handle_list_collections(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
         let filter = body.get_document("filter").ok().cloned();
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let collections = storage
             .catalog()
             .collection_names(&database)
@@ -618,7 +691,7 @@ impl Broker {
         let collection = body.get_str("listIndexes").map_err(|_| {
             CommandError::new(9, "FailedToParse", "listIndexes requires a collection name")
         })?;
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let indexes = storage
             .catalog()
             .list_indexes(&database, collection)?
@@ -858,7 +931,7 @@ impl Broker {
         sort: Option<&Document>,
         projection: Option<&Document>,
     ) -> Result<CachedFindPlan, CommandError> {
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection_name}");
         match storage.catalog().get_collection(database, collection_name) {
@@ -897,8 +970,8 @@ impl Broker {
             return Err(CatalogError::NamespaceExists(database, collection.to_string()).into());
         }
         let sequence = storage.last_applied_sequence() + 1;
-        storage
-            .commit_mutation(WalMutation::ApplyCollectionChanges {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
                 database: database.clone(),
                 collection: collection.to_string(),
                 create_options: Some(options),
@@ -925,13 +998,15 @@ impl Broker {
                 )],
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(Document::new())
     }
 
     fn handle_drop_database(&self, body: &Document) -> Result<Document, CommandError> {
         let database = database_name(body)?;
         let collections = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             storage
                 .catalog()
                 .collection_names(&database)
@@ -940,6 +1015,7 @@ impl Broker {
 
         let mut storage = self.storage.write();
         let collection_count = collections.len();
+        let mut last_sequence = None;
         for (index, collection) in collections.into_iter().enumerate() {
             let sequence = storage.last_applied_sequence() + 1;
             let mut change_events = vec![
@@ -985,13 +1061,19 @@ impl Broker {
                     Document::new(),
                 ));
             }
-            storage
-                .commit_mutation(WalMutation::DropCollection {
-                    database: database.clone(),
-                    collection,
-                    change_events,
-                })
-                .map_err(internal_error)?;
+            last_sequence = Some(
+                storage
+                    .commit_mutation_unflushed(WalMutation::DropCollection {
+                        database: database.clone(),
+                        collection,
+                        change_events,
+                    })
+                    .map_err(internal_error)?,
+            );
+        }
+        drop(storage);
+        if let Some(sequence) = last_sequence {
+            self.await_durable_sequence(sequence)?;
         }
 
         Ok(doc! { "dropped": database })
@@ -1009,8 +1091,8 @@ impl Broker {
             .indexes
             .len() as i32;
         let sequence = storage.last_applied_sequence() + 1;
-        storage
-            .commit_mutation(WalMutation::DropCollection {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::DropCollection {
                 database: database.clone(),
                 collection: collection.to_string(),
                 change_events: vec![
@@ -1043,6 +1125,8 @@ impl Broker {
                 ],
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! {
             "ns": format!("{database}.{collection}"),
             "nIndexesWas": index_count,
@@ -1092,7 +1176,7 @@ impl Broker {
             }
             let sequence = storage.last_applied_sequence() + 1;
             storage
-                .commit_mutation(WalMutation::DropCollection {
+                .commit_mutation_unflushed(WalMutation::DropCollection {
                     database: target_database.to_string(),
                     collection: target_collection.to_string(),
                     change_events: vec![
@@ -1128,7 +1212,7 @@ impl Broker {
         }
 
         storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+            .commit_mutation_unflushed(WalMutation::ReplaceCollection {
                 database: target_database.to_string(),
                 collection: target_collection.to_string(),
                 collection_state: source_state,
@@ -1136,8 +1220,8 @@ impl Broker {
             })
             .map_err(internal_error)?;
         let drop_sequence = storage.last_applied_sequence() + 1;
-        storage
-            .commit_mutation(WalMutation::DropCollection {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::DropCollection {
                 database: source_database.to_string(),
                 collection: source_collection.to_string(),
                 change_events: vec![
@@ -1172,6 +1256,8 @@ impl Broker {
                 ],
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(Document::new())
     }
 
@@ -1261,8 +1347,8 @@ impl Broker {
                 },
             ));
         }
-        storage
-            .commit_mutation(WalMutation::CreateIndexes {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::CreateIndexes {
                 database,
                 collection: collection.to_string(),
                 create_options: (!collection_exists).then(Document::new),
@@ -1270,6 +1356,8 @@ impl Broker {
                 change_events,
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! {
             "numIndexesBefore": before,
             "numIndexesAfter": before + created.len() as i32,
@@ -1292,8 +1380,8 @@ impl Broker {
             target,
         )?;
         let sequence = storage.last_applied_sequence() + 1;
-        storage
-            .commit_mutation(WalMutation::DropIndexes {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::DropIndexes {
                 database: database.clone(),
                 collection: collection.to_string(),
                 target: target.to_string(),
@@ -1316,6 +1404,8 @@ impl Broker {
                 )],
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! { "nIndexesWas": removed as i32 })
     }
 
@@ -1399,8 +1489,8 @@ impl Broker {
                 change_events,
             )
         };
-        storage
-            .commit_mutation(WalMutation::ApplyCollectionChanges {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options,
@@ -1411,6 +1501,8 @@ impl Broker {
                 change_events,
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! { "n": inserted_total })
     }
 
@@ -1438,7 +1530,7 @@ impl Broker {
             let _ = apply_projection(&Document::new(), Some(projection))?;
         }
 
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection}");
         let execution = match storage.catalog().get_collection(&database, collection) {
@@ -1718,8 +1810,8 @@ impl Broker {
             ))?
         };
 
-        storage
-            .commit_mutation(WalMutation::ApplyCollectionChanges {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options,
@@ -1730,6 +1822,8 @@ impl Broker {
                 change_events,
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! {
             "n": matched + upserted.len() as i32,
             "nModified": modified,
@@ -1812,8 +1906,8 @@ impl Broker {
             (changes, change_events, deleted)
         };
 
-        storage
-            .commit_mutation(WalMutation::ApplyCollectionChanges {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ApplyCollectionChanges {
                 database,
                 collection: collection_name.to_string(),
                 create_options: None,
@@ -1824,6 +1918,8 @@ impl Broker {
                 change_events,
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
         Ok(doc! { "n": deleted })
     }
 
@@ -1836,7 +1932,7 @@ impl Broker {
         let skip = body.get_i64("skip").unwrap_or(0).max(0) as usize;
         let limit = body.get_i64("limit").unwrap_or(0);
 
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let mut matches = storage
             .catalog()
             .get_collection(&database, collection_name)
@@ -1866,7 +1962,7 @@ impl Broker {
             .map_err(|_| CommandError::new(9, "FailedToParse", "distinct requires a key"))?;
         let query = body.get_document("query").ok().cloned().unwrap_or_default();
 
-        let storage = self.storage.read();
+        let storage = self.durable_storage_read()?;
         let mut seen = Vec::<Bson>::new();
         if let Ok(collection) = storage.catalog().get_collection(&database, collection_name) {
             for record in &collection.records {
@@ -2186,7 +2282,7 @@ impl Broker {
         }
 
         let (namespace, results) = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2273,7 +2369,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.{collection_name}");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2347,7 +2443,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.{collection_name}");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2418,7 +2514,7 @@ impl Broker {
             .map(|collection| format!("{database}.{collection}"))
             .unwrap_or_else(|| format!("{database}.$cmd.aggregate"));
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2484,7 +2580,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.$cmd.aggregate");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2527,7 +2623,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.$cmd.aggregate");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2593,7 +2689,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.$cmd.aggregate");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2636,7 +2732,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.$cmd.aggregate");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2679,7 +2775,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.$cmd.aggregate");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2723,7 +2819,7 @@ impl Broker {
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.{collection_name}");
         let results = {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -2834,7 +2930,7 @@ impl Broker {
 
         let namespace = format!("{database}.$cmd.aggregate");
         let results = if execution_pipeline.len() > 1 {
-            let storage = self.storage.read();
+            let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
                 catalog: storage.catalog(),
                 change_events: storage.change_events(),
@@ -3368,15 +3464,16 @@ impl Broker {
                 document,
             })?;
         }
-        storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ReplaceCollection {
                 database: database.to_string(),
                 collection: collection.to_string(),
                 collection_state,
                 change_events: Vec::new(),
             })
-            .map(|_| ())
-            .map_err(internal_error)
+            .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)
     }
 
     fn merge_into_collection(
@@ -3475,14 +3572,16 @@ impl Broker {
             }
         }
 
-        storage
-            .commit_mutation(WalMutation::ReplaceCollection {
+        let sequence = storage
+            .commit_mutation_unflushed(WalMutation::ReplaceCollection {
                 database: database.to_string(),
                 collection: target.collection.clone(),
                 collection_state,
                 change_events: Vec::new(),
             })
             .map_err(internal_error)?;
+        drop(storage);
+        self.await_durable_sequence(sequence)?;
 
         if let Some(error) = deferred_error {
             return Err(error);
@@ -6002,6 +6101,8 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::Path,
+        sync::{Arc, Barrier},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -6055,6 +6156,58 @@ mod tests {
         assert_eq!(matches[0].1.get_i32("qty").expect("qty"), 5);
         assert_eq!(matches[1].0, 3);
         assert_eq!(matches[1].1.get_i32("qty").expect("qty"), 7);
+    }
+
+    #[test]
+    fn concurrent_writes_share_group_commit_syncs() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("group-commit.mongodb");
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let workers = 8;
+        let writes_per_worker = 8;
+        let start = Arc::new(Barrier::new(workers + 1));
+
+        thread::scope(|scope| {
+            for worker in 0..workers {
+                let broker = broker.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for write_index in 0..writes_per_worker {
+                        broker
+                            .dispatch(&doc! {
+                                "insert": "widgets",
+                                "documents": [
+                                    {
+                                        "_id": format!("{worker}-{write_index}"),
+                                        "sku": format!("sku-{worker}-{write_index}"),
+                                        "worker": worker as i32,
+                                        "write": write_index as i32,
+                                    }
+                                ],
+                                "$db": "app",
+                            })
+                            .expect("insert");
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        let storage = broker.storage.read();
+        let collection = storage
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let total_writes = workers * writes_per_worker;
+        assert_eq!(collection.records.len(), total_writes);
+        assert_eq!(storage.last_applied_sequence(), total_writes as u64);
+        assert_eq!(storage.durable_sequence(), total_writes as u64);
+        assert!(
+            storage.wal_sync_count() < total_writes,
+            "expected grouped WAL syncs, got {} syncs for {total_writes} writes",
+            storage.wal_sync_count(),
+        );
     }
 
     async fn send_command(

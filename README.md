@@ -123,11 +123,12 @@ file:///absolute/path/to/database.mongodb?db=app
 ### Storage and catalog
 - One durable `.mongodb` file per broker.
 - Fixed file header and rotating superblocks.
-- Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas, typed index create/drop frames, and collection-level replacement or drop frames where a whole-collection rewrite is still required.
+- Append-only WAL for typed collection mutations, with ordered per-record CRUD deltas, typed index create/drop frames, and collection-level replacement or drop frames where a whole-collection rewrite is still required. Concurrent broker writes append and apply those WAL mutations under the storage lock, then share a short group-commit `fsync` barrier before success is returned.
 - Checkpoint snapshots store collection records in fixed-size slotted pages with stable `RecordId`s.
 - Secondary and unique index entries are stored in dedicated B-tree pages with internal and leaf nodes, keyed by BSON plus `RecordId`, and are validated against collection pages on reopen.
 - Incremental CRUD apply batches touched record and index-entry updates in memory, merging only affected index entry vectors and rebuilding each affected B-tree once per committed mutation.
 - Collections persist their next `RecordId` high-water mark and rebuild a transient `record_id -> position` map on open so inserts and record-id lookups do not need to rescan the full collection vector.
+- Read paths wait behind any outstanding WAL durability barrier before borrowing storage state, so they do not observe broker-local writes that have been appended and applied but not yet acknowledged as durable.
 - Recovery replays WAL on top of the newest valid checkpoint and can fall back to an older superblock when the latest checkpoint pages are damaged. Checkpoints also carry forward unchanged collection, index, and change-event pages from the active snapshot instead of re-encoding them, and when the inactive checkpoint region is large enough they reuse that preserved snapshot/WAL space instead of appending another full snapshot to the end of the file.
 - Multiple databases and collections in one file.
 - Collection catalog metadata and persistent index state.
