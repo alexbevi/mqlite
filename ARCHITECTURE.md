@@ -261,7 +261,7 @@ Mutations are durable through an append-only WAL.
 - Read paths borrow storage only after the visible sequence is durable, so queries and metadata commands do not observe broker-local writes that are still waiting on the shared WAL sync.
 - Applying CRUD deltas batches touched record state and index-entry maintenance in memory, merges only the affected index entry vectors, and rebuilds each affected runtime B-tree once per mutation instead of once per row.
 - Each collection persists its next `RecordId` high-water mark in the checkpoint metadata and reconstructs a transient `record_id -> record vector position` map on load so later writes can allocate ids and find target rows without rescanning the collection.
-- Checkpoints carry forward unchanged record, index, and change-event pages from the active snapshot so only dirty namespaces need new page encoding.
+- Checkpoints carry forward unchanged record, index, and change-event pages from the active snapshot. Dirty collections are diffed against the active snapshot so unchanged prefix/suffix record pages, unchanged index trees, and unchanged change-event page ranges can still be reused instead of forcing a full namespace rewrite.
 - Checkpoints can reuse the inactive superblock slot's preserved snapshot or stale WAL region when the next snapshot fits there, while keeping new WAL appends after the preserved fallback checkpoint region.
 - Recovery loads the newest valid checkpoint, then replays WAL frames with sequence numbers greater than the checkpoint sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.

@@ -383,6 +383,14 @@ struct EncodedSnapshotCatalog {
 }
 
 #[derive(Debug, Default)]
+struct PageReusePlan {
+    reused_prefix: Vec<PageRef>,
+    reused_suffix: Vec<PageRef>,
+    middle_start: usize,
+    middle_end: usize,
+}
+
+#[derive(Debug, Default)]
 struct SlottedPageBuilder {
     page_id: u64,
     page_kind: u16,
@@ -667,6 +675,7 @@ impl DatabaseFile {
         self.state.last_checkpoint_unix_ms = current_unix_ms();
 
         let encoded_catalog = encode_snapshot_catalog(
+            &mut self.file,
             &self.state.catalog,
             &self.state.change_events,
             &self.checkpoint_snapshot,
@@ -1854,6 +1863,7 @@ fn encode_unique_index_key(
 }
 
 fn encode_snapshot_catalog(
+    file: &mut File,
     catalog: &Catalog,
     change_events: &[PersistedChangeEvent],
     checkpoint_snapshot: &SnapshotState,
@@ -1869,13 +1879,13 @@ fn encode_snapshot_catalog(
         };
 
         for (collection_name, collection) in &database.collections {
+            let snapshot_collection = checkpoint_snapshot
+                .catalog
+                .databases
+                .get(database_name)
+                .and_then(|database| database.collections.get(collection_name));
             if !dirty_collections.contains(&(database_name.clone(), collection_name.clone())) {
-                if let Some(snapshot_collection) = checkpoint_snapshot
-                    .catalog
-                    .databases
-                    .get(database_name)
-                    .and_then(|database| database.collections.get(collection_name))
-                {
+                if let Some(snapshot_collection) = snapshot_collection {
                     encoded_catalog.record_page_count += snapshot_collection.record_pages.len();
                     encoded_catalog.record_count += snapshot_collection.record_count;
                     encoded_catalog
@@ -1895,16 +1905,69 @@ fn encode_snapshot_catalog(
                 }
             }
 
-            let record_pages = encode_collection_pages(&collection.records, &mut next_page_id)?;
+            let record_reuse_plan = snapshot_collection
+                .map(|snapshot_collection| {
+                    page_reuse_plan(
+                        file,
+                        &collection.records,
+                        &snapshot_collection.record_pages,
+                        decode_record_page,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(PageReusePlan {
+                    middle_end: collection.records.len(),
+                    ..PageReusePlan::default()
+                });
+            encoded_catalog.record_page_count += record_reuse_plan.reused_prefix.len();
+            encoded_catalog.record_page_count += record_reuse_plan.reused_suffix.len();
+            encoded_catalog
+                .reused_page_refs
+                .extend(record_reuse_plan.reused_prefix.iter().cloned());
+            encoded_catalog
+                .reused_page_refs
+                .extend(record_reuse_plan.reused_suffix.iter().cloned());
+
+            let record_pages = encode_collection_pages(
+                &collection.records[record_reuse_plan.middle_start..record_reuse_plan.middle_end],
+                &mut next_page_id,
+            )?;
             let record_page_count_before = encoded_catalog.pages.len();
             encoded_catalog.record_page_count += record_pages.len();
             encoded_catalog.pages.extend(record_pages);
-            let record_page_ids = (record_page_count_before..encoded_catalog.pages.len())
-                .map(|index| encoded_catalog.pages[index].page_id)
+            let mut record_page_ids = record_reuse_plan
+                .reused_prefix
+                .iter()
+                .map(|page_ref| page_ref.page_id)
                 .collect::<Vec<_>>();
+            record_page_ids.extend(
+                (record_page_count_before..encoded_catalog.pages.len())
+                    .map(|index| encoded_catalog.pages[index].page_id)
+                    .collect::<Vec<_>>(),
+            );
+            record_page_ids.extend(
+                record_reuse_plan
+                    .reused_suffix
+                    .iter()
+                    .map(|page_ref| page_ref.page_id),
+            );
 
             let mut snapshot_indexes = BTreeMap::new();
             for (index_name, index) in &collection.indexes {
+                if let Some(snapshot_index) =
+                    snapshot_collection.and_then(|collection| collection.indexes.get(index_name))
+                {
+                    if snapshot_index_matches(file, index_name, index, snapshot_index)? {
+                        encoded_catalog.index_page_count += snapshot_index.pages.len();
+                        encoded_catalog.index_entry_count += snapshot_index.entry_count;
+                        encoded_catalog
+                            .reused_page_refs
+                            .extend(snapshot_index.pages.iter().cloned());
+                        snapshot_indexes.insert(index_name.clone(), snapshot_index.clone());
+                        continue;
+                    }
+                }
+
                 let encoded_index_tree =
                     encode_index_tree_pages(&index.entries, &mut next_page_id)?;
                 let index_page_count_before = encoded_catalog.pages.len();
@@ -1959,18 +2022,116 @@ fn encode_snapshot_catalog(
             .map(|page_ref| page_ref.page_id)
             .collect();
     } else {
-        let change_event_page_count_before = encoded_catalog.pages.len();
-        let change_event_pages = encode_change_event_pages(change_events, &mut next_page_id)?;
-        encoded_catalog.change_event_page_count = change_event_pages.len();
+        let change_event_reuse_plan = page_reuse_plan(
+            file,
+            change_events,
+            &checkpoint_snapshot.change_event_pages,
+            decode_change_event_page,
+        )?;
+        encoded_catalog.change_event_page_count += change_event_reuse_plan.reused_prefix.len();
+        encoded_catalog.change_event_page_count += change_event_reuse_plan.reused_suffix.len();
         encoded_catalog.change_event_count = change_events.len();
+        encoded_catalog
+            .reused_page_refs
+            .extend(change_event_reuse_plan.reused_prefix.iter().cloned());
+        encoded_catalog
+            .reused_page_refs
+            .extend(change_event_reuse_plan.reused_suffix.iter().cloned());
+        let change_event_page_count_before = encoded_catalog.pages.len();
+        let change_event_pages = encode_change_event_pages(
+            &change_events
+                [change_event_reuse_plan.middle_start..change_event_reuse_plan.middle_end],
+            &mut next_page_id,
+        )?;
+        encoded_catalog.change_event_page_count += change_event_pages.len();
         encoded_catalog.pages.extend(change_event_pages);
-        encoded_catalog.change_event_page_ids = (change_event_page_count_before
-            ..encoded_catalog.pages.len())
-            .map(|index| encoded_catalog.pages[index].page_id)
+        encoded_catalog.change_event_page_ids = change_event_reuse_plan
+            .reused_prefix
+            .iter()
+            .map(|page_ref| page_ref.page_id)
+            .chain(
+                (change_event_page_count_before..encoded_catalog.pages.len())
+                    .map(|index| encoded_catalog.pages[index].page_id),
+            )
+            .chain(
+                change_event_reuse_plan
+                    .reused_suffix
+                    .iter()
+                    .map(|page_ref| page_ref.page_id),
+            )
             .collect();
     }
 
     Ok(encoded_catalog)
+}
+
+fn page_reuse_plan<T, F>(
+    file: &mut File,
+    current_entries: &[T],
+    snapshot_pages: &[PageRef],
+    mut decode_page_entries: F,
+) -> Result<PageReusePlan>
+where
+    T: PartialEq,
+    F: FnMut(&mut File, &PageRef) -> Result<Vec<T>>,
+{
+    let mut prefix_pages = 0_usize;
+    let mut middle_start = 0_usize;
+    while prefix_pages < snapshot_pages.len() {
+        let page_ref = &snapshot_pages[prefix_pages];
+        let entry_count = page_ref.entry_count as usize;
+        if middle_start + entry_count > current_entries.len() {
+            break;
+        }
+        let decoded_entries = decode_page_entries(file, page_ref)?;
+        if decoded_entries.as_slice() != &current_entries[middle_start..middle_start + entry_count]
+        {
+            break;
+        }
+        middle_start += entry_count;
+        prefix_pages += 1;
+    }
+
+    let mut suffix_pages = snapshot_pages.len();
+    let mut middle_end = current_entries.len();
+    while suffix_pages > prefix_pages {
+        let page_ref = &snapshot_pages[suffix_pages - 1];
+        let entry_count = page_ref.entry_count as usize;
+        if middle_end < middle_start + entry_count {
+            break;
+        }
+        let decoded_entries = decode_page_entries(file, page_ref)?;
+        if decoded_entries.as_slice() != &current_entries[middle_end - entry_count..middle_end] {
+            break;
+        }
+        middle_end -= entry_count;
+        suffix_pages -= 1;
+    }
+
+    Ok(PageReusePlan {
+        reused_prefix: snapshot_pages[..prefix_pages].to_vec(),
+        reused_suffix: snapshot_pages[suffix_pages..].to_vec(),
+        middle_start,
+        middle_end,
+    })
+}
+
+fn snapshot_index_matches(
+    file: &mut File,
+    index_name: &str,
+    current_index: &IndexCatalog,
+    snapshot_index: &SnapshotIndexCatalog,
+) -> Result<bool> {
+    if current_index.key != snapshot_index.key
+        || current_index.unique != snapshot_index.unique
+        || current_index.expire_after_seconds != snapshot_index.expire_after_seconds
+        || current_index.entries.len() != snapshot_index.entry_count
+    {
+        return Ok(false);
+    }
+
+    let restored_index = restore_index(file, index_name, snapshot_index)?;
+    Ok(restored_index.entries == current_index.entries)
 }
 
 fn next_snapshot_page_id(snapshot_state: &SnapshotState) -> u64 {
@@ -2290,15 +2451,24 @@ fn restore_change_events(
 ) -> Result<Vec<PersistedChangeEvent>> {
     let mut events = Vec::new();
     for page_ref in page_refs {
-        let page = decode_page(file, page_ref)?;
-        if page.page_kind != PAGE_KIND_CHANGE_EVENT {
-            return Err(StorageError::InvalidPage.into());
-        }
-        for (_, document) in page.entries {
-            events.push(bson::from_document(document)?);
-        }
+        events.extend(decode_change_event_page(file, page_ref)?);
     }
     Ok(events)
+}
+
+fn decode_change_event_page(
+    file: &mut File,
+    page_ref: &PageRef,
+) -> Result<Vec<PersistedChangeEvent>> {
+    let page = decode_page(file, page_ref)?;
+    if page.page_kind != PAGE_KIND_CHANGE_EVENT {
+        return Err(StorageError::InvalidPage.into());
+    }
+
+    page.entries
+        .into_iter()
+        .map(|(_, document)| Ok(bson::from_document(document)?))
+        .collect()
 }
 
 fn restore_index(
@@ -3441,6 +3611,119 @@ mod tests {
         assert_eq!(
             collection.indexes.get("sku_1").expect("index").pages,
             first_index_pages
+        );
+    }
+
+    #[test]
+    fn checkpoints_reuse_unchanged_pages_within_dirty_collections() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("checkpoint-partial-page-reuse.mongodb");
+
+        let (first_record_pages, first_index_pages) = {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=12_u64 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id}"),
+                        "qty": record_id as i32,
+                        "payload": "x".repeat(700),
+                    },
+                );
+            }
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("first checkpoint");
+
+            let inspect = DatabaseFile::inspect(&path).expect("inspect");
+            let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+            let collection = snapshot
+                .catalog
+                .databases
+                .get("app")
+                .expect("database")
+                .collections
+                .get("widgets")
+                .expect("collection");
+            assert!(collection.record_pages.len() >= 3);
+            (
+                collection.record_pages.clone(),
+                collection
+                    .indexes
+                    .get("sku_1")
+                    .expect("index")
+                    .pages
+                    .clone(),
+            )
+        };
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("reopen");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Update(CollectionRecord {
+                        record_id: 6,
+                        document: doc! {
+                            "_id": 6_i64,
+                            "sku": "sku-6",
+                            "qty": 600_i32,
+                            "payload": "x".repeat(700),
+                        },
+                    })],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("update");
+            database.checkpoint().expect("second checkpoint");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        let snapshot = latest_snapshot(&path, inspect.active_superblock_slot);
+        let collection = snapshot
+            .catalog
+            .databases
+            .get("app")
+            .expect("database")
+            .collections
+            .get("widgets")
+            .expect("collection");
+        let reused_record_pages = collection
+            .record_pages
+            .iter()
+            .filter(|page_ref| first_record_pages.contains(page_ref))
+            .count();
+        assert_eq!(
+            collection.indexes.get("sku_1").expect("index").pages,
+            first_index_pages
+        );
+        assert!(
+            reused_record_pages >= 2,
+            "expected at least two unchanged record pages to be reused, got {reused_record_pages}",
+        );
+        assert!(
+            reused_record_pages < collection.record_pages.len(),
+            "expected the updated record page to be rewritten",
         );
     }
 
