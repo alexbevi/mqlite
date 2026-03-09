@@ -152,7 +152,8 @@ impl CollectionCatalog {
         for index in self.indexes.values_mut() {
             let entry = index_entry_for_document(record.record_id, &record.document, &index.key);
             insert_index_entry(&mut index.entries, entry, &index.key);
-            index.rebuild_tree();
+            index.refresh_stats();
+            index.invalidate_tree();
         }
         self.record_positions
             .insert(record.record_id, self.records.len());
@@ -182,7 +183,8 @@ impl CollectionCatalog {
             index.entries.retain(|entry| entry.record_id != record_id);
             let entry = index_entry_for_document(record_id, &document, &index.key);
             insert_index_entry(&mut index.entries, entry, &index.key);
-            index.rebuild_tree();
+            index.refresh_stats();
+            index.invalidate_tree();
         }
         self.records[position].document = document;
         Ok(true)
@@ -201,7 +203,8 @@ impl CollectionCatalog {
             index
                 .entries
                 .retain(|entry| !record_ids.contains(&entry.record_id));
-            index.rebuild_tree();
+            index.refresh_stats();
+            index.invalidate_tree();
         }
         before - self.records.len()
     }
@@ -212,6 +215,10 @@ impl CollectionCatalog {
     ) -> Result<(), CatalogError> {
         if mutations.is_empty() {
             return Ok(());
+        }
+
+        if let Some(inserts) = insert_batch_mutations(mutations) {
+            return self.apply_insert_batch(&inserts);
         }
 
         let base_positions = self.record_positions.clone();
@@ -238,8 +245,7 @@ impl CollectionCatalog {
                 .indexes
                 .get_mut(&name)
                 .expect("staged index must exist");
-            index.entries = entries;
-            index.rebuild_tree();
+            index.replace_entries(entries);
         }
         Ok(())
     }
@@ -267,6 +273,50 @@ impl CollectionCatalog {
             .unwrap_or(0)
             .saturating_add(1);
         self.next_record_id = self.next_record_id.max(computed_next_record_id);
+    }
+
+    fn apply_insert_batch(&mut self, inserts: &[&CollectionRecord]) -> Result<(), CatalogError> {
+        if inserts.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen_record_ids = HashSet::with_capacity(inserts.len());
+        for record in inserts {
+            if self.record_positions.contains_key(&record.record_id)
+                || !seen_record_ids.insert(record.record_id)
+            {
+                return Err(CatalogError::InvalidIndexState(format!(
+                    "duplicate record id {}",
+                    record.record_id
+                )));
+            }
+        }
+
+        let staged_indexes = self
+            .indexes
+            .values()
+            .map(|index| {
+                stage_insert_entries(index, inserts).map(|entries| (index.name.clone(), entries))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let start_position = self.records.len();
+        self.records
+            .extend(inserts.iter().map(|record| (*record).clone()));
+        for (offset, record) in inserts.iter().enumerate() {
+            self.record_positions
+                .insert(record.record_id, start_position + offset);
+            self.next_record_id = self.next_record_id.max(record.record_id.saturating_add(1));
+        }
+
+        for (name, entries) in staged_indexes {
+            let index = self
+                .indexes
+                .get_mut(&name)
+                .expect("staged index must exist");
+            index.append_entries(entries)?;
+        }
+        Ok(())
     }
 }
 
@@ -444,7 +494,16 @@ impl IndexCatalog {
     }
 
     pub fn scan_entries(&self, bounds: &IndexBounds) -> Vec<IndexEntry> {
-        self.tree.scan_entries(bounds, &self.key)
+        let start = bounds.lower.as_ref().map_or(0, |bound| {
+            lower_bound_index(&self.entries, bound, &self.key)
+        });
+        let end = bounds.upper.as_ref().map_or(self.entries.len(), |bound| {
+            upper_bound_index(&self.entries, bound, &self.key)
+        });
+        if start >= end {
+            return Vec::new();
+        }
+        self.entries[start..end].to_vec()
     }
 
     pub fn scan_bounds(&self, bounds: &IndexBounds) -> Vec<u64> {
@@ -516,6 +575,51 @@ impl IndexCatalog {
 
     pub fn present_count(&self, field: &str) -> Option<usize> {
         self.stats.present_fields.get(field).copied()
+    }
+
+    pub fn stats_hydrated(&self) -> bool {
+        self.stats.entry_count == self.entries.len()
+            && self.stats.present_fields.len() == self.key.len()
+            && self.stats.value_frequencies.len() == self.key.len()
+    }
+
+    fn refresh_stats(&mut self) {
+        self.stats = IndexStats::build(&self.entries, &self.key);
+    }
+
+    fn invalidate_tree(&mut self) {
+        self.tree = IndexTree::default();
+    }
+
+    fn replace_entries(&mut self, entries: Vec<IndexEntry>) {
+        self.entries = entries;
+        self.refresh_stats();
+        self.invalidate_tree();
+    }
+
+    fn append_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if self.stats_hydrated() {
+            for entry in &entries {
+                self.stats.insert_entry(entry, &self.key);
+            }
+        }
+
+        self.entries = merge_index_entries(
+            std::mem::take(&mut self.entries),
+            entries,
+            &self.key,
+            self.unique,
+            &self.name,
+        )?;
+        if !self.stats_hydrated() {
+            self.refresh_stats();
+        }
+        self.invalidate_tree();
+        Ok(())
     }
 }
 
@@ -623,6 +727,26 @@ impl IndexStats {
             frequencies.sort_by(|left, right| compare_bson(&left.value, &right.value));
         }
         stats
+    }
+
+    fn insert_entry(&mut self, entry: &IndexEntry, key_pattern: &Document) {
+        if self.present_fields.is_empty() && self.value_frequencies.is_empty() {
+            *self = Self::build(&[], key_pattern);
+        }
+
+        self.entry_count += 1;
+        for field in &entry.present_fields {
+            if let Some(count) = self.present_fields.get_mut(field) {
+                *count += 1;
+            }
+        }
+        for (field, value) in &entry.key {
+            let frequencies = self
+                .value_frequencies
+                .get_mut(field)
+                .expect("frequency field");
+            adjust_value_frequency(frequencies, value, 1);
+        }
     }
 }
 
@@ -1085,6 +1209,53 @@ fn insert_index_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry, key_patt
     entries.insert(position, entry);
 }
 
+fn insert_batch_mutations<'a>(
+    mutations: &'a [CollectionMutation<'a>],
+) -> Option<Vec<&'a CollectionRecord>> {
+    let mut inserts = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        match mutation {
+            CollectionMutation::Insert(record) => inserts.push(*record),
+            CollectionMutation::Update(_) | CollectionMutation::Delete(_) => return None,
+        }
+    }
+    Some(inserts)
+}
+
+fn stage_insert_entries(
+    index: &IndexCatalog,
+    inserts: &[&CollectionRecord],
+) -> Result<Vec<IndexEntry>, CatalogError> {
+    let mut entries = inserts
+        .iter()
+        .map(|record| index_entry_for_document(record.record_id, &record.document, &index.key))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| compare_index_entries(left, right, &index.key));
+
+    if !index.unique {
+        return Ok(entries);
+    }
+
+    for pair in entries.windows(2) {
+        if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
+            return Err(CatalogError::DuplicateKey(index.name.clone()));
+        }
+    }
+
+    for entry in &entries {
+        let position = index.entries.partition_point(|existing| {
+            compare_index_keys(&existing.key, &entry.key, &index.key).is_lt()
+        });
+        if index.entries.get(position).is_some_and(|existing| {
+            compare_index_keys(&existing.key, &entry.key, &index.key) == Ordering::Equal
+        }) {
+            return Err(CatalogError::DuplicateKey(index.name.clone()));
+        }
+    }
+
+    Ok(entries)
+}
+
 fn stage_index_entries(
     index: &IndexCatalog,
     base_records: &[CollectionRecord],
@@ -1172,6 +1343,34 @@ fn merge_index_entries(
     }
 
     Ok(merged)
+}
+
+fn adjust_value_frequency(frequencies: &mut Vec<ValueFrequency>, value: &Bson, delta: isize) {
+    match frequencies.binary_search_by(|frequency| compare_bson(&frequency.value, value)) {
+        Ok(position) => {
+            if delta.is_negative() {
+                let remove = frequencies[position].count <= delta.unsigned_abs();
+                if remove {
+                    frequencies.remove(position);
+                } else {
+                    frequencies[position].count -= delta.unsigned_abs();
+                }
+            } else {
+                frequencies[position].count += delta as usize;
+            }
+        }
+        Err(position) => {
+            if delta.is_positive() {
+                frequencies.insert(
+                    position,
+                    ValueFrequency {
+                        value: value.clone(),
+                        count: delta as usize,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn push_index_entry(
@@ -1305,14 +1504,14 @@ fn scan_node(
 fn lower_bound_index(entries: &[IndexEntry], bound: &IndexBound, key_pattern: &Document) -> usize {
     entries.partition_point(|entry| {
         let ordering = compare_index_keys(&entry.key, &bound.key, key_pattern);
-        ordering.is_lt() || (bound.inclusive && ordering.is_eq())
+        ordering.is_lt() || (!bound.inclusive && ordering.is_eq())
     })
 }
 
 fn upper_bound_index(entries: &[IndexEntry], bound: &IndexBound, key_pattern: &Document) -> usize {
     entries.partition_point(|entry| {
         let ordering = compare_index_keys(&entry.key, &bound.key, key_pattern);
-        ordering.is_lt() || (!bound.inclusive && ordering.is_eq())
+        ordering.is_lt() || (bound.inclusive && ordering.is_eq())
     })
 }
 
@@ -1652,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_runtime_btree_bounds_across_multiple_leaf_groups() {
+    fn scans_index_bounds_across_multiple_leaf_groups() {
         let mut collection = CollectionCatalog::new(doc! {});
         for record_id in 1..=200_u64 {
             collection
@@ -1672,7 +1871,6 @@ mod tests {
         .expect("create index");
 
         let index = collection.indexes.get("sku_1").expect("index");
-        assert!(index.tree.height > 1);
         let record_ids = index.scan_bounds(&IndexBounds {
             lower: Some(IndexBound {
                 key: doc! { "sku": "sku-050" },
@@ -1686,6 +1884,66 @@ mod tests {
         assert_eq!(record_ids.first().copied(), Some(50));
         assert_eq!(record_ids.last().copied(), Some(99));
         assert_eq!(record_ids.len(), 50);
+    }
+
+    #[test]
+    fn batched_insert_mutations_preserve_stats_positions_and_bounds_without_tree_rebuild() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        for record_id in 1..=64_u64 {
+            collection
+                .insert_record(CollectionRecord {
+                    record_id,
+                    document: doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                })
+                .expect("insert");
+        }
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let inserted = (65..=128_u64)
+            .map(|record_id| CollectionRecord {
+                record_id,
+                document: doc! {
+                    "_id": record_id as i64,
+                    "sku": format!("sku-{record_id:03}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mutations = inserted
+            .iter()
+            .map(CollectionMutation::Insert)
+            .collect::<Vec<_>>();
+        collection
+            .apply_mutations(&mutations)
+            .expect("apply mutations");
+
+        let index = collection.indexes.get("sku_1").expect("index");
+        assert!(index.tree.root.is_none());
+        assert_eq!(index.stats.entry_count, 128);
+        assert_eq!(collection.record_position(64), Some(63));
+        assert_eq!(collection.record_position(65), Some(64));
+        assert_eq!(collection.record_position(128), Some(127));
+        assert_eq!(collection.next_record_id(), 129);
+
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "sku": "sku-080" },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "sku": "sku-090" },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids.first().copied(), Some(80));
+        assert_eq!(record_ids.last().copied(), Some(90));
+        assert_eq!(record_ids.len(), 11);
     }
 
     #[test]

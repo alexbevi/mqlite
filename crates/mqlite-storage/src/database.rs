@@ -2305,10 +2305,7 @@ fn apply_owned_mutation(
 fn ensure_collection_indexes_hydrated(collection_state: &mut CollectionCatalog) {
     collection_state.refresh_runtime_state();
     for index in collection_state.indexes.values_mut() {
-        if index.stats.entry_count != index.entries.len()
-            || (!index.entries.is_empty() && index.tree.root.is_none())
-            || (index.entries.is_empty() && index.tree.root.is_some())
-        {
+        if !index.stats_hydrated() {
             index.rebuild_tree();
         }
     }
