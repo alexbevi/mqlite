@@ -84,6 +84,7 @@ At a high level, the current engine already covers:
 - single-file durable storage with WAL, checkpoints, recovery, and persisted secondary indexes
 - page-local in-memory secondary-index maintenance so bulk inserts only rewrite touched index leaves
 - incrementally maintained in-memory unique-index validation caches that keep structured BSON keys and borrow per-batch write documents so writes do not rebuild duplicate-key state or duplicate full documents during validation
+- storage commits apply already-validated CRUD deltas through the catalog without repeating the same unique-index duplicate probes on the hot path
 - multiple databases and collections inside one file
 - core MongoDB command flows such as `hello`, `ping`, CRUD, index management, and cursors
 - `find` planning with observable `explain` output for collection and index scans

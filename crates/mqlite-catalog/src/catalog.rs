@@ -56,6 +56,12 @@ pub enum CollectionMutation<'a> {
     Delete(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationValidationMode {
+    Full,
+    TrustUniqueConstraints,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IndexTree {
     pub root: Option<Box<IndexNode>>,
@@ -259,12 +265,29 @@ impl CollectionCatalog {
         &mut self,
         mutations: &[CollectionMutation<'_>],
     ) -> Result<(), CatalogError> {
+        self.apply_mutations_with_mode(mutations, MutationValidationMode::Full)
+    }
+
+    /// Applies mutations after the caller has already validated unique-key and
+    /// target-record constraints against the current collection state.
+    pub fn apply_validated_mutations(
+        &mut self,
+        mutations: &[CollectionMutation<'_>],
+    ) -> Result<(), CatalogError> {
+        self.apply_mutations_with_mode(mutations, MutationValidationMode::TrustUniqueConstraints)
+    }
+
+    fn apply_mutations_with_mode(
+        &mut self,
+        mutations: &[CollectionMutation<'_>],
+        validation_mode: MutationValidationMode,
+    ) -> Result<(), CatalogError> {
         if mutations.is_empty() {
             return Ok(());
         }
 
         if let Some(inserts) = insert_batch_mutations(mutations) {
-            return self.apply_insert_batch(&inserts);
+            return self.apply_insert_batch(&inserts, validation_mode);
         }
 
         let base_positions = self.record_positions.clone();
@@ -277,9 +300,15 @@ impl CollectionCatalog {
             .indexes
             .values()
             .filter_map(|index| {
-                stage_index_entries(index, &self.records, &base_positions, &plan)
-                    .transpose()
-                    .map(|entries| entries.map(|entries| (index.name.clone(), entries)))
+                stage_index_entries(
+                    index,
+                    &self.records,
+                    &base_positions,
+                    &plan,
+                    validation_mode,
+                )
+                .transpose()
+                .map(|entries| entries.map(|entries| (index.name.clone(), entries)))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -321,7 +350,11 @@ impl CollectionCatalog {
         self.next_record_id = self.next_record_id.max(computed_next_record_id);
     }
 
-    fn apply_insert_batch(&mut self, inserts: &[&CollectionRecord]) -> Result<(), CatalogError> {
+    fn apply_insert_batch(
+        &mut self,
+        inserts: &[&CollectionRecord],
+        validation_mode: MutationValidationMode,
+    ) -> Result<(), CatalogError> {
         if inserts.is_empty() {
             return Ok(());
         }
@@ -342,7 +375,8 @@ impl CollectionCatalog {
             .indexes
             .values()
             .map(|index| {
-                stage_insert_entries(index, inserts).map(|entries| (index.name.clone(), entries))
+                stage_insert_entries(index, inserts, validation_mode)
+                    .map(|entries| (index.name.clone(), entries))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1544,6 +1578,7 @@ fn insert_batch_mutations<'a>(
 fn stage_insert_entries(
     index: &IndexCatalog,
     inserts: &[&CollectionRecord],
+    validation_mode: MutationValidationMode,
 ) -> Result<Vec<IndexEntry>, CatalogError> {
     let mut entries = inserts
         .iter()
@@ -1555,15 +1590,17 @@ fn stage_insert_entries(
         return Ok(entries);
     }
 
-    for pair in entries.windows(2) {
-        if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
-            return Err(CatalogError::DuplicateKey(index.name.clone()));
+    if validation_mode == MutationValidationMode::Full {
+        for pair in entries.windows(2) {
+            if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
+                return Err(CatalogError::DuplicateKey(index.name.clone()));
+            }
         }
-    }
 
-    for entry in &entries {
-        if index.contains_unique_key(&entry.key, None) {
-            return Err(CatalogError::DuplicateKey(index.name.clone()));
+        for entry in &entries {
+            if index.contains_unique_key(&entry.key, None) {
+                return Err(CatalogError::DuplicateKey(index.name.clone()));
+            }
         }
     }
 
@@ -1575,6 +1612,7 @@ fn stage_index_entries(
     base_records: &[CollectionRecord],
     base_positions: &HashMap<u64, usize>,
     plan: &CollectionMutationPlan,
+    validation_mode: MutationValidationMode,
 ) -> Result<Option<Vec<IndexEntry>>, CatalogError> {
     let mut affected_record_ids = HashSet::new();
     let mut replacements = Vec::new();
@@ -1623,7 +1661,7 @@ fn stage_index_entries(
         retained,
         replacements,
         &index.key,
-        index.unique,
+        index.unique && validation_mode == MutationValidationMode::Full,
         &index.name,
     )?))
 }
@@ -2257,6 +2295,63 @@ mod tests {
         assert_eq!(record_ids.first().copied(), Some(80));
         assert_eq!(record_ids.last().copied(), Some(90));
         assert_eq!(record_ids.len(), 11);
+    }
+
+    #[test]
+    fn validated_insert_mutations_preserve_stats_positions_and_bounds() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        for record_id in 1..=64_u64 {
+            collection
+                .insert_record(CollectionRecord {
+                    record_id,
+                    document: doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                })
+                .expect("insert");
+        }
+        super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let inserted = (65..=128_u64)
+            .map(|record_id| CollectionRecord {
+                record_id,
+                document: doc! {
+                    "_id": record_id as i64,
+                    "sku": format!("sku-{record_id:03}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mutations = inserted
+            .iter()
+            .map(CollectionMutation::Insert)
+            .collect::<Vec<_>>();
+        collection
+            .apply_validated_mutations(&mutations)
+            .expect("apply validated mutations");
+
+        let index = collection.indexes.get("sku_1").expect("index");
+        assert_eq!(index.stats.entry_count, 128);
+        assert_eq!(collection.record_position(65), Some(64));
+        assert_eq!(collection.record_position(128), Some(127));
+        assert_eq!(collection.next_record_id(), 129);
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "sku": "sku-120" },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "sku": "sku-128" },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids.first().copied(), Some(120));
+        assert_eq!(record_ids.last().copied(), Some(128));
+        assert_eq!(record_ids.len(), 9);
     }
 
     #[test]

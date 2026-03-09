@@ -2333,7 +2333,7 @@ fn apply_owned_mutation(
             } else {
                 changes
             };
-            apply_collection_changes(
+            apply_collection_changes_validated(
                 state,
                 &database,
                 &collection,
@@ -2619,6 +2619,30 @@ fn apply_collection_changes(
     apply_collection_change_set(collection_state, changes)
 }
 
+fn apply_collection_changes_validated(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    changes: &[CollectionChange],
+) -> Result<()> {
+    if state.catalog.get_collection(database, collection).is_err() {
+        let Some(options) = create_options else {
+            return Err(CatalogError::NamespaceNotFound(
+                database.to_string(),
+                collection.to_string(),
+            )
+            .into());
+        };
+        state
+            .catalog
+            .create_collection(database, collection, options.clone())?;
+    }
+
+    let collection_state = state.catalog.get_collection_mut(database, collection)?;
+    apply_collection_change_set_validated(collection_state, changes)
+}
+
 fn rewrite_collection(
     state: &mut PersistedState,
     database: &str,
@@ -2682,6 +2706,23 @@ fn apply_collection_change_set(
         .collect::<Vec<_>>();
     collection_state
         .apply_mutations(&mutations)
+        .map_err(map_catalog_error)
+}
+
+fn apply_collection_change_set_validated(
+    collection_state: &mut CollectionCatalog,
+    changes: &[CollectionChange],
+) -> Result<()> {
+    let mutations = changes
+        .iter()
+        .map(|change| match change {
+            CollectionChange::Insert(record) => CollectionMutation::Insert(record),
+            CollectionChange::Update(record) => CollectionMutation::Update(record),
+            CollectionChange::Delete(record_id) => CollectionMutation::Delete(*record_id),
+        })
+        .collect::<Vec<_>>();
+    collection_state
+        .apply_validated_mutations(&mutations)
         .map_err(map_catalog_error)
 }
 
