@@ -377,6 +377,38 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongodb --db app
 ```
 
+### `bench`
+
+Auto-spawns or reuses the broker for the target file, creates a fresh benchmark collection, optionally creates one secondary index, performs a timed insert phase followed by a timed point-read phase, and prints a JSON report with elapsed milliseconds plus document and command throughput. This is intended as a quick local regression check between storage and broker write-path changes.
+
+Usage:
+
+```text
+mqlite bench --file <path> [--db <name>] [--collection-prefix <name>] [--writes <count>] [--reads <count>] [--write-batch-size <count>] [--index-field <name>] [--unique-index] [--idle-shutdown-secs <seconds>]
+```
+
+Options:
+
+| Option | Summary | Example |
+| --- | --- | --- |
+| `--file <path>` | Target `.mongodb` file for broker discovery or auto-spawn; required. | `mqlite bench --file /tmp/app.mongodb` |
+| `--db <name>` | Database for the benchmark collection; defaults to `bench`. | `mqlite bench --file /tmp/app.mongodb --db app` |
+| `--collection-prefix <name>` | Prefix for the fresh per-run collection name; defaults to `bench`. | `mqlite bench --file /tmp/app.mongodb --collection-prefix quick` |
+| `--writes <count>` | Number of documents to insert; defaults to `1000`. | `mqlite bench --file /tmp/app.mongodb --writes 5000` |
+| `--reads <count>` | Number of point reads to issue after the insert phase; defaults to `1000`. Reads beyond the number of inserted documents are ignored. | `mqlite bench --file /tmp/app.mongodb --reads 5000` |
+| `--write-batch-size <count>` | Number of documents per insert command; defaults to `1`. Use larger values to approximate `insertMany`. | `mqlite bench --file /tmp/app.mongodb --write-batch-size 100` |
+| `--index-field <name>` | Optional field name for a secondary index created before inserts begin. | `mqlite bench --file /tmp/app.mongodb --index-field sku` |
+| `--unique-index` | Make the optional secondary index unique. Requires `--index-field`. | `mqlite bench --file /tmp/app.mongodb --index-field sku --unique-index` |
+| `--idle-shutdown-secs <seconds>` | Idle timeout to pass to an auto-spawned broker; defaults to `60`. This does not affect an already-running broker for the same file. | `mqlite bench --file /tmp/app.mongodb --idle-shutdown-secs 5` |
+| `-h, --help` | Show command help. | `mqlite bench --help` |
+
+Example:
+
+```text
+mqlite bench --file /tmp/example.mongodb --db app --writes 1000 --reads 1000
+mqlite bench --file /tmp/example.mongodb --db app --writes 1000 --reads 1000 --write-batch-size 100 --index-field sku --unique-index
+```
+
 ### `checkpoint`
 
 Opens or creates the target file, writes a new checkpoint, and then prints the resulting storage inspection report as pretty JSON.

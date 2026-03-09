@@ -2,16 +2,18 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    time::SystemTime,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use bson::Document;
+use bson::{Bson, Document, doc};
 use clap::{Parser, Subcommand};
 use mqlite_ipc::{BoxedStream, BrokerPaths, broker_paths, connect, read_manifest, remove_manifest};
 use mqlite_server::{Broker, BrokerConfig};
 use mqlite_storage::DatabaseFile;
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
+use serde_json::json;
 
 #[derive(Debug, Parser)]
 #[command(name = "mqlite")]
@@ -49,6 +51,26 @@ enum Command {
         db: Option<String>,
         #[arg(long)]
         eval: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        idle_shutdown_secs: u64,
+    },
+    Bench {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "bench")]
+        db: String,
+        #[arg(long, default_value = "bench")]
+        collection_prefix: String,
+        #[arg(long, default_value_t = 1000)]
+        writes: u32,
+        #[arg(long, default_value_t = 1000)]
+        reads: u32,
+        #[arg(long, default_value_t = 1)]
+        write_batch_size: u32,
+        #[arg(long)]
+        index_field: Option<String>,
+        #[arg(long, requires = "index_field")]
+        unique_index: bool,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
     },
@@ -108,6 +130,31 @@ async fn main() -> Result<()> {
                         .unwrap_or("mqlite command returned an error")
                 );
             }
+        }
+        Command::Bench {
+            file,
+            db,
+            collection_prefix,
+            writes,
+            reads,
+            write_batch_size,
+            index_field,
+            unique_index,
+            idle_shutdown_secs,
+        } => {
+            let report = run_benchmark(
+                &file,
+                &db,
+                &collection_prefix,
+                writes,
+                reads,
+                write_batch_size,
+                index_field.as_deref(),
+                unique_index,
+                idle_shutdown_secs,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
 
@@ -212,4 +259,186 @@ async fn send_command(stream: &mut BoxedStream, body: Document) -> Result<Docume
         .body()
         .cloned()
         .ok_or_else(|| anyhow!("broker reply did not contain a body section"))
+}
+
+async fn send_checked_command(stream: &mut BoxedStream, body: Document) -> Result<Document> {
+    let response = send_command(stream, body).await?;
+    if response.get_f64("ok").unwrap_or(0.0) == 0.0 {
+        bail!(
+            "{}",
+            response
+                .get_str("errmsg")
+                .unwrap_or("mqlite benchmark command returned an error")
+        );
+    }
+    Ok(response)
+}
+
+async fn run_benchmark(
+    file: &Path,
+    db: &str,
+    collection_prefix: &str,
+    writes: u32,
+    reads: u32,
+    write_batch_size: u32,
+    index_field: Option<&str>,
+    unique_index: bool,
+    idle_shutdown_secs: u64,
+) -> Result<serde_json::Value> {
+    if write_batch_size == 0 {
+        bail!("--write-batch-size must be greater than 0");
+    }
+
+    let run_id = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_micros()
+        .to_string();
+    let collection = format!("{collection_prefix}_{run_id}");
+    let mut stream = connect_or_spawn_broker(file, idle_shutdown_secs).await?;
+
+    send_checked_command(
+        &mut stream,
+        doc! {
+            "create": collection.as_str(),
+            "$db": db,
+        },
+    )
+    .await?;
+
+    if let Some(field) = index_field {
+        let index_name = if unique_index {
+            format!("{field}_1_unique")
+        } else {
+            format!("{field}_1")
+        };
+        let mut key = Document::new();
+        key.insert(field, 1);
+        let mut index_spec = Document::new();
+        index_spec.insert("key", Bson::Document(key));
+        index_spec.insert("name", index_name);
+        index_spec.insert("unique", unique_index);
+        send_checked_command(
+            &mut stream,
+            doc! {
+                "createIndexes": collection.as_str(),
+                "indexes": Bson::Array(vec![Bson::Document(index_spec)]),
+                "$db": db,
+            },
+        )
+        .await?;
+    }
+
+    let write_started_at = Instant::now();
+    let mut write_commands = 0u32;
+    let mut batch_start = 0u32;
+    while batch_start < writes {
+        let batch_end = (batch_start + write_batch_size).min(writes);
+        let documents = (batch_start..batch_end)
+            .map(|sequence| benchmark_document(&run_id, sequence, index_field))
+            .collect::<Vec<_>>();
+        send_checked_command(
+            &mut stream,
+            doc! {
+                "insert": collection.as_str(),
+                "documents": Bson::Array(documents),
+                "$db": db,
+            },
+        )
+        .await?;
+        write_commands += 1;
+        batch_start = batch_end;
+    }
+    let write_elapsed = write_started_at.elapsed();
+
+    let readable = reads.min(writes);
+    let read_started_at = Instant::now();
+    for sequence in 0..readable {
+        let response = send_checked_command(
+            &mut stream,
+            doc! {
+                "find": collection.as_str(),
+                "filter": {
+                    "_id": format!("{run_id}-{sequence}"),
+                },
+                "limit": 1,
+                "$db": db,
+            },
+        )
+        .await?;
+        let first_batch = response
+            .get_document("cursor")
+            .context("find reply missing cursor")?
+            .get_array("firstBatch")
+            .context("find reply missing firstBatch")?;
+        if first_batch.len() != 1 {
+            bail!(
+                "benchmark read expected exactly one document for sequence {sequence}, got {}",
+                first_batch.len()
+            );
+        }
+    }
+    let read_elapsed = read_started_at.elapsed();
+    let total_elapsed = write_elapsed + read_elapsed;
+
+    Ok(json!({
+        "file": file.display().to_string(),
+        "db": db,
+        "collection": collection,
+        "runId": run_id,
+        "index": index_field.map(|field| {
+            json!({
+                "field": field,
+                "unique": unique_index,
+            })
+        }),
+        "writes": benchmark_phase_report(write_elapsed, writes, write_commands, write_batch_size),
+        "reads": benchmark_phase_report(read_elapsed, readable, readable, 1),
+        "totals": {
+            "documents": writes + readable,
+            "elapsedMs": duration_ms(total_elapsed),
+            "docsPerSec": rate_per_second(writes + readable, total_elapsed),
+        }
+    }))
+}
+
+fn benchmark_document(run_id: &str, sequence: u32, index_field: Option<&str>) -> Bson {
+    let mut document = doc! {
+        "_id": format!("{run_id}-{sequence}"),
+        "runId": run_id,
+        "seq": i64::from(sequence),
+        "payload": format!("payload-{sequence}"),
+    };
+    if let Some(field) = index_field {
+        document.insert(field, format!("{run_id}-{sequence}"));
+    }
+    Bson::Document(document)
+}
+
+fn benchmark_phase_report(
+    elapsed: Duration,
+    documents: u32,
+    commands: u32,
+    batch_size: u32,
+) -> serde_json::Value {
+    json!({
+        "documents": documents,
+        "commands": commands,
+        "batchSize": batch_size,
+        "elapsedMs": duration_ms(elapsed),
+        "docsPerSec": rate_per_second(documents, elapsed),
+        "commandsPerSec": rate_per_second(commands, elapsed),
+    })
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn rate_per_second(count: u32, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds == 0.0 {
+        return f64::INFINITY;
+    }
+    f64::from(count) / seconds
 }

@@ -111,6 +111,96 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
 }
 
 #[test]
+fn bench_command_reports_write_and_read_metrics() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("bench.mongodb");
+
+    let mut bench = Command::cargo_bin("mqlite").expect("binary");
+    let output = bench
+        .args([
+            "bench",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--collection-prefix",
+            "quick",
+            "--writes",
+            "3",
+            "--reads",
+            "3",
+            "--write-batch-size",
+            "2",
+            "--index-field",
+            "sku",
+            "--unique-index",
+            "--idle-shutdown-secs",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["db"], "app");
+    let collection_name = response["collection"].as_str().expect("collection");
+    assert!(collection_name.starts_with("quick_"));
+    assert_eq!(response["index"]["field"], "sku");
+    assert_eq!(response["index"]["unique"], true);
+    assert_eq!(response["writes"]["documents"], 3);
+    assert_eq!(response["writes"]["commands"], 2);
+    assert_eq!(response["writes"]["batchSize"], 2);
+    assert_eq!(response["reads"]["documents"], 3);
+    assert_eq!(response["reads"]["commands"], 3);
+    assert_eq!(response["reads"]["batchSize"], 1);
+    assert_eq!(response["totals"]["documents"], 6);
+    assert!(
+        response["writes"]["elapsedMs"]
+            .as_f64()
+            .expect("write elapsed")
+            >= 0.0
+    );
+    assert!(
+        response["reads"]["elapsedMs"]
+            .as_f64()
+            .expect("read elapsed")
+            >= 0.0
+    );
+
+    let mut list_indexes = Command::cargo_bin("mqlite").expect("binary");
+    let output = list_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+        ])
+        .arg(format!(r#"{{"listIndexes":"{collection_name}"}}"#))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    let indexes = response["cursor"]["firstBatch"]
+        .as_array()
+        .expect("firstBatch");
+    let sku_index = indexes
+        .iter()
+        .find(|index| index["name"] == "sku_1_unique")
+        .expect("sku unique index");
+    assert_eq!(sku_index["key"]["sku"], 1);
+    assert_eq!(sku_index["unique"], true);
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_documents_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-documents.mongodb");
