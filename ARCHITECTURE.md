@@ -272,6 +272,7 @@ Mutations are durable through an append-only WAL.
   - sort work
   - projection coverage
   - expected document fetches
+- `update` and `delete` reuse the same indexed candidate planning path as `find`, then reconcile those base candidates against the command-local insert, update, and delete overlay so ordered multi-op writes preserve in-request visibility.
 - A sequence-keyed plan cache stores the last winning choice for each query shape:
   - namespace
   - filter shape

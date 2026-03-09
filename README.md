@@ -161,6 +161,7 @@ file:///absolute/path/to/database.mongodb?db=app
 - `configureFailPoint: "failCommand"` supports local driver-test compatibility for `mode: "off"`, `mode: "alwaysOn"`, and `mode: { times: N }`, with `failCommands`, `errorCode`, `errorLabels`, `blockConnection`, `blockTimeMS`, and `closeConnection`.
 - Persistent `_id_` and secondary index durability across broker restarts.
 - Histogram-backed and interval-count-aware `find` planning that ranks collection and index scans using index value frequencies, bounded interval counts, coverage, sort work, and a sequence-keyed per-query plan cache that persists across broker restart through checkpoint snapshots.
+- `update` and `delete` target records through the same local planner used by `find`, then reconcile those candidates against in-command inserted, updated, and deleted overlays so ordered batched writes still see earlier operations from the same request.
 - Planner-backed `find` index scans for single-field and compound predicates, including compound-prefix equality/range plans, multi-interval `$in` and collapsed `$or` plans, sort-aware plans, and reverse scans over compatible indexes.
 - Branch-union `OR` planning for non-collapsible disjunctions, allowing separate branch plans over different indexes before result union and outer sort/projection handling.
 - Covered projection plans when the filter, sort, and projected fields can be satisfied from index keys alone, including explicit `null` versus missing-field distinctions recovered from persisted index-entry presence metadata.

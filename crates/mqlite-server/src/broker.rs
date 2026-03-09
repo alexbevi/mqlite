@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -1592,15 +1592,13 @@ impl Broker {
                 let multi = operation.get_bool("multi").unwrap_or(false);
                 let upsert = operation.get_bool("upsert").unwrap_or(false);
 
-                let matching_records = current_records(
+                let matching_records = matching_records_for_write(
                     collection,
+                    query,
                     &inserted_records,
                     &visible_updates,
                     &deleted_record_ids,
-                )
-                .filter(|record| document_matches(record.document(), query).unwrap_or(false))
-                .map(|record| (record.record_id(), record.document().clone()))
-                .collect::<Vec<_>>();
+                )?;
 
                 if matching_records.is_empty() {
                     if upsert {
@@ -1782,13 +1780,13 @@ impl Broker {
             let mut deleted = 0_i32;
 
             for (query, limit) in validated_operations {
-                let matches =
-                    current_records(Some(collection), &[], &visible_updates, &deleted_record_ids)
-                        .filter(|record| {
-                            document_matches(record.document(), &query).unwrap_or(false)
-                        })
-                        .map(|record| (record.record_id(), record.document().clone()))
-                        .collect::<Vec<_>>();
+                let matches = matching_records_for_write(
+                    Some(collection),
+                    &query,
+                    &[],
+                    &visible_updates,
+                    &deleted_record_ids,
+                )?;
                 let limit = if limit == 1 { 1 } else { usize::MAX };
                 for (record_id, document) in matches.into_iter().take(limit) {
                     if deleted_record_ids.insert(record_id) {
@@ -5857,63 +5855,140 @@ fn internal_error(error: anyhow::Error) -> CommandError {
     CommandError::new(8, "UnknownError", error.to_string())
 }
 
-enum CurrentRecordRef<'a> {
-    Base(&'a CollectionRecord),
-    Overlay {
-        record_id: u64,
-        document: &'a Document,
-    },
-}
+fn matching_records_for_write(
+    collection: Option<&CollectionCatalog>,
+    query: &Document,
+    inserted_records: &[CollectionRecord],
+    visible_updates: &BTreeMap<u64, Document>,
+    deleted_record_ids: &BTreeSet<u64>,
+) -> Result<Vec<(u64, Document)>, CommandError> {
+    let expression = parse_filter(query)?;
+    let mut matches = Vec::new();
+    let mut seen_record_ids = BTreeSet::new();
+    let base_positions = collection
+        .map(|collection| {
+            collection
+                .records
+                .iter()
+                .enumerate()
+                .map(|(position, record)| (record.record_id, position))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let inserted_positions = inserted_records
+        .iter()
+        .enumerate()
+        .map(|(position, record)| (record.record_id, position))
+        .collect::<HashMap<_, _>>();
 
-impl CurrentRecordRef<'_> {
-    fn record_id(&self) -> u64 {
-        match self {
-            Self::Base(record) => record.record_id,
-            Self::Overlay { record_id, .. } => *record_id,
-        }
-    }
-
-    fn document(&self) -> &Document {
-        match self {
-            Self::Base(record) => &record.document,
-            Self::Overlay { document, .. } => document,
-        }
-    }
-}
-
-fn current_records<'a>(
-    collection: Option<&'a CollectionCatalog>,
-    inserted_records: &'a [CollectionRecord],
-    visible_updates: &'a BTreeMap<u64, Document>,
-    deleted_record_ids: &'a BTreeSet<u64>,
-) -> impl Iterator<Item = CurrentRecordRef<'a>> + 'a {
-    let base_records = collection.into_iter().flat_map(move |collection| {
-        collection.records.iter().filter_map(move |record| {
-            if deleted_record_ids.contains(&record.record_id) {
-                return None;
+    if let Some(collection) = collection {
+        let mut base_matches = planned_base_write_matches(collection, query)?;
+        for (record_id, base_document) in base_matches.drain(..) {
+            if deleted_record_ids.contains(&record_id) {
+                continue;
             }
-            Some(match visible_updates.get(&record.record_id) {
-                Some(document) => CurrentRecordRef::Overlay {
-                    record_id: record.record_id,
-                    document,
-                },
-                None => CurrentRecordRef::Base(record),
-            })
-        })
-    });
-    let inserted_records = inserted_records.iter().filter_map(move |record| {
-        if deleted_record_ids.contains(&record.record_id) {
-            return None;
+            let visible_document = visible_updates
+                .get(&record_id)
+                .cloned()
+                .unwrap_or(base_document);
+            if !document_matches_expression(&visible_document, &expression) {
+                continue;
+            }
+            if seen_record_ids.insert(record_id) {
+                matches.push((
+                    base_positions
+                        .get(&record_id)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    inserted_positions
+                        .get(&record_id)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    record_id,
+                    visible_document,
+                ));
+            }
         }
-        Some(match visible_updates.get(&record.record_id) {
-            Some(document) => CurrentRecordRef::Overlay {
-                record_id: record.record_id,
-                document,
-            },
-            None => CurrentRecordRef::Base(record),
-        })
+    }
+
+    for (record_id, document) in visible_updates {
+        if deleted_record_ids.contains(record_id) || seen_record_ids.contains(record_id) {
+            continue;
+        }
+        if document_matches_expression(document, &expression) {
+            seen_record_ids.insert(*record_id);
+            matches.push((
+                base_positions.get(record_id).copied().unwrap_or(usize::MAX),
+                inserted_positions
+                    .get(record_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                *record_id,
+                document.clone(),
+            ));
+        }
+    }
+
+    for record in inserted_records {
+        if deleted_record_ids.contains(&record.record_id)
+            || seen_record_ids.contains(&record.record_id)
+        {
+            continue;
+        }
+        if document_matches_expression(&record.document, &expression) {
+            seen_record_ids.insert(record.record_id);
+            matches.push((
+                usize::MAX,
+                inserted_positions
+                    .get(&record.record_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                record.record_id,
+                record.document.clone(),
+            ));
+        }
+    }
+    matches.sort_by_key(|(base_position, inserted_position, record_id, _)| {
+        (*base_position, *inserted_position, *record_id)
     });
-    base_records.chain(inserted_records)
+    Ok(matches
+        .into_iter()
+        .map(|(_, _, record_id, document)| (record_id, document))
+        .collect())
+}
+
+fn planned_base_write_matches(
+    collection: &CollectionCatalog,
+    query: &Document,
+) -> Result<Vec<(u64, Document)>, CommandError> {
+    let plan = plan_find(collection, query, None, None, None)?;
+    let base_positions = collection
+        .records
+        .iter()
+        .enumerate()
+        .map(|(position, record)| (record.record_id, position))
+        .collect::<HashMap<_, _>>();
+    let record_ids = plan.record_ids().to_vec();
+    let documents = plan.into_execution().documents;
+    let mut matches = record_ids
+        .into_iter()
+        .zip(documents)
+        .map(|(record_id, document)| {
+            (
+                base_positions
+                    .get(&record_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                record_id,
+                document,
+            )
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(position, record_id, _)| (*position, *record_id));
+    Ok(matches
+        .into_iter()
+        .map(|(_, record_id, document)| (record_id, document))
+        .collect())
 }
 
 fn next_record_id(collection: Option<&CollectionCatalog>) -> u64 {
@@ -5932,17 +6007,62 @@ fn next_record_id(collection: Option<&CollectionCatalog>) -> u64 {
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         path::Path,
         time::{Duration, Instant},
     };
 
     use bson::{Bson, doc, oid::ObjectId};
+    use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
     use mqlite_ipc::{connect, read_manifest};
     use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
 
-    use super::{Broker, BrokerConfig};
+    use super::{Broker, BrokerConfig, matching_records_for_write};
+
+    #[test]
+    fn write_matching_records_include_overlay_updates_and_inserts() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 1,
+                document: doc! { "_id": 1, "sku": "alpha" },
+            })
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord {
+                record_id: 2,
+                document: doc! { "_id": 2, "sku": "beta" },
+            })
+            .expect("insert");
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let visible_updates =
+            BTreeMap::from([(2_u64, doc! { "_id": 2, "sku": "gamma", "qty": 5 })]);
+        let inserted_records = vec![CollectionRecord {
+            record_id: 3,
+            document: doc! { "_id": 3, "sku": "gamma", "qty": 7 },
+        }];
+        let matches = matching_records_for_write(
+            Some(&collection),
+            &doc! { "sku": "gamma" },
+            &inserted_records,
+            &visible_updates,
+            &BTreeSet::new(),
+        )
+        .expect("matching records");
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].0, 2);
+        assert_eq!(matches[0].1.get_i32("qty").expect("qty"), 5);
+        assert_eq!(matches[1].0, 3);
+        assert_eq!(matches[1].1.get_i32("qty").expect("qty"), 7);
+    }
 
     async fn send_command(
         stream: &mut mqlite_ipc::BoxedStream,
