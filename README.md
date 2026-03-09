@@ -83,6 +83,7 @@ printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongo
 At a high level, the current engine already covers:
 - single-file durable storage with WAL, checkpoints, recovery, and persisted secondary indexes
 - page-local in-memory secondary-index maintenance so bulk inserts only rewrite touched index leaves
+- incrementally maintained in-memory unique-index validation caches so writes do not rebuild duplicate-key state from the full catalog
 - multiple databases and collections inside one file
 - core MongoDB command flows such as `hello`, `ping`, CRUD, index management, and cursors
 - `find` planning with observable `explain` output for collection and index scans

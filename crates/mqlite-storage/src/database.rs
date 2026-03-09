@@ -152,6 +152,7 @@ pub struct DatabaseFile {
     path: PathBuf,
     file: File,
     state: PersistedState,
+    validation_state: ValidationState,
     durable_sequence: u64,
     checkpoint_snapshot: SnapshotState,
     active_slot: usize,
@@ -596,6 +597,7 @@ impl DatabaseFile {
                 change_events: Vec::new(),
                 plan_cache_entries: Vec::new(),
             },
+            validation_state: ValidationState::default(),
             durable_sequence: 0,
             checkpoint_snapshot: SnapshotState::default(),
             active_slot: 0,
@@ -662,7 +664,7 @@ impl DatabaseFile {
 
     pub fn commit_mutation_unflushed(&mut self, mutation: WalMutation) -> Result<u64> {
         let sequence = self.state.last_applied_sequence + 1;
-        validate_mutation(&self.state, &mutation)?;
+        let validation_plan = validate_mutation(&self.state, &self.validation_state, &mutation)?;
 
         let appended_bytes = append_wal_entry(
             &mut self.file,
@@ -678,6 +680,8 @@ impl DatabaseFile {
             &mutation,
         );
         apply_owned_mutation(&mut self.state, sequence, mutation)?;
+        self.validation_state
+            .apply_plan(&self.state.catalog, validation_plan)?;
         self.wal_end_offset += appended_bytes;
         self.wal_records_since_checkpoint += 1;
         self.wal_bytes_since_checkpoint += appended_bytes;
@@ -792,6 +796,7 @@ impl DatabaseFile {
             checkpoint_counts,
         } = load_state(&mut self.file)?;
         self.state = state;
+        self.validation_state = ValidationState::build(&self.state.catalog)?;
         self.durable_sequence = self.state.last_applied_sequence;
         self.checkpoint_snapshot = checkpoint_snapshot;
         self.active_slot = active_slot;
@@ -2361,17 +2366,34 @@ fn mark_mutation_dirty(
     }
 }
 
-fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<()> {
-    match mutation {
+fn validate_mutation(
+    state: &PersistedState,
+    validation_state: &ValidationState,
+    mutation: &WalMutation,
+) -> Result<ValidationPlan> {
+    let plan = match mutation {
         WalMutation::ReplaceCollection {
-            collection_state, ..
+            database,
+            collection,
+            collection_state,
+            ..
         } => {
             validate_collection_indexes(collection_state).map_err(map_catalog_error)?;
+            ValidationPlan::RebuildCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+            }
         }
         WalMutation::RewriteCollection {
+            database,
+            collection,
             options, changes, ..
         } => {
             validate_rewrite_collection(options, changes)?;
+            ValidationPlan::RebuildCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+            }
         }
         WalMutation::ApplyCollectionChanges {
             database,
@@ -2384,13 +2406,26 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
             ..
         } => {
             let changes = resolved_collection_changes(changes, inserts, updates, deletes);
-            validate_collection_changes(
+            let delta = validate_collection_changes(
                 state,
+                validation_state,
                 database,
                 collection,
                 create_options.as_ref(),
                 &changes,
             )?;
+            if state.catalog.get_collection(database, collection).is_ok() {
+                ValidationPlan::ApplyCollectionDelta {
+                    database: database.clone(),
+                    collection: collection.clone(),
+                    delta,
+                }
+            } else {
+                ValidationPlan::RebuildCollection {
+                    database: database.clone(),
+                    collection: collection.clone(),
+                }
+            }
         }
         WalMutation::CreateIndexes {
             database,
@@ -2400,6 +2435,10 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
             ..
         } => {
             validate_create_indexes(state, database, collection, create_options.as_ref(), specs)?;
+            ValidationPlan::RebuildCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+            }
         }
         WalMutation::DropIndexes {
             database,
@@ -2409,6 +2448,10 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
         } => {
             let collection_state = state.catalog.get_collection(database, collection)?;
             validate_drop_indexes(collection_state, target)?;
+            ValidationPlan::RebuildCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+            }
         }
         WalMutation::DropCollection {
             database,
@@ -2416,9 +2459,13 @@ fn validate_mutation(state: &PersistedState, mutation: &WalMutation) -> Result<(
             ..
         } => {
             state.catalog.get_collection(database, collection)?;
+            ValidationPlan::RemoveCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+            }
         }
-    }
-    Ok(())
+    };
+    Ok(plan)
 }
 
 fn apply_create_indexes(
@@ -2513,22 +2560,29 @@ fn rewrite_collection(
 
 fn validate_collection_changes(
     state: &PersistedState,
+    validation_state: &ValidationState,
     database: &str,
     collection: &str,
     create_options: Option<&bson::Document>,
     changes: &[CollectionChange],
-) -> Result<()> {
+) -> Result<CollectionValidationDelta> {
     let collection_state = match state.catalog.get_collection(database, collection) {
         Ok(collection_state) => Some(collection_state),
         Err(CatalogError::NamespaceNotFound(_, _)) => None,
         Err(error) => return Err(error.into()),
     };
     let mut overlay =
-        CollectionValidationOverlay::new(collection_state, create_options, database, collection)?;
+        CollectionValidationOverlay::new(
+            collection_state,
+            validation_state.collection(database, collection),
+            create_options,
+            database,
+            collection,
+        )?;
     for change in changes {
         overlay.apply(change)?;
     }
-    Ok(())
+    Ok(overlay.into_delta())
 }
 
 fn validate_rewrite_collection(
@@ -2591,33 +2645,76 @@ fn checkpoint_page_refs(pages_start: u64, pages: &[EncodedPage]) -> Vec<PageRef>
     page_refs
 }
 
+#[derive(Debug, Clone)]
 struct UniqueIndexValidator {
     name: String,
     key: bson::Document,
     entries: HashMap<Vec<u8>, u64>,
 }
 
+#[derive(Debug, Default)]
+struct ValidationState {
+    databases: HashMap<String, HashMap<String, CollectionValidationState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollectionValidationState {
+    unique_indexes: BTreeMap<String, UniqueIndexValidator>,
+}
+
+#[derive(Debug)]
+enum ValidationPlan {
+    RebuildCollection { database: String, collection: String },
+    RemoveCollection { database: String, collection: String },
+    ApplyCollectionDelta {
+        database: String,
+        collection: String,
+        delta: CollectionValidationDelta,
+    },
+}
+
+#[derive(Debug, Default)]
+struct CollectionValidationDelta {
+    unique_indexes: Vec<UniqueIndexDelta>,
+}
+
+#[derive(Debug, Default)]
+struct UniqueIndexDelta {
+    name: String,
+    additions: HashMap<Vec<u8>, u64>,
+    removals: HashSet<Vec<u8>>,
+}
+
 struct CollectionValidationOverlay<'a> {
-    base_records: HashMap<u64, &'a bson::Document>,
+    base_collection: Option<&'a CollectionCatalog>,
     overlay_records: HashMap<u64, bson::Document>,
     deleted_record_ids: HashSet<u64>,
-    unique_indexes: Vec<UniqueIndexValidator>,
+    unique_indexes: Vec<UniqueIndexOverlay<'a>>,
+}
+
+struct UniqueIndexOverlay<'a> {
+    name: String,
+    key: bson::Document,
+    base_entries: Option<&'a HashMap<Vec<u8>, u64>>,
+    pending_entries: HashMap<Vec<u8>, u64>,
+    removed_keys: HashSet<Vec<u8>>,
 }
 
 impl<'a> CollectionValidationOverlay<'a> {
     fn new(
         collection: Option<&'a CollectionCatalog>,
+        validation_state: Option<&'a CollectionValidationState>,
         create_options: Option<&bson::Document>,
         database: &str,
         collection_name: &str,
     ) -> Result<Self> {
         let unique_indexes = match collection {
-            Some(collection) => collection
-                .indexes
+            Some(_) => validation_state
+                .ok_or(StorageError::InvalidIndexState)?
+                .unique_indexes
                 .values()
-                .filter(|index| index.unique)
-                .map(UniqueIndexValidator::from_catalog)
-                .collect::<Result<Vec<_>>>()?,
+                .map(UniqueIndexOverlay::from_validator)
+                .collect(),
             None => {
                 if create_options.is_none() {
                     return Err(CatalogError::NamespaceNotFound(
@@ -2626,18 +2723,12 @@ impl<'a> CollectionValidationOverlay<'a> {
                     )
                     .into());
                 }
-                vec![UniqueIndexValidator::default_id_index()]
+                vec![UniqueIndexOverlay::default_id_index()]
             }
         };
 
         Ok(Self {
-            base_records: collection.map_or_else(HashMap::new, |collection| {
-                collection
-                    .records
-                    .iter()
-                    .map(|record| (record.record_id, &record.document))
-                    .collect()
-            }),
+            base_collection: collection,
             overlay_records: HashMap::new(),
             deleted_record_ids: HashSet::new(),
             unique_indexes,
@@ -2704,7 +2795,11 @@ impl<'a> CollectionValidationOverlay<'a> {
         };
         self.remove_unique_keys(record_id, &keys);
         self.overlay_records.remove(&record_id);
-        if self.base_records.contains_key(&record_id) {
+        if self
+            .base_collection
+            .and_then(|collection| collection.record_position(record_id))
+            .is_some()
+        {
             self.deleted_record_ids.insert(record_id);
         } else {
             self.deleted_record_ids.remove(&record_id);
@@ -2718,7 +2813,14 @@ impl<'a> CollectionValidationOverlay<'a> {
         }
         self.overlay_records
             .get(&record_id)
-            .or_else(|| self.base_records.get(&record_id).copied())
+            .or_else(|| {
+                self.base_collection.and_then(|collection| {
+                    collection
+                        .record_position(record_id)
+                        .and_then(|position| collection.records.get(position))
+                        .map(|record| &record.document)
+                })
+            })
     }
 
     fn unique_keys(&self, document: &bson::Document) -> Result<Vec<(usize, Vec<u8>)>> {
@@ -2736,9 +2838,9 @@ impl<'a> CollectionValidationOverlay<'a> {
 
     fn validate_unique_keys(&self, record_id: u64, keys: &[(usize, Vec<u8>)]) -> Result<()> {
         for (index_position, key) in keys {
-            if let Some(existing_record_id) = self.unique_indexes[*index_position].entries.get(key)
+            if let Some(existing_record_id) = self.unique_indexes[*index_position].record_for_key(key)
             {
-                if *existing_record_id != record_id {
+                if existing_record_id != record_id {
                     return Err(CatalogError::DuplicateKey(
                         self.unique_indexes[*index_position].name.clone(),
                     )
@@ -2751,21 +2853,23 @@ impl<'a> CollectionValidationOverlay<'a> {
 
     fn install_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
         for (index_position, key) in keys {
-            self.unique_indexes[*index_position]
-                .entries
-                .insert(key.clone(), record_id);
+            self.unique_indexes[*index_position].insert_key(key.clone(), record_id);
         }
     }
 
     fn remove_unique_keys(&mut self, record_id: u64, keys: &[(usize, Vec<u8>)]) {
         for (index_position, key) in keys {
-            if self.unique_indexes[*index_position]
-                .entries
-                .get(key)
-                .is_some_and(|existing_record_id| *existing_record_id == record_id)
-            {
-                self.unique_indexes[*index_position].entries.remove(key);
-            }
+            self.unique_indexes[*index_position].remove_key(key, record_id);
+        }
+    }
+
+    fn into_delta(self) -> CollectionValidationDelta {
+        CollectionValidationDelta {
+            unique_indexes: self
+                .unique_indexes
+                .into_iter()
+                .map(UniqueIndexOverlay::into_delta)
+                .collect(),
         }
     }
 }
@@ -2784,12 +2888,177 @@ impl UniqueIndexValidator {
             entries,
         })
     }
+}
+
+impl ValidationState {
+    fn build(catalog: &Catalog) -> Result<Self> {
+        let mut state = Self::default();
+        for (database_name, database) in &catalog.databases {
+            for (collection_name, collection) in &database.collections {
+                state.insert_collection(
+                    database_name.clone(),
+                    collection_name.clone(),
+                    CollectionValidationState::from_collection(collection)?,
+                );
+            }
+        }
+        Ok(state)
+    }
+
+    fn collection(&self, database: &str, collection: &str) -> Option<&CollectionValidationState> {
+        self.databases.get(database).and_then(|db| db.get(collection))
+    }
+
+    fn apply_plan(&mut self, catalog: &Catalog, plan: ValidationPlan) -> Result<()> {
+        match plan {
+            ValidationPlan::RebuildCollection {
+                database,
+                collection,
+            } => self.rebuild_collection(catalog, &database, &collection),
+            ValidationPlan::RemoveCollection {
+                database,
+                collection,
+            } => {
+                self.remove_collection(&database, &collection);
+                Ok(())
+            }
+            ValidationPlan::ApplyCollectionDelta {
+                database,
+                collection,
+                delta,
+            } => self.apply_collection_delta(&database, &collection, delta),
+        }
+    }
+
+    fn rebuild_collection(&mut self, catalog: &Catalog, database: &str, collection: &str) -> Result<()> {
+        let collection_state = catalog.get_collection(database, collection)?;
+        self.insert_collection(
+            database.to_string(),
+            collection.to_string(),
+            CollectionValidationState::from_collection(collection_state)?,
+        );
+        Ok(())
+    }
+
+    fn apply_collection_delta(
+        &mut self,
+        database: &str,
+        collection: &str,
+        delta: CollectionValidationDelta,
+    ) -> Result<()> {
+        let collection_state = self
+            .databases
+            .get_mut(database)
+            .and_then(|db| db.get_mut(collection))
+            .ok_or(StorageError::InvalidIndexState)?;
+        for index_delta in delta.unique_indexes {
+            let index_state = collection_state
+                .unique_indexes
+                .get_mut(&index_delta.name)
+                .ok_or(StorageError::InvalidIndexState)?;
+            for key in index_delta.removals {
+                index_state.entries.remove(&key);
+            }
+            index_state.entries.extend(index_delta.additions);
+        }
+        Ok(())
+    }
+
+    fn insert_collection(
+        &mut self,
+        database: String,
+        collection: String,
+        validation_state: CollectionValidationState,
+    ) {
+        self.databases
+            .entry(database)
+            .or_default()
+            .insert(collection, validation_state);
+    }
+
+    fn remove_collection(&mut self, database: &str, collection: &str) {
+        let remove_database = if let Some(database_entry) = self.databases.get_mut(database) {
+            database_entry.remove(collection);
+            database_entry.is_empty()
+        } else {
+            false
+        };
+        if remove_database {
+            self.databases.remove(database);
+        }
+    }
+}
+
+impl CollectionValidationState {
+    fn from_collection(collection: &CollectionCatalog) -> Result<Self> {
+        let unique_indexes = collection
+            .indexes
+            .values()
+            .filter(|index| index.unique)
+            .map(|index| Ok((index.name.clone(), UniqueIndexValidator::from_catalog(index)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Self { unique_indexes })
+    }
+}
+
+impl<'a> UniqueIndexOverlay<'a> {
+    fn from_validator(index: &'a UniqueIndexValidator) -> Self {
+        Self {
+            name: index.name.clone(),
+            key: index.key.clone(),
+            base_entries: Some(&index.entries),
+            pending_entries: HashMap::new(),
+            removed_keys: HashSet::new(),
+        }
+    }
 
     fn default_id_index() -> Self {
         Self {
             name: "_id_".to_string(),
             key: bson::doc! { "_id": 1 },
-            entries: HashMap::new(),
+            base_entries: None,
+            pending_entries: HashMap::new(),
+            removed_keys: HashSet::new(),
+        }
+    }
+
+    fn record_for_key(&self, key: &[u8]) -> Option<u64> {
+        if let Some(record_id) = self.pending_entries.get(key) {
+            return Some(*record_id);
+        }
+        if self.removed_keys.contains(key) {
+            return None;
+        }
+        self.base_entries.and_then(|entries| entries.get(key).copied())
+    }
+
+    fn insert_key(&mut self, key: Vec<u8>, record_id: u64) {
+        self.removed_keys.remove(&key);
+        self.pending_entries.insert(key, record_id);
+    }
+
+    fn remove_key(&mut self, key: &[u8], record_id: u64) {
+        if self
+            .pending_entries
+            .get(key)
+            .is_some_and(|existing_record_id| *existing_record_id == record_id)
+        {
+            self.pending_entries.remove(key);
+        }
+        if self
+            .base_entries
+            .and_then(|entries| entries.get(key))
+            .is_some_and(|existing_record_id| *existing_record_id == record_id)
+        {
+            self.removed_keys.insert(key.to_vec());
+        }
+    }
+
+    fn into_delta(self) -> UniqueIndexDelta {
+        UniqueIndexDelta {
+            name: self.name,
+            additions: self.pending_entries,
+            removals: self.removed_keys,
         }
     }
 }
@@ -3753,6 +4022,34 @@ mod tests {
         .expect("sample change event")
     }
 
+    fn validation_index_keys(
+        database: &DatabaseFile,
+        db: &str,
+        collection: &str,
+        index: &str,
+    ) -> Vec<String> {
+        let validation_index = database
+            .validation_state
+            .databases
+            .get(db)
+            .and_then(|db| db.get(collection))
+            .and_then(|collection| collection.unique_indexes.get(index))
+            .expect("validation index");
+        let mut keys = validation_index
+            .entries
+            .keys()
+            .map(|bytes| {
+                bson::from_slice::<bson::Document>(bytes)
+                    .expect("key document")
+                    .get_str("sku")
+                    .expect("sku")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
     #[test]
     fn unflushed_mutations_require_an_explicit_wal_sync() {
         let temp_dir = tempdir().expect("tempdir");
@@ -4077,6 +4374,108 @@ mod tests {
             vec![(1, "alpha".to_string()), (2, "beta".to_string())]
         );
         assert_eq!(reopened.change_events(), change_events.as_slice());
+    }
+
+    #[test]
+    fn validation_cache_tracks_unique_keys_incrementally_across_writes() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("validation-cache.mongodb");
+
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+        let mut collection = CollectionCatalog::new(doc! {});
+        insert_record(&mut collection, 1, doc! { "_id": 1, "sku": "alpha" });
+        insert_record(&mut collection, 2, doc! { "_id": 2, "sku": "beta" });
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: collection,
+                change_events: Vec::new(),
+            })
+            .expect("replace collection");
+        assert_eq!(
+            validation_index_keys(&database, "app", "widgets", "sku_1"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: None,
+                changes: vec![CollectionChange::Insert(CollectionRecord {
+                    record_id: 3,
+                    document: doc! { "_id": 3, "sku": "gamma" },
+                })],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect("insert");
+        assert_eq!(
+            validation_index_keys(&database, "app", "widgets", "sku_1"),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+
+        database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: None,
+                changes: vec![CollectionChange::Update(CollectionRecord {
+                    record_id: 2,
+                    document: doc! { "_id": 2, "sku": "delta" },
+                })],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect("update");
+        assert_eq!(
+            validation_index_keys(&database, "app", "widgets", "sku_1"),
+            vec!["alpha".to_string(), "delta".to_string(), "gamma".to_string()]
+        );
+
+        database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: None,
+                changes: vec![CollectionChange::Delete(1)],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect("delete");
+        assert_eq!(
+            validation_index_keys(&database, "app", "widgets", "sku_1"),
+            vec!["delta".to_string(), "gamma".to_string()]
+        );
+
+        database
+            .commit_mutation(WalMutation::DropIndexes {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                target: "sku_1".to_string(),
+                change_events: Vec::new(),
+            })
+            .expect("drop index");
+        let validation_collection = database
+            .validation_state
+            .databases
+            .get("app")
+            .and_then(|db| db.get("widgets"))
+            .expect("validation collection");
+        assert!(validation_collection.unique_indexes.contains_key("_id_"));
+        assert!(!validation_collection.unique_indexes.contains_key("sku_1"));
     }
 
     #[test]
