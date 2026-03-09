@@ -42,11 +42,13 @@ const MAX_OR_BRANCHES: usize = 32;
 const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
+const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub database_path: PathBuf,
     pub idle_shutdown_secs: u64,
+    pub checkpoint_interval_secs: u64,
 }
 
 impl BrokerConfig {
@@ -54,6 +56,7 @@ impl BrokerConfig {
         Self {
             database_path: database_path.as_ref().to_path_buf(),
             idle_shutdown_secs,
+            checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
         }
     }
 }
@@ -248,6 +251,8 @@ impl Broker {
         write_manifest(&manifest, &self.paths.manifest_path)?;
 
         let idle_timeout = Duration::from_secs(self.config.idle_shutdown_secs.max(1));
+        let checkpoint_interval = Duration::from_secs(self.config.checkpoint_interval_secs.max(1));
+        let mut last_checkpoint = Instant::now();
         loop {
             let sleep = tokio::time::sleep(Duration::from_millis(250));
             tokio::pin!(sleep);
@@ -265,6 +270,10 @@ impl Broker {
                     });
                 }
                 _ = &mut sleep => {
+                    if last_checkpoint.elapsed() >= checkpoint_interval {
+                        self.checkpoint_if_needed()?;
+                        last_checkpoint = Instant::now();
+                    }
                     if self.active_connections.load(Ordering::SeqCst) == 0
                         && self.last_activity.lock().elapsed() >= idle_timeout
                     {
@@ -274,20 +283,35 @@ impl Broker {
             }
         }
 
-        let persisted_cache = self.persisted_plan_cache_entries();
-        let should_checkpoint = {
-            let storage = self.storage.read();
-            storage.has_pending_wal()
-                || storage.persisted_plan_cache_entries() != persisted_cache.as_slice()
-        };
-        if should_checkpoint {
-            let mut storage = self.storage.write();
-            storage.set_persisted_plan_cache_entries(persisted_cache);
-            storage.checkpoint()?;
-        }
+        self.checkpoint_if_needed()?;
         remove_manifest(&self.paths.manifest_path)?;
         cleanup_endpoint(&self.paths.endpoint)?;
         Ok(())
+    }
+
+    fn checkpoint_if_needed(&self) -> Result<bool> {
+        loop {
+            let mut storage = self.storage.write();
+            let visible_sequence = storage.last_applied_sequence();
+            let durable_sequence = self.wal_commit.state.lock().durable_sequence;
+            if durable_sequence < visible_sequence {
+                drop(storage);
+                self.await_durable_sequence(visible_sequence)
+                    .map_err(anyhow::Error::from)?;
+                continue;
+            }
+
+            let persisted_cache = self.persisted_plan_cache_entries();
+            if !storage.has_pending_wal()
+                && storage.persisted_plan_cache_entries() == persisted_cache.as_slice()
+            {
+                return Ok(false);
+            }
+
+            storage.set_persisted_plan_cache_entries(persisted_cache);
+            storage.checkpoint()?;
+            return Ok(true);
+        }
     }
 
     fn cached_find_plan(
@@ -6179,6 +6203,7 @@ mod tests {
     use bson::{Bson, doc, oid::ObjectId};
     use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
     use mqlite_ipc::{connect, read_manifest};
+    use mqlite_storage::DatabaseFile;
     use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
@@ -6302,15 +6327,21 @@ mod tests {
         }
     }
 
-    async fn start_broker_at(
-        database_path: &Path,
+    async fn start_broker_with_config(
+        config: BrokerConfig,
     ) -> (JoinHandle<anyhow::Result<()>>, mqlite_ipc::BrokerManifest) {
-        let broker = Broker::new(BrokerConfig::new(database_path, 1)).expect("broker");
+        let broker = Broker::new(config).expect("broker");
         let manifest_path = broker.paths().manifest_path.clone();
         let serve_task = tokio::spawn(broker.clone().serve());
         wait_for_manifest(&manifest_path, &serve_task).await;
         let manifest = read_manifest(&manifest_path).expect("manifest");
         (serve_task, manifest)
+    }
+
+    async fn start_broker_at(
+        database_path: &Path,
+    ) -> (JoinHandle<anyhow::Result<()>>, mqlite_ipc::BrokerManifest) {
+        start_broker_with_config(BrokerConfig::new(database_path, 1)).await
     }
 
     async fn start_broker(
@@ -6332,6 +6363,46 @@ mod tests {
         let response = send_command(&mut stream, body).await;
         assert_eq!(response.get_f64("ok").expect("ok"), 0.0);
         assert_eq!(response.get_i32("code").expect("code"), expected_code);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn checkpoints_pending_wal_during_live_serve_sessions() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("periodic-checkpoint.mongodb");
+        let mut config = BrokerConfig::new(&database_path, 1);
+        config.checkpoint_interval_secs = 1;
+        let (serve_task, manifest) = start_broker_with_config(config).await;
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [
+                    { "sku": "alpha", "qty": 1 }
+                ],
+                "$db": "app"
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect");
+        assert_eq!(inspect.current_record_count, 1);
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
+        assert!(
+            !serve_task.is_finished(),
+            "broker should remain running after a periodic checkpoint"
+        );
+
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
             .await

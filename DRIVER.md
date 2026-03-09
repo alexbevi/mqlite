@@ -51,6 +51,7 @@ Local durable-file compression is internal to `mqlite` and does not change the `
 - If no live broker exists, spawn `mqlite serve --file <path>`.
 - Re-read the manifest and connect once the endpoint is ready.
 - If the spawned broker exits before writing the manifest, surface that startup error instead of reporting only a manifest timeout.
+- Once the broker is running, it checkpoints automatically about every 60 seconds as well as on idle shutdown so long-lived driver sessions do not accumulate unbounded WAL replay.
 - Brokers are shared per file and may shut down after an idle timeout.
 
 ### Transport
