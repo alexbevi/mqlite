@@ -230,6 +230,140 @@ pub struct InspectReport {
     pub databases: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoReport {
+    pub path: PathBuf,
+    pub file_format_version: u32,
+    pub file_size: u64,
+    pub last_applied_sequence: u64,
+    pub summary: InfoSummary,
+    pub last_checkpoint: InfoCheckpoint,
+    pub wal_since_checkpoint: InfoWal,
+    pub databases: Vec<InfoDatabase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoSummary {
+    pub database_count: usize,
+    pub collection_count: usize,
+    pub index_count: usize,
+    pub record_count: usize,
+    pub index_entry_count: usize,
+    pub change_event_count: usize,
+    pub plan_cache_entry_count: usize,
+    pub document_bytes: u64,
+    pub index_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoCheckpoint {
+    pub generation: u64,
+    pub last_applied_sequence: u64,
+    pub last_checkpoint_unix_ms: u64,
+    pub active_superblock_slot: usize,
+    pub valid_superblocks: usize,
+    pub database_count: usize,
+    pub collection_count: usize,
+    pub index_count: usize,
+    pub snapshot_offset: u64,
+    pub snapshot_len: u64,
+    pub wal_offset: u64,
+    pub page_size: usize,
+    pub page_count: usize,
+    pub page_bytes: u64,
+    pub record_page_count: usize,
+    pub record_page_bytes: u64,
+    pub index_page_count: usize,
+    pub index_page_bytes: u64,
+    pub change_event_page_count: usize,
+    pub change_event_page_bytes: u64,
+    pub record_count: usize,
+    pub index_entry_count: usize,
+    pub change_event_count: usize,
+    pub plan_cache_entry_count: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoWal {
+    pub record_count: usize,
+    pub bytes: u64,
+    pub truncated_tail: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoDatabase {
+    pub name: String,
+    pub collection_count: usize,
+    pub index_count: usize,
+    pub record_count: usize,
+    pub index_entry_count: usize,
+    pub document_bytes: u64,
+    pub index_bytes: u64,
+    pub total_bytes: u64,
+    pub checkpoint: InfoDatabaseCheckpoint,
+    pub collections: Vec<InfoCollection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoDatabaseCheckpoint {
+    pub collection_count: usize,
+    pub index_count: usize,
+    pub record_count: usize,
+    pub index_entry_count: usize,
+    pub record_page_count: usize,
+    pub record_page_bytes: u64,
+    pub index_page_count: usize,
+    pub index_page_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoCollection {
+    pub name: String,
+    pub document_count: usize,
+    pub index_count: usize,
+    pub index_entry_count: usize,
+    pub document_bytes: u64,
+    pub index_bytes: u64,
+    pub total_bytes: u64,
+    pub checkpoint: InfoCollectionCheckpoint,
+    pub indexes: Vec<InfoIndex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoCollectionCheckpoint {
+    pub index_count: usize,
+    pub record_count: usize,
+    pub index_entry_count: usize,
+    pub record_page_count: usize,
+    pub record_page_bytes: u64,
+    pub index_page_count: usize,
+    pub index_page_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoIndex {
+    pub name: String,
+    pub key: bson::Document,
+    pub unique: bool,
+    pub expire_after_seconds: Option<i64>,
+    pub entry_count: usize,
+    pub bytes: u64,
+    pub checkpoint: InfoIndexCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InfoIndexCheckpoint {
+    pub entry_count: usize,
+    pub page_count: usize,
+    pub page_bytes: u64,
+    pub root_page_id: Option<u64>,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("file does not contain a valid mqlite header")]
@@ -336,6 +470,52 @@ impl Default for SnapshotState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SnapshotCatalog {
     databases: BTreeMap<String, SnapshotDatabaseCatalog>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SnapshotCatalogStats {
+    database_count: usize,
+    collection_count: usize,
+    index_count: usize,
+    record_page_count: usize,
+    record_page_bytes: u64,
+    index_page_count: usize,
+    index_page_bytes: u64,
+    record_count: usize,
+    index_entry_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SnapshotDatabaseStats {
+    collection_count: usize,
+    index_count: usize,
+    record_page_count: usize,
+    record_page_bytes: u64,
+    index_page_count: usize,
+    index_page_bytes: u64,
+    record_count: usize,
+    index_entry_count: usize,
+    collections: BTreeMap<String, SnapshotCollectionStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SnapshotCollectionStats {
+    index_count: usize,
+    record_page_count: usize,
+    record_page_bytes: u64,
+    index_page_count: usize,
+    index_page_bytes: u64,
+    record_count: usize,
+    index_entry_count: usize,
+    indexes: BTreeMap<String, SnapshotIndexStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SnapshotIndexStats {
+    entry_count: usize,
+    page_count: usize,
+    page_bytes: u64,
+    root_page_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -957,6 +1137,13 @@ impl DatabaseFile {
             file_size: loaded.file_size,
             databases: loaded.state.catalog.database_names(),
         })
+    }
+
+    pub fn info(path: impl AsRef<Path>) -> Result<InfoReport> {
+        let path = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new().read(true).open(&path)?;
+        let loaded = load_state(&mut file)?;
+        build_info_report(path, &loaded)
     }
 
     pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport> {
@@ -4361,6 +4548,295 @@ fn superblock_offset(slot: usize) -> u64 {
     HEADER_LEN as u64 + (slot * SUPERBLOCK_LEN) as u64
 }
 
+fn build_info_report(path: PathBuf, loaded: &LoadedState) -> Result<InfoReport> {
+    let checkpoint_catalog_stats = snapshot_catalog_stats(&loaded.checkpoint_snapshot.catalog);
+    let change_event_page_bytes = sum_page_bytes(&loaded.checkpoint_snapshot.change_event_pages);
+    let checkpoint_page_bytes = checkpoint_catalog_stats.record_page_bytes
+        + checkpoint_catalog_stats.index_page_bytes
+        + change_event_page_bytes;
+    let databases = loaded
+        .state
+        .catalog
+        .databases
+        .iter()
+        .map(|(name, database)| {
+            let checkpoint = loaded.checkpoint_snapshot.catalog.databases.get(name);
+            build_database_info(name, database, checkpoint)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let summary = InfoSummary {
+        database_count: databases.len(),
+        collection_count: databases
+            .iter()
+            .map(|database| database.collection_count)
+            .sum(),
+        index_count: databases.iter().map(|database| database.index_count).sum(),
+        record_count: databases.iter().map(|database| database.record_count).sum(),
+        index_entry_count: databases
+            .iter()
+            .map(|database| database.index_entry_count)
+            .sum(),
+        change_event_count: loaded.state.change_events.len(),
+        plan_cache_entry_count: loaded.state.plan_cache_entries.len(),
+        document_bytes: databases
+            .iter()
+            .map(|database| database.document_bytes)
+            .sum(),
+        index_bytes: databases.iter().map(|database| database.index_bytes).sum(),
+        total_bytes: databases.iter().map(|database| database.total_bytes).sum(),
+    };
+    Ok(InfoReport {
+        path,
+        file_format_version: loaded.state.file_format_version,
+        file_size: loaded.file_size,
+        last_applied_sequence: loaded.state.last_applied_sequence,
+        summary,
+        last_checkpoint: InfoCheckpoint {
+            generation: loaded.active_superblock.generation,
+            last_applied_sequence: loaded.active_superblock.last_applied_sequence,
+            last_checkpoint_unix_ms: loaded.active_superblock.last_checkpoint_unix_ms,
+            active_superblock_slot: loaded.active_slot,
+            valid_superblocks: loaded.valid_superblocks,
+            database_count: checkpoint_catalog_stats.database_count,
+            collection_count: checkpoint_catalog_stats.collection_count,
+            index_count: checkpoint_catalog_stats.index_count,
+            snapshot_offset: loaded.active_superblock.snapshot_offset,
+            snapshot_len: loaded.active_superblock.snapshot_len,
+            wal_offset: loaded.active_superblock.wal_offset,
+            page_size: PAGE_SIZE,
+            page_count: loaded.checkpoint_counts.page_count,
+            page_bytes: checkpoint_page_bytes,
+            record_page_count: loaded.checkpoint_counts.record_page_count,
+            record_page_bytes: checkpoint_catalog_stats.record_page_bytes,
+            index_page_count: loaded.checkpoint_counts.index_page_count,
+            index_page_bytes: checkpoint_catalog_stats.index_page_bytes,
+            change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
+            change_event_page_bytes,
+            record_count: loaded.checkpoint_counts.record_count,
+            index_entry_count: loaded.checkpoint_counts.index_entry_count,
+            change_event_count: loaded.checkpoint_counts.change_event_count,
+            plan_cache_entry_count: loaded.checkpoint_snapshot.plan_cache_entries.len(),
+            total_bytes: loaded.active_superblock.snapshot_len + checkpoint_page_bytes,
+        },
+        wal_since_checkpoint: InfoWal {
+            record_count: loaded.wal_recovery.records,
+            bytes: loaded.wal_recovery.bytes,
+            truncated_tail: loaded.wal_recovery.truncated_tail,
+        },
+        databases,
+    })
+}
+
+fn build_database_info(
+    name: &str,
+    database: &DatabaseCatalog,
+    checkpoint: Option<&SnapshotDatabaseCatalog>,
+) -> Result<InfoDatabase> {
+    let checkpoint = checkpoint.map(snapshot_database_stats).unwrap_or_default();
+    let collections = database
+        .collections
+        .iter()
+        .map(|(collection_name, collection)| {
+            let checkpoint_collection = checkpoint.collections.get(collection_name);
+            build_collection_info(collection_name, collection, checkpoint_collection)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let collection_count = collections.len();
+    let index_count = collections
+        .iter()
+        .map(|collection| collection.index_count)
+        .sum();
+    let record_count = collections
+        .iter()
+        .map(|collection| collection.document_count)
+        .sum();
+    let index_entry_count = collections
+        .iter()
+        .map(|collection| collection.index_entry_count)
+        .sum();
+    let document_bytes = collections
+        .iter()
+        .map(|collection| collection.document_bytes)
+        .sum();
+    let index_bytes = collections
+        .iter()
+        .map(|collection| collection.index_bytes)
+        .sum();
+    Ok(InfoDatabase {
+        name: name.to_string(),
+        collection_count,
+        index_count,
+        record_count,
+        index_entry_count,
+        document_bytes,
+        index_bytes,
+        total_bytes: document_bytes + index_bytes,
+        checkpoint: InfoDatabaseCheckpoint {
+            collection_count: checkpoint.collection_count,
+            index_count: checkpoint.index_count,
+            record_count: checkpoint.record_count,
+            index_entry_count: checkpoint.index_entry_count,
+            record_page_count: checkpoint.record_page_count,
+            record_page_bytes: checkpoint.record_page_bytes,
+            index_page_count: checkpoint.index_page_count,
+            index_page_bytes: checkpoint.index_page_bytes,
+            total_bytes: checkpoint.record_page_bytes + checkpoint.index_page_bytes,
+        },
+        collections,
+    })
+}
+
+fn build_collection_info(
+    name: &str,
+    collection: &CollectionCatalog,
+    checkpoint: Option<&SnapshotCollectionStats>,
+) -> Result<InfoCollection> {
+    let checkpoint = checkpoint.cloned().unwrap_or_default();
+    let indexes = collection
+        .indexes
+        .iter()
+        .map(|(index_name, index)| {
+            let checkpoint_index = checkpoint.indexes.get(index_name);
+            build_index_info(index, checkpoint_index)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let document_bytes = current_document_bytes(collection)?;
+    let index_bytes = indexes.iter().map(|index| index.bytes).sum();
+    let index_entry_count = indexes.iter().map(|index| index.entry_count).sum();
+    Ok(InfoCollection {
+        name: name.to_string(),
+        document_count: collection.records.len(),
+        index_count: indexes.len(),
+        index_entry_count,
+        document_bytes,
+        index_bytes,
+        total_bytes: document_bytes + index_bytes,
+        checkpoint: InfoCollectionCheckpoint {
+            index_count: checkpoint.index_count,
+            record_count: checkpoint.record_count,
+            index_entry_count: checkpoint.index_entry_count,
+            record_page_count: checkpoint.record_page_count,
+            record_page_bytes: checkpoint.record_page_bytes,
+            index_page_count: checkpoint.index_page_count,
+            index_page_bytes: checkpoint.index_page_bytes,
+            total_bytes: checkpoint.record_page_bytes + checkpoint.index_page_bytes,
+        },
+        indexes,
+    })
+}
+
+fn build_index_info(
+    index: &IndexCatalog,
+    checkpoint: Option<&SnapshotIndexStats>,
+) -> Result<InfoIndex> {
+    let checkpoint = checkpoint.cloned().unwrap_or_default();
+    let bytes = current_index_bytes(index)?;
+    Ok(InfoIndex {
+        name: index.name.clone(),
+        key: index.key.clone(),
+        unique: index.unique,
+        expire_after_seconds: index.expire_after_seconds,
+        entry_count: index.entry_count(),
+        bytes,
+        checkpoint: InfoIndexCheckpoint {
+            entry_count: checkpoint.entry_count,
+            page_count: checkpoint.page_count,
+            page_bytes: checkpoint.page_bytes,
+            root_page_id: checkpoint.root_page_id,
+            total_bytes: checkpoint.page_bytes,
+        },
+    })
+}
+
+fn snapshot_catalog_stats(catalog: &SnapshotCatalog) -> SnapshotCatalogStats {
+    let mut stats = SnapshotCatalogStats {
+        database_count: catalog.databases.len(),
+        ..SnapshotCatalogStats::default()
+    };
+    for database in catalog.databases.values() {
+        let database_stats = snapshot_database_stats(database);
+        stats.collection_count += database_stats.collection_count;
+        stats.index_count += database_stats.index_count;
+        stats.record_page_count += database_stats.record_page_count;
+        stats.record_page_bytes += database_stats.record_page_bytes;
+        stats.index_page_count += database_stats.index_page_count;
+        stats.index_page_bytes += database_stats.index_page_bytes;
+        stats.record_count += database_stats.record_count;
+        stats.index_entry_count += database_stats.index_entry_count;
+    }
+    stats
+}
+
+fn snapshot_database_stats(database: &SnapshotDatabaseCatalog) -> SnapshotDatabaseStats {
+    let mut stats = SnapshotDatabaseStats {
+        collection_count: database.collections.len(),
+        ..SnapshotDatabaseStats::default()
+    };
+    for (name, collection) in &database.collections {
+        let collection_stats = snapshot_collection_stats(collection);
+        stats.index_count += collection_stats.index_count;
+        stats.record_page_count += collection_stats.record_page_count;
+        stats.record_page_bytes += collection_stats.record_page_bytes;
+        stats.index_page_count += collection_stats.index_page_count;
+        stats.index_page_bytes += collection_stats.index_page_bytes;
+        stats.record_count += collection_stats.record_count;
+        stats.index_entry_count += collection_stats.index_entry_count;
+        stats.collections.insert(name.clone(), collection_stats);
+    }
+    stats
+}
+
+fn snapshot_collection_stats(collection: &SnapshotCollectionCatalog) -> SnapshotCollectionStats {
+    let mut stats = SnapshotCollectionStats {
+        index_count: collection.indexes.len(),
+        record_page_count: collection.record_pages.len(),
+        record_page_bytes: sum_page_bytes(&collection.record_pages),
+        record_count: collection.record_count,
+        ..SnapshotCollectionStats::default()
+    };
+    for (name, index) in &collection.indexes {
+        let index_stats = snapshot_index_stats(index);
+        stats.index_page_count += index_stats.page_count;
+        stats.index_page_bytes += index_stats.page_bytes;
+        stats.index_entry_count += index_stats.entry_count;
+        stats.indexes.insert(name.clone(), index_stats);
+    }
+    stats
+}
+
+fn snapshot_index_stats(index: &SnapshotIndexCatalog) -> SnapshotIndexStats {
+    SnapshotIndexStats {
+        entry_count: index.entry_count,
+        page_count: index.pages.len(),
+        page_bytes: sum_page_bytes(&index.pages),
+        root_page_id: index.root_page_id,
+    }
+}
+
+fn sum_page_bytes(page_refs: &[PageRef]) -> u64 {
+    page_refs
+        .iter()
+        .map(|page_ref| u64::from(page_ref.page_len))
+        .sum()
+}
+
+fn current_document_bytes(collection: &CollectionCatalog) -> Result<u64> {
+    collection.records.iter().try_fold(0_u64, |total, record| {
+        let bytes = record.encoded_document_bytes()?;
+        Ok(total + bytes.len() as u64)
+    })
+}
+
+fn current_index_bytes(index: &IndexCatalog) -> Result<u64> {
+    index
+        .entries_snapshot()
+        .iter()
+        .try_fold(0_u64, |total, entry| {
+            let bytes = encode_index_entry_payload_bytes(entry)?;
+            Ok(total + bytes.len() as u64)
+        })
+}
+
 fn record_count(catalog: &Catalog) -> usize {
     catalog
         .databases
@@ -4587,6 +5063,152 @@ mod tests {
         assert_eq!(inspect.last_applied_sequence, 1);
         assert_eq!(inspect.wal_records_since_checkpoint, 1);
         assert_eq!(inspect.databases, vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn info_reports_current_state_and_last_checkpoint_breakdown() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("info.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1, "sku": "alpha", "qty": 2 });
+            insert_record(&mut widgets, 2, doc! { "_id": 2, "sku": "beta", "qty": 4 });
+            apply_index_specs(
+                &mut widgets,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: vec![
+                        sample_change_event(1, "insert"),
+                        sample_change_event(2, "insert"),
+                    ],
+                })
+                .expect("seed widgets");
+            database.checkpoint().expect("checkpoint");
+
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1, "sku": "alpha", "qty": 2 });
+            insert_record(&mut widgets, 2, doc! { "_id": 2, "sku": "beta", "qty": 4 });
+            insert_record(&mut widgets, 3, doc! { "_id": 3, "sku": "gamma", "qty": 6 });
+            apply_index_specs(
+                &mut widgets,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("recreate index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: vec![sample_change_event(3, "insert")],
+                })
+                .expect("update widgets");
+
+            let mut events = CollectionCatalog::new(doc! {});
+            insert_record(
+                &mut events,
+                1,
+                doc! { "_id": 1, "kind": "login", "user": "alex" },
+            );
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "analytics".to_string(),
+                    collection: "events".to_string(),
+                    collection_state: events,
+                    change_events: vec![sample_change_event(4, "insert")],
+                })
+                .expect("seed analytics");
+        }
+
+        let report = DatabaseFile::info(&path).expect("info");
+        assert_eq!(report.last_applied_sequence, 3);
+        assert_eq!(report.summary.database_count, 2);
+        assert_eq!(report.summary.collection_count, 2);
+        assert_eq!(report.summary.index_count, 3);
+        assert_eq!(report.summary.record_count, 4);
+        assert_eq!(report.summary.index_entry_count, 7);
+        assert_eq!(report.summary.change_event_count, 4);
+        assert_eq!(report.summary.plan_cache_entry_count, 0);
+        assert!(report.summary.document_bytes > 0);
+        assert!(report.summary.index_bytes > 0);
+        assert_eq!(
+            report.summary.total_bytes,
+            report.summary.document_bytes + report.summary.index_bytes
+        );
+
+        assert_eq!(report.last_checkpoint.generation, 2);
+        assert_eq!(report.last_checkpoint.last_applied_sequence, 1);
+        assert_eq!(report.last_checkpoint.database_count, 1);
+        assert_eq!(report.last_checkpoint.collection_count, 1);
+        assert_eq!(report.last_checkpoint.index_count, 2);
+        assert_eq!(report.last_checkpoint.record_count, 2);
+        assert_eq!(report.last_checkpoint.index_entry_count, 4);
+        assert_eq!(report.last_checkpoint.change_event_count, 2);
+        assert_eq!(
+            report.last_checkpoint.total_bytes,
+            report.last_checkpoint.snapshot_len + report.last_checkpoint.page_bytes
+        );
+
+        assert_eq!(report.wal_since_checkpoint.record_count, 2);
+        assert!(report.wal_since_checkpoint.bytes > 0);
+        assert!(!report.wal_since_checkpoint.truncated_tail);
+
+        let analytics = report
+            .databases
+            .iter()
+            .find(|database| database.name == "analytics")
+            .expect("analytics database");
+        assert_eq!(analytics.collection_count, 1);
+        assert_eq!(analytics.record_count, 1);
+        assert_eq!(analytics.index_count, 1);
+        assert_eq!(analytics.checkpoint.collection_count, 0);
+        assert_eq!(analytics.checkpoint.total_bytes, 0);
+
+        let app = report
+            .databases
+            .iter()
+            .find(|database| database.name == "app")
+            .expect("app database");
+        assert_eq!(app.collection_count, 1);
+        assert_eq!(app.record_count, 3);
+        assert_eq!(app.index_count, 2);
+        assert_eq!(app.index_entry_count, 6);
+        assert_eq!(app.checkpoint.collection_count, 1);
+        assert_eq!(app.checkpoint.index_count, 2);
+        assert_eq!(app.checkpoint.record_count, 2);
+        assert_eq!(app.checkpoint.index_entry_count, 4);
+
+        let widgets = app
+            .collections
+            .iter()
+            .find(|collection| collection.name == "widgets")
+            .expect("widgets collection");
+        assert_eq!(widgets.document_count, 3);
+        assert_eq!(widgets.index_count, 2);
+        assert_eq!(widgets.index_entry_count, 6);
+        assert_eq!(widgets.checkpoint.record_count, 2);
+        assert_eq!(widgets.checkpoint.index_entry_count, 4);
+        assert!(widgets.checkpoint.record_page_bytes > 0);
+        assert!(widgets.checkpoint.index_page_bytes > 0);
+
+        let sku_index = widgets
+            .indexes
+            .iter()
+            .find(|index| index.name == "sku_1")
+            .expect("sku index");
+        assert_eq!(sku_index.key, doc! { "sku": 1 });
+        assert!(sku_index.unique);
+        assert_eq!(sku_index.entry_count, 3);
+        assert_eq!(sku_index.checkpoint.entry_count, 2);
+        assert!(sku_index.bytes > 0);
+        assert!(sku_index.checkpoint.page_bytes > 0);
     }
 
     #[test]

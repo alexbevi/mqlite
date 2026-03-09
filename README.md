@@ -72,8 +72,11 @@ The CLI is intentionally small and focused:
 | `mqlite command --file <path>` | Send one MongoDB command over a real `OP_MSG` request and print the reply as JSON. |
 | `mqlite bench --file <path>` | Run a quick local write/read benchmark through the broker. |
 | `mqlite checkpoint --file <path>` | Force a checkpoint and print storage metadata. |
+| `mqlite info --file <path>` | Print current database, collection, and index counts and sizes plus last-checkpoint details. |
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
 | `mqlite inspect --file <path>` | Print file, checkpoint, WAL, and catalog metadata. |
+
+`mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report.
 
 You can also pipe JSON into `mqlite command`:
 

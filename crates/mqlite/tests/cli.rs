@@ -1,4 +1,9 @@
-use std::{fs, thread, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use assert_cmd::Command;
 use bson::{Binary, Bson, doc, spec::BinarySubtype};
@@ -16,6 +21,16 @@ fn assert_json_number_close(value: &Value, expected: f64) {
         (actual - expected).abs() < 1e-12,
         "expected {expected}, got {actual}"
     );
+}
+
+fn wait_for_broker_exit(database_path: &Path) {
+    let manifest_path = broker_paths(database_path)
+        .expect("broker paths")
+        .manifest_path;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while manifest_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -37,12 +52,134 @@ fn inspect_and_verify_commands_work() {
         .assert()
         .success();
 
+    let mut info = Command::cargo_bin("mqlite").expect("binary");
+    info.args(["info", "--file"])
+        .arg(&database_path)
+        .assert()
+        .success();
+
     let mut verify = Command::cargo_bin("mqlite").expect("binary");
     verify
         .args(["verify", "--file"])
         .arg(&database_path)
         .assert()
         .success();
+}
+
+#[test]
+fn info_command_reports_current_and_checkpoint_state() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("info-cli.mongodb");
+
+    let mut create = Command::cargo_bin("mqlite").expect("binary");
+    create
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_index = Command::cargo_bin("mqlite").expect("binary");
+    create_index
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha","qty":2},{"_id":2,"sku":"beta","qty":4}]}"#,
+        ])
+        .assert()
+        .success();
+
+    wait_for_broker_exit(&database_path);
+
+    let mut checkpoint = Command::cargo_bin("mqlite").expect("binary");
+    checkpoint
+        .args(["checkpoint", "--file"])
+        .arg(&database_path)
+        .assert()
+        .success();
+
+    let mut insert_after_checkpoint = Command::cargo_bin("mqlite").expect("binary");
+    insert_after_checkpoint
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":3,"sku":"gamma","qty":6}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let output = {
+        let mut info = Command::cargo_bin("mqlite").expect("binary");
+        info.args(["info", "--file"])
+            .arg(&database_path)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["summary"]["database_count"], 1);
+    assert_eq!(response["summary"]["collection_count"], 1);
+    assert_eq!(response["summary"]["index_count"], 2);
+    assert_eq!(response["summary"]["record_count"], 3);
+    assert_eq!(response["summary"]["index_entry_count"], 6);
+    assert_eq!(response["last_applied_sequence"], 4);
+    assert_eq!(response["last_checkpoint"]["last_applied_sequence"], 3);
+    assert_eq!(response["last_checkpoint"]["record_count"], 2);
+    assert_eq!(response["last_checkpoint"]["index_entry_count"], 4);
+    assert_eq!(response["wal_since_checkpoint"]["record_count"], 1);
+
+    let databases = response["databases"].as_array().expect("databases");
+    let app = databases
+        .iter()
+        .find(|database| database["name"] == "app")
+        .expect("app database");
+    let collections = app["collections"].as_array().expect("collections");
+    let widgets = collections
+        .iter()
+        .find(|collection| collection["name"] == "widgets")
+        .expect("widgets collection");
+    assert_eq!(widgets["document_count"], 3);
+    assert_eq!(widgets["checkpoint"]["record_count"], 2);
+
+    let indexes = widgets["indexes"].as_array().expect("indexes");
+    let sku_index = indexes
+        .iter()
+        .find(|index| index["name"] == "sku_1")
+        .expect("sku_1 index");
+    assert_eq!(sku_index["unique"], true);
+    assert_eq!(sku_index["entry_count"], 3);
+    assert_eq!(sku_index["checkpoint"]["entry_count"], 2);
 }
 
 #[test]

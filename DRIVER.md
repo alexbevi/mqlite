@@ -10,6 +10,8 @@ file:///absolute/path/to/database.mongodb?db=app
 
 The driver still speaks `OP_MSG` exclusively. The only difference is that the remote socket becomes a local IPC stream backed by a per-file `mqlite` broker.
 
+For direct local validation outside a driver, the CLI also exposes `mqlite info --file <path>` for per-database, per-collection, and per-index size and count summaries plus last-checkpoint metadata, while `mqlite inspect` remains the lower-level file-layout view.
+
 ## Required Driver Behavior
 
 ### URI parsing

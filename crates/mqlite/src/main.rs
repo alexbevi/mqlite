@@ -45,6 +45,10 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    Info {
+        #[arg(long)]
+        file: PathBuf,
+    },
     #[command(name = "command")]
     Request {
         #[arg(long)]
@@ -111,6 +115,12 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&DatabaseFile::inspect(file)?)?
+            );
+        }
+        Command::Info { file } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&DatabaseFile::info(file)?)?
             );
         }
         Command::Request {

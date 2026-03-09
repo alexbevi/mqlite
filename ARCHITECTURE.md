@@ -19,7 +19,7 @@ The current workspace is split into focused crates:
 - `mqlite-query`: filter parsing, projection, updates, and aggregation semantics.
 - `mqlite-exec`: cursor batching and cursor lifecycle.
 - `mqlite-server`: command dispatch, planning, execution, and broker lifecycle.
-- `mqlite`: CLI entrypoints such as `serve`, `command`, `inspect`, `verify`, and `checkpoint`.
+- `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, and `checkpoint`.
 
 ## Source Layout
 
@@ -55,6 +55,11 @@ The broker is the only writer for a database file.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
 - The attach or spawn path treats the manifest as the readiness signal, but if `serve` exits before publishing it the caller reports that startup error directly instead of waiting out the manifest timeout.
 - Auto-spawned brokers can also receive a watched parent pid; once that launcher process has died and the broker has no active IPC connections left, the broker exits immediately instead of waiting for the normal idle timeout.
+
+The CLI surfaces split along intent:
+- `mqlite command` is the direct wire-protocol validation path.
+- `mqlite info` summarizes the recovered current catalog state, per-namespace sizes and counts, WAL backlog, and the most recent checkpoint.
+- `mqlite inspect` stays focused on lower-level file, superblock, WAL, and catalog metadata.
 
 ## Durable File Layout
 
