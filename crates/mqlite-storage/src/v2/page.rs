@@ -6,20 +6,22 @@ use mqlite_catalog::IndexEntry;
 
 use crate::v2::{
     catalog::{CollectionMeta, IndexMeta, PersistedIndexStats},
+    keycodec::encode_index_key,
     layout::{DEFAULT_PAGE_SIZE, PageKind},
 };
 use crate::{PersistedChangeEvent, PersistedPlanCacheEntry};
 
 pub(crate) type PageId = u64;
 
-const PAGE_MAGIC: &[u8; 8] = b"MQLTPG08";
+const PAGE_MAGIC: &[u8; 8] = b"MQLTPG09";
 const PAGE_LEN: usize = DEFAULT_PAGE_SIZE as usize;
 const PAGE_HEADER_LEN: usize = 64;
 const PAGE_CHECKSUM_OFFSET: usize = 32;
 const RECORD_LEAF_SLOT_LEN: usize = 16;
 const RECORD_INTERNAL_SLOT_LEN: usize = 16;
-const SECONDARY_LEAF_SLOT_LEN: usize = 24;
-const SECONDARY_INTERNAL_SLOT_LEN: usize = 20;
+const SECONDARY_LEAF_SLOT_LEN: usize = 16;
+const SECONDARY_INTERNAL_SLOT_LEN: usize = 24;
+const SECONDARY_POSTING_LEN: usize = 16;
 const NAMESPACE_LEAF_SLOT_LEN: usize = 12;
 const NAMESPACE_INTERNAL_SLOT_LEN: usize = 12;
 const META_SLOT_LEN: usize = 4;
@@ -178,27 +180,87 @@ impl RecordInternalPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SecondaryEntry {
+pub(crate) struct SecondaryPosting {
     pub record_id: u64,
-    pub key: Document,
     pub present_mask: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecondaryEntry {
+    pub key_bytes: Vec<u8>,
+    pub normalized_key: Vec<u8>,
+    pub postings: Vec<SecondaryPosting>,
 }
 
 impl SecondaryEntry {
     pub fn from_index_entry(entry: &IndexEntry, key_pattern: &Document) -> Result<Self> {
         Ok(Self {
-            record_id: entry.record_id,
-            key: entry.key.clone(),
-            present_mask: present_mask_for_fields(key_pattern, &entry.present_fields)?,
+            key_bytes: bson::to_vec(&entry.key)?,
+            normalized_key: encode_index_key(&entry.key, key_pattern)?,
+            postings: vec![SecondaryPosting {
+                record_id: entry.record_id,
+                present_mask: present_mask_for_fields(key_pattern, &entry.present_fields)?,
+            }],
         })
     }
 
-    pub fn into_index_entry(self, key_pattern: &Document) -> IndexEntry {
-        IndexEntry {
-            record_id: self.record_id,
-            key: self.key,
-            present_fields: present_fields_from_mask(key_pattern, self.present_mask),
-        }
+    pub fn from_index_entries(entries: &[IndexEntry], key_pattern: &Document) -> Result<Self> {
+        let first = entries
+            .first()
+            .ok_or_else(|| anyhow!("secondary entry group cannot be empty"))?;
+        Ok(Self {
+            key_bytes: bson::to_vec(&first.key)?,
+            normalized_key: encode_index_key(&first.key, key_pattern)?,
+            postings: entries
+                .iter()
+                .map(|entry| {
+                    Ok(SecondaryPosting {
+                        record_id: entry.record_id,
+                        present_mask: present_mask_for_fields(key_pattern, &entry.present_fields)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    pub fn from_key_document(
+        key: &Document,
+        postings: Vec<SecondaryPosting>,
+        key_pattern: &Document,
+    ) -> Result<Self> {
+        Ok(Self {
+            key_bytes: bson::to_vec(key)?,
+            normalized_key: encode_index_key(key, key_pattern)?,
+            postings,
+        })
+    }
+
+    pub fn decode_key_document(&self) -> Result<Document> {
+        bson::from_slice(&self.key_bytes).map_err(Into::into)
+    }
+
+    pub fn first_record_id(&self) -> u64 {
+        self.postings
+            .first()
+            .map(|posting| posting.record_id)
+            .unwrap_or_default()
+    }
+
+    pub fn posting_count(&self) -> usize {
+        self.postings.len()
+    }
+
+    pub fn into_index_entries(self, key_pattern: &Document) -> Result<Vec<IndexEntry>> {
+        let key = bson::from_slice::<Document>(&self.key_bytes)?;
+        Ok(self
+            .postings
+            .into_iter()
+            .map(|posting| IndexEntry {
+                record_id: posting.record_id,
+                key: key.clone(),
+                present_fields: present_fields_from_mask(key_pattern, posting.present_mask),
+            })
+            .collect())
     }
 }
 
@@ -222,10 +284,18 @@ impl SecondaryLeafPage {
 
         let mut upper = PAGE_LEN;
         let slot_area_end = page_slot_area_end(self.entries.len(), SECONDARY_LEAF_SLOT_LEN)?;
+        let mut previous_key = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
-            let encoded_key = bson::to_vec(&entry.key)?;
+            let shared_prefix_len = shared_prefix_len(&previous_key, &entry.normalized_key)?;
+            let normalized_suffix = &entry.normalized_key[shared_prefix_len as usize..];
+            let postings_len = entry
+                .postings
+                .len()
+                .checked_mul(SECONDARY_POSTING_LEN)
+                .ok_or_else(|| anyhow!("secondary leaf page {} overflows", self.page_id))?;
+
             upper = upper
-                .checked_sub(encoded_key.len())
+                .checked_sub(postings_len)
                 .ok_or_else(|| anyhow!("secondary leaf page {} overflows", self.page_id))?;
             if upper < slot_area_end {
                 return Err(anyhow!(
@@ -233,16 +303,51 @@ impl SecondaryLeafPage {
                     self.page_id
                 ));
             }
-            bytes[upper..upper + encoded_key.len()].copy_from_slice(&encoded_key);
+            let postings_offset = upper;
+            encode_secondary_postings(
+                &entry.postings,
+                &mut bytes[postings_offset..postings_offset + postings_len],
+            );
+
+            upper = upper
+                .checked_sub(entry.key_bytes.len())
+                .ok_or_else(|| anyhow!("secondary leaf page {} overflows", self.page_id))?;
+            if upper < slot_area_end {
+                return Err(anyhow!(
+                    "secondary leaf page {} exceeds page capacity",
+                    self.page_id
+                ));
+            }
+            bytes[upper..upper + entry.key_bytes.len()].copy_from_slice(&entry.key_bytes);
+            let key_offset = upper;
+
+            upper = upper
+                .checked_sub(normalized_suffix.len())
+                .ok_or_else(|| anyhow!("secondary leaf page {} overflows", self.page_id))?;
+            if upper < slot_area_end {
+                return Err(anyhow!(
+                    "secondary leaf page {} exceeds page capacity",
+                    self.page_id
+                ));
+            }
+            bytes[upper..upper + normalized_suffix.len()].copy_from_slice(normalized_suffix);
+            let normalized_offset = upper;
 
             let slot_offset = PAGE_HEADER_LEN + index * SECONDARY_LEAF_SLOT_LEN;
-            bytes[slot_offset..slot_offset + 8].copy_from_slice(&entry.record_id.to_le_bytes());
-            bytes[slot_offset + 8..slot_offset + 16]
-                .copy_from_slice(&entry.present_mask.to_le_bytes());
-            bytes[slot_offset + 16..slot_offset + 18]
-                .copy_from_slice(&(upper as u16).to_le_bytes());
-            bytes[slot_offset + 18..slot_offset + 20]
-                .copy_from_slice(&(encoded_key.len() as u16).to_le_bytes());
+            bytes[slot_offset..slot_offset + 2].copy_from_slice(&shared_prefix_len.to_le_bytes());
+            bytes[slot_offset + 2..slot_offset + 4]
+                .copy_from_slice(&(normalized_offset as u16).to_le_bytes());
+            bytes[slot_offset + 4..slot_offset + 6]
+                .copy_from_slice(&(normalized_suffix.len() as u16).to_le_bytes());
+            bytes[slot_offset + 6..slot_offset + 8]
+                .copy_from_slice(&(key_offset as u16).to_le_bytes());
+            bytes[slot_offset + 8..slot_offset + 10]
+                .copy_from_slice(&(entry.key_bytes.len() as u16).to_le_bytes());
+            bytes[slot_offset + 10..slot_offset + 12]
+                .copy_from_slice(&(postings_offset as u16).to_le_bytes());
+            bytes[slot_offset + 12..slot_offset + 14]
+                .copy_from_slice(&(entry.postings.len() as u16).to_le_bytes());
+            previous_key = entry.normalized_key.clone();
         }
 
         finalize_checksum(&mut bytes);
@@ -252,20 +357,42 @@ impl SecondaryLeafPage {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let header = decode_header(bytes, PageKind::SecondaryLeaf)?;
         let mut entries = Vec::with_capacity(header.cell_count);
+        let mut previous_key = Vec::new();
         for index in 0..header.cell_count {
             let slot_offset = PAGE_HEADER_LEN + index * SECONDARY_LEAF_SLOT_LEN;
-            let record_id = u64::from_le_bytes(bytes[slot_offset..slot_offset + 8].try_into()?);
-            let present_mask =
-                u64::from_le_bytes(bytes[slot_offset + 8..slot_offset + 16].try_into()?);
-            let payload_offset =
-                u16::from_le_bytes(bytes[slot_offset + 16..slot_offset + 18].try_into()?);
-            let payload_len =
-                u16::from_le_bytes(bytes[slot_offset + 18..slot_offset + 20].try_into()?);
+            let shared_prefix_len =
+                u16::from_le_bytes(bytes[slot_offset..slot_offset + 2].try_into()?);
+            let normalized_offset =
+                u16::from_le_bytes(bytes[slot_offset + 2..slot_offset + 4].try_into()?);
+            let normalized_len =
+                u16::from_le_bytes(bytes[slot_offset + 4..slot_offset + 6].try_into()?);
+            let key_offset =
+                u16::from_le_bytes(bytes[slot_offset + 6..slot_offset + 8].try_into()?);
+            let key_len = u16::from_le_bytes(bytes[slot_offset + 8..slot_offset + 10].try_into()?);
+            let postings_offset =
+                u16::from_le_bytes(bytes[slot_offset + 10..slot_offset + 12].try_into()?);
+            let posting_count =
+                u16::from_le_bytes(bytes[slot_offset + 12..slot_offset + 14].try_into()?);
+            let mut normalized_key = previous_key
+                .get(..shared_prefix_len as usize)
+                .ok_or_else(|| anyhow!("secondary leaf page shared prefix exceeds previous key"))?
+                .to_vec();
+            normalized_key.extend_from_slice(slice_payload(
+                bytes,
+                normalized_offset,
+                normalized_len,
+            )?);
+            let postings_len = posting_count as usize * SECONDARY_POSTING_LEN;
             entries.push(SecondaryEntry {
-                record_id,
-                present_mask,
-                key: bson::from_slice(slice_payload(bytes, payload_offset, payload_len)?)?,
+                key_bytes: slice_payload(bytes, key_offset, key_len)?.to_vec(),
+                normalized_key: normalized_key.clone(),
+                postings: decode_secondary_postings(slice_payload(
+                    bytes,
+                    postings_offset,
+                    postings_len as u16,
+                )?)?,
             });
+            previous_key = normalized_key;
         }
 
         Ok(Self {
@@ -278,9 +405,31 @@ impl SecondaryLeafPage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SecondarySeparator {
-    pub key: Document,
+    pub normalized_key: Vec<u8>,
     pub record_id: u64,
     pub child_page_id: PageId,
+}
+
+impl SecondarySeparator {
+    pub fn from_entry(entry: &SecondaryEntry, child_page_id: PageId) -> Self {
+        Self {
+            normalized_key: entry.normalized_key.clone(),
+            record_id: entry.first_record_id(),
+            child_page_id,
+        }
+    }
+
+    pub fn from_index_entry(
+        entry: &IndexEntry,
+        child_page_id: PageId,
+        key_pattern: &Document,
+    ) -> Result<Self> {
+        Ok(Self {
+            normalized_key: encode_index_key(&entry.key, key_pattern)?,
+            record_id: entry.record_id,
+            child_page_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,10 +452,12 @@ impl SecondaryInternalPage {
 
         let mut upper = PAGE_LEN;
         let slot_area_end = page_slot_area_end(self.separators.len(), SECONDARY_INTERNAL_SLOT_LEN)?;
+        let mut previous_key = Vec::new();
         for (index, separator) in self.separators.iter().enumerate() {
-            let encoded_key = bson::to_vec(&separator.key)?;
+            let shared_prefix_len = shared_prefix_len(&previous_key, &separator.normalized_key)?;
+            let normalized_suffix = &separator.normalized_key[shared_prefix_len as usize..];
             upper = upper
-                .checked_sub(encoded_key.len())
+                .checked_sub(normalized_suffix.len())
                 .ok_or_else(|| anyhow!("secondary internal page {} overflows", self.page_id))?;
             if upper < slot_area_end {
                 return Err(anyhow!(
@@ -314,7 +465,7 @@ impl SecondaryInternalPage {
                     self.page_id
                 ));
             }
-            bytes[upper..upper + encoded_key.len()].copy_from_slice(&encoded_key);
+            bytes[upper..upper + normalized_suffix.len()].copy_from_slice(normalized_suffix);
 
             let slot_offset = PAGE_HEADER_LEN + index * SECONDARY_INTERNAL_SLOT_LEN;
             bytes[slot_offset..slot_offset + 8]
@@ -322,9 +473,12 @@ impl SecondaryInternalPage {
             bytes[slot_offset + 8..slot_offset + 16]
                 .copy_from_slice(&separator.record_id.to_le_bytes());
             bytes[slot_offset + 16..slot_offset + 18]
-                .copy_from_slice(&(upper as u16).to_le_bytes());
+                .copy_from_slice(&shared_prefix_len.to_le_bytes());
             bytes[slot_offset + 18..slot_offset + 20]
-                .copy_from_slice(&(encoded_key.len() as u16).to_le_bytes());
+                .copy_from_slice(&(upper as u16).to_le_bytes());
+            bytes[slot_offset + 20..slot_offset + 22]
+                .copy_from_slice(&(normalized_suffix.len() as u16).to_le_bytes());
+            previous_key = separator.normalized_key.clone();
         }
 
         finalize_checksum(&mut bytes);
@@ -340,20 +494,31 @@ impl SecondaryInternalPage {
             )
         })?;
         let mut separators = Vec::with_capacity(header.cell_count);
+        let mut previous_key = Vec::new();
         for index in 0..header.cell_count {
             let slot_offset = PAGE_HEADER_LEN + index * SECONDARY_INTERNAL_SLOT_LEN;
             let child_page_id = u64::from_le_bytes(bytes[slot_offset..slot_offset + 8].try_into()?);
             let record_id =
                 u64::from_le_bytes(bytes[slot_offset + 8..slot_offset + 16].try_into()?);
-            let payload_offset =
+            let shared_prefix_len =
                 u16::from_le_bytes(bytes[slot_offset + 16..slot_offset + 18].try_into()?);
-            let payload_len =
+            let payload_offset =
                 u16::from_le_bytes(bytes[slot_offset + 18..slot_offset + 20].try_into()?);
+            let payload_len =
+                u16::from_le_bytes(bytes[slot_offset + 20..slot_offset + 22].try_into()?);
+            let mut normalized_key = previous_key
+                .get(..shared_prefix_len as usize)
+                .ok_or_else(|| {
+                    anyhow!("secondary internal page shared prefix exceeds previous key")
+                })?
+                .to_vec();
+            normalized_key.extend_from_slice(slice_payload(bytes, payload_offset, payload_len)?);
             separators.push(SecondarySeparator {
                 child_page_id,
                 record_id,
-                key: bson::from_slice(slice_payload(bytes, payload_offset, payload_len)?)?,
+                normalized_key: normalized_key.clone(),
             });
+            previous_key = normalized_key;
         }
 
         Ok(Self {
@@ -730,6 +895,38 @@ fn decode_single_payload(bytes: &[u8]) -> Result<&[u8]> {
     slice_payload(bytes, payload_offset, payload_len)
 }
 
+fn shared_prefix_len(left: &[u8], right: &[u8]) -> Result<u16> {
+    let len = left
+        .iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    u16::try_from(len).map_err(|_| anyhow!("secondary key prefix exceeds u16::MAX"))
+}
+
+fn encode_secondary_postings(postings: &[SecondaryPosting], bytes: &mut [u8]) {
+    for (index, posting) in postings.iter().enumerate() {
+        let slot_offset = index * SECONDARY_POSTING_LEN;
+        bytes[slot_offset..slot_offset + 8].copy_from_slice(&posting.record_id.to_le_bytes());
+        bytes[slot_offset + 8..slot_offset + 16]
+            .copy_from_slice(&posting.present_mask.to_le_bytes());
+    }
+}
+
+fn decode_secondary_postings(bytes: &[u8]) -> Result<Vec<SecondaryPosting>> {
+    if bytes.len() % SECONDARY_POSTING_LEN != 0 {
+        return Err(anyhow!("secondary posting payload is misaligned"));
+    }
+    let mut postings = Vec::with_capacity(bytes.len() / SECONDARY_POSTING_LEN);
+    for chunk in bytes.chunks_exact(SECONDARY_POSTING_LEN) {
+        postings.push(SecondaryPosting {
+            record_id: u64::from_le_bytes(chunk[..8].try_into()?),
+            present_mask: u64::from_le_bytes(chunk[8..16].try_into()?),
+        });
+    }
+    Ok(postings)
+}
+
 fn present_mask_for_fields(key_pattern: &Document, present_fields: &[String]) -> Result<u64> {
     if key_pattern.len() > u64::BITS as usize {
         return Err(anyhow!(
@@ -873,18 +1070,25 @@ mod tests {
             page_id: 3,
             next_page_id: Some(4),
             entries: vec![
-                SecondaryEntry::from_index_entry(
-                    &IndexEntry {
-                        record_id: 11,
-                        key: doc! { "sku": "a", "qty": 3 },
-                        present_fields: vec!["sku".to_string()],
-                    },
+                SecondaryEntry::from_index_entries(
+                    &[
+                        IndexEntry {
+                            record_id: 11,
+                            key: doc! { "sku": "a", "qty": 3 },
+                            present_fields: vec!["sku".to_string()],
+                        },
+                        IndexEntry {
+                            record_id: 12,
+                            key: doc! { "sku": "a", "qty": 3 },
+                            present_fields: vec!["sku".to_string(), "qty".to_string()],
+                        },
+                    ],
                     &key_pattern,
                 )
-                .expect("entry"),
+                .expect("grouped entry"),
                 SecondaryEntry::from_index_entry(
                     &IndexEntry {
-                        record_id: 12,
+                        record_id: 13,
                         key: doc! { "sku": "b", "qty": 4 },
                         present_fields: vec!["sku".to_string(), "qty".to_string()],
                     },
@@ -900,11 +1104,18 @@ mod tests {
         let internal = SecondaryInternalPage {
             page_id: 6,
             first_child_page_id: 3,
-            separators: vec![SecondarySeparator {
-                key: doc! { "sku": "b", "qty": 4 },
-                record_id: 12,
-                child_page_id: 4,
-            }],
+            separators: vec![
+                SecondarySeparator::from_index_entry(
+                    &IndexEntry {
+                        record_id: 13,
+                        key: doc! { "sku": "b", "qty": 4 },
+                        present_fields: vec!["sku".to_string(), "qty".to_string()],
+                    },
+                    4,
+                    &key_pattern,
+                )
+                .expect("separator"),
+            ],
         };
         let decoded_internal =
             SecondaryInternalPage::decode(&internal.encode().expect("encode internal"))

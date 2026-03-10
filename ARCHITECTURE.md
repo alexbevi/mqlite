@@ -99,7 +99,10 @@ front rather than being reconstructed from checkpoint snapshot references:
 - collection-meta and index-meta pages for page roots, key patterns, and counters
 - stats pages for persisted per-index value frequencies and field-presence counts
 - record internal and leaf pages keyed by stable `RecordId`
-- secondary-index internal and leaf pages keyed by persisted BSON key plus `RecordId`
+- secondary-index internal pages keyed by prefix-compressed normalized sort-key bytes plus
+  `RecordId`
+- secondary-index leaf pages keyed by prefix-compressed normalized sort-key bytes, storing the raw
+  BSON key once per key plus duplicate-key posting lists of `RecordId` and presence-mask pairs
 - two rotating superblocks with summary counters for metadata-only open paths
 
 The storage crate resolves collections through persisted namespace metadata, serves page-backed

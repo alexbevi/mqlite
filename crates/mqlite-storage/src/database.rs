@@ -3701,7 +3701,7 @@ mod tests {
         v2_engine::create_empty(&path).expect("create v2 file");
 
         let report = DatabaseFile::info(&path).expect("info");
-        assert_eq!(report.file_format_version, 8);
+        assert_eq!(report.file_format_version, 9);
         assert_eq!(report.summary.database_count, 0);
         assert_eq!(report.summary.record_count, 0);
         assert_eq!(report.last_checkpoint.active_superblock_slot, 0);

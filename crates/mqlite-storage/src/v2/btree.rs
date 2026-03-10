@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 
 use anyhow::{Result, anyhow};
-use bson::{Bson, Document};
-use mqlite_bson::compare_bson;
-use mqlite_catalog::{IndexBound, IndexBounds, IndexEntry};
+use bson::Document;
+use mqlite_catalog::{IndexBounds, IndexEntry};
 
 use crate::v2::{
+    keycodec::{compare_encoded_index_keys, encode_index_key},
     layout::PageKind,
     page::{
         PageId, RecordInternalPage, RecordLeafPage, RecordSlot, SecondaryEntry,
@@ -22,6 +22,12 @@ pub(crate) enum ScanDirection {
 
 pub(crate) trait PageReader {
     fn read_page(&self, page_id: PageId) -> Result<SharedPage>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedBound {
+    key: Vec<u8>,
+    inclusive: bool,
 }
 
 impl PageReader for Pager {
@@ -124,8 +130,9 @@ impl SecondaryTree {
         let Some(root_page_id) = self.root_page_id else {
             return Ok(Vec::new());
         };
-        let mut leaf_page_id = Some(if let Some(lower) = bounds.lower.as_ref() {
-            find_leaf_for_lower_bound(reader, root_page_id, &self.key_pattern, lower)?
+        let encoded_bounds = encode_bounds(bounds, &self.key_pattern)?;
+        let mut leaf_page_id = Some(if let Some(lower) = encoded_bounds.lower.as_ref() {
+            find_leaf_for_lower_bound(reader, root_page_id, lower)?
         } else {
             leftmost_secondary_leaf(reader, root_page_id)?
         });
@@ -136,11 +143,11 @@ impl SecondaryTree {
             leaf_page_id = leaf.next_page_id;
             let mut past_upper = false;
             for entry in leaf.entries {
-                if !entry_within_bounds(&entry, bounds, &self.key_pattern) {
-                    past_upper = entry_past_upper_bound(&entry, bounds, &self.key_pattern);
+                if !entry_within_bounds(&entry, &encoded_bounds) {
+                    past_upper = entry_past_upper_bound(&entry, &encoded_bounds);
                     continue;
                 }
-                entries.push(entry.into_index_entry(&self.key_pattern));
+                entries.extend(entry.into_index_entries(&self.key_pattern)?);
             }
             if past_upper {
                 break;
@@ -161,12 +168,12 @@ impl SecondaryTree {
         let Some(root_page_id) = self.root_page_id else {
             return Ok(None);
         };
+        let encoded_key = encode_index_key(key, &self.key_pattern)?;
         let leaf_page_id = find_leaf_for_lower_bound(
             reader,
             root_page_id,
-            &self.key_pattern,
-            &IndexBound {
-                key: key.clone(),
+            &EncodedBound {
+                key: encoded_key.clone(),
                 inclusive: true,
             },
         )?;
@@ -177,17 +184,16 @@ impl SecondaryTree {
                 .entries
                 .binary_search_by(|entry| {
                     compare_secondary_tuple(
-                        &entry.key,
-                        entry.record_id,
-                        key,
+                        &entry.normalized_key,
+                        entry.first_record_id(),
+                        &encoded_key,
                         u64::MIN,
-                        &self.key_pattern,
                     )
                 })
                 .unwrap_or_else(|position| position);
             for entry in leaf.entries.iter().skip(start) {
-                match compare_secondary_keys(&entry.key, key, &self.key_pattern) {
-                    Ordering::Equal => return Ok(Some(entry.record_id)),
+                match compare_encoded_index_keys(&entry.normalized_key, &encoded_key) {
+                    Ordering::Equal => return Ok(Some(entry.first_record_id())),
                     Ordering::Greater => return Ok(None),
                     Ordering::Less => {}
                 }
@@ -219,8 +225,7 @@ fn leftmost_secondary_leaf<R: PageReader>(reader: &R, mut page_id: PageId) -> Re
 fn find_leaf_for_lower_bound<R: PageReader>(
     reader: &R,
     mut page_id: PageId,
-    key_pattern: &Document,
-    lower: &IndexBound,
+    lower: &EncodedBound,
 ) -> Result<PageId> {
     let target_record_id = if lower.inclusive { u64::MIN } else { u64::MAX };
     loop {
@@ -229,8 +234,7 @@ fn find_leaf_for_lower_bound<R: PageReader>(
             PageKind::SecondaryLeaf => return Ok(page_id),
             PageKind::SecondaryInternal => {
                 let internal = SecondaryInternalPage::decode(page.as_ref())?;
-                page_id =
-                    child_for_secondary_entry(&internal, &lower.key, target_record_id, key_pattern);
+                page_id = child_for_secondary_entry(&internal, &lower.key, target_record_id);
             }
             other => {
                 return Err(anyhow!(
@@ -253,19 +257,13 @@ fn child_for_record_id(page: &RecordInternalPage, record_id: u64) -> PageId {
     }
 }
 
-fn child_for_secondary_entry(
-    page: &SecondaryInternalPage,
-    key: &Document,
-    record_id: u64,
-    key_pattern: &Document,
-) -> PageId {
+fn child_for_secondary_entry(page: &SecondaryInternalPage, key: &[u8], record_id: u64) -> PageId {
     match page.separators.binary_search_by(|separator| {
         compare_secondary_tuple(
-            &separator.key,
+            &separator.normalized_key,
             separator.record_id,
             key,
             record_id,
-            key_pattern,
         )
     }) {
         Ok(index) => page.separators[index].child_page_id,
@@ -274,81 +272,71 @@ fn child_for_secondary_entry(
     }
 }
 
-fn entry_within_bounds(
-    entry: &SecondaryEntry,
-    bounds: &IndexBounds,
-    key_pattern: &Document,
-) -> bool {
-    entry_satisfies_lower_bound(entry, bounds.lower.as_ref(), key_pattern)
-        && entry_satisfies_upper_bound(entry, bounds.upper.as_ref(), key_pattern)
+fn encode_bounds(bounds: &IndexBounds, key_pattern: &Document) -> Result<EncodedBounds> {
+    Ok(EncodedBounds {
+        lower: bounds
+            .lower
+            .as_ref()
+            .map(|bound| {
+                Ok::<EncodedBound, anyhow::Error>(EncodedBound {
+                    key: encode_index_key(&bound.key, key_pattern)?,
+                    inclusive: bound.inclusive,
+                })
+            })
+            .transpose()?,
+        upper: bounds
+            .upper
+            .as_ref()
+            .map(|bound| {
+                Ok::<EncodedBound, anyhow::Error>(EncodedBound {
+                    key: encode_index_key(&bound.key, key_pattern)?,
+                    inclusive: bound.inclusive,
+                })
+            })
+            .transpose()?,
+    })
 }
 
-fn entry_satisfies_lower_bound(
-    entry: &SecondaryEntry,
-    lower: Option<&IndexBound>,
-    key_pattern: &Document,
-) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedBounds {
+    lower: Option<EncodedBound>,
+    upper: Option<EncodedBound>,
+}
+
+fn entry_within_bounds(entry: &SecondaryEntry, bounds: &EncodedBounds) -> bool {
+    entry_satisfies_lower_bound(entry, bounds.lower.as_ref())
+        && entry_satisfies_upper_bound(entry, bounds.upper.as_ref())
+}
+
+fn entry_satisfies_lower_bound(entry: &SecondaryEntry, lower: Option<&EncodedBound>) -> bool {
     lower.is_none_or(|bound| {
-        let ordering = compare_secondary_keys(&entry.key, &bound.key, key_pattern);
+        let ordering = compare_encoded_index_keys(&entry.normalized_key, &bound.key);
         ordering.is_gt() || (bound.inclusive && ordering.is_eq())
     })
 }
 
-fn entry_satisfies_upper_bound(
-    entry: &SecondaryEntry,
-    upper: Option<&IndexBound>,
-    key_pattern: &Document,
-) -> bool {
+fn entry_satisfies_upper_bound(entry: &SecondaryEntry, upper: Option<&EncodedBound>) -> bool {
     upper.is_none_or(|bound| {
-        let ordering = compare_secondary_keys(&entry.key, &bound.key, key_pattern);
+        let ordering = compare_encoded_index_keys(&entry.normalized_key, &bound.key);
         ordering.is_lt() || (bound.inclusive && ordering.is_eq())
     })
 }
 
-fn entry_past_upper_bound(
-    entry: &SecondaryEntry,
-    bounds: &IndexBounds,
-    key_pattern: &Document,
-) -> bool {
+fn entry_past_upper_bound(entry: &SecondaryEntry, bounds: &EncodedBounds) -> bool {
     bounds.upper.as_ref().is_some_and(|bound| {
-        let ordering = compare_secondary_keys(&entry.key, &bound.key, key_pattern);
+        let ordering = compare_encoded_index_keys(&entry.normalized_key, &bound.key);
         ordering.is_gt() || (!bound.inclusive && ordering.is_eq())
     })
 }
 
 fn compare_secondary_tuple(
-    left_key: &Document,
+    left_key: &[u8],
     left_record_id: u64,
-    right_key: &Document,
+    right_key: &[u8],
     right_record_id: u64,
-    key_pattern: &Document,
 ) -> Ordering {
-    compare_secondary_keys(left_key, right_key, key_pattern)
+    compare_encoded_index_keys(left_key, right_key)
         .then_with(|| left_record_id.cmp(&right_record_id))
-}
-
-fn compare_secondary_keys(left: &Document, right: &Document, key_pattern: &Document) -> Ordering {
-    for (field, direction) in key_pattern {
-        let left_value = left.get(field).unwrap_or(&Bson::Null);
-        let right_value = right.get(field).unwrap_or(&Bson::Null);
-        let mut ordering = compare_bson(left_value, right_value);
-        if key_direction(direction) < 0 {
-            ordering = ordering.reverse();
-        }
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
-}
-
-fn key_direction(value: &Bson) -> i32 {
-    match value {
-        Bson::Int32(direction) if *direction < 0 => -1,
-        Bson::Int64(direction) if *direction < 0 => -1,
-        Bson::Double(direction) if *direction < 0.0 => -1,
-        _ => 1,
-    }
 }
 
 #[cfg(test)]
@@ -461,11 +449,18 @@ mod tests {
             SecondaryInternalPage {
                 page_id: 10,
                 first_child_page_id: 11,
-                separators: vec![SecondarySeparator {
-                    key: doc! { "sku": "b", "qty": 5 },
-                    record_id: 3,
-                    child_page_id: 12,
-                }],
+                separators: vec![
+                    SecondarySeparator::from_index_entry(
+                        &IndexEntry {
+                            record_id: 3,
+                            key: doc! { "sku": "b", "qty": 5 },
+                            present_fields: vec!["sku".to_string(), "qty".to_string()],
+                        },
+                        12,
+                        &key_pattern,
+                    )
+                    .expect("separator"),
+                ],
             }
             .encode()
             .expect("encode secondary internal")
@@ -575,11 +570,18 @@ mod tests {
             SecondaryInternalPage {
                 page_id: 1,
                 first_child_page_id: 2,
-                separators: vec![SecondarySeparator {
-                    key: doc! { "_id": 3 },
-                    record_id: 12,
-                    child_page_id: 3,
-                }],
+                separators: vec![
+                    SecondarySeparator::from_index_entry(
+                        &IndexEntry {
+                            record_id: 12,
+                            key: doc! { "_id": 3 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        3,
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("separator"),
+                ],
             }
             .encode()
             .expect("encode internal")
@@ -591,16 +593,24 @@ mod tests {
                 page_id: 2,
                 next_page_id: Some(3),
                 entries: vec![
-                    SecondaryEntry {
-                        record_id: 10,
-                        key: doc! { "_id": 1 },
-                        present_mask: 1,
-                    },
-                    SecondaryEntry {
-                        record_id: 11,
-                        key: doc! { "_id": 2 },
-                        present_mask: 1,
-                    },
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 10,
+                            key: doc! { "_id": 1 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 11,
+                            key: doc! { "_id": 2 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
                 ],
             }
             .encode()
@@ -613,16 +623,24 @@ mod tests {
                 page_id: 3,
                 next_page_id: None,
                 entries: vec![
-                    SecondaryEntry {
-                        record_id: 12,
-                        key: doc! { "_id": 3 },
-                        present_mask: 1,
-                    },
-                    SecondaryEntry {
-                        record_id: 13,
-                        key: doc! { "_id": 4 },
-                        present_mask: 1,
-                    },
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 12,
+                            key: doc! { "_id": 3 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 13,
+                            key: doc! { "_id": 4 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
                 ],
             }
             .encode()

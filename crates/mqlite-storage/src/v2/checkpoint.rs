@@ -17,6 +17,7 @@ use crate::v2::{
         CollectionMeta, IndexMeta, PersistedIndexStats, PersistedValueFrequency, RootSet,
         SummaryCounters,
     },
+    keycodec::encode_index_key,
     layout::{
         DATA_START_OFFSET, DEFAULT_PAGE_SIZE, FILE_MAGIC, FileHeader, HEADER_LEN, SUPERBLOCK_COUNT,
         SUPERBLOCK_LEN, page_offset,
@@ -602,14 +603,34 @@ impl CheckpointWriter {
             return Ok((None, 0, 0));
         }
         let mut index_bytes = 0_u64;
-        let secondary_entries = entries
-            .iter()
-            .map(|entry| {
-                index_bytes += bson::to_vec(&entry.key)?.len() as u64;
-                SecondaryEntry::from_index_entry(entry, &index.key)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let entry_count = secondary_entries.len() as u64;
+        let mut secondary_entries = Vec::new();
+        let mut current_group = Vec::new();
+        let mut current_key: Option<Vec<u8>> = None;
+        for entry in entries.iter().cloned() {
+            let encoded_key = encode_index_key(&entry.key, &index.key)?;
+            match current_key.as_ref() {
+                Some(existing) if *existing == encoded_key => current_group.push(entry),
+                _ => {
+                    if !current_group.is_empty() {
+                        secondary_entries.push(SecondaryEntry::from_index_entries(
+                            &current_group,
+                            &index.key,
+                        )?);
+                        current_group.clear();
+                    }
+                    index_bytes += bson::to_vec(&entry.key)?.len() as u64;
+                    current_key = Some(encoded_key);
+                    current_group.push(entry);
+                }
+            }
+        }
+        if !current_group.is_empty() {
+            secondary_entries.push(SecondaryEntry::from_index_entries(
+                &current_group,
+                &index.key,
+            )?);
+        }
+        let entry_count = entries.len() as u64;
 
         let leaf_chunks = chunk_by_encode(secondary_entries, |chunk| {
             SecondaryLeafPage {
@@ -661,11 +682,7 @@ impl CheckpointWriter {
                 separators: chunk
                     .iter()
                     .skip(1)
-                    .map(|child| SecondarySeparator {
-                        key: child.first_entry.key.clone(),
-                        record_id: child.first_entry.record_id,
-                        child_page_id: child.page_id,
-                    })
+                    .map(|child| SecondarySeparator::from_entry(&child.first_entry, child.page_id))
                     .collect(),
             }
             .encode()
@@ -683,10 +700,8 @@ impl CheckpointWriter {
                     separators: chunk
                         .iter()
                         .skip(1)
-                        .map(|child| SecondarySeparator {
-                            key: child.first_entry.key.clone(),
-                            record_id: child.first_entry.record_id,
-                            child_page_id: child.page_id,
+                        .map(|child| {
+                            SecondarySeparator::from_entry(&child.first_entry, child.page_id)
                         })
                         .collect(),
                 }
@@ -876,7 +891,7 @@ mod tests {
         assert_eq!(index.present_count("sku"), Some(2));
 
         let info = DatabaseFile::info(&path).expect("info");
-        assert_eq!(info.file_format_version, 8);
+        assert_eq!(info.file_format_version, 9);
         assert_eq!(info.summary.collection_count, 1);
         assert_eq!(info.summary.index_count, 2);
         assert_eq!(info.summary.record_count, 2);

@@ -3,15 +3,15 @@ use blake3::Hasher;
 
 use crate::v2::catalog::{RootSet, SummaryCounters};
 
-pub const FILE_MAGIC: &[u8; 8] = b"MQLTHD08";
-pub const FILE_FORMAT_VERSION: u32 = 8;
+pub const FILE_MAGIC: &[u8; 8] = b"MQLTHD09";
+pub const FILE_FORMAT_VERSION: u32 = 9;
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 pub const HEADER_LEN: usize = 4096;
 pub const SUPERBLOCK_COUNT: usize = 2;
 pub const SUPERBLOCK_LEN: usize = DEFAULT_PAGE_SIZE as usize;
 pub const DATA_START_OFFSET: u64 = (HEADER_LEN + SUPERBLOCK_COUNT * SUPERBLOCK_LEN) as u64;
 pub const HEADER_CHECKSUM_OFFSET: usize = 48;
-pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB08";
+pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"MQLTSB09";
 const ROOT_SET_OFFSET: usize = 56;
 const SUMMARY_OFFSET: usize = 104;
 const SUPERBLOCK_CHECKSUM_OFFSET: usize = 184;

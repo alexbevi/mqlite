@@ -390,7 +390,7 @@ mod tests {
         assert!(is_v2_file(&path).expect("detect v2 magic"));
 
         let report = read_info(&path).expect("read v2 info");
-        assert_eq!(report.file_format_version, 8);
+        assert_eq!(report.file_format_version, 9);
         assert_eq!(report.summary.record_count, 0);
         assert_eq!(report.summary.index_count, 0);
         assert_eq!(report.last_checkpoint.active_superblock_slot, 0);
@@ -408,7 +408,7 @@ mod tests {
         create_empty(&path).expect("create v2 file");
 
         let report = read_inspect(&path).expect("read v2 inspect");
-        assert_eq!(report.file_format_version, 8);
+        assert_eq!(report.file_format_version, 9);
         assert_eq!(report.current_record_count, 0);
         assert_eq!(report.checkpoint_page_count, 0);
         assert_eq!(report.active_superblock_slot, 0);
@@ -483,6 +483,69 @@ mod tests {
         assert_eq!(
             widgets.records[1].document,
             doc! { "_id": 2, "sku": "beta" }
+        );
+    }
+
+    #[test]
+    fn loads_duplicate_secondary_keys_from_v2_posting_lists() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = PathBuf::from(temp_dir.path().join("v2-duplicate-keys.mongodb"));
+
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(
+                1,
+                doc! { "_id": 1, "category": "tools" },
+            ))
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord::new(
+                2,
+                doc! { "_id": 2, "category": "tools" },
+            ))
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord::new(
+                3,
+                doc! { "_id": 3, "category": "books" },
+            ))
+            .expect("insert");
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "category": 1 }, "name": "category_1", "unique": false }],
+        )
+        .expect("index");
+
+        let mut catalog = Catalog {
+            databases: BTreeMap::new(),
+        };
+        catalog.replace_collection("app", "widgets", collection);
+        write_catalog_checkpoint(&path, &catalog).expect("write checkpoint");
+
+        let loaded = load_catalog(&path).expect("load catalog");
+        let category_index = loaded
+            .get_collection("app", "widgets")
+            .expect("widgets collection")
+            .indexes
+            .get("category_1")
+            .expect("category index");
+        let entries = category_index.scan_entries(&mqlite_catalog::IndexBounds {
+            lower: Some(mqlite_catalog::IndexBound {
+                key: doc! { "category": "tools" },
+                inclusive: true,
+            }),
+            upper: Some(mqlite_catalog::IndexBound {
+                key: doc! { "category": "tools" },
+                inclusive: true,
+            }),
+        });
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| entry.record_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 
