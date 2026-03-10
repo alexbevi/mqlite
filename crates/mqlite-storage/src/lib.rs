@@ -1,5 +1,6 @@
 mod database;
 mod engine;
+mod v2;
 
 pub use database::{
     CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
