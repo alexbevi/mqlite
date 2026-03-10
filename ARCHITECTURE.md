@@ -91,12 +91,15 @@ The current format version is encoded in the header and checkpoint snapshot. Rec
 The in-progress v2 format uses 8 KiB fixed pages behind the same single-file model. Its page set is
 typed up front rather than being reconstructed from checkpoint snapshot references:
 
+- namespace internal and leaf pages keyed by namespace or index-name strings
+- collection-meta and index-meta pages for page roots, key patterns, and counters
 - record internal and leaf pages keyed by stable `RecordId`
 - secondary-index internal and leaf pages keyed by persisted BSON key plus `RecordId`
 - two rotating superblocks with summary counters for metadata-only open paths
 
 Those v2 pages are not broker-default yet, but the storage crate now has direct page codecs and
-read handles for them so later planner and broker work can avoid full catalog hydration on reopen.
+read handles for them. It can now resolve a collection through persisted namespace metadata and
+serve page-backed collection and index read views without full catalog hydration on reopen.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug
@@ -104,7 +107,7 @@ in page-backed record and index handles later without changing the planner’s c
 surface. The broker’s `find` and `explain` read paths now ask the storage engine for that borrowed
 collection read view instead of reaching straight through to `Catalog` state. The v2 collection and
 index handles now also implement that shared read-view surface over a pager, so the remaining gap
-is namespace loading and write-side durability rather than planner compatibility.
+is write-side durability and full broker cutover rather than planner compatibility.
 
 ## Snapshot Contents
 

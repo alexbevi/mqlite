@@ -1,9 +1,13 @@
 use anyhow::{Result, anyhow};
 use blake3::Hasher;
 use bson::Document;
+use ciborium::{de as cbor_de, ser as cbor_ser};
 use mqlite_catalog::IndexEntry;
 
-use crate::v2::layout::{DEFAULT_PAGE_SIZE, PageKind};
+use crate::v2::{
+    catalog::{CollectionMeta, IndexMeta},
+    layout::{DEFAULT_PAGE_SIZE, PageKind},
+};
 
 pub(crate) type PageId = u64;
 
@@ -15,6 +19,9 @@ const RECORD_LEAF_SLOT_LEN: usize = 16;
 const RECORD_INTERNAL_SLOT_LEN: usize = 16;
 const SECONDARY_LEAF_SLOT_LEN: usize = 24;
 const SECONDARY_INTERNAL_SLOT_LEN: usize = 20;
+const NAMESPACE_LEAF_SLOT_LEN: usize = 12;
+const NAMESPACE_INTERNAL_SLOT_LEN: usize = 12;
+const META_SLOT_LEN: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordSlot {
@@ -356,6 +363,213 @@ impl SecondaryInternalPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamespaceEntry {
+    pub name: String,
+    pub target_page_id: PageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamespaceLeafPage {
+    pub page_id: PageId,
+    pub next_page_id: Option<PageId>,
+    pub entries: Vec<NamespaceEntry>,
+}
+
+impl NamespaceLeafPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut bytes = [0_u8; PAGE_LEN];
+        encode_header(
+            &mut bytes,
+            PageKind::NamespaceLeaf,
+            self.page_id,
+            self.next_page_id,
+            self.entries.len(),
+        )?;
+
+        let mut upper = PAGE_LEN;
+        let slot_area_end = page_slot_area_end(self.entries.len(), NAMESPACE_LEAF_SLOT_LEN)?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let name_bytes = entry.name.as_bytes();
+            upper = upper
+                .checked_sub(name_bytes.len())
+                .ok_or_else(|| anyhow!("namespace leaf page {} overflows", self.page_id))?;
+            if upper < slot_area_end {
+                return Err(anyhow!(
+                    "namespace leaf page {} exceeds page capacity",
+                    self.page_id
+                ));
+            }
+            bytes[upper..upper + name_bytes.len()].copy_from_slice(name_bytes);
+
+            let slot_offset = PAGE_HEADER_LEN + index * NAMESPACE_LEAF_SLOT_LEN;
+            bytes[slot_offset..slot_offset + 8]
+                .copy_from_slice(&entry.target_page_id.to_le_bytes());
+            bytes[slot_offset + 8..slot_offset + 10].copy_from_slice(&(upper as u16).to_le_bytes());
+            bytes[slot_offset + 10..slot_offset + 12]
+                .copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        }
+
+        finalize_checksum(&mut bytes);
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::NamespaceLeaf)?;
+        let mut entries = Vec::with_capacity(header.cell_count);
+        for index in 0..header.cell_count {
+            let slot_offset = PAGE_HEADER_LEN + index * NAMESPACE_LEAF_SLOT_LEN;
+            let target_page_id =
+                u64::from_le_bytes(bytes[slot_offset..slot_offset + 8].try_into()?);
+            let payload_offset =
+                u16::from_le_bytes(bytes[slot_offset + 8..slot_offset + 10].try_into()?);
+            let payload_len =
+                u16::from_le_bytes(bytes[slot_offset + 10..slot_offset + 12].try_into()?);
+            entries.push(NamespaceEntry {
+                target_page_id,
+                name: String::from_utf8(
+                    slice_payload(bytes, payload_offset, payload_len)?.to_vec(),
+                )?,
+            });
+        }
+
+        Ok(Self {
+            page_id: header.page_id,
+            next_page_id: header.aux_page_id,
+            entries,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamespaceSeparator {
+    pub name: String,
+    pub child_page_id: PageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamespaceInternalPage {
+    pub page_id: PageId,
+    pub first_child_page_id: PageId,
+    pub separators: Vec<NamespaceSeparator>,
+}
+
+impl NamespaceInternalPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut bytes = [0_u8; PAGE_LEN];
+        encode_header(
+            &mut bytes,
+            PageKind::NamespaceInternal,
+            self.page_id,
+            Some(self.first_child_page_id),
+            self.separators.len(),
+        )?;
+
+        let mut upper = PAGE_LEN;
+        let slot_area_end = page_slot_area_end(self.separators.len(), NAMESPACE_INTERNAL_SLOT_LEN)?;
+        for (index, separator) in self.separators.iter().enumerate() {
+            let name_bytes = separator.name.as_bytes();
+            upper = upper
+                .checked_sub(name_bytes.len())
+                .ok_or_else(|| anyhow!("namespace internal page {} overflows", self.page_id))?;
+            if upper < slot_area_end {
+                return Err(anyhow!(
+                    "namespace internal page {} exceeds page capacity",
+                    self.page_id
+                ));
+            }
+            bytes[upper..upper + name_bytes.len()].copy_from_slice(name_bytes);
+
+            let slot_offset = PAGE_HEADER_LEN + index * NAMESPACE_INTERNAL_SLOT_LEN;
+            bytes[slot_offset..slot_offset + 8]
+                .copy_from_slice(&separator.child_page_id.to_le_bytes());
+            bytes[slot_offset + 8..slot_offset + 10].copy_from_slice(&(upper as u16).to_le_bytes());
+            bytes[slot_offset + 10..slot_offset + 12]
+                .copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        }
+
+        finalize_checksum(&mut bytes);
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::NamespaceInternal)?;
+        let first_child_page_id = header.aux_page_id.ok_or_else(|| {
+            anyhow!(
+                "namespace internal page {} is missing first child",
+                header.page_id
+            )
+        })?;
+        let mut separators = Vec::with_capacity(header.cell_count);
+        for index in 0..header.cell_count {
+            let slot_offset = PAGE_HEADER_LEN + index * NAMESPACE_INTERNAL_SLOT_LEN;
+            let child_page_id = u64::from_le_bytes(bytes[slot_offset..slot_offset + 8].try_into()?);
+            let payload_offset =
+                u16::from_le_bytes(bytes[slot_offset + 8..slot_offset + 10].try_into()?);
+            let payload_len =
+                u16::from_le_bytes(bytes[slot_offset + 10..slot_offset + 12].try_into()?);
+            separators.push(NamespaceSeparator {
+                child_page_id,
+                name: String::from_utf8(
+                    slice_payload(bytes, payload_offset, payload_len)?.to_vec(),
+                )?,
+            });
+        }
+
+        Ok(Self {
+            page_id: header.page_id,
+            first_child_page_id,
+            separators,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollectionMetaPage {
+    pub page_id: PageId,
+    pub meta: CollectionMeta,
+}
+
+impl CollectionMetaPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut payload = Vec::new();
+        cbor_ser::into_writer(&self.meta, &mut payload)?;
+        encode_single_payload_page(PageKind::CollectionMeta, self.page_id, &payload)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::CollectionMeta)?;
+        let payload = decode_single_payload(bytes)?;
+        Ok(Self {
+            page_id: header.page_id,
+            meta: cbor_de::from_reader(payload)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexMetaPage {
+    pub page_id: PageId,
+    pub meta: IndexMeta,
+}
+
+impl IndexMetaPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut payload = Vec::new();
+        cbor_ser::into_writer(&self.meta, &mut payload)?;
+        encode_single_payload_page(PageKind::IndexMeta, self.page_id, &payload)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::IndexMeta)?;
+        let payload = decode_single_payload(bytes)?;
+        Ok(Self {
+            page_id: header.page_id,
+            meta: cbor_de::from_reader(payload)?,
+        })
+    }
+}
+
 pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
     if bytes.len() < PAGE_LEN {
         return Err(anyhow!("v2 page is truncated"));
@@ -384,6 +598,37 @@ fn slice_payload(bytes: &[u8], payload_offset: u16, payload_len: u16) -> Result<
         return Err(anyhow!("page payload points outside the page"));
     }
     Ok(&bytes[start..end])
+}
+
+fn encode_single_payload_page(
+    page_kind: PageKind,
+    page_id: PageId,
+    payload: &[u8],
+) -> Result<[u8; PAGE_LEN]> {
+    let mut bytes = [0_u8; PAGE_LEN];
+    encode_header(&mut bytes, page_kind, page_id, None, 1)?;
+    let slot_area_end = page_slot_area_end(1, META_SLOT_LEN)?;
+    let payload_offset = PAGE_LEN
+        .checked_sub(payload.len())
+        .ok_or_else(|| anyhow!("page {page_id} overflows"))?;
+    if payload_offset < slot_area_end {
+        return Err(anyhow!("page {page_id} exceeds page capacity"));
+    }
+    bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+    bytes[PAGE_HEADER_LEN..PAGE_HEADER_LEN + 2]
+        .copy_from_slice(&(payload_offset as u16).to_le_bytes());
+    bytes[PAGE_HEADER_LEN + 2..PAGE_HEADER_LEN + 4]
+        .copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    finalize_checksum(&mut bytes);
+    Ok(bytes)
+}
+
+fn decode_single_payload(bytes: &[u8]) -> Result<&[u8]> {
+    let payload_offset =
+        u16::from_le_bytes(bytes[PAGE_HEADER_LEN..PAGE_HEADER_LEN + 2].try_into()?);
+    let payload_len =
+        u16::from_le_bytes(bytes[PAGE_HEADER_LEN + 2..PAGE_HEADER_LEN + 4].try_into()?);
+    slice_payload(bytes, payload_offset, payload_len)
 }
 
 fn present_mask_for_fields(key_pattern: &Document, present_fields: &[String]) -> Result<u64> {
@@ -484,9 +729,11 @@ mod tests {
     use mqlite_catalog::IndexEntry;
 
     use super::{
-        RecordInternalPage, RecordLeafPage, RecordSeparator, RecordSlot, SecondaryEntry,
-        SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
+        CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
+        NamespaceLeafPage, NamespaceSeparator, RecordInternalPage, RecordLeafPage, RecordSeparator,
+        RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
     };
+    use crate::v2::catalog::{CollectionMeta, IndexMeta, SummaryCounters};
 
     #[test]
     fn round_trips_record_pages() {
@@ -560,5 +807,79 @@ mod tests {
             SecondaryInternalPage::decode(&internal.encode().expect("encode internal"))
                 .expect("decode internal");
         assert_eq!(decoded_internal, internal);
+    }
+
+    #[test]
+    fn round_trips_namespace_pages() {
+        let leaf = NamespaceLeafPage {
+            page_id: 7,
+            next_page_id: Some(8),
+            entries: vec![
+                NamespaceEntry {
+                    name: "app.widgets".to_string(),
+                    target_page_id: 21,
+                },
+                NamespaceEntry {
+                    name: "app.widgets:sku_1".to_string(),
+                    target_page_id: 22,
+                },
+            ],
+        };
+        let decoded_leaf =
+            NamespaceLeafPage::decode(&leaf.encode().expect("encode leaf")).expect("decode leaf");
+        assert_eq!(decoded_leaf, leaf);
+
+        let internal = NamespaceInternalPage {
+            page_id: 9,
+            first_child_page_id: 7,
+            separators: vec![NamespaceSeparator {
+                name: "app.widgets".to_string(),
+                child_page_id: 8,
+            }],
+        };
+        let decoded_internal =
+            NamespaceInternalPage::decode(&internal.encode().expect("encode internal"))
+                .expect("decode internal");
+        assert_eq!(decoded_internal, internal);
+    }
+
+    #[test]
+    fn round_trips_meta_pages() {
+        let collection = CollectionMetaPage {
+            page_id: 11,
+            meta: CollectionMeta {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                record_root_page_id: Some(31),
+                index_directory_root_page_id: Some(32),
+                options_bytes: bson::to_vec(&doc! { "capped": false }).expect("options"),
+                next_record_id: 17,
+                summary: SummaryCounters {
+                    record_count: 4,
+                    index_count: 2,
+                    ..SummaryCounters::default()
+                },
+            },
+        };
+        let decoded_collection =
+            CollectionMetaPage::decode(&collection.encode().expect("encode collection meta"))
+                .expect("decode collection meta");
+        assert_eq!(decoded_collection, collection);
+
+        let index = IndexMetaPage {
+            page_id: 12,
+            meta: IndexMeta {
+                name: "sku_1".to_string(),
+                root_page_id: Some(41),
+                key_pattern_bytes: bson::to_vec(&doc! { "sku": 1 }).expect("pattern"),
+                unique: true,
+                expire_after_seconds: None,
+                entry_count: 4,
+                index_bytes: 256,
+            },
+        };
+        let decoded_index = IndexMetaPage::decode(&index.encode().expect("encode index meta"))
+            .expect("decode index meta");
+        assert_eq!(decoded_index, index);
     }
 }

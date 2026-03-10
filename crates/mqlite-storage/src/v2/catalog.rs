@@ -6,17 +6,21 @@ use std::{
 use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
 use mqlite_catalog::{CollectionRecord, IndexBounds, IndexEntry};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     engine::{CollectionReadView, IndexReadView},
     v2::{
         btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
-        page::RecordSlot,
+        page::{
+            CollectionMetaPage, IndexMetaPage, NamespaceInternalPage, NamespaceLeafPage, PageId,
+            RecordSlot, page_kind,
+        },
         pager::Pager,
     },
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootSet {
     pub namespace_root_page_id: Option<u64>,
     pub change_stream_root_page_id: Option<u64>,
@@ -26,7 +30,7 @@ pub struct RootSet {
     pub next_page_id: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryCounters {
     pub database_count: u64,
     pub collection_count: u64,
@@ -40,7 +44,7 @@ pub struct SummaryCounters {
     pub page_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionMeta {
     pub database: String,
     pub collection: String,
@@ -51,7 +55,7 @@ pub struct CollectionMeta {
     pub summary: SummaryCounters,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub name: String,
     pub root_page_id: Option<u64>,
@@ -296,6 +300,139 @@ impl IndexReadView for PagerIndexReadView {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PagerNamespaceCatalog {
+    namespace_root_page_id: Option<PageId>,
+    pager: Arc<Mutex<Pager>>,
+}
+
+impl PagerNamespaceCatalog {
+    pub fn new(namespace_root_page_id: Option<PageId>, pager: Arc<Mutex<Pager>>) -> Self {
+        Self {
+            namespace_root_page_id,
+            pager,
+        }
+    }
+
+    pub fn collection_read_view(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<PagerCollectionReadView>> {
+        let mut pager = lock_pager(&self.pager)?;
+        let Some(collection_meta_page_id) = lookup_namespace_target(
+            &mut *pager,
+            self.namespace_root_page_id,
+            &format!("{database}.{collection}"),
+        )?
+        else {
+            return Ok(None);
+        };
+        let collection = load_collection_handle(&mut *pager, collection_meta_page_id)?;
+        drop(pager);
+        Ok(Some(PagerCollectionReadView::new(
+            collection,
+            Arc::clone(&self.pager),
+        )))
+    }
+}
+
+fn lookup_namespace_target<R: PageReader>(
+    reader: &mut R,
+    mut page_id: Option<PageId>,
+    target: &str,
+) -> Result<Option<PageId>> {
+    while let Some(current_page_id) = page_id {
+        let page = reader.read_page(current_page_id)?;
+        match page_kind(&page)? {
+            crate::v2::layout::PageKind::NamespaceLeaf => {
+                let leaf = NamespaceLeafPage::decode(&page)?;
+                match leaf
+                    .entries
+                    .binary_search_by(|entry| entry.name.as_str().cmp(target))
+                {
+                    Ok(position) => return Ok(Some(leaf.entries[position].target_page_id)),
+                    Err(_) => {
+                        let should_advance = leaf
+                            .entries
+                            .last()
+                            .is_some_and(|entry| entry.name.as_str() < target);
+                        page_id = if should_advance {
+                            leaf.next_page_id
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+            crate::v2::layout::PageKind::NamespaceInternal => {
+                let internal = NamespaceInternalPage::decode(&page)?;
+                let mut child_page_id = internal.first_child_page_id;
+                for separator in &internal.separators {
+                    if target < separator.name.as_str() {
+                        break;
+                    }
+                    child_page_id = separator.child_page_id;
+                }
+                page_id = Some(child_page_id);
+            }
+            other => return Err(anyhow!("expected namespace page, found {:?}", other)),
+        }
+    }
+    Ok(None)
+}
+
+fn load_collection_handle<R: PageReader>(
+    reader: &mut R,
+    meta_page_id: PageId,
+) -> Result<CollectionHandle> {
+    let page = reader.read_page(meta_page_id)?;
+    let meta = CollectionMetaPage::decode(&page)?.meta;
+    let indexes = load_index_handles(reader, meta.index_directory_root_page_id)?;
+    CollectionHandle::new(meta, indexes)
+}
+
+fn load_index_handles<R: PageReader>(
+    reader: &mut R,
+    root_page_id: Option<PageId>,
+) -> Result<Vec<IndexHandle>> {
+    let Some(mut leaf_page_id) = leftmost_namespace_leaf(reader, root_page_id)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut indexes = Vec::new();
+    loop {
+        let leaf = NamespaceLeafPage::decode(&reader.read_page(leaf_page_id)?)?;
+        for entry in &leaf.entries {
+            let page = reader.read_page(entry.target_page_id)?;
+            indexes.push(IndexHandle::new(IndexMetaPage::decode(&page)?.meta)?);
+        }
+        match leaf.next_page_id {
+            Some(next_page_id) => leaf_page_id = next_page_id,
+            None => break,
+        }
+    }
+
+    Ok(indexes)
+}
+
+fn leftmost_namespace_leaf<R: PageReader>(
+    reader: &mut R,
+    mut page_id: Option<PageId>,
+) -> Result<Option<PageId>> {
+    while let Some(current_page_id) = page_id {
+        let page = reader.read_page(current_page_id)?;
+        match page_kind(&page)? {
+            crate::v2::layout::PageKind::NamespaceLeaf => return Ok(Some(current_page_id)),
+            crate::v2::layout::PageKind::NamespaceInternal => {
+                page_id = Some(NamespaceInternalPage::decode(&page)?.first_child_page_id);
+            }
+            other => return Err(anyhow!("expected namespace page, found {:?}", other)),
+        }
+    }
+    Ok(None)
+}
+
 fn lock_pager(pager: &Arc<Mutex<Pager>>) -> Result<MutexGuard<'_, Pager>> {
     pager
         .lock()
@@ -318,7 +455,7 @@ mod tests {
 
     use super::{
         CollectionHandle, CollectionMeta, IndexHandle, IndexMeta, PagerCollectionReadView,
-        SummaryCounters,
+        PagerNamespaceCatalog, SummaryCounters,
     };
     use crate::{
         engine::CollectionReadView,
@@ -326,7 +463,10 @@ mod tests {
             btree::PageReader,
             engine::create_empty,
             layout::{DEFAULT_PAGE_SIZE, page_offset},
-            page::{PageId, RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage},
+            page::{
+                CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceLeafPage, PageId,
+                RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage,
+            },
             pager::Pager,
         },
     };
@@ -501,6 +641,130 @@ mod tests {
         let records = view.scan_records().expect("scan records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_id, 10);
+        assert_eq!(
+            view.record_document(10).expect("record document"),
+            Some(doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+        );
+        assert_eq!(view.index_names(), vec!["_id_".to_string()]);
+    }
+
+    #[test]
+    fn pager_namespace_catalog_loads_collection_views_from_namespace_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("namespace-view.mongodb");
+        create_empty(&path).expect("create v2 file");
+
+        write_page(
+            &path,
+            1,
+            &NamespaceLeafPage {
+                page_id: 1,
+                next_page_id: None,
+                entries: vec![NamespaceEntry {
+                    name: "app.widgets".to_string(),
+                    target_page_id: 2,
+                }],
+            }
+            .encode()
+            .expect("encode namespace leaf"),
+        );
+        write_page(
+            &path,
+            2,
+            &CollectionMetaPage {
+                page_id: 2,
+                meta: CollectionMeta {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    record_root_page_id: Some(4),
+                    index_directory_root_page_id: Some(3),
+                    options_bytes: bson::to_vec(&doc! {}).expect("options"),
+                    next_record_id: 11,
+                    summary: SummaryCounters {
+                        record_count: 1,
+                        index_count: 1,
+                        ..SummaryCounters::default()
+                    },
+                },
+            }
+            .encode()
+            .expect("encode collection meta"),
+        );
+        write_page(
+            &path,
+            3,
+            &NamespaceLeafPage {
+                page_id: 3,
+                next_page_id: None,
+                entries: vec![NamespaceEntry {
+                    name: "_id_".to_string(),
+                    target_page_id: 5,
+                }],
+            }
+            .encode()
+            .expect("encode index directory"),
+        );
+        write_page(
+            &path,
+            4,
+            &RecordLeafPage {
+                page_id: 4,
+                next_page_id: None,
+                entries: vec![
+                    RecordSlot::from_document(10, &doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+                        .expect("record"),
+                ],
+            }
+            .encode()
+            .expect("encode records"),
+        );
+        write_page(
+            &path,
+            5,
+            &IndexMetaPage {
+                page_id: 5,
+                meta: IndexMeta {
+                    name: "_id_".to_string(),
+                    root_page_id: Some(6),
+                    key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
+                    unique: true,
+                    expire_after_seconds: None,
+                    entry_count: 1,
+                    index_bytes: 32,
+                },
+            }
+            .encode()
+            .expect("encode index meta"),
+        );
+        write_page(
+            &path,
+            6,
+            &SecondaryLeafPage {
+                page_id: 6,
+                next_page_id: None,
+                entries: vec![
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 10,
+                            key: doc! { "_id": 7 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
+                ],
+            }
+            .encode()
+            .expect("encode index"),
+        );
+
+        let pager = Arc::new(Mutex::new(Pager::open(&path).expect("open pager")));
+        let catalog = PagerNamespaceCatalog::new(Some(1), pager);
+        let view = catalog
+            .collection_read_view("app", "widgets")
+            .expect("load view")
+            .expect("collection view");
+
         assert_eq!(
             view.record_document(10).expect("record document"),
             Some(doc! { "_id": 7, "sku": "alpha", "qty": 4 })

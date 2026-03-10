@@ -2,6 +2,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::Result;
@@ -10,6 +11,7 @@ use fs4::FileExt;
 use crate::{
     InfoCheckpoint, InfoReport, InfoSummary, InfoWal,
     v2::{
+        catalog::{PagerCollectionReadView, PagerNamespaceCatalog},
         layout::{
             FILE_FORMAT_VERSION, FILE_MAGIC, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN,
             Superblock,
@@ -112,6 +114,25 @@ pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
         },
         databases: Vec::new(),
     })
+}
+
+pub(crate) fn open_namespace_catalog(path: impl AsRef<Path>) -> Result<PagerNamespaceCatalog> {
+    let pager = Arc::new(Mutex::new(Pager::open(path)?));
+    let namespace_root_page_id = pager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?
+        .active_superblock()
+        .roots
+        .namespace_root_page_id;
+    Ok(PagerNamespaceCatalog::new(namespace_root_page_id, pager))
+}
+
+pub(crate) fn open_collection_read_view(
+    path: impl AsRef<Path>,
+    database: &str,
+    collection: &str,
+) -> Result<Option<PagerCollectionReadView>> {
+    open_namespace_catalog(path)?.collection_read_view(database, collection)
 }
 
 #[cfg(test)]
