@@ -93,6 +93,7 @@ typed up front rather than being reconstructed from checkpoint snapshot referenc
 
 - namespace internal and leaf pages keyed by namespace or index-name strings
 - collection-meta and index-meta pages for page roots, key patterns, and counters
+- stats pages for persisted per-index value frequencies and field-presence counts
 - record internal and leaf pages keyed by stable `RecordId`
 - secondary-index internal and leaf pages keyed by persisted BSON key plus `RecordId`
 - two rotating superblocks with summary counters for metadata-only open paths
@@ -101,9 +102,11 @@ Those v2 pages are not broker-default yet, but the storage crate now has direct 
 read handles for them. It can now resolve a collection through persisted namespace metadata and
 serve page-backed collection and index read views without full catalog hydration on reopen. The
 storage crate can also emit a full v2 checkpoint from an in-memory catalog by writing namespace,
-meta, record, and secondary-index pages plus a new superblock summary. The v2 `info` path now
-builds its per-database, per-collection, and per-index report from that persisted namespace and
-meta page graph instead of returning only top-level counters.
+meta, record, secondary-index, and stats pages plus a new superblock summary. The v2 `info` path
+now builds its per-database, per-collection, and per-index report from that persisted namespace
+and meta page graph instead of returning only top-level counters. Page-backed v2 index read views
+also preserve histogram-style value frequencies and field-presence counts through checkpoint and
+reopen, so planning can keep using persisted estimates instead of rebuilding in-memory stats.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug

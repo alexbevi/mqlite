@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
+use mqlite_bson::compare_bson;
 use mqlite_catalog::{CollectionRecord, IndexBounds, IndexEntry};
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +15,7 @@ use crate::{
         btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
         page::{
             CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
-            NamespaceLeafPage, PageId, RecordSlot, page_kind,
+            NamespaceLeafPage, PageId, RecordSlot, StatsPage, page_kind,
         },
         pager::Pager,
     },
@@ -64,6 +65,20 @@ pub struct IndexMeta {
     pub expire_after_seconds: Option<i64>,
     pub entry_count: u64,
     pub index_bytes: u64,
+    pub stats_page_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedIndexStats {
+    pub entry_count: u64,
+    pub present_fields: BTreeMap<String, u64>,
+    pub value_frequencies: BTreeMap<String, Vec<PersistedValueFrequency>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedValueFrequency {
+    pub encoded_value: Vec<u8>,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,13 +158,15 @@ impl CollectionHandle {
 pub(crate) struct IndexHandle {
     meta: IndexMeta,
     key_pattern: Document,
+    stats: Option<PersistedIndexStats>,
 }
 
 impl IndexHandle {
-    pub fn new(meta: IndexMeta) -> Result<Self> {
+    pub fn new(meta: IndexMeta, stats: Option<PersistedIndexStats>) -> Result<Self> {
         Ok(Self {
             key_pattern: bson::from_slice(&meta.key_pattern_bytes)?,
             meta,
+            stats,
         })
     }
 
@@ -163,6 +180,10 @@ impl IndexHandle {
 
     pub fn key_pattern(&self) -> &Document {
         &self.key_pattern
+    }
+
+    pub fn stats(&self) -> Option<&PersistedIndexStats> {
+        self.stats.as_ref()
     }
 
     pub fn scan_bounds<R: PageReader>(
@@ -279,24 +300,60 @@ impl IndexReadView for PagerIndexReadView {
     }
 
     fn estimate_value_count(&self, _field: &str, _value: &Bson) -> Option<usize> {
-        None
+        let stats = self.index.stats()?;
+        stats
+            .value_frequencies
+            .get(_field)?
+            .iter()
+            .find_map(|frequency| {
+                decode_persisted_stat_value(&frequency.encoded_value)
+                    .ok()
+                    .filter(|candidate| compare_bson(candidate, _value).is_eq())
+                    .map(|_| frequency.count as usize)
+            })
     }
 
     fn estimate_values_count(&self, _field: &str, _values: &[Bson]) -> Option<usize> {
-        None
+        _values.iter().try_fold(0_usize, |total, value| {
+            self.estimate_value_count(_field, value)
+                .map(|count| total + count)
+        })
     }
 
     fn estimate_range_count(
         &self,
-        _field: &str,
-        _lower: Option<(&Bson, bool)>,
-        _upper: Option<(&Bson, bool)>,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
     ) -> Option<usize> {
-        None
+        let stats = self.index.stats()?;
+        let frequencies = stats.value_frequencies.get(field)?;
+        Some(
+            frequencies
+                .iter()
+                .filter_map(|frequency| {
+                    let value = decode_persisted_stat_value(&frequency.encoded_value).ok()?;
+                    let lower_ok = lower.is_none_or(|(bound, inclusive)| {
+                        let ordering = compare_bson(&value, bound);
+                        ordering.is_gt() || (inclusive && ordering.is_eq())
+                    });
+                    let upper_ok = upper.is_none_or(|(bound, inclusive)| {
+                        let ordering = compare_bson(&value, bound);
+                        ordering.is_lt() || (inclusive && ordering.is_eq())
+                    });
+                    (lower_ok && upper_ok).then_some(frequency.count as usize)
+                })
+                .sum(),
+        )
     }
 
-    fn present_count(&self, _field: &str) -> Option<usize> {
-        None
+    fn present_count(&self, field: &str) -> Option<usize> {
+        self.index
+            .stats()?
+            .present_fields
+            .get(field)
+            .copied()
+            .map(|count| count as usize)
     }
 }
 
@@ -413,7 +470,9 @@ fn load_index_handles<R: PageReader>(
         let leaf = NamespaceLeafPage::decode(&reader.read_page(leaf_page_id)?)?;
         for entry in &leaf.entries {
             let page = reader.read_page(entry.target_page_id)?;
-            indexes.push(IndexHandle::new(IndexMetaPage::decode(&page)?.meta)?);
+            let meta = IndexMetaPage::decode(&page)?.meta;
+            let stats = load_index_stats(reader, meta.stats_page_id)?;
+            indexes.push(IndexHandle::new(meta, stats)?);
         }
         match leaf.next_page_id {
             Some(next_page_id) => leaf_page_id = next_page_id,
@@ -422,6 +481,25 @@ fn load_index_handles<R: PageReader>(
     }
 
     Ok(indexes)
+}
+
+fn load_index_stats<R: PageReader>(
+    reader: &mut R,
+    stats_page_id: Option<PageId>,
+) -> Result<Option<PersistedIndexStats>> {
+    let Some(stats_page_id) = stats_page_id else {
+        return Ok(None);
+    };
+    let page = reader.read_page(stats_page_id)?;
+    Ok(Some(StatsPage::decode(&page)?.stats))
+}
+
+fn decode_persisted_stat_value(bytes: &[u8]) -> Result<Bson> {
+    let document = bson::from_slice::<Document>(bytes)?;
+    document
+        .get("v")
+        .cloned()
+        .ok_or_else(|| anyhow!("persisted stats value is missing field `v`"))
 }
 
 fn scan_namespace_entries<R: PageReader>(
@@ -483,7 +561,7 @@ mod tests {
 
     use super::{
         CollectionHandle, CollectionMeta, IndexHandle, IndexMeta, PagerCollectionReadView,
-        PagerNamespaceCatalog, SummaryCounters,
+        PagerNamespaceCatalog, PersistedIndexStats, PersistedValueFrequency, SummaryCounters,
     };
     use crate::{
         engine::CollectionReadView,
@@ -493,7 +571,7 @@ mod tests {
             layout::{DEFAULT_PAGE_SIZE, page_offset},
             page::{
                 CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceLeafPage, PageId,
-                RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage,
+                RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage, StatsPage,
             },
             pager::Pager,
         },
@@ -572,15 +650,19 @@ mod tests {
                     ..SummaryCounters::default()
                 },
             },
-            [IndexHandle::new(IndexMeta {
-                name: "_id_".to_string(),
-                root_page_id: Some(2),
-                key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
-                unique: true,
-                expire_after_seconds: None,
-                entry_count: 1,
-                index_bytes: 32,
-            })
+            [IndexHandle::new(
+                IndexMeta {
+                    name: "_id_".to_string(),
+                    root_page_id: Some(2),
+                    key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
+                    unique: true,
+                    expire_after_seconds: None,
+                    entry_count: 1,
+                    index_bytes: 32,
+                    stats_page_id: None,
+                },
+                None,
+            )
             .expect("index handle")],
         )
         .expect("collection handle");
@@ -651,15 +733,19 @@ mod tests {
                     ..SummaryCounters::default()
                 },
             },
-            [IndexHandle::new(IndexMeta {
-                name: "_id_".to_string(),
-                root_page_id: Some(2),
-                key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
-                unique: true,
-                expire_after_seconds: None,
-                entry_count: 1,
-                index_bytes: 32,
-            })
+            [IndexHandle::new(
+                IndexMeta {
+                    name: "_id_".to_string(),
+                    root_page_id: Some(2),
+                    key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
+                    unique: true,
+                    expire_after_seconds: None,
+                    entry_count: 1,
+                    index_bytes: 32,
+                    stats_page_id: None,
+                },
+                None,
+            )
             .expect("index handle")],
         )
         .expect("collection handle");
@@ -759,6 +845,7 @@ mod tests {
                     expire_after_seconds: None,
                     entry_count: 1,
                     index_bytes: 32,
+                    stats_page_id: Some(7),
                 },
             }
             .encode()
@@ -785,6 +872,28 @@ mod tests {
             .encode()
             .expect("encode index"),
         );
+        write_page(
+            &path,
+            7,
+            &StatsPage {
+                page_id: 7,
+                stats: PersistedIndexStats {
+                    entry_count: 1,
+                    present_fields: [("_id".to_string(), 1)].into_iter().collect(),
+                    value_frequencies: [(
+                        "_id".to_string(),
+                        vec![PersistedValueFrequency {
+                            encoded_value: bson::to_vec(&doc! { "v": 7 }).expect("value"),
+                            count: 1,
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            }
+            .encode()
+            .expect("encode stats"),
+        );
 
         let pager = Arc::new(Mutex::new(Pager::open(&path).expect("open pager")));
         let catalog = PagerNamespaceCatalog::new(Some(1), pager);
@@ -798,6 +907,9 @@ mod tests {
             Some(doc! { "_id": 7, "sku": "alpha", "qty": 4 })
         );
         assert_eq!(view.index_names(), vec!["_id_".to_string()]);
+        let index = view.index("_id_").expect("index view");
+        assert_eq!(index.estimate_value_count("_id", &Bson::Int32(7)), Some(1));
+        assert_eq!(index.present_count("_id"), Some(1));
     }
 
     fn write_page(path: &std::path::Path, page_id: PageId, bytes: &[u8]) {

@@ -5,7 +5,7 @@ use ciborium::{de as cbor_de, ser as cbor_ser};
 use mqlite_catalog::IndexEntry;
 
 use crate::v2::{
-    catalog::{CollectionMeta, IndexMeta},
+    catalog::{CollectionMeta, IndexMeta, PersistedIndexStats},
     layout::{DEFAULT_PAGE_SIZE, PageKind},
 };
 
@@ -570,6 +570,29 @@ impl IndexMetaPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatsPage {
+    pub page_id: PageId,
+    pub stats: PersistedIndexStats,
+}
+
+impl StatsPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut payload = Vec::new();
+        cbor_ser::into_writer(&self.stats, &mut payload)?;
+        encode_single_payload_page(PageKind::Stats, self.page_id, &payload)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::Stats)?;
+        let payload = decode_single_payload(bytes)?;
+        Ok(Self {
+            page_id: header.page_id,
+            stats: cbor_de::from_reader(payload)?,
+        })
+    }
+}
+
 pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
     if bytes.len() < PAGE_LEN {
         return Err(anyhow!("v2 page is truncated"));
@@ -732,8 +755,11 @@ mod tests {
         CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
         NamespaceLeafPage, NamespaceSeparator, RecordInternalPage, RecordLeafPage, RecordSeparator,
         RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
+        StatsPage,
     };
-    use crate::v2::catalog::{CollectionMeta, IndexMeta, SummaryCounters};
+    use crate::v2::catalog::{
+        CollectionMeta, IndexMeta, PersistedIndexStats, PersistedValueFrequency, SummaryCounters,
+    };
 
     #[test]
     fn round_trips_record_pages() {
@@ -876,10 +902,31 @@ mod tests {
                 expire_after_seconds: None,
                 entry_count: 4,
                 index_bytes: 256,
+                stats_page_id: Some(13),
             },
         };
         let decoded_index = IndexMetaPage::decode(&index.encode().expect("encode index meta"))
             .expect("decode index meta");
         assert_eq!(decoded_index, index);
+
+        let stats = StatsPage {
+            page_id: 13,
+            stats: PersistedIndexStats {
+                entry_count: 4,
+                present_fields: [("sku".to_string(), 4)].into_iter().collect(),
+                value_frequencies: [(
+                    "sku".to_string(),
+                    vec![PersistedValueFrequency {
+                        encoded_value: bson::to_vec(&doc! { "v": "alpha" }).expect("value"),
+                        count: 4,
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let decoded_stats =
+            StatsPage::decode(&stats.encode().expect("encode stats")).expect("decode stats");
+        assert_eq!(decoded_stats, stats);
     }
 }

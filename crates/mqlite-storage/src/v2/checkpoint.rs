@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     io::{Seek, SeekFrom, Write},
     path::Path,
@@ -6,18 +7,23 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use bson::Bson;
 use fs4::FileExt;
+use mqlite_bson::compare_bson;
 use mqlite_catalog::{Catalog, CollectionCatalog, IndexCatalog};
 
 use crate::v2::{
-    catalog::{CollectionMeta, IndexMeta, RootSet, SummaryCounters},
+    catalog::{
+        CollectionMeta, IndexMeta, PersistedIndexStats, PersistedValueFrequency, RootSet,
+        SummaryCounters,
+    },
     engine::create_empty,
     layout::{DEFAULT_PAGE_SIZE, HEADER_LEN, page_offset},
     page::{
         CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
         NamespaceLeafPage, NamespaceSeparator, PageId, RecordInternalPage, RecordLeafPage,
         RecordSeparator, RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage,
-        SecondarySeparator,
+        SecondarySeparator, StatsPage,
     },
 };
 
@@ -48,6 +54,8 @@ pub(crate) fn write_catalog_checkpoint(path: impl AsRef<Path>, catalog: &Catalog
             let mut index_directory_entries = Vec::new();
             for (index_name, index) in &collection.indexes {
                 let (root_page_id, entry_count, bytes) = writer.write_secondary_tree(index)?;
+                let stats_page_id =
+                    writer.write_index_stats(build_persisted_index_stats(index)?)?;
                 index_entry_count += entry_count;
                 index_bytes += bytes;
                 summary.index_entry_count += entry_count;
@@ -60,6 +68,7 @@ pub(crate) fn write_catalog_checkpoint(path: impl AsRef<Path>, catalog: &Catalog
                     expire_after_seconds: index.expire_after_seconds,
                     entry_count,
                     index_bytes: bytes,
+                    stats_page_id: Some(stats_page_id),
                 })?;
                 index_directory_entries.push(NamespaceEntry {
                     name: index_name.clone(),
@@ -160,6 +169,13 @@ impl CheckpointWriter {
         let page_id = self.allocate_page_id();
         self.pages
             .push((page_id, IndexMetaPage { page_id, meta }.encode()?.to_vec()));
+        Ok(page_id)
+    }
+
+    fn write_index_stats(&mut self, stats: PersistedIndexStats) -> Result<PageId> {
+        let page_id = self.allocate_page_id();
+        self.pages
+            .push((page_id, StatsPage { page_id, stats }.encode()?.to_vec()));
         Ok(page_id)
     }
 
@@ -485,6 +501,75 @@ struct SecondaryChild {
     first_entry: SecondaryEntry,
 }
 
+fn build_persisted_index_stats(index: &IndexCatalog) -> Result<PersistedIndexStats> {
+    let entries = index.entries_snapshot();
+    let mut present_fields = index
+        .key
+        .keys()
+        .cloned()
+        .map(|field| (field, 0_u64))
+        .collect::<BTreeMap<_, _>>();
+    let mut value_frequencies = index
+        .key
+        .keys()
+        .cloned()
+        .map(|field| (field, BTreeMap::<Vec<u8>, u64>::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for entry in &entries {
+        for field in &entry.present_fields {
+            if let Some(count) = present_fields.get_mut(field) {
+                *count += 1;
+            }
+        }
+        for (field, value) in &entry.key {
+            if let Some(frequencies) = value_frequencies.get_mut(field) {
+                let encoded = encode_persisted_stat_value(value)?;
+                *frequencies.entry(encoded).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let value_frequencies = value_frequencies
+        .into_iter()
+        .map(|(field, frequencies)| {
+            let mut frequencies = frequencies
+                .into_iter()
+                .map(|(encoded_value, count)| PersistedValueFrequency {
+                    encoded_value,
+                    count,
+                })
+                .collect::<Vec<_>>();
+            frequencies.sort_by(|left, right| {
+                let left = decode_persisted_stat_value(&left.encoded_value)
+                    .expect("persisted stats values are valid bson scalars");
+                let right = decode_persisted_stat_value(&right.encoded_value)
+                    .expect("persisted stats values are valid bson scalars");
+                compare_bson(&left, &right)
+            });
+            (field, frequencies)
+        })
+        .collect();
+
+    Ok(PersistedIndexStats {
+        entry_count: entries.len() as u64,
+        present_fields,
+        value_frequencies,
+    })
+}
+
+fn encode_persisted_stat_value(value: &Bson) -> Result<Vec<u8>> {
+    Ok(bson::to_vec(&bson::doc! { "v": value.clone() })?)
+}
+
+fn decode_persisted_stat_value(bytes: &[u8]) -> Result<Bson> {
+    let document = bson::from_slice::<bson::Document>(bytes)?;
+    document
+        .get("v")
+        .cloned()
+        .ok_or_else(|| anyhow!("persisted stats value is missing field `v`"))
+}
+
 fn chunk_by_encode<T: Clone>(
     items: Vec<T>,
     fits: impl Fn(&[T]) -> Result<()>,
@@ -521,7 +606,7 @@ fn checkpoint_unix_ms() -> u64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use bson::doc;
+    use bson::{Bson, doc};
     use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
@@ -561,6 +646,12 @@ mod tests {
             view.record_document(2).expect("record"),
             Some(doc! { "_id": 2, "sku": "beta" })
         );
+        let index = view.index("sku_1").expect("sku index");
+        assert_eq!(
+            index.estimate_value_count("sku", &Bson::String("alpha".to_string())),
+            Some(1)
+        );
+        assert_eq!(index.present_count("sku"), Some(2));
 
         let info = DatabaseFile::info(&path).expect("info");
         assert_eq!(info.file_format_version, 8);
