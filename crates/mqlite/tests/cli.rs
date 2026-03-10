@@ -8,6 +8,7 @@ use std::{
 use assert_cmd::Command;
 use bson::{Binary, Bson, doc, spec::BinarySubtype};
 use mqlite_ipc::broker_paths;
+use mqlite_storage::DatabaseFile;
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -250,7 +251,7 @@ fn command_auto_spawns_and_recovers_after_broker_restart() {
 }
 
 #[test]
-fn command_auto_spawned_broker_exits_when_launcher_process_ends() {
+fn command_auto_spawned_broker_checkpoints_and_exits_when_launcher_process_ends() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("launcher-owned.mongodb");
     let manifest_path = broker_paths(&database_path)
@@ -268,7 +269,7 @@ fn command_auto_spawned_broker_exits_when_launcher_process_ends() {
             "--idle-shutdown-secs",
             "60",
             "--eval",
-            r#"{"create":"widgets"}"#,
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha"}]}"#,
         ])
         .assert()
         .success();
@@ -282,6 +283,10 @@ fn command_auto_spawned_broker_exits_when_launcher_process_ends() {
         !manifest_path.exists(),
         "auto-spawned broker should exit after the launcher process ends"
     );
+
+    let inspect = DatabaseFile::inspect(&database_path).expect("inspect after launcher exit");
+    assert_eq!(inspect.current_record_count, 1);
+    assert_eq!(inspect.wal_records_since_checkpoint, 0);
 }
 
 #[test]

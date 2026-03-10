@@ -298,22 +298,44 @@ impl Broker {
                                 .map_err(|error| anyhow!("background checkpoint task failed: {error}"))?,
                         )?;
                     }
+                    let active_connections = self.active_connections.load(Ordering::SeqCst);
+                    let active_commands = self.active_commands.load(Ordering::SeqCst);
+                    let quiet_for = self.last_activity.lock().elapsed();
                     let watched_parent_exited = self.watched_parent_has_exited();
-                    if watched_parent_exited && self.active_connections.load(Ordering::SeqCst) == 0
+                    if checkpoint_task.is_none()
+                        && !watched_parent_exited
+                        && active_connections == 0
+                        && active_commands == 0
+                        && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
+                        if let Some(job) = self.prepare_background_checkpoint()? {
+                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
+                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
+                                if checkpoint_test_delay_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(
+                                        checkpoint_test_delay_ms,
+                                    ));
+                                }
+                                job.run()
+                            }));
+                            last_checkpoint = Instant::now();
+                            continue;
+                        }
+                    }
+                    if watched_parent_exited && active_connections == 0 {
                         break;
                     }
                     if checkpoint_task.is_none()
-                        && self.active_connections.load(Ordering::SeqCst) == 0
-                        && self.last_activity.lock().elapsed() >= idle_timeout
+                        && active_connections == 0
+                        && quiet_for >= idle_timeout
                     {
                         break;
                     }
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
                         && last_checkpoint.elapsed() >= checkpoint_interval
-                        && self.active_commands.load(Ordering::SeqCst) == 0
-                        && self.last_activity.lock().elapsed() >= CHECKPOINT_QUIET_PERIOD
+                        && active_commands == 0
+                        && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
                             let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
@@ -6900,6 +6922,54 @@ mod tests {
         ping_task.await.expect("join ping task");
 
         drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn checkpoints_after_last_connection_closes() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("drain-checkpoint.mongodb");
+        let mut config = BrokerConfig::new(&database_path, 3);
+        config.checkpoint_interval_secs = 60;
+
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1_i64, "sku": "alpha" }],
+                "$db": "app",
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let inspect = DatabaseFile::inspect(&database_path).expect("inspect after drain");
+            if inspect.wal_records_since_checkpoint == 0 {
+                assert_eq!(inspect.current_record_count, 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the broker to checkpoint after the last connection closed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         tokio::time::timeout(Duration::from_secs(5), serve_task)
             .await
             .expect("shutdown timeout")
