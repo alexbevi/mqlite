@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
 use mqlite_bson::compare_bson;
-use mqlite_catalog::{CollectionRecord, IndexBounds, IndexEntry};
+use mqlite_catalog::{CollectionCatalog, CollectionRecord, IndexBounds, IndexCatalog, IndexEntry};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -400,6 +400,20 @@ impl PagerNamespaceCatalog {
             .map(|entry| load_collection_handle(&mut *pager, entry.target_page_id))
             .collect()
     }
+
+    pub fn load_catalog(&self) -> Result<mqlite_catalog::Catalog> {
+        let mut pager = lock_pager(&self.pager)?;
+        let mut catalog = mqlite_catalog::Catalog::new();
+        for entry in scan_namespace_entries(&mut *pager, self.namespace_root_page_id)? {
+            let collection = load_collection_catalog(&mut *pager, entry.target_page_id)?;
+            catalog.replace_collection(
+                &collection.meta.database,
+                &collection.meta.collection,
+                collection.catalog,
+            );
+        }
+        Ok(catalog)
+    }
 }
 
 fn lookup_namespace_target<R: PageReader>(
@@ -457,6 +471,54 @@ fn load_collection_handle<R: PageReader>(
     CollectionHandle::new(meta, indexes)
 }
 
+fn load_collection_catalog<R: PageReader>(
+    reader: &mut R,
+    meta_page_id: PageId,
+) -> Result<LoadedCollectionCatalog> {
+    let handle = load_collection_handle(reader, meta_page_id)?;
+    let options = bson::from_slice(&handle.meta().options_bytes)?;
+    let records = handle
+        .scan_records(reader)?
+        .into_iter()
+        .map(|record| {
+            Ok(CollectionRecord::from_encoded(
+                record.record_id,
+                record.decode_document()?,
+                record.encoded_document,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut indexes = BTreeMap::new();
+    for (name, index) in handle.indexes() {
+        let mut catalog = IndexCatalog::new(
+            name.clone(),
+            index.key_pattern().clone(),
+            index.meta().unique,
+        );
+        catalog.expire_after_seconds = index.meta().expire_after_seconds;
+        catalog.load_entries(index.scan_bounds(
+            reader,
+            &IndexBounds {
+                lower: None,
+                upper: None,
+            },
+            ScanDirection::Forward,
+        )?)?;
+        indexes.insert(name.clone(), catalog);
+    }
+
+    Ok(LoadedCollectionCatalog {
+        meta: handle.meta().clone(),
+        catalog: CollectionCatalog::from_parts(
+            options,
+            indexes,
+            records,
+            handle.meta().next_record_id,
+        ),
+    })
+}
+
 fn load_index_handles<R: PageReader>(
     reader: &mut R,
     root_page_id: Option<PageId>,
@@ -500,6 +562,11 @@ fn decode_persisted_stat_value(bytes: &[u8]) -> Result<Bson> {
         .get("v")
         .cloned()
         .ok_or_else(|| anyhow!("persisted stats value is missing field `v`"))
+}
+
+struct LoadedCollectionCatalog {
+    meta: CollectionMeta,
+    catalog: CollectionCatalog,
 }
 
 fn scan_namespace_entries<R: PageReader>(

@@ -106,7 +106,9 @@ meta, record, secondary-index, and stats pages plus a new superblock summary. Th
 now builds its per-database, per-collection, and per-index report from that persisted namespace
 and meta page graph instead of returning only top-level counters. Page-backed v2 index read views
 also preserve histogram-style value frequencies and field-presence counts through checkpoint and
-reopen, so planning can keep using persisted estimates instead of rebuilding in-memory stats.
+reopen, so planning can keep using persisted estimates instead of rebuilding in-memory stats. The
+same v2 page graph can now also be materialized back into a full `Catalog` when a broker path
+still needs collection-owned mutable state instead of a borrowed page-backed read view.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Result;
 use fs4::FileExt;
+use mqlite_catalog::Catalog;
 
 use crate::{
     InfoCheckpoint, InfoCollection, InfoCollectionCheckpoint, InfoDatabase, InfoDatabaseCheckpoint,
@@ -153,6 +154,10 @@ pub(crate) fn open_collection_read_view(
     open_namespace_catalog(path)?.collection_read_view(database, collection)
 }
 
+pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
+    open_namespace_catalog(path)?.load_catalog()
+}
+
 fn build_database_info(name: String, collections: Vec<CollectionHandle>) -> Result<InfoDatabase> {
     let collections = collections
         .into_iter()
@@ -260,7 +265,7 @@ mod tests {
     use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
-    use super::{create_empty, is_v2_file, read_info};
+    use super::{create_empty, is_v2_file, load_catalog, read_info};
     use crate::v2::{
         checkpoint::write_catalog_checkpoint,
         layout::{DATA_START_OFFSET, DEFAULT_PAGE_SIZE},
@@ -315,5 +320,41 @@ mod tests {
         assert_eq!(report.databases[0].collections.len(), 1);
         assert_eq!(report.databases[0].collections[0].name, "widgets");
         assert_eq!(report.databases[0].collections[0].indexes.len(), 2);
+    }
+
+    #[test]
+    fn loads_full_catalog_from_v2_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = PathBuf::from(temp_dir.path().join("v2-catalog.mongodb"));
+
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }))
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "beta" }))
+            .expect("insert");
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("index");
+
+        let mut catalog = Catalog {
+            databases: BTreeMap::new(),
+        };
+        catalog.replace_collection("app", "widgets", collection);
+        write_catalog_checkpoint(&path, &catalog).expect("write checkpoint");
+
+        let loaded = load_catalog(&path).expect("load catalog");
+        let widgets = loaded
+            .get_collection("app", "widgets")
+            .expect("widgets collection");
+        assert_eq!(widgets.records.len(), 2);
+        assert_eq!(widgets.indexes.len(), 2);
+        assert_eq!(
+            widgets.records[1].document,
+            doc! { "_id": 2, "sku": "beta" }
+        );
     }
 }

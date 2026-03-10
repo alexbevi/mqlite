@@ -91,6 +91,7 @@ At a high level, the current engine already covers:
 - selective zstd compression for checkpoint pages, snapshot metadata, and large WAL frames when the stored bytes shrink materially
 - page-local in-memory secondary-index maintenance so bulk inserts only rewrite touched index leaves
 - persisted v2 index stats so page-backed reads keep value-frequency and field-presence estimates after checkpoint and reopen
+- v2 page graphs can now be materialized back into a full in-memory catalog when a broker path still needs collection-owned state
 - incrementally maintained in-memory unique-index validation caches that keep structured BSON keys and borrow per-batch write documents so writes do not rebuild duplicate-key state or duplicate full documents during validation
 - storage commits apply already-validated CRUD deltas through the catalog without repeating the same unique-index duplicate probes on the hot path
 - write-path BSON reuse so inserted and updated records can carry cached raw BSON bytes into WAL and checkpoint encoding instead of reserializing the same document for every layer
