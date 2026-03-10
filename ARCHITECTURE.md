@@ -65,6 +65,7 @@ The CLI surfaces split along intent:
 - `mqlite command` is the direct wire-protocol validation path.
 - `mqlite info` summarizes the recovered current catalog state, per-namespace sizes and counts, WAL backlog, and the most recent checkpoint.
 - `mqlite inspect` stays focused on lower-level file, superblock, WAL, and catalog metadata.
+- When a file has no WAL tail to replay, `mqlite info` and `mqlite inspect` answer from checkpoint metadata directly instead of hydrating every collection and index page first. Legacy v1 files that still consist of a very large uncheckpointed WAL tail now fail fast for those metadata commands instead of replaying the whole backlog just to print a report. `mqlite verify` remains the slower full validation path.
 
 ## Durable File Layout
 

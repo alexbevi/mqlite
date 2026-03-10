@@ -76,7 +76,7 @@ The CLI is intentionally small and focused:
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
 | `mqlite inspect --file <path>` | Print file, checkpoint, WAL, and catalog metadata. |
 
-`mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report.
+`mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report. On a file with no WAL backlog, both commands now read checkpoint metadata directly instead of rehydrating every record and index page first, so they return quickly even on large files. Legacy v1 files with an oversized uncheckpointed WAL tail now fail fast with an explicit checkpoint-or-v2 rewrite error instead of spending a long time replaying that backlog just to print metadata. Use `mqlite verify` when you want the slower full page-validation pass.
 
 You can also pipe JSON into `mqlite command`:
 

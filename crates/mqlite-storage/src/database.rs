@@ -47,6 +47,7 @@ const SNAPSHOT_COMPRESSION_MIN_LEN: usize = 1024;
 const SNAPSHOT_COMPRESSION_MIN_SAVINGS: usize = 256;
 const WAL_COMPRESSION_MIN_LEN: usize = PAGE_SIZE;
 const WAL_COMPRESSION_MIN_SAVINGS: usize = 512;
+const FAST_INFO_MAX_LEGACY_WAL_BYTES: u64 = 32 * 1024 * 1024;
 pub const EMPTY_BSON_DOCUMENT_BYTES: &[u8; 5] = &[5, 0, 0, 0, 0];
 const PAGE_KIND_RECORD: u16 = 1;
 const PAGE_KIND_INDEX_LEAF: u16 = 2;
@@ -432,6 +433,13 @@ struct WalRecovery {
     change_events_dirty: bool,
 }
 
+#[derive(Debug, Default)]
+struct WalMetadata {
+    records: usize,
+    bytes: u64,
+    truncated_tail: bool,
+}
+
 #[derive(Debug)]
 struct LoadedState {
     state: PersistedState,
@@ -442,6 +450,45 @@ struct LoadedState {
     wal_recovery: WalRecovery,
     file_size: u64,
     checkpoint_counts: CheckpointCounts,
+}
+
+#[derive(Debug)]
+struct LoadedMetadata {
+    checkpoint_snapshot: SnapshotState,
+    active_slot: usize,
+    active_superblock: Superblock,
+    valid_superblocks: usize,
+    wal_metadata: WalMetadata,
+    file_size: u64,
+    checkpoint_counts: CheckpointCounts,
+}
+
+#[derive(Debug, Default)]
+struct WalCatalogMetadata {
+    databases: BTreeMap<String, WalDatabaseMetadata>,
+    change_event_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct WalDatabaseMetadata {
+    collections: BTreeMap<String, WalCollectionMetadata>,
+}
+
+#[derive(Debug, Default)]
+struct WalCollectionMetadata {
+    indexes: BTreeMap<String, WalIndexMetadata>,
+    record_sizes: HashMap<u64, usize>,
+    document_count: usize,
+    document_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WalIndexMetadata {
+    key: bson::Document,
+    unique: bool,
+    expire_after_seconds: Option<i64>,
+    entry_count: usize,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,7 +1159,25 @@ impl DatabaseFile {
 
     pub fn inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
         let path = path.as_ref().to_path_buf();
+        if v2_engine::is_v2_file(&path)? {
+            return v2_engine::read_inspect(&path);
+        }
         let mut file = OpenOptions::new().read(true).open(&path)?;
+        let metadata = load_metadata(&mut file)?;
+        if requires_legacy_wal_upgrade(&metadata) {
+            return Err(anyhow::anyhow!(
+                "legacy v1 file has an uncheckpointed WAL backlog of {} bytes; run a checkpoint or rewrite the file as v2 before using inspect",
+                metadata.wal_metadata.bytes
+            ));
+        }
+        if metadata.checkpoint_counts.page_count == 0 && metadata.wal_metadata.records > 0 {
+            let wal_catalog =
+                load_wal_only_catalog_metadata(&mut file, metadata.active_superblock.wal_offset)?;
+            return Ok(build_wal_only_inspect_report(path, &metadata, &wal_catalog));
+        }
+        if metadata.wal_metadata.records == 0 && !metadata.wal_metadata.truncated_tail {
+            return Ok(build_metadata_only_inspect_report(path, &metadata));
+        }
         let loaded = load_state(&mut file)?;
         Ok(InspectReport {
             path,
@@ -1150,6 +1215,21 @@ impl DatabaseFile {
             return v2_engine::read_info(&path);
         }
         let mut file = OpenOptions::new().read(true).open(&path)?;
+        let metadata = load_metadata(&mut file)?;
+        if requires_legacy_wal_upgrade(&metadata) {
+            return Err(anyhow::anyhow!(
+                "legacy v1 file has an uncheckpointed WAL backlog of {} bytes; run a checkpoint or rewrite the file as v2 before using info",
+                metadata.wal_metadata.bytes
+            ));
+        }
+        if metadata.checkpoint_counts.page_count == 0 && metadata.wal_metadata.records > 0 {
+            let wal_catalog =
+                load_wal_only_catalog_metadata(&mut file, metadata.active_superblock.wal_offset)?;
+            return Ok(build_wal_only_info_report(path, &metadata, &wal_catalog));
+        }
+        if metadata.wal_metadata.records == 0 && !metadata.wal_metadata.truncated_tail {
+            return build_metadata_only_info_report(path, &metadata);
+        }
         let loaded = load_state(&mut file)?;
         build_info_report(path, &loaded)
     }
@@ -1723,6 +1803,52 @@ fn load_state(file: &mut File) -> Result<LoadedState> {
         active_superblock,
         valid_superblocks,
         wal_recovery,
+        file_size,
+        checkpoint_counts,
+    })
+}
+
+fn load_metadata(file: &mut File) -> Result<LoadedMetadata> {
+    read_header(file)?;
+
+    let file_size = file.metadata()?.len();
+    if file_size < DATA_START_OFFSET {
+        return Err(StorageError::Truncated.into());
+    }
+
+    let mut candidates = Vec::new();
+    let mut valid_superblocks = 0;
+    for slot in 0..SUPERBLOCK_COUNT {
+        let superblock = match read_superblock(file, slot) {
+            Ok(Some(superblock)) => superblock,
+            Ok(None) => continue,
+            Err(error) if is_skippable_checkpoint_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let (checkpoint_snapshot, checkpoint_counts) =
+            match read_snapshot_metadata(file, &superblock) {
+                Ok(loaded) => loaded,
+                Err(error) if is_skippable_checkpoint_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+        valid_superblocks += 1;
+        candidates.push((slot, superblock, checkpoint_snapshot, checkpoint_counts));
+    }
+
+    let Some((active_slot, active_superblock, checkpoint_snapshot, checkpoint_counts)) = candidates
+        .into_iter()
+        .max_by_key(|(_, superblock, _, _)| superblock.generation)
+    else {
+        return Err(StorageError::NoValidSuperblock.into());
+    };
+
+    let wal_metadata = scan_wal_metadata(file, active_superblock.wal_offset)?;
+    Ok(LoadedMetadata {
+        checkpoint_snapshot,
+        active_slot,
+        active_superblock,
+        valid_superblocks,
+        wal_metadata,
         file_size,
         checkpoint_counts,
     })
@@ -2701,6 +2827,16 @@ fn decode_wal_entry(bytes: &[u8]) -> Result<WalEntry> {
     compact_wal_entry.into_wal_entry()
 }
 
+fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
+    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let mut cursor = Cursor::new(bytes.as_ref());
+    let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
+    if cursor.position() != bytes.as_ref().len() as u64 {
+        return Err(StorageError::InvalidWalFrame.into());
+    }
+    Ok(compact_wal_entry)
+}
+
 fn read_snapshot(
     file: &mut File,
     superblock: &Superblock,
@@ -2746,6 +2882,131 @@ fn read_snapshot(
             ..checkpoint_counts
         },
     ))
+}
+
+fn read_snapshot_metadata(
+    file: &mut File,
+    superblock: &Superblock,
+) -> Result<(SnapshotState, CheckpointCounts)> {
+    if superblock.snapshot_offset < DATA_START_OFFSET
+        || superblock.wal_offset < superblock.snapshot_offset
+    {
+        return Err(StorageError::InvalidHeader.into());
+    }
+
+    file.seek(SeekFrom::Start(superblock.snapshot_offset))?;
+    let mut snapshot = vec![0_u8; superblock.snapshot_len as usize];
+    file.read_exact(&mut snapshot)
+        .map_err(|_| StorageError::Truncated)?;
+    if hash_bytes(&snapshot) != superblock.snapshot_checksum {
+        return Err(StorageError::InvalidSnapshotChecksum.into());
+    }
+
+    let snapshot_state = decode_snapshot_state(&snapshot)?;
+    if snapshot_state.file_format_version != FILE_FORMAT_VERSION {
+        return Err(StorageError::UnsupportedVersion(snapshot_state.file_format_version).into());
+    }
+
+    let catalog_stats = snapshot_catalog_stats(&snapshot_state.catalog);
+    Ok((
+        snapshot_state.clone(),
+        CheckpointCounts {
+            page_count: catalog_stats.record_page_count
+                + catalog_stats.index_page_count
+                + snapshot_state.change_event_pages.len(),
+            record_page_count: catalog_stats.record_page_count,
+            index_page_count: catalog_stats.index_page_count,
+            change_event_page_count: snapshot_state.change_event_pages.len(),
+            record_count: catalog_stats.record_count,
+            index_entry_count: catalog_stats.index_entry_count,
+            change_event_count: snapshot_state.change_event_count,
+        },
+    ))
+}
+
+fn scan_wal_metadata(file: &mut File, start_offset: u64) -> Result<WalMetadata> {
+    let file_size = file.metadata()?.len();
+    if start_offset > file_size {
+        return Err(StorageError::Truncated.into());
+    }
+
+    let mut recovery = WalMetadata::default();
+    let mut offset = start_offset;
+    while offset < file_size {
+        if file_size - offset < WAL_HEADER_LEN as u64 {
+            recovery.truncated_tail = true;
+            break;
+        }
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; WAL_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|_| StorageError::Truncated)?;
+
+        if &header[..4] != WAL_FRAME_MAGIC {
+            break;
+        }
+
+        let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+        let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+        if payload_end > file_size {
+            recovery.truncated_tail = true;
+            break;
+        }
+
+        recovery.records += 1;
+        offset = payload_end;
+    }
+
+    recovery.bytes = offset.saturating_sub(start_offset);
+    Ok(recovery)
+}
+
+fn load_wal_only_catalog_metadata(
+    file: &mut File,
+    start_offset: u64,
+) -> Result<WalCatalogMetadata> {
+    let file_size = file.metadata()?.len();
+    if start_offset > file_size {
+        return Err(StorageError::Truncated.into());
+    }
+
+    let mut metadata = WalCatalogMetadata::default();
+    let mut offset = start_offset;
+    while offset < file_size {
+        if file_size - offset < WAL_HEADER_LEN as u64 {
+            break;
+        }
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; WAL_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|_| StorageError::Truncated)?;
+
+        if &header[..4] != WAL_FRAME_MAGIC {
+            break;
+        }
+
+        let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+        let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+        if payload_end > file_size {
+            break;
+        }
+
+        let mut payload = vec![0_u8; payload_len as usize];
+        file.read_exact(&mut payload)
+            .map_err(|_| StorageError::Truncated)?;
+
+        if hash_bytes(&payload) != header[8..40] {
+            return Err(StorageError::InvalidWalChecksum.into());
+        }
+
+        let entry = decode_compact_wal_entry(&payload)?;
+        apply_wal_metadata_mutation(&mut metadata, entry.mutation)?;
+        offset = payload_end;
+    }
+
+    Ok(metadata)
 }
 
 fn append_wal_entry(
@@ -4637,6 +4898,532 @@ fn superblock_offset(slot: usize) -> u64 {
     HEADER_LEN as u64 + (slot * SUPERBLOCK_LEN) as u64
 }
 
+fn requires_legacy_wal_upgrade(loaded: &LoadedMetadata) -> bool {
+    loaded.checkpoint_counts.page_count == 0
+        && loaded.wal_metadata.bytes > FAST_INFO_MAX_LEGACY_WAL_BYTES
+}
+
+fn apply_wal_metadata_mutation(
+    metadata: &mut WalCatalogMetadata,
+    mutation: CompactWalMutation,
+) -> Result<()> {
+    match mutation {
+        CompactWalMutation::ReplaceCollection {
+            database,
+            collection,
+            collection_state,
+            change_events,
+        } => {
+            let collection_metadata = wal_collection_metadata_from_compact(&collection_state)?;
+            metadata
+                .databases
+                .entry(database)
+                .or_default()
+                .collections
+                .insert(collection, collection_metadata);
+            metadata.change_event_count += change_events.len();
+        }
+        CompactWalMutation::RewriteCollection {
+            database,
+            collection,
+            changes,
+            change_events,
+            ..
+        } => {
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            apply_wal_collection_changes(collection_metadata, &changes);
+            metadata.change_event_count += change_events.len();
+        }
+        CompactWalMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            create_options,
+            changes,
+            inserts,
+            updates,
+            deletes,
+            change_events,
+        } => {
+            if create_options.is_some() {
+                let _ = ensure_wal_collection_metadata(metadata, &database, &collection);
+            }
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            let changes = if changes.is_empty() {
+                inserts
+                    .into_iter()
+                    .map(CompactCollectionChange::Insert)
+                    .chain(updates.into_iter().map(CompactCollectionChange::Update))
+                    .chain(deletes.into_iter().map(CompactCollectionChange::Delete))
+                    .collect::<Vec<_>>()
+            } else {
+                changes
+            };
+            apply_wal_collection_changes(collection_metadata, &changes);
+            metadata.change_event_count += change_events.len();
+        }
+        CompactWalMutation::CreateIndexes {
+            database,
+            collection,
+            create_options,
+            specs,
+            change_events,
+        } => {
+            if create_options.is_some() {
+                let _ = ensure_wal_collection_metadata(metadata, &database, &collection);
+            }
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            for spec in specs {
+                let document = decode_document_bytes(&spec)?;
+                let name = document.get_str("name")?.to_string();
+                let key = document.get_document("key")?.clone();
+                let bytes =
+                    estimate_index_bytes_for_count(collection_metadata.document_count, &key);
+                collection_metadata.indexes.insert(
+                    name,
+                    WalIndexMetadata {
+                        key,
+                        unique: document.get_bool("unique").unwrap_or(false),
+                        expire_after_seconds: document.get_i64("expireAfterSeconds").ok(),
+                        entry_count: collection_metadata.document_count,
+                        bytes,
+                    },
+                );
+            }
+            metadata.change_event_count += change_events.len();
+        }
+        CompactWalMutation::DropIndexes {
+            database,
+            collection,
+            target,
+            change_events,
+        } => {
+            if let Some(collection_metadata) = metadata
+                .databases
+                .get_mut(&database)
+                .and_then(|database| database.collections.get_mut(&collection))
+            {
+                if target == "*" {
+                    collection_metadata.indexes.retain(|name, _| name == "_id_");
+                } else {
+                    collection_metadata.indexes.remove(&target);
+                }
+            }
+            metadata.change_event_count += change_events.len();
+        }
+        CompactWalMutation::DropCollection {
+            database,
+            collection,
+            change_events,
+        } => {
+            if let Some(database_metadata) = metadata.databases.get_mut(&database) {
+                database_metadata.collections.remove(&collection);
+                if database_metadata.collections.is_empty() {
+                    metadata.databases.remove(&database);
+                }
+            }
+            metadata.change_event_count += change_events.len();
+        }
+    }
+    Ok(())
+}
+
+fn wal_collection_metadata_from_compact(
+    collection: &CompactCollectionCatalog,
+) -> Result<WalCollectionMetadata> {
+    let document_count = collection.records.len();
+    let document_bytes = collection
+        .records
+        .iter()
+        .map(|record| record.document.len() as u64)
+        .sum();
+    let record_sizes = collection
+        .records
+        .iter()
+        .map(|record| (record.record_id, record.document.len()))
+        .collect::<HashMap<_, _>>();
+    let indexes = collection
+        .indexes
+        .iter()
+        .map(|(name, index)| {
+            Ok((
+                name.clone(),
+                WalIndexMetadata {
+                    key: decode_document_bytes(&index.key)?,
+                    unique: index.unique,
+                    expire_after_seconds: index.expire_after_seconds,
+                    entry_count: index.entries.len(),
+                    bytes: estimate_compact_index_bytes(index),
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(WalCollectionMetadata {
+        indexes,
+        record_sizes,
+        document_count,
+        document_bytes,
+    })
+}
+
+fn ensure_wal_collection_metadata<'a>(
+    metadata: &'a mut WalCatalogMetadata,
+    database: &str,
+    collection: &str,
+) -> &'a mut WalCollectionMetadata {
+    metadata
+        .databases
+        .entry(database.to_string())
+        .or_default()
+        .collections
+        .entry(collection.to_string())
+        .or_insert_with(default_wal_collection_metadata)
+}
+
+fn default_wal_collection_metadata() -> WalCollectionMetadata {
+    let mut indexes = BTreeMap::new();
+    indexes.insert(
+        "_id_".to_string(),
+        WalIndexMetadata {
+            key: bson::doc! { "_id": 1 },
+            unique: true,
+            expire_after_seconds: None,
+            entry_count: 0,
+            bytes: 0,
+        },
+    );
+    WalCollectionMetadata {
+        indexes,
+        record_sizes: HashMap::new(),
+        document_count: 0,
+        document_bytes: 0,
+    }
+}
+
+fn apply_wal_collection_changes(
+    collection: &mut WalCollectionMetadata,
+    changes: &[CompactCollectionChange],
+) {
+    let previous_document_count = collection.document_count;
+    for change in changes {
+        match change {
+            CompactCollectionChange::Insert(record) => {
+                let new_len = record.document.len();
+                match collection.record_sizes.insert(record.record_id, new_len) {
+                    Some(old_len) => {
+                        collection.document_bytes = collection
+                            .document_bytes
+                            .saturating_sub(old_len as u64)
+                            .saturating_add(new_len as u64);
+                    }
+                    None => {
+                        collection.document_count += 1;
+                        collection.document_bytes += new_len as u64;
+                    }
+                }
+            }
+            CompactCollectionChange::Update(record) => {
+                let new_len = record.document.len();
+                match collection.record_sizes.insert(record.record_id, new_len) {
+                    Some(old_len) => {
+                        collection.document_bytes = collection
+                            .document_bytes
+                            .saturating_sub(old_len as u64)
+                            .saturating_add(new_len as u64);
+                    }
+                    None => {
+                        let previous_average = average_document_bytes(collection);
+                        collection.document_bytes = collection
+                            .document_bytes
+                            .saturating_sub(previous_average)
+                            .saturating_add(new_len as u64);
+                    }
+                }
+            }
+            CompactCollectionChange::Delete(record_id) => {
+                if collection.document_count > 0 {
+                    collection.document_count -= 1;
+                }
+                let removed_len = collection
+                    .record_sizes
+                    .remove(record_id)
+                    .map(|len| len as u64)
+                    .unwrap_or_else(|| average_document_bytes(collection));
+                collection.document_bytes = collection.document_bytes.saturating_sub(removed_len);
+            }
+        }
+    }
+
+    for index in collection.indexes.values_mut() {
+        index.bytes = scale_index_bytes(
+            index.bytes,
+            previous_document_count,
+            collection.document_count,
+            &index.key,
+        );
+        index.entry_count = collection.document_count;
+    }
+}
+
+fn average_document_bytes(collection: &WalCollectionMetadata) -> u64 {
+    if collection.document_count == 0 {
+        0
+    } else {
+        collection.document_bytes / collection.document_count as u64
+    }
+}
+
+fn scale_index_bytes(
+    current_bytes: u64,
+    previous_count: usize,
+    next_count: usize,
+    key: &bson::Document,
+) -> u64 {
+    if next_count == 0 {
+        return 0;
+    }
+    if previous_count == 0 || current_bytes == 0 {
+        return estimate_index_bytes_for_count(next_count, key);
+    }
+    current_bytes.saturating_mul(next_count as u64) / previous_count as u64
+}
+
+fn estimate_index_bytes_for_count(count: usize, key: &bson::Document) -> u64 {
+    let key_bytes = bson::to_vec(key)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    count as u64 * (key_bytes + 32).max(48)
+}
+
+fn estimate_compact_index_bytes(index: &CompactIndexCatalog) -> u64 {
+    index
+        .entries
+        .iter()
+        .map(|entry| {
+            entry.key.len() as u64
+                + entry
+                    .present_fields
+                    .iter()
+                    .map(|field| field.len() as u64 + 4)
+                    .sum::<u64>()
+                + 24
+        })
+        .sum()
+}
+
+fn build_wal_only_inspect_report(
+    path: PathBuf,
+    loaded: &LoadedMetadata,
+    metadata: &WalCatalogMetadata,
+) -> InspectReport {
+    InspectReport {
+        path,
+        file_format_version: loaded.checkpoint_snapshot.file_format_version,
+        checkpoint_generation: loaded.active_superblock.generation,
+        last_applied_sequence: loaded.checkpoint_snapshot.last_applied_sequence
+            + loaded.wal_metadata.records as u64,
+        last_checkpoint_unix_ms: loaded.checkpoint_snapshot.last_checkpoint_unix_ms,
+        active_superblock_slot: loaded.active_slot,
+        valid_superblocks: loaded.valid_superblocks,
+        snapshot_offset: loaded.active_superblock.snapshot_offset,
+        snapshot_len: loaded.active_superblock.snapshot_len,
+        wal_offset: loaded.active_superblock.wal_offset,
+        page_size: PAGE_SIZE,
+        checkpoint_page_count: loaded.checkpoint_counts.page_count,
+        checkpoint_record_page_count: loaded.checkpoint_counts.record_page_count,
+        checkpoint_index_page_count: loaded.checkpoint_counts.index_page_count,
+        checkpoint_change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
+        checkpoint_record_count: loaded.checkpoint_counts.record_count,
+        checkpoint_index_entry_count: loaded.checkpoint_counts.index_entry_count,
+        checkpoint_change_event_count: loaded.checkpoint_counts.change_event_count,
+        current_record_count: metadata
+            .databases
+            .values()
+            .flat_map(|database| database.collections.values())
+            .map(|collection| collection.document_count)
+            .sum(),
+        current_index_entry_count: metadata
+            .databases
+            .values()
+            .flat_map(|database| database.collections.values())
+            .flat_map(|collection| collection.indexes.values())
+            .map(|index| index.entry_count)
+            .sum(),
+        current_change_event_count: metadata.change_event_count,
+        wal_records_since_checkpoint: loaded.wal_metadata.records,
+        wal_bytes_since_checkpoint: loaded.wal_metadata.bytes,
+        truncated_wal_tail: loaded.wal_metadata.truncated_tail,
+        file_size: loaded.file_size,
+        databases: metadata.databases.keys().cloned().collect(),
+    }
+}
+
+fn build_wal_only_info_report(
+    path: PathBuf,
+    loaded: &LoadedMetadata,
+    metadata: &WalCatalogMetadata,
+) -> InfoReport {
+    let databases = metadata
+        .databases
+        .iter()
+        .map(|(name, database)| {
+            let collections = database
+                .collections
+                .iter()
+                .map(|(collection_name, collection)| {
+                    let indexes = collection
+                        .indexes
+                        .iter()
+                        .map(|(index_name, index)| InfoIndex {
+                            name: index_name.clone(),
+                            key: index.key.clone(),
+                            unique: index.unique,
+                            expire_after_seconds: index.expire_after_seconds,
+                            entry_count: index.entry_count,
+                            bytes: index.bytes,
+                            checkpoint: InfoIndexCheckpoint {
+                                entry_count: 0,
+                                page_count: 0,
+                                page_bytes: 0,
+                                root_page_id: None,
+                                total_bytes: 0,
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    let index_entry_count = indexes.iter().map(|index| index.entry_count).sum();
+                    let index_bytes = indexes.iter().map(|index| index.bytes).sum();
+                    InfoCollection {
+                        name: collection_name.clone(),
+                        document_count: collection.document_count,
+                        index_count: indexes.len(),
+                        index_entry_count,
+                        document_bytes: collection.document_bytes,
+                        index_bytes,
+                        total_bytes: collection.document_bytes + index_bytes,
+                        checkpoint: InfoCollectionCheckpoint {
+                            index_count: 0,
+                            record_count: 0,
+                            index_entry_count: 0,
+                            record_page_count: 0,
+                            record_page_bytes: 0,
+                            index_page_count: 0,
+                            index_page_bytes: 0,
+                            total_bytes: 0,
+                        },
+                        indexes,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let record_count = collections
+                .iter()
+                .map(|collection| collection.document_count)
+                .sum();
+            let index_count = collections
+                .iter()
+                .map(|collection| collection.index_count)
+                .sum();
+            let index_entry_count = collections
+                .iter()
+                .map(|collection| collection.index_entry_count)
+                .sum();
+            let document_bytes = collections
+                .iter()
+                .map(|collection| collection.document_bytes)
+                .sum();
+            let index_bytes = collections
+                .iter()
+                .map(|collection| collection.index_bytes)
+                .sum();
+            InfoDatabase {
+                name: name.clone(),
+                collection_count: collections.len(),
+                index_count,
+                record_count,
+                index_entry_count,
+                document_bytes,
+                index_bytes,
+                total_bytes: document_bytes + index_bytes,
+                checkpoint: InfoDatabaseCheckpoint {
+                    collection_count: 0,
+                    index_count: 0,
+                    record_count: 0,
+                    index_entry_count: 0,
+                    record_page_count: 0,
+                    record_page_bytes: 0,
+                    index_page_count: 0,
+                    index_page_bytes: 0,
+                    total_bytes: 0,
+                },
+                collections,
+            }
+        })
+        .collect::<Vec<_>>();
+    let summary = InfoSummary {
+        database_count: databases.len(),
+        collection_count: databases
+            .iter()
+            .map(|database| database.collection_count)
+            .sum(),
+        index_count: databases.iter().map(|database| database.index_count).sum(),
+        record_count: databases.iter().map(|database| database.record_count).sum(),
+        index_entry_count: databases
+            .iter()
+            .map(|database| database.index_entry_count)
+            .sum(),
+        change_event_count: metadata.change_event_count,
+        plan_cache_entry_count: loaded.checkpoint_snapshot.plan_cache_entries.len(),
+        document_bytes: databases
+            .iter()
+            .map(|database| database.document_bytes)
+            .sum(),
+        index_bytes: databases.iter().map(|database| database.index_bytes).sum(),
+        total_bytes: databases.iter().map(|database| database.total_bytes).sum(),
+    };
+    InfoReport {
+        path,
+        file_format_version: loaded.checkpoint_snapshot.file_format_version,
+        file_size: loaded.file_size,
+        last_applied_sequence: loaded.checkpoint_snapshot.last_applied_sequence
+            + loaded.wal_metadata.records as u64,
+        summary,
+        last_checkpoint: InfoCheckpoint {
+            generation: loaded.active_superblock.generation,
+            last_applied_sequence: loaded.active_superblock.last_applied_sequence,
+            last_checkpoint_unix_ms: loaded.active_superblock.last_checkpoint_unix_ms,
+            active_superblock_slot: loaded.active_slot,
+            valid_superblocks: loaded.valid_superblocks,
+            database_count: 0,
+            collection_count: 0,
+            index_count: 0,
+            snapshot_offset: loaded.active_superblock.snapshot_offset,
+            snapshot_len: loaded.active_superblock.snapshot_len,
+            wal_offset: loaded.active_superblock.wal_offset,
+            page_size: PAGE_SIZE,
+            page_count: 0,
+            page_bytes: 0,
+            record_page_count: 0,
+            record_page_bytes: 0,
+            index_page_count: 0,
+            index_page_bytes: 0,
+            change_event_page_count: 0,
+            change_event_page_bytes: 0,
+            record_count: 0,
+            index_entry_count: 0,
+            change_event_count: 0,
+            plan_cache_entry_count: loaded.checkpoint_snapshot.plan_cache_entries.len(),
+            total_bytes: loaded.active_superblock.snapshot_len,
+        },
+        wal_since_checkpoint: InfoWal {
+            record_count: loaded.wal_metadata.records,
+            bytes: loaded.wal_metadata.bytes,
+            truncated_tail: loaded.wal_metadata.truncated_tail,
+        },
+        databases,
+    }
+}
+
 fn build_info_report(path: PathBuf, loaded: &LoadedState) -> Result<InfoReport> {
     let checkpoint_catalog_stats = snapshot_catalog_stats(&loaded.checkpoint_snapshot.catalog);
     let change_event_page_bytes = sum_page_bytes(&loaded.checkpoint_snapshot.change_event_pages);
@@ -4713,6 +5500,229 @@ fn build_info_report(path: PathBuf, loaded: &LoadedState) -> Result<InfoReport> 
             truncated_tail: loaded.wal_recovery.truncated_tail,
         },
         databases,
+    })
+}
+
+fn build_metadata_only_inspect_report(path: PathBuf, loaded: &LoadedMetadata) -> InspectReport {
+    InspectReport {
+        path,
+        file_format_version: loaded.checkpoint_snapshot.file_format_version,
+        checkpoint_generation: loaded.active_superblock.generation,
+        last_applied_sequence: loaded.checkpoint_snapshot.last_applied_sequence,
+        last_checkpoint_unix_ms: loaded.checkpoint_snapshot.last_checkpoint_unix_ms,
+        active_superblock_slot: loaded.active_slot,
+        valid_superblocks: loaded.valid_superblocks,
+        snapshot_offset: loaded.active_superblock.snapshot_offset,
+        snapshot_len: loaded.active_superblock.snapshot_len,
+        wal_offset: loaded.active_superblock.wal_offset,
+        page_size: PAGE_SIZE,
+        checkpoint_page_count: loaded.checkpoint_counts.page_count,
+        checkpoint_record_page_count: loaded.checkpoint_counts.record_page_count,
+        checkpoint_index_page_count: loaded.checkpoint_counts.index_page_count,
+        checkpoint_change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
+        checkpoint_record_count: loaded.checkpoint_counts.record_count,
+        checkpoint_index_entry_count: loaded.checkpoint_counts.index_entry_count,
+        checkpoint_change_event_count: loaded.checkpoint_counts.change_event_count,
+        current_record_count: loaded.checkpoint_counts.record_count,
+        current_index_entry_count: loaded.checkpoint_counts.index_entry_count,
+        current_change_event_count: loaded.checkpoint_counts.change_event_count,
+        wal_records_since_checkpoint: loaded.wal_metadata.records,
+        wal_bytes_since_checkpoint: loaded.wal_metadata.bytes,
+        truncated_wal_tail: loaded.wal_metadata.truncated_tail,
+        file_size: loaded.file_size,
+        databases: loaded
+            .checkpoint_snapshot
+            .catalog
+            .databases
+            .keys()
+            .cloned()
+            .collect(),
+    }
+}
+
+fn build_metadata_only_info_report(path: PathBuf, loaded: &LoadedMetadata) -> Result<InfoReport> {
+    let checkpoint_catalog_stats = snapshot_catalog_stats(&loaded.checkpoint_snapshot.catalog);
+    let change_event_page_bytes = sum_page_bytes(&loaded.checkpoint_snapshot.change_event_pages);
+    let checkpoint_page_bytes = checkpoint_catalog_stats.record_page_bytes
+        + checkpoint_catalog_stats.index_page_bytes
+        + change_event_page_bytes;
+    let databases = loaded
+        .checkpoint_snapshot
+        .catalog
+        .databases
+        .iter()
+        .map(|(name, database)| build_snapshot_database_info(name, database))
+        .collect::<Result<Vec<_>>>()?;
+    let summary = InfoSummary {
+        database_count: databases.len(),
+        collection_count: databases
+            .iter()
+            .map(|database| database.collection_count)
+            .sum(),
+        index_count: databases.iter().map(|database| database.index_count).sum(),
+        record_count: databases.iter().map(|database| database.record_count).sum(),
+        index_entry_count: databases
+            .iter()
+            .map(|database| database.index_entry_count)
+            .sum(),
+        change_event_count: loaded.checkpoint_snapshot.change_event_count,
+        plan_cache_entry_count: loaded.checkpoint_snapshot.plan_cache_entries.len(),
+        document_bytes: databases
+            .iter()
+            .map(|database| database.document_bytes)
+            .sum(),
+        index_bytes: databases.iter().map(|database| database.index_bytes).sum(),
+        total_bytes: databases.iter().map(|database| database.total_bytes).sum(),
+    };
+    Ok(InfoReport {
+        path,
+        file_format_version: loaded.checkpoint_snapshot.file_format_version,
+        file_size: loaded.file_size,
+        last_applied_sequence: loaded.checkpoint_snapshot.last_applied_sequence,
+        summary,
+        last_checkpoint: InfoCheckpoint {
+            generation: loaded.active_superblock.generation,
+            last_applied_sequence: loaded.active_superblock.last_applied_sequence,
+            last_checkpoint_unix_ms: loaded.active_superblock.last_checkpoint_unix_ms,
+            active_superblock_slot: loaded.active_slot,
+            valid_superblocks: loaded.valid_superblocks,
+            database_count: checkpoint_catalog_stats.database_count,
+            collection_count: checkpoint_catalog_stats.collection_count,
+            index_count: checkpoint_catalog_stats.index_count,
+            snapshot_offset: loaded.active_superblock.snapshot_offset,
+            snapshot_len: loaded.active_superblock.snapshot_len,
+            wal_offset: loaded.active_superblock.wal_offset,
+            page_size: PAGE_SIZE,
+            page_count: loaded.checkpoint_counts.page_count,
+            page_bytes: checkpoint_page_bytes,
+            record_page_count: loaded.checkpoint_counts.record_page_count,
+            record_page_bytes: checkpoint_catalog_stats.record_page_bytes,
+            index_page_count: loaded.checkpoint_counts.index_page_count,
+            index_page_bytes: checkpoint_catalog_stats.index_page_bytes,
+            change_event_page_count: loaded.checkpoint_counts.change_event_page_count,
+            change_event_page_bytes,
+            record_count: loaded.checkpoint_counts.record_count,
+            index_entry_count: loaded.checkpoint_counts.index_entry_count,
+            change_event_count: loaded.checkpoint_counts.change_event_count,
+            plan_cache_entry_count: loaded.checkpoint_snapshot.plan_cache_entries.len(),
+            total_bytes: loaded.active_superblock.snapshot_len + checkpoint_page_bytes,
+        },
+        wal_since_checkpoint: InfoWal {
+            record_count: loaded.wal_metadata.records,
+            bytes: loaded.wal_metadata.bytes,
+            truncated_tail: loaded.wal_metadata.truncated_tail,
+        },
+        databases,
+    })
+}
+
+fn build_snapshot_database_info(
+    name: &str,
+    database: &SnapshotDatabaseCatalog,
+) -> Result<InfoDatabase> {
+    let checkpoint = snapshot_database_stats(database);
+    let collections = database
+        .collections
+        .iter()
+        .map(|(collection_name, collection)| {
+            build_snapshot_collection_info(collection_name, collection)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let collection_count = collections.len();
+    let index_count = collections
+        .iter()
+        .map(|collection| collection.index_count)
+        .sum();
+    let record_count = collections
+        .iter()
+        .map(|collection| collection.document_count)
+        .sum();
+    let index_entry_count = collections
+        .iter()
+        .map(|collection| collection.index_entry_count)
+        .sum();
+    let document_bytes = collections
+        .iter()
+        .map(|collection| collection.document_bytes)
+        .sum();
+    let index_bytes = collections
+        .iter()
+        .map(|collection| collection.index_bytes)
+        .sum();
+    Ok(InfoDatabase {
+        name: name.to_string(),
+        collection_count,
+        index_count,
+        record_count,
+        index_entry_count,
+        document_bytes,
+        index_bytes,
+        total_bytes: document_bytes + index_bytes,
+        checkpoint: InfoDatabaseCheckpoint {
+            collection_count: checkpoint.collection_count,
+            index_count: checkpoint.index_count,
+            record_count: checkpoint.record_count,
+            index_entry_count: checkpoint.index_entry_count,
+            record_page_count: checkpoint.record_page_count,
+            record_page_bytes: checkpoint.record_page_bytes,
+            index_page_count: checkpoint.index_page_count,
+            index_page_bytes: checkpoint.index_page_bytes,
+            total_bytes: checkpoint.record_page_bytes + checkpoint.index_page_bytes,
+        },
+        collections,
+    })
+}
+
+fn build_snapshot_collection_info(
+    name: &str,
+    collection: &SnapshotCollectionCatalog,
+) -> Result<InfoCollection> {
+    let checkpoint = snapshot_collection_stats(collection);
+    let indexes = collection
+        .indexes
+        .iter()
+        .map(|(index_name, index)| build_snapshot_index_info(index_name, index))
+        .collect::<Result<Vec<_>>>()?;
+    let index_bytes = indexes.iter().map(|index| index.bytes).sum();
+    let index_entry_count = indexes.iter().map(|index| index.entry_count).sum();
+    Ok(InfoCollection {
+        name: name.to_string(),
+        document_count: collection.record_count,
+        index_count: indexes.len(),
+        index_entry_count,
+        document_bytes: checkpoint.record_page_bytes,
+        index_bytes,
+        total_bytes: checkpoint.record_page_bytes + index_bytes,
+        checkpoint: InfoCollectionCheckpoint {
+            index_count: checkpoint.index_count,
+            record_count: checkpoint.record_count,
+            index_entry_count: checkpoint.index_entry_count,
+            record_page_count: checkpoint.record_page_count,
+            record_page_bytes: checkpoint.record_page_bytes,
+            index_page_count: checkpoint.index_page_count,
+            index_page_bytes: checkpoint.index_page_bytes,
+            total_bytes: checkpoint.record_page_bytes + checkpoint.index_page_bytes,
+        },
+        indexes,
+    })
+}
+
+fn build_snapshot_index_info(name: &str, index: &SnapshotIndexCatalog) -> Result<InfoIndex> {
+    let checkpoint = snapshot_index_stats(index);
+    Ok(InfoIndex {
+        name: name.to_string(),
+        key: index.key.clone(),
+        unique: index.unique,
+        expire_after_seconds: index.expire_after_seconds,
+        entry_count: index.entry_count,
+        bytes: checkpoint.page_bytes,
+        checkpoint: InfoIndexCheckpoint {
+            entry_count: checkpoint.entry_count,
+            page_count: checkpoint.page_count,
+            page_bytes: checkpoint.page_bytes,
+            root_page_id: checkpoint.root_page_id,
+            total_bytes: checkpoint.page_bytes,
+        },
     })
 }
 
@@ -4998,11 +6008,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION,
+        CheckpointCounts, CollectionChange, DATA_START_OFFSET, DatabaseFile,
+        FAST_INFO_MAX_LEGACY_WAL_BYTES, FILE_FORMAT_VERSION, LoadedMetadata,
         PAGE_KIND_INDEX_INTERNAL, PAGE_SIZE, PersistedChangeEvent, PersistedPlanCacheChoice,
-        PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, VerifyReport, WAL_FRAME_MAGIC,
-        WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC, decode_page, decode_snapshot_state,
-        read_superblock,
+        PersistedPlanCacheEntry, SUPERBLOCK_COUNT, SnapshotState, Superblock, VerifyReport,
+        WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMetadata, WalMutation, ZSTD_BLOB_MAGIC, decode_page,
+        decode_snapshot_state, load_metadata, read_superblock, requires_legacy_wal_upgrade,
     };
     use crate::v2::engine as v2_engine;
 
@@ -5314,6 +6325,108 @@ mod tests {
         assert_eq!(report.summary.record_count, 0);
         assert_eq!(report.last_checkpoint.active_superblock_slot, 0);
         assert_eq!(report.last_checkpoint.valid_superblocks, 1);
+    }
+
+    #[test]
+    fn info_reports_checkpoint_metadata_without_rehydrating_clean_v1_files() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("info-metadata-only.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1, "sku": "alpha", "qty": 2 });
+            insert_record(&mut widgets, 2, doc! { "_id": 2, "sku": "beta", "qty": 4 });
+            apply_index_specs(
+                &mut widgets,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: vec![
+                        sample_change_event(1, "insert"),
+                        sample_change_event(2, "insert"),
+                    ],
+                })
+                .expect("seed widgets");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open file");
+        let metadata = load_metadata(&mut file).expect("load metadata");
+        assert_eq!(metadata.wal_metadata.records, 0);
+        assert_eq!(metadata.checkpoint_counts.record_count, 2);
+        assert_eq!(metadata.checkpoint_counts.index_entry_count, 4);
+
+        let report = DatabaseFile::info(&path).expect("info");
+        assert_eq!(report.last_applied_sequence, 1);
+        assert_eq!(report.wal_since_checkpoint.record_count, 0);
+        assert_eq!(report.summary.database_count, 1);
+        assert_eq!(report.summary.record_count, 2);
+        assert_eq!(report.summary.index_entry_count, 4);
+        assert!(report.summary.document_bytes > 0);
+        assert!(report.summary.index_bytes > 0);
+    }
+
+    #[test]
+    fn inspect_reports_checkpoint_metadata_without_rehydrating_clean_v1_files() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("inspect-metadata-only.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1, "sku": "alpha", "qty": 2 });
+            apply_index_specs(
+                &mut widgets,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: vec![sample_change_event(1, "insert")],
+                })
+                .expect("seed widgets");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let report = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(report.last_applied_sequence, 1);
+        assert_eq!(report.current_record_count, 1);
+        assert_eq!(report.current_index_entry_count, 2);
+        assert_eq!(report.current_change_event_count, 1);
+        assert_eq!(report.wal_records_since_checkpoint, 0);
+        assert!(!report.truncated_wal_tail);
+        assert_eq!(report.databases, vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn large_legacy_wal_only_files_are_rejected_for_fast_info_paths() {
+        let loaded = LoadedMetadata {
+            checkpoint_snapshot: SnapshotState::default(),
+            active_slot: 0,
+            active_superblock: Superblock::default(),
+            valid_superblocks: 1,
+            wal_metadata: WalMetadata {
+                records: 1,
+                bytes: FAST_INFO_MAX_LEGACY_WAL_BYTES + 1,
+                truncated_tail: false,
+            },
+            file_size: DATA_START_OFFSET + FAST_INFO_MAX_LEGACY_WAL_BYTES + 1,
+            checkpoint_counts: CheckpointCounts::default(),
+        };
+
+        assert!(requires_legacy_wal_upgrade(&loaded));
     }
 
     #[test]

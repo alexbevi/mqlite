@@ -12,8 +12,8 @@ use mqlite_catalog::Catalog;
 
 use crate::{
     InfoCheckpoint, InfoCollection, InfoCollectionCheckpoint, InfoDatabase, InfoDatabaseCheckpoint,
-    InfoIndex, InfoIndexCheckpoint, InfoReport, InfoSummary, InfoWal, PersistedChangeEvent,
-    PersistedPlanCacheEntry, PersistedState,
+    InfoIndex, InfoIndexCheckpoint, InfoReport, InfoSummary, InfoWal, InspectReport,
+    PersistedChangeEvent, PersistedPlanCacheEntry, PersistedState,
     v2::{
         catalog::{CollectionHandle, PagerCollectionReadView, PagerNamespaceCatalog},
         layout::{
@@ -133,6 +133,50 @@ pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
             bytes: pager.wal_bytes(),
             truncated_tail: false,
         },
+        databases,
+    })
+}
+
+pub(crate) fn read_inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
+    let path = path.as_ref().to_path_buf();
+    let pager = Pager::open(&path)?;
+    let header = pager.header();
+    let superblock = pager.active_superblock();
+    let summary = &superblock.summary;
+    let databases = open_namespace_catalog(&path)?
+        .collection_handles()?
+        .into_iter()
+        .map(|collection| collection.meta().database.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    Ok(InspectReport {
+        path,
+        file_format_version: FILE_FORMAT_VERSION,
+        checkpoint_generation: superblock.generation,
+        last_applied_sequence: superblock.durable_lsn,
+        last_checkpoint_unix_ms: superblock.last_checkpoint_unix_ms,
+        active_superblock_slot: pager.active_superblock_slot(),
+        valid_superblocks: pager.valid_superblocks(),
+        snapshot_offset: 0,
+        snapshot_len: 0,
+        wal_offset: superblock.wal_start_offset,
+        page_size: header.page_size as usize,
+        checkpoint_page_count: summary.page_count as usize,
+        checkpoint_record_page_count: 0,
+        checkpoint_index_page_count: 0,
+        checkpoint_change_event_page_count: 0,
+        checkpoint_record_count: summary.record_count as usize,
+        checkpoint_index_entry_count: summary.index_entry_count as usize,
+        checkpoint_change_event_count: summary.change_event_count as usize,
+        current_record_count: summary.record_count as usize,
+        current_index_entry_count: summary.index_entry_count as usize,
+        current_change_event_count: summary.change_event_count as usize,
+        wal_records_since_checkpoint: 0,
+        wal_bytes_since_checkpoint: pager.wal_bytes(),
+        truncated_wal_tail: false,
+        file_size: pager.file_size(),
         databases,
     })
 }
@@ -316,7 +360,9 @@ mod tests {
     use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
-    use super::{create_empty, is_v2_file, load_catalog, load_persisted_state, read_info};
+    use super::{
+        create_empty, is_v2_file, load_catalog, load_persisted_state, read_info, read_inspect,
+    };
     use crate::v2::{
         checkpoint::{write_catalog_checkpoint, write_state_checkpoint},
         layout::{DATA_START_OFFSET, DEFAULT_PAGE_SIZE},
@@ -339,6 +385,24 @@ mod tests {
         assert_eq!(report.last_checkpoint.page_size, DEFAULT_PAGE_SIZE as usize);
         assert_eq!(report.last_checkpoint.wal_offset, DATA_START_OFFSET);
         assert_eq!(report.wal_since_checkpoint.bytes, 0);
+    }
+
+    #[test]
+    fn creates_empty_v2_file_and_reads_inspect() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = PathBuf::from(temp_dir.path().join("v2-inspect.mongodb"));
+
+        create_empty(&path).expect("create v2 file");
+
+        let report = read_inspect(&path).expect("read v2 inspect");
+        assert_eq!(report.file_format_version, 8);
+        assert_eq!(report.current_record_count, 0);
+        assert_eq!(report.checkpoint_page_count, 0);
+        assert_eq!(report.active_superblock_slot, 0);
+        assert_eq!(report.valid_superblocks, 1);
+        assert_eq!(report.page_size, DEFAULT_PAGE_SIZE as usize);
+        assert_eq!(report.wal_offset, DATA_START_OFFSET);
+        assert_eq!(report.wal_bytes_since_checkpoint, 0);
     }
 
     #[test]
