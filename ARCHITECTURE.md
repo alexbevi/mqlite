@@ -102,7 +102,9 @@ The `find` planner is now being split away from direct `CollectionCatalog` assum
 planning and costing paths target a narrower collection and index read view so the broker can plug
 in page-backed record and index handles later without changing the planner’s cost model or explain
 surface. The broker’s `find` and `explain` read paths now ask the storage engine for that borrowed
-collection read view instead of reaching straight through to `Catalog` state.
+collection read view instead of reaching straight through to `Catalog` state. The v2 collection and
+index handles now also implement that shared read-view surface over a pager, so the remaining gap
+is namespace loading and write-side durability rather than planner compatibility.
 
 ## Snapshot Contents
 

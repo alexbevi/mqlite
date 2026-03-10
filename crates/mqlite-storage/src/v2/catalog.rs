@@ -1,12 +1,19 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
-use mqlite_catalog::{IndexBounds, IndexEntry};
+use mqlite_catalog::{CollectionRecord, IndexBounds, IndexEntry};
 
-use crate::v2::{
-    btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
-    page::RecordSlot,
+use crate::{
+    engine::{CollectionReadView, IndexReadView},
+    v2::{
+        btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
+        page::RecordSlot,
+        pager::Pager,
+    },
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,18 +172,163 @@ impl IndexHandle {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PagerCollectionReadView {
+    collection: CollectionHandle,
+    pager: Arc<Mutex<Pager>>,
+    indexes: BTreeMap<String, PagerIndexReadView>,
+}
+
+impl PagerCollectionReadView {
+    pub fn new(collection: CollectionHandle, pager: Arc<Mutex<Pager>>) -> Self {
+        let indexes = collection
+            .indexes()
+            .iter()
+            .map(|(name, index)| {
+                (
+                    name.clone(),
+                    PagerIndexReadView {
+                        index: index.clone(),
+                        pager: Arc::clone(&pager),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            collection,
+            pager,
+            indexes,
+        }
+    }
+}
+
+impl CollectionReadView for PagerCollectionReadView {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
+        let mut pager = lock_pager(&self.pager)?;
+        self.collection
+            .scan_records(&mut *pager)?
+            .into_iter()
+            .map(|record| {
+                Ok(CollectionRecord::from_encoded(
+                    record.record_id,
+                    record.decode_document()?,
+                    record.encoded_document,
+                ))
+            })
+            .collect()
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
+        let mut pager = lock_pager(&self.pager)?;
+        self.collection
+            .record_by_id(&mut *pager, record_id)?
+            .map(|record| record.decode_document())
+            .transpose()
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn IndexReadView> {
+        self.indexes
+            .get(name)
+            .map(|index| index as &dyn IndexReadView)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PagerIndexReadView {
+    index: IndexHandle,
+    pager: Arc<Mutex<Pager>>,
+}
+
+impl IndexReadView for PagerIndexReadView {
+    fn name(&self) -> &str {
+        self.index.name()
+    }
+
+    fn key_pattern(&self) -> &Document {
+        self.index.key_pattern()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.index.meta().entry_count as usize
+    }
+
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>> {
+        let mut pager = lock_pager(&self.pager)?;
+        self.index
+            .scan_bounds(&mut *pager, bounds, ScanDirection::Forward)
+    }
+
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        self.scan_entries(bounds)
+            .map(|entries| entries.len())
+            .unwrap_or(0)
+    }
+
+    fn covers_paths(&self, paths: &std::collections::BTreeSet<String>) -> bool {
+        paths
+            .iter()
+            .all(|path| self.key_pattern().contains_key(path))
+    }
+
+    fn estimate_value_count(&self, _field: &str, _value: &Bson) -> Option<usize> {
+        None
+    }
+
+    fn estimate_values_count(&self, _field: &str, _values: &[Bson]) -> Option<usize> {
+        None
+    }
+
+    fn estimate_range_count(
+        &self,
+        _field: &str,
+        _lower: Option<(&Bson, bool)>,
+        _upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn present_count(&self, _field: &str) -> Option<usize> {
+        None
+    }
+}
+
+fn lock_pager(pager: &Arc<Mutex<Pager>>) -> Result<MutexGuard<'_, Pager>> {
+    pager
+        .lock()
+        .map_err(|_| anyhow!("v2 pager mutex was poisoned"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        fs::OpenOptions,
+        io::{Seek, SeekFrom, Write},
+        sync::{Arc, Mutex},
+    };
 
     use anyhow::{Result, anyhow};
     use bson::{Bson, doc};
     use mqlite_catalog::IndexEntry;
+    use tempfile::tempdir;
 
-    use super::{CollectionHandle, CollectionMeta, IndexHandle, IndexMeta, SummaryCounters};
-    use crate::v2::{
-        btree::PageReader,
-        page::{PageId, RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage},
+    use super::{
+        CollectionHandle, CollectionMeta, IndexHandle, IndexMeta, PagerCollectionReadView,
+        SummaryCounters,
+    };
+    use crate::{
+        engine::CollectionReadView,
+        v2::{
+            btree::PageReader,
+            engine::create_empty,
+            layout::{DEFAULT_PAGE_SIZE, page_offset},
+            page::{PageId, RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage},
+            pager::Pager,
+        },
     };
 
     #[derive(Default)]
@@ -273,5 +425,98 @@ mod tests {
             record.decode_document().expect("decode"),
             doc! { "_id": 7, "sku": "alpha", "qty": 4 }
         );
+    }
+
+    #[test]
+    fn pager_collection_read_view_reads_records_from_v2_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("view.mongodb");
+        create_empty(&path).expect("create v2 file");
+
+        write_page(
+            &path,
+            1,
+            &RecordLeafPage {
+                page_id: 1,
+                next_page_id: None,
+                entries: vec![
+                    RecordSlot::from_document(10, &doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+                        .expect("record"),
+                ],
+            }
+            .encode()
+            .expect("encode records"),
+        );
+        write_page(
+            &path,
+            2,
+            &SecondaryLeafPage {
+                page_id: 2,
+                next_page_id: None,
+                entries: vec![
+                    SecondaryEntry::from_index_entry(
+                        &IndexEntry {
+                            record_id: 10,
+                            key: doc! { "_id": 7 },
+                            present_fields: vec!["_id".to_string()],
+                        },
+                        &doc! { "_id": 1 },
+                    )
+                    .expect("entry"),
+                ],
+            }
+            .encode()
+            .expect("encode index"),
+        );
+
+        let collection = CollectionHandle::new(
+            CollectionMeta {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                record_root_page_id: Some(1),
+                index_directory_root_page_id: None,
+                options_bytes: bson::to_vec(&doc! {}).expect("options"),
+                next_record_id: 11,
+                summary: SummaryCounters {
+                    record_count: 1,
+                    index_count: 1,
+                    ..SummaryCounters::default()
+                },
+            },
+            [IndexHandle::new(IndexMeta {
+                name: "_id_".to_string(),
+                root_page_id: Some(2),
+                key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
+                unique: true,
+                expire_after_seconds: None,
+                entry_count: 1,
+                index_bytes: 32,
+            })
+            .expect("index handle")],
+        )
+        .expect("collection handle");
+        let pager = Arc::new(Mutex::new(Pager::open(&path).expect("open pager")));
+        let view = PagerCollectionReadView::new(collection, pager);
+
+        let records = view.scan_records().expect("scan records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, 10);
+        assert_eq!(
+            view.record_document(10).expect("record document"),
+            Some(doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+        );
+        assert_eq!(view.index_names(), vec!["_id_".to_string()]);
+    }
+
+    fn write_page(path: &std::path::Path, page_id: PageId, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open v2 file");
+        let offset = page_offset(page_id, DEFAULT_PAGE_SIZE).expect("page offset");
+        file.seek(SeekFrom::Start(offset)).expect("seek page");
+        file.write_all(bytes).expect("write page");
+        file.flush().expect("flush page");
     }
 }
