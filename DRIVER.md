@@ -10,7 +10,7 @@ file:///absolute/path/to/database.mongodb?db=app
 
 The driver still speaks `OP_MSG` exclusively. The only difference is that the remote socket becomes a local IPC stream backed by a per-file `mqlite` broker.
 
-For direct local validation outside a driver, the CLI also exposes `mqlite info --file <path>` for per-database, per-collection, and per-index size and count summaries plus last-checkpoint metadata, while `mqlite inspect` remains the lower-level file-layout view. On files with no WAL backlog, both commands now answer from checkpoint metadata without first rebuilding every collection and index into memory; large legacy v1 WAL-only files fail fast with an explicit checkpoint-or-v2 rewrite error instead of replaying the full tail just to print metadata. `mqlite verify` remains the command that does the full structural walk.
+For direct local validation outside a driver, the CLI also exposes `mqlite info --file <path>` for per-database, per-collection, and per-index size and count summaries plus last-checkpoint metadata, while `mqlite inspect` remains the lower-level file-layout view. `mqlite` now creates and writes only the page-backed v2 format. Both metadata commands answer from checkpoint metadata plus a metadata-only WAL fold when needed, instead of rebuilding every collection and index into memory first. Older pre-v2 files are rejected explicitly. `mqlite verify` remains the command that does the full structural walk.
 
 On the storage side, the page-backed v2 read path now persists per-index value-frequency and field-presence stats through checkpoint and reopen, so broker planning can reuse those estimates without rebuilding them first.
 V2 checkpoints also now persist change-stream history and plan-cache entries alongside the page graph, so broker-visible durable state can round-trip through the new superblock roots without the old snapshot wrapper.
@@ -56,7 +56,7 @@ Local durable-file compression is internal to `mqlite` and does not change the `
 - If no live broker exists, spawn `mqlite serve --file <path> --watch-parent-pid <launcher-pid>`.
 - Re-read the manifest and connect once the endpoint is ready.
 - If the spawned broker exits before writing the manifest, surface that startup error instead of reporting only a manifest timeout.
-- Once the broker is running, it checkpoints automatically after about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. That periodic checkpoint is handed off to a background worker so later commands can keep running; if the broker cannot safely reuse inactive checkpoint space for that rewrite, it leaves the WAL in place and still checkpoints on idle shutdown.
+- Once the broker is running, it checkpoints automatically after about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. That periodic checkpoint is handed off to a background worker so later commands can keep running; any writes that arrive after the checkpoint snapshot remain in the WAL tail until the next checkpoint.
 - Brokers are shared per file and may shut down after an idle timeout, but launcher-owned brokers should also exit promptly once their spawning process is gone and their active IPC connections have drained.
 
 ### Transport

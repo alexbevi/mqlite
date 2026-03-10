@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -336,20 +336,48 @@ fn load_change_events(
     pager: &mut Pager,
     root_page_id: Option<u64>,
 ) -> Result<Vec<PersistedChangeEvent>> {
-    let Some(root_page_id) = root_page_id else {
+    let Some(mut page_id) = root_page_id else {
         return Ok(Vec::new());
     };
-    Ok(ChangeEventsPage::decode(&pager.read_page_bytes(root_page_id)?)?.events)
+    let mut seen = HashSet::new();
+    let mut events = Vec::new();
+    loop {
+        if !seen.insert(page_id) {
+            return Err(anyhow::anyhow!(
+                "v2 change-event page chain contains a cycle"
+            ));
+        }
+        let page = ChangeEventsPage::decode(&pager.read_page_bytes(page_id)?)?;
+        events.extend(page.events);
+        let Some(next_page_id) = page.next_page_id else {
+            break;
+        };
+        page_id = next_page_id;
+    }
+    Ok(events)
 }
 
 fn load_plan_cache_entries(
     pager: &mut Pager,
     root_page_id: Option<u64>,
 ) -> Result<Vec<PersistedPlanCacheEntry>> {
-    let Some(root_page_id) = root_page_id else {
+    let Some(mut page_id) = root_page_id else {
         return Ok(Vec::new());
     };
-    Ok(PlanCachePage::decode(&pager.read_page_bytes(root_page_id)?)?.entries)
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    loop {
+        if !seen.insert(page_id) {
+            return Err(anyhow::anyhow!("v2 plan-cache page chain contains a cycle"));
+        }
+        let page = PlanCachePage::decode(&pager.read_page_bytes(page_id)?)?;
+        entries.extend(page.entries);
+        let Some(next_page_id) = page.next_page_id else {
+            break;
+        };
+        page_id = next_page_id;
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]

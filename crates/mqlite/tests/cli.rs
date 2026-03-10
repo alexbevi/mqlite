@@ -308,7 +308,7 @@ fn command_reports_broker_startup_failure_for_invalid_existing_file() {
         .stderr(predicates::str::contains(
             "mqlite broker exited before writing its manifest",
         ))
-        .stderr(predicates::str::contains("Error: file is truncated"))
+        .stderr(predicates::str::contains("supported v2 mqlite database"))
         .stderr(predicates::str::contains("timed out waiting for mqlite broker manifest").not());
 }
 

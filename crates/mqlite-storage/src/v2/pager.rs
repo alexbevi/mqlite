@@ -93,8 +93,7 @@ impl Pager {
     }
 
     pub fn wal_bytes(&self) -> u64 {
-        self.active_superblock
-            .wal_end_offset
+        self.file_size
             .saturating_sub(self.active_superblock.wal_start_offset)
     }
 

@@ -535,7 +535,7 @@ impl CollectionMetaPage {
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut payload = Vec::new();
         cbor_ser::into_writer(&self.meta, &mut payload)?;
-        encode_single_payload_page(PageKind::CollectionMeta, self.page_id, &payload)
+        encode_single_payload_page(PageKind::CollectionMeta, self.page_id, None, &payload)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -558,7 +558,7 @@ impl IndexMetaPage {
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut payload = Vec::new();
         cbor_ser::into_writer(&self.meta, &mut payload)?;
-        encode_single_payload_page(PageKind::IndexMeta, self.page_id, &payload)
+        encode_single_payload_page(PageKind::IndexMeta, self.page_id, None, &payload)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -581,7 +581,7 @@ impl StatsPage {
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut payload = Vec::new();
         cbor_ser::into_writer(&self.stats, &mut payload)?;
-        encode_single_payload_page(PageKind::Stats, self.page_id, &payload)
+        encode_single_payload_page(PageKind::Stats, self.page_id, None, &payload)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -597,6 +597,7 @@ impl StatsPage {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChangeEventsPage {
     pub page_id: PageId,
+    pub next_page_id: Option<PageId>,
     pub events: Vec<PersistedChangeEvent>,
 }
 
@@ -604,7 +605,12 @@ impl ChangeEventsPage {
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut payload = Vec::new();
         cbor_ser::into_writer(&self.events, &mut payload)?;
-        encode_single_payload_page(PageKind::ChangeEventLeaf, self.page_id, &payload)
+        encode_single_payload_page(
+            PageKind::ChangeEventLeaf,
+            self.page_id,
+            self.next_page_id,
+            &payload,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -612,6 +618,7 @@ impl ChangeEventsPage {
         let payload = decode_single_payload(bytes)?;
         Ok(Self {
             page_id: header.page_id,
+            next_page_id: header.aux_page_id,
             events: cbor_de::from_reader(payload)?,
         })
     }
@@ -620,6 +627,7 @@ impl ChangeEventsPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanCachePage {
     pub page_id: PageId,
+    pub next_page_id: Option<PageId>,
     pub entries: Vec<PersistedPlanCacheEntry>,
 }
 
@@ -627,7 +635,12 @@ impl PlanCachePage {
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut payload = Vec::new();
         cbor_ser::into_writer(&self.entries, &mut payload)?;
-        encode_single_payload_page(PageKind::PlanCache, self.page_id, &payload)
+        encode_single_payload_page(
+            PageKind::PlanCache,
+            self.page_id,
+            self.next_page_id,
+            &payload,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -635,6 +648,7 @@ impl PlanCachePage {
         let payload = decode_single_payload(bytes)?;
         Ok(Self {
             page_id: header.page_id,
+            next_page_id: header.aux_page_id,
             entries: cbor_de::from_reader(payload)?,
         })
     }
@@ -673,10 +687,11 @@ fn slice_payload(bytes: &[u8], payload_offset: u16, payload_len: u16) -> Result<
 fn encode_single_payload_page(
     page_kind: PageKind,
     page_id: PageId,
+    aux_page_id: Option<PageId>,
     payload: &[u8],
 ) -> Result<[u8; PAGE_LEN]> {
     let mut bytes = [0_u8; PAGE_LEN];
-    encode_header(&mut bytes, page_kind, page_id, None, 1)?;
+    encode_header(&mut bytes, page_kind, page_id, aux_page_id, 1)?;
     let slot_area_end = page_slot_area_end(1, META_SLOT_LEN)?;
     let payload_offset = PAGE_LEN
         .checked_sub(payload.len())
@@ -979,6 +994,7 @@ mod tests {
 
         let change_events = ChangeEventsPage {
             page_id: 14,
+            next_page_id: Some(15),
             events: vec![
                 PersistedChangeEvent::new(
                     &doc! { "_data": "token-1" },
@@ -1006,7 +1022,8 @@ mod tests {
         assert_eq!(decoded_change_events, change_events);
 
         let plan_cache = PlanCachePage {
-            page_id: 15,
+            page_id: 16,
+            next_page_id: None,
             entries: vec![PersistedPlanCacheEntry {
                 namespace: "app.widgets".to_string(),
                 filter_shape: "{\"sku\":?}".to_string(),

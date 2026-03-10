@@ -39,7 +39,7 @@ mqlite command --file /tmp/example.mongodb --db app --eval '{"find":"widgets","f
 `mqlite command` will reuse an existing broker for that file or auto-spawn one if needed.
 If the auto-spawned broker exits before it publishes its manifest, the command reports that startup failure instead of collapsing it into a generic manifest timeout.
 Launcher-owned brokers are also started with `--watch-parent-pid`, so `mqlite command` and driver-managed brokers shut themselves down shortly after the spawning process exits instead of waiting out the full idle timeout.
-Brokers also checkpoint automatically after about 60 seconds once the broker reaches a brief quiet window with no command in flight. The broker snapshots that checkpoint into a background worker so later commands can keep running; if the current inactive checkpoint region is too small to rewrite safely in place, the broker leaves the WAL in place and falls back to the normal idle-shutdown checkpoint instead of blocking active work.
+Brokers also checkpoint automatically after about 60 seconds once the broker reaches a brief quiet window with no command in flight. The broker snapshots that checkpoint into a background worker so later commands can keep running, and any writes that arrive after the snapshot stays in the WAL tail until the next checkpoint.
 
 If you want a broker to stay up explicitly, run:
 
@@ -76,7 +76,7 @@ The CLI is intentionally small and focused:
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
 | `mqlite inspect --file <path>` | Print file, checkpoint, WAL, and catalog metadata. |
 
-`mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report. On a file with no WAL backlog, both commands now read checkpoint metadata directly instead of rehydrating every record and index page first, so they return quickly even on large files. Legacy v1 files with an oversized uncheckpointed WAL tail now fail fast with an explicit checkpoint-or-v2 rewrite error instead of spending a long time replaying that backlog just to print metadata. Use `mqlite verify` when you want the slower full page-validation pass.
+`mqlite` now creates and writes only the page-backed v2 file format. `mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report. Both commands answer from persisted checkpoint metadata and, when needed, fold in the WAL tail with a metadata-only scan instead of rehydrating every record and index page first, so they return quickly even on large files. Older pre-v2 files are rejected explicitly. Use `mqlite verify` when you want the slower full page-validation pass.
 
 You can also pipe JSON into `mqlite command`:
 

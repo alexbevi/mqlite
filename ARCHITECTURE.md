@@ -21,10 +21,9 @@ The current workspace is split into focused crates:
 - `mqlite-server`: command dispatch, planning, execution, and broker lifecycle.
 - `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, and `checkpoint`.
 
-`mqlite-storage/src/v2/` is the in-progress page-backed engine path. It currently contains the
-v2 header and superblock format, metadata-only `info` reads, typed record and secondary page
-codecs, and read-only record and index tree handles that can serve point and range reads directly
-from persisted pages without rehydrating a full `Catalog`.
+`mqlite-storage/src/v2/` is the on-disk storage engine. It contains the v2 header and superblock
+format, typed record and secondary page codecs, checkpoint writers, recovery readers, and
+page-backed metadata paths for `info` and `inspect`.
 
 ## Source Layout
 
@@ -54,7 +53,7 @@ The broker is the only writer for a database file.
 
 - Reads are served from in-process state loaded from the file plus any applied WAL mutations.
 - Writes append WAL records, update in-memory state, and become durable before command success. Concurrent writers share a short group-commit sync barrier so multiple acknowledged commands can ride the same `fsync`.
-- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. The broker captures checkpoint state briefly under the storage lock, then writes the checkpoint on a background worker so later commands can keep running. If the inactive checkpoint region is not large enough for a safe concurrent rewrite, the broker leaves the WAL in place and relies on the idle-shutdown checkpoint instead of blocking active command execution.
+- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. The broker captures checkpoint state briefly under the storage lock, then writes the checkpoint on a background worker so later commands can keep running. Writes that arrive after that capture remain in the WAL tail and are preserved across the checkpoint.
 - Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
 - CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
@@ -65,32 +64,34 @@ The CLI surfaces split along intent:
 - `mqlite command` is the direct wire-protocol validation path.
 - `mqlite info` summarizes the recovered current catalog state, per-namespace sizes and counts, WAL backlog, and the most recent checkpoint.
 - `mqlite inspect` stays focused on lower-level file, superblock, WAL, and catalog metadata.
-- When a file has no WAL tail to replay, `mqlite info` and `mqlite inspect` answer from checkpoint metadata directly instead of hydrating every collection and index page first. Legacy v1 files that still consist of a very large uncheckpointed WAL tail now fail fast for those metadata commands instead of replaying the whole backlog just to print a report. `mqlite verify` remains the slower full validation path.
+- `mqlite` now creates and writes only the page-backed v2 file format. `mqlite info` and `mqlite inspect` answer from checkpoint metadata and, when needed, fold in the WAL tail with a metadata-only scan instead of hydrating every collection and index page first. Pre-v2 files are rejected explicitly. `mqlite verify` remains the slower full validation path.
 
 ## Durable File Layout
 
-The file is versioned and self-describing.
+The v2 file is versioned and self-describing.
 
 - Fixed header:
   - magic and file format version
   - reserved metadata region
 - Dual rotating superblocks:
   - generation number
-  - last applied sequence
+  - durable sequence
   - checkpoint time
-  - snapshot offset and length
-  - WAL start offset
-  - snapshot checksum
+  - WAL start and end offsets
+  - durable root page ids
+  - persisted summary counters
 - Data region:
-  - slotted record pages
-  - slotted index leaf and internal pages
-  - selectively zstd-compressed checkpoint pages and snapshot metadata when the stored bytes shrink materially
-  - append-only WAL frames after the active snapshot
+  - namespace internal and leaf pages
+  - collection-meta, index-meta, and stats pages
+  - record internal and leaf pages
+  - secondary-index internal and leaf pages
+  - change-event and plan-cache pages
+  - append-only WAL frames after the checkpointed page graph
 
-The current format version is encoded in the header and checkpoint snapshot. Recovery rejects unsupported versions.
+The current format version is encoded in the header and active superblock. Recovery rejects unsupported versions.
 
-The in-progress v2 format uses 8 KiB fixed pages behind the same single-file model. Its page set is
-typed up front rather than being reconstructed from checkpoint snapshot references:
+The v2 format uses 8 KiB fixed pages behind the same single-file model. Its page set is typed up
+front rather than being reconstructed from checkpoint snapshot references:
 
 - namespace internal and leaf pages keyed by namespace or index-name strings
 - collection-meta and index-meta pages for page roots, key patterns, and counters
@@ -99,20 +100,16 @@ typed up front rather than being reconstructed from checkpoint snapshot referenc
 - secondary-index internal and leaf pages keyed by persisted BSON key plus `RecordId`
 - two rotating superblocks with summary counters for metadata-only open paths
 
-Those v2 pages are not broker-default yet, but the storage crate now has direct page codecs and
-read handles for them. It can now resolve a collection through persisted namespace metadata and
-serve page-backed collection and index read views without full catalog hydration on reopen. The
-storage crate can also emit a full v2 checkpoint from an in-memory catalog by writing namespace,
-meta, record, secondary-index, and stats pages plus a new superblock summary. The v2 `info` path
-now builds its per-database, per-collection, and per-index report from that persisted namespace
-and meta page graph instead of returning only top-level counters. Page-backed v2 index read views
-also preserve histogram-style value frequencies and field-presence counts through checkpoint and
-reopen, so planning can keep using persisted estimates instead of rebuilding in-memory stats. The
-same v2 page graph can now also be materialized back into a full `Catalog` when a broker path
-still needs collection-owned mutable state instead of a borrowed page-backed read view. V2
-checkpoints also now have direct page payloads for persisted change-stream history and plan-cache
-entries, so the full broker-visible durable state can round-trip through the v2 superblock roots
-instead of living only in the old snapshot format.
+The storage crate resolves collections through persisted namespace metadata, serves page-backed
+collection and index read views without full catalog hydration on reopen, and emits full v2
+checkpoints by writing namespace, meta, record, secondary-index, stats, change-event, and
+plan-cache pages plus a new superblock summary. The v2 `info` path builds its per-database,
+per-collection, and per-index report from that persisted namespace and meta page graph and folds
+in any WAL tail with a metadata-only pass. Page-backed v2 index read views preserve histogram-style
+value frequencies and field-presence counts through checkpoint and reopen, so planning can keep
+using persisted estimates instead of rebuilding in-memory stats. The same v2 page graph can also
+be materialized back into a full `Catalog` when a broker path still needs collection-owned mutable
+state instead of a borrowed page-backed read view.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug

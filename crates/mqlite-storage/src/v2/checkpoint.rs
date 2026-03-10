@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,8 +17,10 @@ use crate::v2::{
         CollectionMeta, IndexMeta, PersistedIndexStats, PersistedValueFrequency, RootSet,
         SummaryCounters,
     },
-    engine::create_empty,
-    layout::{DEFAULT_PAGE_SIZE, HEADER_LEN, page_offset},
+    layout::{
+        DATA_START_OFFSET, DEFAULT_PAGE_SIZE, FILE_MAGIC, FileHeader, HEADER_LEN, SUPERBLOCK_COUNT,
+        SUPERBLOCK_LEN, page_offset,
+    },
     page::{
         ChangeEventsPage, CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
         NamespaceLeafPage, NamespaceSeparator, PageId, PlanCachePage, RecordInternalPage,
@@ -29,6 +31,12 @@ use crate::v2::{
 use crate::{PersistedChangeEvent, PersistedPlanCacheEntry, PersistedState};
 
 use super::layout::Superblock;
+
+pub(crate) struct CheckpointWriteResult {
+    pub active_superblock_slot: usize,
+    pub active_superblock: Superblock,
+    pub file_size: u64,
+}
 
 pub(crate) fn write_catalog_checkpoint(path: impl AsRef<Path>, catalog: &Catalog) -> Result<()> {
     write_checkpoint_state(path, 0, checkpoint_unix_ms(), catalog, &[], &[])
@@ -54,7 +62,76 @@ fn write_checkpoint_state(
     plan_cache_entries: &[PersistedPlanCacheEntry],
 ) -> Result<()> {
     let path = path.as_ref();
-    create_empty(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock_exclusive()?;
+    let (active_superblock_slot, current_generation) = read_active_superblock_position(&mut file)?;
+    write_checkpoint_state_to_file(
+        &mut file,
+        durable_lsn,
+        last_checkpoint_unix_ms,
+        catalog,
+        change_events,
+        plan_cache_entries,
+        active_superblock_slot,
+        current_generation,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn initialize_empty_file(file: &mut File) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(&FileHeader::default().encode())?;
+    file.write_all(&vec![0_u8; SUPERBLOCK_LEN * SUPERBLOCK_COUNT])?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_state_checkpoint_to_file(
+    file: &mut File,
+    state: &PersistedState,
+    active_superblock_slot: usize,
+    current_generation: u64,
+) -> Result<CheckpointWriteResult> {
+    write_checkpoint_state_to_file(
+        file,
+        state.last_applied_sequence,
+        state.last_checkpoint_unix_ms,
+        &state.catalog,
+        &state.change_events,
+        &state.plan_cache_entries,
+        active_superblock_slot,
+        current_generation,
+    )
+}
+
+fn write_checkpoint_state_to_file(
+    file: &mut File,
+    durable_lsn: u64,
+    last_checkpoint_unix_ms: u64,
+    catalog: &Catalog,
+    change_events: &[PersistedChangeEvent],
+    plan_cache_entries: &[PersistedPlanCacheEntry],
+    active_superblock_slot: usize,
+    current_generation: u64,
+) -> Result<CheckpointWriteResult> {
+    if file.metadata()?.len() == 0 {
+        initialize_empty_file(file)?;
+    }
+
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header_bytes)?;
+    if &header_bytes[..8] != FILE_MAGIC {
+        return Err(anyhow!("existing file is not a v2 database"));
+    }
+    FileHeader::decode(&header_bytes)?;
 
     let mut writer = CheckpointWriter::default();
     let mut summary = SummaryCounters {
@@ -135,8 +212,13 @@ fn write_checkpoint_state(
 
     let next_page_id = writer.next_page_id.max(1);
     let wal_offset = page_offset(next_page_id, DEFAULT_PAGE_SIZE)?;
+    let next_slot = if current_generation == 0 {
+        0
+    } else {
+        (active_superblock_slot + 1) % SUPERBLOCK_COUNT
+    };
     let superblock = Superblock {
-        generation: 1,
+        generation: current_generation + 1,
         durable_lsn,
         last_checkpoint_unix_ms,
         wal_start_offset: wal_offset,
@@ -152,18 +234,56 @@ fn write_checkpoint_state(
         summary,
     };
 
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    file.lock_exclusive()?;
+    file.set_len(DATA_START_OFFSET)?;
     for (page_id, page) in writer.pages {
         file.seek(SeekFrom::Start(page_offset(page_id, DEFAULT_PAGE_SIZE)?))?;
         file.write_all(&page)?;
     }
-    file.seek(SeekFrom::Start(HEADER_LEN as u64))?;
+    file.seek(SeekFrom::Start(
+        HEADER_LEN as u64 + next_slot as u64 * SUPERBLOCK_LEN as u64,
+    ))?;
     file.write_all(&superblock.encode())?;
     file.set_len(wal_offset)?;
     file.flush()?;
     file.sync_all()?;
-    Ok(())
+    Ok(CheckpointWriteResult {
+        active_superblock_slot: next_slot,
+        active_superblock: superblock,
+        file_size: wal_offset,
+    })
+}
+
+fn read_active_superblock_position(file: &mut File) -> Result<(usize, u64)> {
+    let file_size = file.metadata()?.len();
+    if file_size < DATA_START_OFFSET {
+        return Ok((0, 0));
+    }
+
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header_bytes)?;
+    if FileHeader::decode(&header_bytes).is_err() {
+        return Ok((0, 0));
+    }
+
+    let mut active: Option<(usize, u64)> = None;
+    for slot in 0..SUPERBLOCK_COUNT {
+        file.seek(SeekFrom::Start(
+            HEADER_LEN as u64 + slot as u64 * SUPERBLOCK_LEN as u64,
+        ))?;
+        let mut bytes = [0_u8; SUPERBLOCK_LEN];
+        file.read_exact(&mut bytes)?;
+        let superblock = match Superblock::decode(&bytes) {
+            Ok(superblock) => superblock,
+            Err(_) => continue,
+        };
+        match active {
+            Some((_, generation)) if generation >= superblock.generation => {}
+            _ => active = Some((slot, superblock.generation)),
+        }
+    }
+
+    Ok(active.unwrap_or((0, 0)))
 }
 
 #[derive(Default)]
@@ -213,17 +333,33 @@ impl CheckpointWriter {
         if change_events.is_empty() {
             return Ok(None);
         }
-        let page_id = self.allocate_page_id();
-        self.pages.push((
-            page_id,
+        let chunks = chunk_by_encode(change_events.to_vec(), |chunk| {
             ChangeEventsPage {
-                page_id,
-                events: change_events.to_vec(),
+                page_id: 1,
+                next_page_id: None,
+                events: chunk.to_vec(),
             }
-            .encode()?
-            .to_vec(),
-        ));
-        Ok(Some(page_id))
+            .encode()
+            .map(|_| ())
+        })?;
+        let page_ids = (0..chunks.len())
+            .map(|_| self.allocate_page_id())
+            .collect::<Vec<_>>();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let page_id = page_ids[index];
+            let next_page_id = page_ids.get(index + 1).copied();
+            self.pages.push((
+                page_id,
+                ChangeEventsPage {
+                    page_id,
+                    next_page_id,
+                    events: chunk,
+                }
+                .encode()?
+                .to_vec(),
+            ));
+        }
+        Ok(page_ids.first().copied())
     }
 
     fn write_plan_cache(
@@ -233,17 +369,33 @@ impl CheckpointWriter {
         if plan_cache_entries.is_empty() {
             return Ok(None);
         }
-        let page_id = self.allocate_page_id();
-        self.pages.push((
-            page_id,
+        let chunks = chunk_by_encode(plan_cache_entries.to_vec(), |chunk| {
             PlanCachePage {
-                page_id,
-                entries: plan_cache_entries.to_vec(),
+                page_id: 1,
+                next_page_id: None,
+                entries: chunk.to_vec(),
             }
-            .encode()?
-            .to_vec(),
-        ));
-        Ok(Some(page_id))
+            .encode()
+            .map(|_| ())
+        })?;
+        let page_ids = (0..chunks.len())
+            .map(|_| self.allocate_page_id())
+            .collect::<Vec<_>>();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let page_id = page_ids[index];
+            let next_page_id = page_ids.get(index + 1).copied();
+            self.pages.push((
+                page_id,
+                PlanCachePage {
+                    page_id,
+                    next_page_id,
+                    entries: chunk,
+                }
+                .encode()?
+                .to_vec(),
+            ));
+        }
+        Ok(page_ids.first().copied())
     }
 
     fn write_namespace_tree(&mut self, mut entries: Vec<NamespaceEntry>) -> Result<Option<PageId>> {
@@ -677,8 +829,11 @@ mod tests {
     use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
-    use super::write_catalog_checkpoint;
-    use crate::{CollectionReadView, DatabaseFile, v2::engine::open_collection_read_view};
+    use super::{write_catalog_checkpoint, write_state_checkpoint};
+    use crate::{
+        CollectionReadView, DatabaseFile, PersistedChangeEvent, PersistedPlanCacheChoice,
+        PersistedPlanCacheEntry, PersistedState, v2::engine::open_collection_read_view,
+    };
 
     #[test]
     fn writes_v2_checkpoint_that_round_trips_via_namespace_loader() {
@@ -725,5 +880,64 @@ mod tests {
         assert_eq!(info.summary.collection_count, 1);
         assert_eq!(info.summary.index_count, 2);
         assert_eq!(info.summary.record_count, 2);
+    }
+
+    #[test]
+    fn writes_large_change_event_and_plan_cache_chains() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("checkpoint-v2-large-metadata.mongodb");
+
+        let change_events = (0..24_u32)
+            .map(|index| {
+                PersistedChangeEvent::new(
+                    &doc! { "_data": format!("token-{index}") },
+                    bson::Timestamp {
+                        time: 1_700_000_000 + index,
+                        increment: 1,
+                    },
+                    bson::DateTime::from_millis(1_700_000_000_000 + i64::from(index)),
+                    "app".to_string(),
+                    Some("widgets".to_string()),
+                    "insert".to_string(),
+                    Some(&doc! { "_id": index as i64 }),
+                    Some(&doc! {
+                        "_id": index as i64,
+                        "payload": "x".repeat(512),
+                    }),
+                    None,
+                    None,
+                    false,
+                    &doc! { "payload": "x".repeat(512) },
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("build change events");
+        let plan_cache_entries = (0..200_u64)
+            .map(|index| PersistedPlanCacheEntry {
+                namespace: "app.widgets".to_string(),
+                filter_shape: format!("{{\"sku\":{index},\"payload\":?}}"),
+                sort_shape: "{\"sku\":1}".to_string(),
+                projection_shape: "{\"_id\":1}".to_string(),
+                sequence: index,
+                choice: PersistedPlanCacheChoice::Index("sku_1".to_string()),
+            })
+            .collect::<Vec<_>>();
+        let state = PersistedState {
+            file_format_version: 8,
+            last_applied_sequence: 99,
+            last_checkpoint_unix_ms: 1_700_000_000_000,
+            catalog: Catalog::new(),
+            change_events: change_events.clone(),
+            plan_cache_entries: plan_cache_entries.clone(),
+        };
+
+        write_state_checkpoint(&path, &state).expect("write checkpoint");
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        assert_eq!(reopened.change_events(), change_events.as_slice());
+        assert_eq!(
+            reopened.persisted_plan_cache_entries(),
+            plan_cache_entries.as_slice()
+        );
     }
 }
