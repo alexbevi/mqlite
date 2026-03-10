@@ -183,6 +183,32 @@ impl IndexHandle {
         SecondaryTree::new(self.meta.root_page_id, self.key_pattern.clone())
             .lookup_exact_record_id(reader, key)
     }
+
+    pub fn estimated_bounds_count(&self, bounds: &IndexBounds) -> Option<usize> {
+        if bounds.lower.is_none() && bounds.upper.is_none() {
+            return Some(self.meta.entry_count as usize);
+        }
+
+        if exact_match_on_full_key_pattern(bounds, &self.key_pattern) && self.meta.unique {
+            return Some(1);
+        }
+
+        let field = single_field_key_pattern(&self.key_pattern)?;
+        let exact_value = exact_single_field_value(bounds, field);
+        if let Some(value) = exact_value {
+            return self
+                .stats
+                .as_ref()
+                .and_then(|_| estimate_value_count_from_stats(self.stats.as_ref(), field, value));
+        }
+
+        estimate_range_count_from_stats(
+            self.stats.as_ref(),
+            field,
+            bound_value(bounds.lower.as_ref(), field),
+            bound_value(bounds.upper.as_ref(), field),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -273,9 +299,13 @@ impl IndexReadView for PagerIndexReadView {
     }
 
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
-        self.scan_entries(bounds)
-            .map(|entries| entries.len())
-            .unwrap_or(0)
+        self.index
+            .estimated_bounds_count(bounds)
+            .unwrap_or_else(|| {
+                self.scan_entries(bounds)
+                    .map(|entries| entries.len())
+                    .unwrap_or(0)
+            })
     }
 
     fn covers_paths(&self, paths: &std::collections::BTreeSet<String>) -> bool {
@@ -285,17 +315,7 @@ impl IndexReadView for PagerIndexReadView {
     }
 
     fn estimate_value_count(&self, _field: &str, _value: &Bson) -> Option<usize> {
-        let stats = self.index.stats()?;
-        stats
-            .value_frequencies
-            .get(_field)?
-            .iter()
-            .find_map(|frequency| {
-                decode_persisted_stat_value(&frequency.encoded_value)
-                    .ok()
-                    .filter(|candidate| compare_bson(candidate, _value).is_eq())
-                    .map(|_| frequency.count as usize)
-            })
+        estimate_value_count_from_stats(self.index.stats(), _field, _value)
     }
 
     fn estimate_values_count(&self, _field: &str, _values: &[Bson]) -> Option<usize> {
@@ -311,25 +331,7 @@ impl IndexReadView for PagerIndexReadView {
         lower: Option<(&Bson, bool)>,
         upper: Option<(&Bson, bool)>,
     ) -> Option<usize> {
-        let stats = self.index.stats()?;
-        let frequencies = stats.value_frequencies.get(field)?;
-        Some(
-            frequencies
-                .iter()
-                .filter_map(|frequency| {
-                    let value = decode_persisted_stat_value(&frequency.encoded_value).ok()?;
-                    let lower_ok = lower.is_none_or(|(bound, inclusive)| {
-                        let ordering = compare_bson(&value, bound);
-                        ordering.is_gt() || (inclusive && ordering.is_eq())
-                    });
-                    let upper_ok = upper.is_none_or(|(bound, inclusive)| {
-                        let ordering = compare_bson(&value, bound);
-                        ordering.is_lt() || (inclusive && ordering.is_eq())
-                    });
-                    (lower_ok && upper_ok).then_some(frequency.count as usize)
-                })
-                .sum(),
-        )
+        estimate_range_count_from_stats(self.index.stats(), field, lower, upper)
     }
 
     fn present_count(&self, field: &str) -> Option<usize> {
@@ -547,6 +549,98 @@ fn decode_persisted_stat_value(bytes: &[u8]) -> Result<Bson> {
         .ok_or_else(|| anyhow!("persisted stats value is missing field `v`"))
 }
 
+fn single_field_key_pattern(key_pattern: &Document) -> Option<&str> {
+    (key_pattern.len() == 1)
+        .then(|| key_pattern.keys().next())
+        .flatten()
+        .map(String::as_str)
+}
+
+fn exact_match_on_full_key_pattern(bounds: &IndexBounds, key_pattern: &Document) -> bool {
+    let (Some(lower), Some(upper)) = (bounds.lower.as_ref(), bounds.upper.as_ref()) else {
+        return false;
+    };
+    if !lower.inclusive || !upper.inclusive {
+        return false;
+    }
+    key_pattern.keys().all(|field| {
+        let Some(lower_value) = lower.key.get(field) else {
+            return false;
+        };
+        let Some(upper_value) = upper.key.get(field) else {
+            return false;
+        };
+        compare_bson(lower_value, upper_value).is_eq()
+    })
+}
+
+fn exact_single_field_value<'a>(bounds: &'a IndexBounds, field: &str) -> Option<&'a Bson> {
+    let (Some(lower), Some(upper)) = (bounds.lower.as_ref(), bounds.upper.as_ref()) else {
+        return None;
+    };
+    if !lower.inclusive || !upper.inclusive {
+        return None;
+    }
+    let lower_value = lower.key.get(field)?;
+    let upper_value = upper.key.get(field)?;
+    compare_bson(lower_value, upper_value)
+        .is_eq()
+        .then_some(lower_value)
+}
+
+fn bound_value<'a>(
+    bound: Option<&'a mqlite_catalog::IndexBound>,
+    field: &str,
+) -> Option<(&'a Bson, bool)> {
+    let bound = bound?;
+    Some((bound.key.get(field)?, bound.inclusive))
+}
+
+fn estimate_value_count_from_stats(
+    stats: Option<&PersistedIndexStats>,
+    field: &str,
+    value: &Bson,
+) -> Option<usize> {
+    let stats = stats?;
+    stats
+        .value_frequencies
+        .get(field)?
+        .iter()
+        .find_map(|frequency| {
+            decode_persisted_stat_value(&frequency.encoded_value)
+                .ok()
+                .filter(|candidate| compare_bson(candidate, value).is_eq())
+                .map(|_| frequency.count as usize)
+        })
+}
+
+fn estimate_range_count_from_stats(
+    stats: Option<&PersistedIndexStats>,
+    field: &str,
+    lower: Option<(&Bson, bool)>,
+    upper: Option<(&Bson, bool)>,
+) -> Option<usize> {
+    let stats = stats?;
+    let frequencies = stats.value_frequencies.get(field)?;
+    Some(
+        frequencies
+            .iter()
+            .filter_map(|frequency| {
+                let value = decode_persisted_stat_value(&frequency.encoded_value).ok()?;
+                let lower_ok = lower.is_none_or(|(bound, inclusive)| {
+                    let ordering = compare_bson(&value, bound);
+                    ordering.is_gt() || (inclusive && ordering.is_eq())
+                });
+                let upper_ok = upper.is_none_or(|(bound, inclusive)| {
+                    let ordering = compare_bson(&value, bound);
+                    ordering.is_lt() || (inclusive && ordering.is_eq())
+                });
+                (lower_ok && upper_ok).then_some(frequency.count as usize)
+            })
+            .sum(),
+    )
+}
+
 struct LoadedCollectionCatalog {
     meta: CollectionMeta,
     catalog: CollectionCatalog,
@@ -600,7 +694,7 @@ mod tests {
 
     use anyhow::{Result, anyhow};
     use bson::{Bson, doc};
-    use mqlite_catalog::IndexEntry;
+    use mqlite_catalog::{IndexBounds, IndexEntry};
     use tempfile::tempdir;
 
     use super::{
@@ -719,6 +813,92 @@ mod tests {
         assert_eq!(
             record.decode_document().expect("decode"),
             doc! { "_id": 7, "sku": "alpha", "qty": 4 }
+        );
+    }
+
+    #[test]
+    fn index_handle_estimates_unique_exact_bounds_without_scanning() {
+        let index = IndexHandle::new(
+            IndexMeta {
+                name: "_id_".to_string(),
+                root_page_id: None,
+                key_pattern_bytes: bson::to_vec(&doc! { "_id": 1 }).expect("pattern"),
+                unique: true,
+                expire_after_seconds: None,
+                entry_count: 100,
+                index_bytes: 0,
+                stats_page_id: None,
+            },
+            None,
+        )
+        .expect("index handle");
+
+        assert_eq!(
+            index.estimated_bounds_count(&IndexBounds {
+                lower: Some(mqlite_catalog::IndexBound {
+                    key: doc! { "_id": 7 },
+                    inclusive: true,
+                }),
+                upper: Some(mqlite_catalog::IndexBound {
+                    key: doc! { "_id": 7 },
+                    inclusive: true,
+                }),
+            }),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn index_handle_estimates_single_field_ranges_from_stats() {
+        let index = IndexHandle::new(
+            IndexMeta {
+                name: "qty_1".to_string(),
+                root_page_id: None,
+                key_pattern_bytes: bson::to_vec(&doc! { "qty": 1 }).expect("pattern"),
+                unique: false,
+                expire_after_seconds: None,
+                entry_count: 4,
+                index_bytes: 0,
+                stats_page_id: Some(9),
+            },
+            Some(PersistedIndexStats {
+                entry_count: 4,
+                present_fields: [("qty".to_string(), 4)].into_iter().collect(),
+                value_frequencies: [(
+                    "qty".to_string(),
+                    vec![
+                        PersistedValueFrequency {
+                            encoded_value: bson::to_vec(&doc! { "v": 1 }).expect("value"),
+                            count: 1,
+                        },
+                        PersistedValueFrequency {
+                            encoded_value: bson::to_vec(&doc! { "v": 2 }).expect("value"),
+                            count: 2,
+                        },
+                        PersistedValueFrequency {
+                            encoded_value: bson::to_vec(&doc! { "v": 3 }).expect("value"),
+                            count: 1,
+                        },
+                    ],
+                )]
+                .into_iter()
+                .collect(),
+            }),
+        )
+        .expect("index handle");
+
+        assert_eq!(
+            index.estimated_bounds_count(&IndexBounds {
+                lower: Some(mqlite_catalog::IndexBound {
+                    key: doc! { "qty": 2 },
+                    inclusive: true,
+                }),
+                upper: Some(mqlite_catalog::IndexBound {
+                    key: doc! { "qty": 3 },
+                    inclusive: true,
+                }),
+            }),
+            Some(3)
         );
     }
 

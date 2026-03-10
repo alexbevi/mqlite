@@ -332,6 +332,8 @@ Mutations are durable through an append-only WAL.
   - sort work
   - projection coverage
   - expected document fetches
+- V2 persisted index read views answer whole-index, exact unique-key, and single-field range
+  cardinality estimates from metadata or persisted stats before falling back to an index scan.
 - `update` and `delete` reuse the same indexed candidate planning path as `find`, then reconcile those base candidates against the command-local insert, update, and delete overlay so ordered multi-op writes preserve in-request visibility.
 - A sequence-keyed plan cache stores the last winning choice for each query shape:
   - namespace
