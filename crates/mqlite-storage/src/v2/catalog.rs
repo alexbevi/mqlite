@@ -12,7 +12,7 @@ use crate::{
         btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
         page::{
             CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
-            NamespaceLeafPage, PageId, RecordSlot, StatsPage, page_kind,
+            NamespaceLeafPage, PageId, RecordSlot, StatsPage, page_kind_unchecked,
         },
         pager::Pager,
     },
@@ -406,7 +406,7 @@ fn lookup_namespace_target<R: PageReader>(
 ) -> Result<Option<PageId>> {
     while let Some(current_page_id) = page_id {
         let page = reader.read_page(current_page_id)?;
-        match page_kind(page.as_ref())? {
+        match page_kind_unchecked(page.as_ref())? {
             crate::v2::layout::PageKind::NamespaceLeaf => {
                 let leaf = NamespaceLeafPage::decode(page.as_ref())?;
                 match leaf
@@ -672,7 +672,7 @@ fn leftmost_namespace_leaf<R: PageReader>(
 ) -> Result<Option<PageId>> {
     while let Some(current_page_id) = page_id {
         let page = reader.read_page(current_page_id)?;
-        match page_kind(page.as_ref())? {
+        match page_kind_unchecked(page.as_ref())? {
             crate::v2::layout::PageKind::NamespaceLeaf => return Ok(Some(current_page_id)),
             crate::v2::layout::PageKind::NamespaceInternal => {
                 page_id = Some(NamespaceInternalPage::decode(page.as_ref())?.first_child_page_id);

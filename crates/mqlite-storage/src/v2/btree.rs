@@ -9,7 +9,7 @@ use crate::v2::{
     layout::PageKind,
     page::{
         PageId, RecordInternalPage, RecordLeafPage, RecordSlot, SecondaryEntry,
-        SecondaryInternalPage, SecondaryLeafPage, page_kind,
+        SecondaryInternalPage, SecondaryLeafPage, page_kind_unchecked,
     },
     pager::{Pager, SharedPage},
 };
@@ -47,7 +47,7 @@ impl RecordTree {
 
         loop {
             let page = reader.read_page(page_id)?;
-            match page_kind(page.as_ref())? {
+            match page_kind_unchecked(page.as_ref())? {
                 PageKind::RecordLeaf => {
                     let leaf = RecordLeafPage::decode(page.as_ref())?;
                     return Ok(leaf
@@ -76,7 +76,7 @@ impl RecordTree {
         };
         loop {
             let page = reader.read_page(page_id)?;
-            match page_kind(page.as_ref())? {
+            match page_kind_unchecked(page.as_ref())? {
                 PageKind::RecordLeaf => break,
                 PageKind::RecordInternal => {
                     page_id = RecordInternalPage::decode(page.as_ref())?.first_child_page_id;
@@ -201,7 +201,7 @@ impl SecondaryTree {
 fn leftmost_secondary_leaf<R: PageReader>(reader: &R, mut page_id: PageId) -> Result<PageId> {
     loop {
         let page = reader.read_page(page_id)?;
-        match page_kind(page.as_ref())? {
+        match page_kind_unchecked(page.as_ref())? {
             PageKind::SecondaryLeaf => return Ok(page_id),
             PageKind::SecondaryInternal => {
                 page_id = SecondaryInternalPage::decode(page.as_ref())?.first_child_page_id;
@@ -225,7 +225,7 @@ fn find_leaf_for_lower_bound<R: PageReader>(
     let target_record_id = if lower.inclusive { u64::MIN } else { u64::MAX };
     loop {
         let page = reader.read_page(page_id)?;
-        match page_kind(page.as_ref())? {
+        match page_kind_unchecked(page.as_ref())? {
             PageKind::SecondaryLeaf => return Ok(page_id),
             PageKind::SecondaryInternal => {
                 let internal = SecondaryInternalPage::decode(page.as_ref())?;

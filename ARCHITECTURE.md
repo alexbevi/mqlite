@@ -23,7 +23,8 @@ The current workspace is split into focused crates:
 
 `mqlite-storage/src/v2/` is the on-disk storage engine. It contains the v2 header and superblock
 format, typed record and secondary page codecs, checkpoint writers, recovery readers, a shared
-pager that serves page reads through offset-based I/O plus an in-process page cache, and
+pager that serves page reads through offset-based I/O plus an in-process page cache, validates page
+checksums when pages enter that cache, and
 page-backed metadata paths for `info` and `inspect`.
 
 ## Source Layout

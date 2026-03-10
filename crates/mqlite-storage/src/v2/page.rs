@@ -654,7 +654,7 @@ impl PlanCachePage {
     }
 }
 
-pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
+pub(crate) fn validate_page(bytes: &[u8]) -> Result<PageKind> {
     if bytes.len() < PAGE_LEN {
         return Err(anyhow!("v2 page is truncated"));
     }
@@ -663,6 +663,20 @@ pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
     }
     if page_checksum(bytes) != bytes[PAGE_CHECKSUM_OFFSET..PAGE_HEADER_LEN] {
         return Err(anyhow!("v2 page checksum mismatch"));
+    }
+    PageKind::try_from(u16::from_le_bytes(bytes[8..10].try_into()?))
+}
+
+pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
+    validate_page(bytes)
+}
+
+pub(crate) fn page_kind_unchecked(bytes: &[u8]) -> Result<PageKind> {
+    if bytes.len() < PAGE_LEN {
+        return Err(anyhow!("v2 page is truncated"));
+    }
+    if &bytes[..8] != PAGE_MAGIC {
+        return Err(anyhow!("v2 page magic mismatch"));
     }
     PageKind::try_from(u16::from_le_bytes(bytes[8..10].try_into()?))
 }
@@ -792,7 +806,7 @@ struct DecodedHeader {
 }
 
 fn decode_header(bytes: &[u8], expected_kind: PageKind) -> Result<DecodedHeader> {
-    let page_kind = page_kind(bytes)?;
+    let page_kind = page_kind_unchecked(bytes)?;
     if page_kind != expected_kind {
         return Err(anyhow!(
             "expected {:?} page, found {:?}",

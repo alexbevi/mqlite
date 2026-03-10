@@ -13,7 +13,7 @@ use crate::v2::{
     layout::{
         DATA_START_OFFSET, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN, Superblock, page_offset,
     },
-    page::PageId,
+    page::{PageId, validate_page},
 };
 
 const DEFAULT_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -139,6 +139,7 @@ impl Pager {
         let offset = page_offset(page_id, self.header.page_size)?;
         let mut bytes = vec![0_u8; self.header.page_size as usize];
         read_exact_at(&self.file, &mut bytes, offset)?;
+        validate_page(&bytes)?;
         let bytes: SharedPage = bytes.into();
 
         Ok(self.cache.lock().insert(page_id, bytes))
@@ -296,5 +297,44 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(pager.cache_len(), 1);
+    }
+
+    #[test]
+    fn rejects_corrupt_pages_when_loading_them_into_cache() {
+        let temp = NamedTempFile::new().expect("temp file");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(temp.path())
+            .expect("open temp file");
+
+        file.write_all(&FileHeader::default().encode())
+            .expect("write header");
+        file.write_all(&Superblock::default().encode())
+            .expect("write superblock");
+        file.write_all(&vec![0_u8; SUPERBLOCK_LEN * (SUPERBLOCK_COUNT - 1)])
+            .expect("write remaining superblocks");
+        let mut page = RecordLeafPage {
+            page_id: 1,
+            next_page_id: None,
+            entries: vec![RecordSlot {
+                record_id: 7,
+                encoded_document: bson::to_vec(&bson::doc! { "_id": 7 }).expect("encode doc"),
+            }],
+        }
+        .encode()
+        .expect("encode page");
+        page[80] ^= 0xFF;
+        file.write_all(&page).expect("write page");
+        file.flush().expect("flush file");
+
+        let pager = Pager::open(temp.path()).expect("open pager");
+        let error = pager
+            .read_page_bytes(1)
+            .expect_err("corrupt page must fail");
+
+        assert!(error.to_string().contains("checksum"));
     }
 }
