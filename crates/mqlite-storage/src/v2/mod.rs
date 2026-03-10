@@ -2,6 +2,7 @@
 
 pub(crate) mod btree;
 pub(crate) mod catalog;
+pub(crate) mod checkpoint;
 pub(crate) mod engine;
 pub(crate) mod layout;
 pub(crate) mod page;
