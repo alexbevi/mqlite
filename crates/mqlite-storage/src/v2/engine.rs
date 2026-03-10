@@ -12,13 +12,15 @@ use mqlite_catalog::Catalog;
 
 use crate::{
     InfoCheckpoint, InfoCollection, InfoCollectionCheckpoint, InfoDatabase, InfoDatabaseCheckpoint,
-    InfoIndex, InfoIndexCheckpoint, InfoReport, InfoSummary, InfoWal,
+    InfoIndex, InfoIndexCheckpoint, InfoReport, InfoSummary, InfoWal, PersistedChangeEvent,
+    PersistedPlanCacheEntry, PersistedState,
     v2::{
         catalog::{CollectionHandle, PagerCollectionReadView, PagerNamespaceCatalog},
         layout::{
             FILE_FORMAT_VERSION, FILE_MAGIC, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN,
             Superblock,
         },
+        page::{ChangeEventsPage, PlanCachePage},
         pager::Pager,
     },
 };
@@ -158,6 +160,35 @@ pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
     open_namespace_catalog(path)?.load_catalog()
 }
 
+pub(crate) fn load_persisted_state(path: impl AsRef<Path>) -> Result<PersistedState> {
+    let pager = Arc::new(Mutex::new(Pager::open(path)?));
+    let (durable_lsn, last_checkpoint_unix_ms, roots) = {
+        let guard = pager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?;
+        (
+            guard.active_superblock().durable_lsn,
+            guard.active_superblock().last_checkpoint_unix_ms,
+            guard.active_superblock().roots.clone(),
+        )
+    };
+
+    let catalog = PagerNamespaceCatalog::new(roots.namespace_root_page_id, Arc::clone(&pager))
+        .load_catalog()?;
+    let mut pager = pager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?;
+
+    Ok(PersistedState {
+        file_format_version: FILE_FORMAT_VERSION,
+        last_applied_sequence: durable_lsn,
+        last_checkpoint_unix_ms,
+        catalog,
+        change_events: load_change_events(&mut pager, roots.change_stream_root_page_id)?,
+        plan_cache_entries: load_plan_cache_entries(&mut pager, roots.plan_cache_root_page_id)?,
+    })
+}
+
 fn build_database_info(name: String, collections: Vec<CollectionHandle>) -> Result<InfoDatabase> {
     let collections = collections
         .into_iter()
@@ -257,6 +288,26 @@ fn build_collection_info(collection: CollectionHandle) -> Result<InfoCollection>
     })
 }
 
+fn load_change_events(
+    pager: &mut Pager,
+    root_page_id: Option<u64>,
+) -> Result<Vec<PersistedChangeEvent>> {
+    let Some(root_page_id) = root_page_id else {
+        return Ok(Vec::new());
+    };
+    Ok(ChangeEventsPage::decode(&pager.read_page_bytes(root_page_id)?)?.events)
+}
+
+fn load_plan_cache_entries(
+    pager: &mut Pager,
+    root_page_id: Option<u64>,
+) -> Result<Vec<PersistedPlanCacheEntry>> {
+    let Some(root_page_id) = root_page_id else {
+        return Ok(Vec::new());
+    };
+    Ok(PlanCachePage::decode(&pager.read_page_bytes(root_page_id)?)?.entries)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
@@ -265,9 +316,9 @@ mod tests {
     use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
-    use super::{create_empty, is_v2_file, load_catalog, read_info};
+    use super::{create_empty, is_v2_file, load_catalog, load_persisted_state, read_info};
     use crate::v2::{
-        checkpoint::write_catalog_checkpoint,
+        checkpoint::{write_catalog_checkpoint, write_state_checkpoint},
         layout::{DATA_START_OFFSET, DEFAULT_PAGE_SIZE},
     };
 
@@ -355,6 +406,72 @@ mod tests {
         assert_eq!(
             widgets.records[1].document,
             doc! { "_id": 2, "sku": "beta" }
+        );
+    }
+
+    #[test]
+    fn loads_persisted_state_from_v2_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = PathBuf::from(temp_dir.path().join("v2-state.mongodb"));
+
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }))
+            .expect("insert");
+
+        let mut catalog = Catalog {
+            databases: BTreeMap::new(),
+        };
+        catalog.replace_collection("app", "widgets", collection);
+
+        let state = crate::PersistedState {
+            file_format_version: crate::FILE_FORMAT_VERSION,
+            last_applied_sequence: 7,
+            last_checkpoint_unix_ms: 123,
+            catalog,
+            change_events: vec![
+                crate::PersistedChangeEvent::new(
+                    &doc! { "_data": "token-1" },
+                    bson::Timestamp {
+                        time: 7,
+                        increment: 1,
+                    },
+                    bson::DateTime::from_millis(1_700_000_000_000),
+                    "app".to_string(),
+                    Some("widgets".to_string()),
+                    "insert".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &doc! {},
+                )
+                .expect("change event"),
+            ],
+            plan_cache_entries: vec![crate::PersistedPlanCacheEntry {
+                namespace: "app.widgets".to_string(),
+                filter_shape: "{\"sku\":?}".to_string(),
+                sort_shape: "{}".to_string(),
+                projection_shape: "{}".to_string(),
+                sequence: 7,
+                choice: crate::PersistedPlanCacheChoice::Index("sku_1".to_string()),
+            }],
+        };
+        write_state_checkpoint(&path, &state).expect("write checkpoint");
+
+        let loaded = load_persisted_state(&path).expect("load persisted state");
+        assert_eq!(loaded.last_applied_sequence, 7);
+        assert_eq!(loaded.change_events.len(), 1);
+        assert_eq!(loaded.plan_cache_entries.len(), 1);
+        assert_eq!(
+            loaded
+                .catalog
+                .get_collection("app", "widgets")
+                .expect("widgets")
+                .records
+                .len(),
+            1
         );
     }
 }

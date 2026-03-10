@@ -13,6 +13,7 @@ The driver still speaks `OP_MSG` exclusively. The only difference is that the re
 For direct local validation outside a driver, the CLI also exposes `mqlite info --file <path>` for per-database, per-collection, and per-index size and count summaries plus last-checkpoint metadata, while `mqlite inspect` remains the lower-level file-layout view.
 
 On the storage side, the page-backed v2 read path now persists per-index value-frequency and field-presence stats through checkpoint and reopen, so broker planning can reuse those estimates without rebuilding them first.
+V2 checkpoints also now persist change-stream history and plan-cache entries alongside the page graph, so broker-visible durable state can round-trip through the new superblock roots without the old snapshot wrapper.
 
 ## Required Driver Behavior
 

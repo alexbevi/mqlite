@@ -20,22 +20,47 @@ use crate::v2::{
     engine::create_empty,
     layout::{DEFAULT_PAGE_SIZE, HEADER_LEN, page_offset},
     page::{
-        CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
-        NamespaceLeafPage, NamespaceSeparator, PageId, RecordInternalPage, RecordLeafPage,
-        RecordSeparator, RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage,
-        SecondarySeparator, StatsPage,
+        ChangeEventsPage, CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
+        NamespaceLeafPage, NamespaceSeparator, PageId, PlanCachePage, RecordInternalPage,
+        RecordLeafPage, RecordSeparator, RecordSlot, SecondaryEntry, SecondaryInternalPage,
+        SecondaryLeafPage, SecondarySeparator, StatsPage,
     },
 };
+use crate::{PersistedChangeEvent, PersistedPlanCacheEntry, PersistedState};
 
 use super::layout::Superblock;
 
 pub(crate) fn write_catalog_checkpoint(path: impl AsRef<Path>, catalog: &Catalog) -> Result<()> {
+    write_checkpoint_state(path, 0, checkpoint_unix_ms(), catalog, &[], &[])
+}
+
+pub(crate) fn write_state_checkpoint(path: impl AsRef<Path>, state: &PersistedState) -> Result<()> {
+    write_checkpoint_state(
+        path,
+        state.last_applied_sequence,
+        state.last_checkpoint_unix_ms,
+        &state.catalog,
+        &state.change_events,
+        &state.plan_cache_entries,
+    )
+}
+
+fn write_checkpoint_state(
+    path: impl AsRef<Path>,
+    durable_lsn: u64,
+    last_checkpoint_unix_ms: u64,
+    catalog: &Catalog,
+    change_events: &[PersistedChangeEvent],
+    plan_cache_entries: &[PersistedPlanCacheEntry],
+) -> Result<()> {
     let path = path.as_ref();
     create_empty(path)?;
 
     let mut writer = CheckpointWriter::default();
     let mut summary = SummaryCounters {
         database_count: catalog.databases.len() as u64,
+        change_event_count: change_events.len() as u64,
+        plan_cache_entry_count: plan_cache_entries.len() as u64,
         ..SummaryCounters::default()
     };
     let mut namespace_entries = Vec::new();
@@ -104,20 +129,22 @@ pub(crate) fn write_catalog_checkpoint(path: impl AsRef<Path>, catalog: &Catalog
     }
 
     let namespace_root_page_id = writer.write_namespace_tree(namespace_entries)?;
+    let change_stream_root_page_id = writer.write_change_events(change_events)?;
+    let plan_cache_root_page_id = writer.write_plan_cache(plan_cache_entries)?;
     summary.page_count = writer.page_count();
 
     let next_page_id = writer.next_page_id.max(1);
     let wal_offset = page_offset(next_page_id, DEFAULT_PAGE_SIZE)?;
     let superblock = Superblock {
         generation: 1,
-        durable_lsn: 0,
-        last_checkpoint_unix_ms: checkpoint_unix_ms(),
+        durable_lsn,
+        last_checkpoint_unix_ms,
         wal_start_offset: wal_offset,
         wal_end_offset: wal_offset,
         roots: RootSet {
             namespace_root_page_id,
-            change_stream_root_page_id: None,
-            plan_cache_root_page_id: None,
+            change_stream_root_page_id,
+            plan_cache_root_page_id,
             stats_root_page_id: None,
             freelist_root_page_id: None,
             next_page_id,
@@ -177,6 +204,46 @@ impl CheckpointWriter {
         self.pages
             .push((page_id, StatsPage { page_id, stats }.encode()?.to_vec()));
         Ok(page_id)
+    }
+
+    fn write_change_events(
+        &mut self,
+        change_events: &[PersistedChangeEvent],
+    ) -> Result<Option<PageId>> {
+        if change_events.is_empty() {
+            return Ok(None);
+        }
+        let page_id = self.allocate_page_id();
+        self.pages.push((
+            page_id,
+            ChangeEventsPage {
+                page_id,
+                events: change_events.to_vec(),
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        Ok(Some(page_id))
+    }
+
+    fn write_plan_cache(
+        &mut self,
+        plan_cache_entries: &[PersistedPlanCacheEntry],
+    ) -> Result<Option<PageId>> {
+        if plan_cache_entries.is_empty() {
+            return Ok(None);
+        }
+        let page_id = self.allocate_page_id();
+        self.pages.push((
+            page_id,
+            PlanCachePage {
+                page_id,
+                entries: plan_cache_entries.to_vec(),
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        Ok(Some(page_id))
     }
 
     fn write_namespace_tree(&mut self, mut entries: Vec<NamespaceEntry>) -> Result<Option<PageId>> {

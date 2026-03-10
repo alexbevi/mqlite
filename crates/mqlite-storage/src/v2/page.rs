@@ -8,6 +8,7 @@ use crate::v2::{
     catalog::{CollectionMeta, IndexMeta, PersistedIndexStats},
     layout::{DEFAULT_PAGE_SIZE, PageKind},
 };
+use crate::{PersistedChangeEvent, PersistedPlanCacheEntry};
 
 pub(crate) type PageId = u64;
 
@@ -593,6 +594,52 @@ impl StatsPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChangeEventsPage {
+    pub page_id: PageId,
+    pub events: Vec<PersistedChangeEvent>,
+}
+
+impl ChangeEventsPage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut payload = Vec::new();
+        cbor_ser::into_writer(&self.events, &mut payload)?;
+        encode_single_payload_page(PageKind::ChangeEventLeaf, self.page_id, &payload)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::ChangeEventLeaf)?;
+        let payload = decode_single_payload(bytes)?;
+        Ok(Self {
+            page_id: header.page_id,
+            events: cbor_de::from_reader(payload)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanCachePage {
+    pub page_id: PageId,
+    pub entries: Vec<PersistedPlanCacheEntry>,
+}
+
+impl PlanCachePage {
+    pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
+        let mut payload = Vec::new();
+        cbor_ser::into_writer(&self.entries, &mut payload)?;
+        encode_single_payload_page(PageKind::PlanCache, self.page_id, &payload)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = decode_header(bytes, PageKind::PlanCache)?;
+        let payload = decode_single_payload(bytes)?;
+        Ok(Self {
+            page_id: header.page_id,
+            entries: cbor_de::from_reader(payload)?,
+        })
+    }
+}
+
 pub(crate) fn page_kind(bytes: &[u8]) -> Result<PageKind> {
     if bytes.len() < PAGE_LEN {
         return Err(anyhow!("v2 page is truncated"));
@@ -752,14 +799,15 @@ mod tests {
     use mqlite_catalog::IndexEntry;
 
     use super::{
-        CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
-        NamespaceLeafPage, NamespaceSeparator, RecordInternalPage, RecordLeafPage, RecordSeparator,
-        RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
-        StatsPage,
+        ChangeEventsPage, CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
+        NamespaceLeafPage, NamespaceSeparator, PlanCachePage, RecordInternalPage, RecordLeafPage,
+        RecordSeparator, RecordSlot, SecondaryEntry, SecondaryInternalPage, SecondaryLeafPage,
+        SecondarySeparator, StatsPage,
     };
     use crate::v2::catalog::{
         CollectionMeta, IndexMeta, PersistedIndexStats, PersistedValueFrequency, SummaryCounters,
     };
+    use crate::{PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry};
 
     #[test]
     fn round_trips_record_pages() {
@@ -928,5 +976,49 @@ mod tests {
         let decoded_stats =
             StatsPage::decode(&stats.encode().expect("encode stats")).expect("decode stats");
         assert_eq!(decoded_stats, stats);
+
+        let change_events = ChangeEventsPage {
+            page_id: 14,
+            events: vec![
+                PersistedChangeEvent::new(
+                    &doc! { "_data": "token-1" },
+                    bson::Timestamp {
+                        time: 7,
+                        increment: 1,
+                    },
+                    bson::DateTime::from_millis(1_700_000_000_000),
+                    "app".to_string(),
+                    Some("widgets".to_string()),
+                    "insert".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &doc! { "marker": 5 },
+                )
+                .expect("change event"),
+            ],
+        };
+        let decoded_change_events =
+            ChangeEventsPage::decode(&change_events.encode().expect("encode change events"))
+                .expect("decode change events");
+        assert_eq!(decoded_change_events, change_events);
+
+        let plan_cache = PlanCachePage {
+            page_id: 15,
+            entries: vec![PersistedPlanCacheEntry {
+                namespace: "app.widgets".to_string(),
+                filter_shape: "{\"sku\":?}".to_string(),
+                sort_shape: "{}".to_string(),
+                projection_shape: "{}".to_string(),
+                sequence: 9,
+                choice: PersistedPlanCacheChoice::Index("sku_1".to_string()),
+            }],
+        };
+        let decoded_plan_cache =
+            PlanCachePage::decode(&plan_cache.encode().expect("encode plan cache"))
+                .expect("decode plan cache");
+        assert_eq!(decoded_plan_cache, plan_cache);
     }
 }

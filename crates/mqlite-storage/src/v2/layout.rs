@@ -32,6 +32,7 @@ pub enum PageKind {
     Freelist = 11,
     Overflow = 12,
     Stats = 13,
+    PlanCache = 14,
 }
 
 impl TryFrom<u16> for PageKind {
@@ -52,6 +53,7 @@ impl TryFrom<u16> for PageKind {
             11 => Self::Freelist,
             12 => Self::Overflow,
             13 => Self::Stats,
+            14 => Self::PlanCache,
             _ => return Err(anyhow!("unknown v2 page kind {value}")),
         })
     }

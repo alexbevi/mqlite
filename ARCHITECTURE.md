@@ -108,7 +108,10 @@ and meta page graph instead of returning only top-level counters. Page-backed v2
 also preserve histogram-style value frequencies and field-presence counts through checkpoint and
 reopen, so planning can keep using persisted estimates instead of rebuilding in-memory stats. The
 same v2 page graph can now also be materialized back into a full `Catalog` when a broker path
-still needs collection-owned mutable state instead of a borrowed page-backed read view.
+still needs collection-owned mutable state instead of a borrowed page-backed read view. V2
+checkpoints also now have direct page payloads for persisted change-stream history and plan-cache
+entries, so the full broker-visible durable state can round-trip through the v2 superblock roots
+instead of living only in the old snapshot format.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug
