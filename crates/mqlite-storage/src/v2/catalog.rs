@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
@@ -114,21 +111,17 @@ impl CollectionHandle {
 
     pub fn record_by_id<R: PageReader>(
         &self,
-        reader: &mut R,
+        reader: &R,
         record_id: u64,
     ) -> Result<Option<RecordSlot>> {
         self.record_tree.lookup(reader, record_id)
     }
 
-    pub fn scan_records<R: PageReader>(&self, reader: &mut R) -> Result<Vec<RecordSlot>> {
+    pub fn scan_records<R: PageReader>(&self, reader: &R) -> Result<Vec<RecordSlot>> {
         self.record_tree.scan(reader)
     }
 
-    pub fn lookup_by_id<R: PageReader>(
-        &self,
-        reader: &mut R,
-        id: &Bson,
-    ) -> Result<Option<RecordSlot>> {
+    pub fn lookup_by_id<R: PageReader>(&self, reader: &R, id: &Bson) -> Result<Option<RecordSlot>> {
         let Some(index) = self.indexes.get("_id_") else {
             return Ok(None);
         };
@@ -188,7 +181,7 @@ impl IndexHandle {
 
     pub fn scan_bounds<R: PageReader>(
         &self,
-        reader: &mut R,
+        reader: &R,
         bounds: &IndexBounds,
         direction: ScanDirection,
     ) -> Result<Vec<IndexEntry>> {
@@ -200,12 +193,12 @@ impl IndexHandle {
 #[derive(Debug)]
 pub(crate) struct PagerCollectionReadView {
     collection: CollectionHandle,
-    pager: Arc<Mutex<Pager>>,
+    pager: Arc<Pager>,
     indexes: BTreeMap<String, PagerIndexReadView>,
 }
 
 impl PagerCollectionReadView {
-    pub fn new(collection: CollectionHandle, pager: Arc<Mutex<Pager>>) -> Self {
+    pub fn new(collection: CollectionHandle, pager: Arc<Pager>) -> Self {
         let indexes = collection
             .indexes()
             .iter()
@@ -229,9 +222,8 @@ impl PagerCollectionReadView {
 
 impl CollectionReadView for PagerCollectionReadView {
     fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
-        let mut pager = lock_pager(&self.pager)?;
         self.collection
-            .scan_records(&mut *pager)?
+            .scan_records(&*self.pager)?
             .into_iter()
             .map(|record| {
                 Ok(CollectionRecord::from_encoded(
@@ -244,9 +236,8 @@ impl CollectionReadView for PagerCollectionReadView {
     }
 
     fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
-        let mut pager = lock_pager(&self.pager)?;
         self.collection
-            .record_by_id(&mut *pager, record_id)?
+            .record_by_id(&*self.pager, record_id)?
             .map(|record| record.decode_document())
             .transpose()
     }
@@ -265,7 +256,7 @@ impl CollectionReadView for PagerCollectionReadView {
 #[derive(Debug)]
 pub(crate) struct PagerIndexReadView {
     index: IndexHandle,
-    pager: Arc<Mutex<Pager>>,
+    pager: Arc<Pager>,
 }
 
 impl IndexReadView for PagerIndexReadView {
@@ -282,9 +273,8 @@ impl IndexReadView for PagerIndexReadView {
     }
 
     fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>> {
-        let mut pager = lock_pager(&self.pager)?;
         self.index
-            .scan_bounds(&mut *pager, bounds, ScanDirection::Forward)
+            .scan_bounds(&*self.pager, bounds, ScanDirection::Forward)
     }
 
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
@@ -360,11 +350,11 @@ impl IndexReadView for PagerIndexReadView {
 #[derive(Debug)]
 pub(crate) struct PagerNamespaceCatalog {
     namespace_root_page_id: Option<PageId>,
-    pager: Arc<Mutex<Pager>>,
+    pager: Arc<Pager>,
 }
 
 impl PagerNamespaceCatalog {
-    pub fn new(namespace_root_page_id: Option<PageId>, pager: Arc<Mutex<Pager>>) -> Self {
+    pub fn new(namespace_root_page_id: Option<PageId>, pager: Arc<Pager>) -> Self {
         Self {
             namespace_root_page_id,
             pager,
@@ -376,17 +366,15 @@ impl PagerNamespaceCatalog {
         database: &str,
         collection: &str,
     ) -> Result<Option<PagerCollectionReadView>> {
-        let mut pager = lock_pager(&self.pager)?;
         let Some(collection_meta_page_id) = lookup_namespace_target(
-            &mut *pager,
+            &*self.pager,
             self.namespace_root_page_id,
             &format!("{database}.{collection}"),
         )?
         else {
             return Ok(None);
         };
-        let collection = load_collection_handle(&mut *pager, collection_meta_page_id)?;
-        drop(pager);
+        let collection = load_collection_handle(&*self.pager, collection_meta_page_id)?;
         Ok(Some(PagerCollectionReadView::new(
             collection,
             Arc::clone(&self.pager),
@@ -394,18 +382,16 @@ impl PagerNamespaceCatalog {
     }
 
     pub fn collection_handles(&self) -> Result<Vec<CollectionHandle>> {
-        let mut pager = lock_pager(&self.pager)?;
-        scan_namespace_entries(&mut *pager, self.namespace_root_page_id)?
+        scan_namespace_entries(&*self.pager, self.namespace_root_page_id)?
             .into_iter()
-            .map(|entry| load_collection_handle(&mut *pager, entry.target_page_id))
+            .map(|entry| load_collection_handle(&*self.pager, entry.target_page_id))
             .collect()
     }
 
     pub fn load_catalog(&self) -> Result<mqlite_catalog::Catalog> {
-        let mut pager = lock_pager(&self.pager)?;
         let mut catalog = mqlite_catalog::Catalog::new();
-        for entry in scan_namespace_entries(&mut *pager, self.namespace_root_page_id)? {
-            let collection = load_collection_catalog(&mut *pager, entry.target_page_id)?;
+        for entry in scan_namespace_entries(&*self.pager, self.namespace_root_page_id)? {
+            let collection = load_collection_catalog(&*self.pager, entry.target_page_id)?;
             catalog.replace_collection(
                 &collection.meta.database,
                 &collection.meta.collection,
@@ -417,15 +403,15 @@ impl PagerNamespaceCatalog {
 }
 
 fn lookup_namespace_target<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     mut page_id: Option<PageId>,
     target: &str,
 ) -> Result<Option<PageId>> {
     while let Some(current_page_id) = page_id {
         let page = reader.read_page(current_page_id)?;
-        match page_kind(&page)? {
+        match page_kind(page.as_ref())? {
             crate::v2::layout::PageKind::NamespaceLeaf => {
-                let leaf = NamespaceLeafPage::decode(&page)?;
+                let leaf = NamespaceLeafPage::decode(page.as_ref())?;
                 match leaf
                     .entries
                     .binary_search_by(|entry| entry.name.as_str().cmp(target))
@@ -445,7 +431,7 @@ fn lookup_namespace_target<R: PageReader>(
                 }
             }
             crate::v2::layout::PageKind::NamespaceInternal => {
-                let internal = NamespaceInternalPage::decode(&page)?;
+                let internal = NamespaceInternalPage::decode(page.as_ref())?;
                 let mut child_page_id = internal.first_child_page_id;
                 for separator in &internal.separators {
                     if target < separator.name.as_str() {
@@ -462,17 +448,17 @@ fn lookup_namespace_target<R: PageReader>(
 }
 
 fn load_collection_handle<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     meta_page_id: PageId,
 ) -> Result<CollectionHandle> {
     let page = reader.read_page(meta_page_id)?;
-    let meta = CollectionMetaPage::decode(&page)?.meta;
+    let meta = CollectionMetaPage::decode(page.as_ref())?.meta;
     let indexes = load_index_handles(reader, meta.index_directory_root_page_id)?;
     CollectionHandle::new(meta, indexes)
 }
 
 fn load_collection_catalog<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     meta_page_id: PageId,
 ) -> Result<LoadedCollectionCatalog> {
     let handle = load_collection_handle(reader, meta_page_id)?;
@@ -520,7 +506,7 @@ fn load_collection_catalog<R: PageReader>(
 }
 
 fn load_index_handles<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     root_page_id: Option<PageId>,
 ) -> Result<Vec<IndexHandle>> {
     let Some(mut leaf_page_id) = leftmost_namespace_leaf(reader, root_page_id)? else {
@@ -529,10 +515,10 @@ fn load_index_handles<R: PageReader>(
 
     let mut indexes = Vec::new();
     loop {
-        let leaf = NamespaceLeafPage::decode(&reader.read_page(leaf_page_id)?)?;
+        let leaf = NamespaceLeafPage::decode(reader.read_page(leaf_page_id)?.as_ref())?;
         for entry in &leaf.entries {
             let page = reader.read_page(entry.target_page_id)?;
-            let meta = IndexMetaPage::decode(&page)?.meta;
+            let meta = IndexMetaPage::decode(page.as_ref())?.meta;
             let stats = load_index_stats(reader, meta.stats_page_id)?;
             indexes.push(IndexHandle::new(meta, stats)?);
         }
@@ -546,14 +532,14 @@ fn load_index_handles<R: PageReader>(
 }
 
 fn load_index_stats<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     stats_page_id: Option<PageId>,
 ) -> Result<Option<PersistedIndexStats>> {
     let Some(stats_page_id) = stats_page_id else {
         return Ok(None);
     };
     let page = reader.read_page(stats_page_id)?;
-    Ok(Some(StatsPage::decode(&page)?.stats))
+    Ok(Some(StatsPage::decode(page.as_ref())?.stats))
 }
 
 fn decode_persisted_stat_value(bytes: &[u8]) -> Result<Bson> {
@@ -570,7 +556,7 @@ struct LoadedCollectionCatalog {
 }
 
 fn scan_namespace_entries<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     root_page_id: Option<PageId>,
 ) -> Result<Vec<NamespaceEntry>> {
     let Some(mut leaf_page_id) = leftmost_namespace_leaf(reader, root_page_id)? else {
@@ -579,7 +565,7 @@ fn scan_namespace_entries<R: PageReader>(
 
     let mut entries = Vec::new();
     loop {
-        let leaf = NamespaceLeafPage::decode(&reader.read_page(leaf_page_id)?)?;
+        let leaf = NamespaceLeafPage::decode(reader.read_page(leaf_page_id)?.as_ref())?;
         entries.extend(leaf.entries);
         match leaf.next_page_id {
             Some(next_page_id) => leaf_page_id = next_page_id,
@@ -590,26 +576,20 @@ fn scan_namespace_entries<R: PageReader>(
 }
 
 fn leftmost_namespace_leaf<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     mut page_id: Option<PageId>,
 ) -> Result<Option<PageId>> {
     while let Some(current_page_id) = page_id {
         let page = reader.read_page(current_page_id)?;
-        match page_kind(&page)? {
+        match page_kind(page.as_ref())? {
             crate::v2::layout::PageKind::NamespaceLeaf => return Ok(Some(current_page_id)),
             crate::v2::layout::PageKind::NamespaceInternal => {
-                page_id = Some(NamespaceInternalPage::decode(&page)?.first_child_page_id);
+                page_id = Some(NamespaceInternalPage::decode(page.as_ref())?.first_child_page_id);
             }
             other => return Err(anyhow!("expected namespace page, found {:?}", other)),
         }
     }
     Ok(None)
-}
-
-fn lock_pager(pager: &Arc<Mutex<Pager>>) -> Result<MutexGuard<'_, Pager>> {
-    pager
-        .lock()
-        .map_err(|_| anyhow!("v2 pager mutex was poisoned"))
 }
 
 #[cfg(test)]
@@ -618,7 +598,7 @@ mod tests {
         collections::BTreeMap,
         fs::OpenOptions,
         io::{Seek, SeekFrom, Write},
-        sync::{Arc, Mutex},
+        sync::Arc,
     };
 
     use anyhow::{Result, anyhow};
@@ -656,10 +636,10 @@ mod tests {
     }
 
     impl PageReader for MemoryPageReader {
-        fn read_page(&mut self, page_id: PageId) -> Result<Vec<u8>> {
+        fn read_page(&self, page_id: PageId) -> Result<crate::v2::pager::SharedPage> {
             self.pages
                 .get(&page_id)
-                .cloned()
+                .map(|page| crate::v2::pager::SharedPage::from(page.clone()))
                 .ok_or_else(|| anyhow!("missing page {page_id}"))
         }
     }
@@ -816,7 +796,7 @@ mod tests {
             .expect("index handle")],
         )
         .expect("collection handle");
-        let pager = Arc::new(Mutex::new(Pager::open(&path).expect("open pager")));
+        let pager = Arc::new(Pager::open(&path).expect("open pager"));
         let view = PagerCollectionReadView::new(collection, pager);
 
         let records = view.scan_records().expect("scan records");
@@ -962,7 +942,7 @@ mod tests {
             .expect("encode stats"),
         );
 
-        let pager = Arc::new(Mutex::new(Pager::open(&path).expect("open pager")));
+        let pager = Arc::new(Pager::open(&path).expect("open pager"));
         let catalog = PagerNamespaceCatalog::new(Some(1), pager);
         let view = catalog
             .collection_read_view("app", "widgets")

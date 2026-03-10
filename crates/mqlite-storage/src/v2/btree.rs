@@ -11,7 +11,7 @@ use crate::v2::{
         PageId, RecordInternalPage, RecordLeafPage, RecordSlot, SecondaryEntry,
         SecondaryInternalPage, SecondaryLeafPage, page_kind,
     },
-    pager::Pager,
+    pager::{Pager, SharedPage},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,11 +21,11 @@ pub(crate) enum ScanDirection {
 }
 
 pub(crate) trait PageReader {
-    fn read_page(&mut self, page_id: PageId) -> Result<Vec<u8>>;
+    fn read_page(&self, page_id: PageId) -> Result<SharedPage>;
 }
 
 impl PageReader for Pager {
-    fn read_page(&mut self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<SharedPage> {
         self.read_page_bytes(page_id)
     }
 }
@@ -40,27 +40,23 @@ impl RecordTree {
         Self { root_page_id }
     }
 
-    pub fn lookup<R: PageReader>(
-        &self,
-        reader: &mut R,
-        record_id: u64,
-    ) -> Result<Option<RecordSlot>> {
+    pub fn lookup<R: PageReader>(&self, reader: &R, record_id: u64) -> Result<Option<RecordSlot>> {
         let Some(mut page_id) = self.root_page_id else {
             return Ok(None);
         };
 
         loop {
             let page = reader.read_page(page_id)?;
-            match page_kind(&page)? {
+            match page_kind(page.as_ref())? {
                 PageKind::RecordLeaf => {
-                    let leaf = RecordLeafPage::decode(&page)?;
+                    let leaf = RecordLeafPage::decode(page.as_ref())?;
                     return Ok(leaf
                         .entries
                         .into_iter()
                         .find(|entry| entry.record_id == record_id));
                 }
                 PageKind::RecordInternal => {
-                    let internal = RecordInternalPage::decode(&page)?;
+                    let internal = RecordInternalPage::decode(page.as_ref())?;
                     page_id = child_for_record_id(&internal, record_id);
                 }
                 other => {
@@ -73,16 +69,16 @@ impl RecordTree {
         }
     }
 
-    pub fn scan<R: PageReader>(&self, reader: &mut R) -> Result<Vec<RecordSlot>> {
+    pub fn scan<R: PageReader>(&self, reader: &R) -> Result<Vec<RecordSlot>> {
         let Some(mut page_id) = self.root_page_id else {
             return Ok(Vec::new());
         };
         loop {
             let page = reader.read_page(page_id)?;
-            match page_kind(&page)? {
+            match page_kind(page.as_ref())? {
                 PageKind::RecordLeaf => break,
                 PageKind::RecordInternal => {
-                    page_id = RecordInternalPage::decode(&page)?.first_child_page_id;
+                    page_id = RecordInternalPage::decode(page.as_ref())?.first_child_page_id;
                 }
                 other => {
                     return Err(anyhow!(
@@ -96,7 +92,7 @@ impl RecordTree {
         let mut records = Vec::new();
         let mut next_page_id = Some(page_id);
         while let Some(current_page_id) = next_page_id {
-            let page = RecordLeafPage::decode(&reader.read_page(current_page_id)?)?;
+            let page = RecordLeafPage::decode(reader.read_page(current_page_id)?.as_ref())?;
             next_page_id = page.next_page_id;
             records.extend(page.entries);
         }
@@ -120,7 +116,7 @@ impl SecondaryTree {
 
     pub fn scan_bounds<R: PageReader>(
         &self,
-        reader: &mut R,
+        reader: &R,
         bounds: &IndexBounds,
         direction: ScanDirection,
     ) -> Result<Vec<IndexEntry>> {
@@ -135,7 +131,7 @@ impl SecondaryTree {
 
         let mut entries = Vec::new();
         while let Some(current_page_id) = leaf_page_id {
-            let leaf = SecondaryLeafPage::decode(&reader.read_page(current_page_id)?)?;
+            let leaf = SecondaryLeafPage::decode(reader.read_page(current_page_id)?.as_ref())?;
             leaf_page_id = leaf.next_page_id;
             let mut past_upper = false;
             for entry in leaf.entries {
@@ -157,13 +153,13 @@ impl SecondaryTree {
     }
 }
 
-fn leftmost_secondary_leaf<R: PageReader>(reader: &mut R, mut page_id: PageId) -> Result<PageId> {
+fn leftmost_secondary_leaf<R: PageReader>(reader: &R, mut page_id: PageId) -> Result<PageId> {
     loop {
         let page = reader.read_page(page_id)?;
-        match page_kind(&page)? {
+        match page_kind(page.as_ref())? {
             PageKind::SecondaryLeaf => return Ok(page_id),
             PageKind::SecondaryInternal => {
-                page_id = SecondaryInternalPage::decode(&page)?.first_child_page_id;
+                page_id = SecondaryInternalPage::decode(page.as_ref())?.first_child_page_id;
             }
             other => {
                 return Err(anyhow!(
@@ -176,7 +172,7 @@ fn leftmost_secondary_leaf<R: PageReader>(reader: &mut R, mut page_id: PageId) -
 }
 
 fn find_leaf_for_lower_bound<R: PageReader>(
-    reader: &mut R,
+    reader: &R,
     mut page_id: PageId,
     key_pattern: &Document,
     lower: &IndexBound,
@@ -184,10 +180,10 @@ fn find_leaf_for_lower_bound<R: PageReader>(
     let target_record_id = if lower.inclusive { u64::MIN } else { u64::MAX };
     loop {
         let page = reader.read_page(page_id)?;
-        match page_kind(&page)? {
+        match page_kind(page.as_ref())? {
             PageKind::SecondaryLeaf => return Ok(page_id),
             PageKind::SecondaryInternal => {
-                let internal = SecondaryInternalPage::decode(&page)?;
+                let internal = SecondaryInternalPage::decode(page.as_ref())?;
                 page_id =
                     child_for_secondary_entry(&internal, &lower.key, target_record_id, key_pattern);
             }
@@ -322,9 +318,12 @@ mod tests {
     use mqlite_catalog::{IndexBound, IndexBounds, IndexEntry};
 
     use super::{PageId, PageReader, RecordTree, ScanDirection, SecondaryTree};
-    use crate::v2::page::{
-        RecordInternalPage, RecordLeafPage, RecordSeparator, RecordSlot, SecondaryEntry,
-        SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
+    use crate::v2::{
+        page::{
+            RecordInternalPage, RecordLeafPage, RecordSeparator, RecordSlot, SecondaryEntry,
+            SecondaryInternalPage, SecondaryLeafPage, SecondarySeparator,
+        },
+        pager::SharedPage,
     };
 
     #[derive(Default)]
@@ -339,10 +338,10 @@ mod tests {
     }
 
     impl PageReader for MemoryPageReader {
-        fn read_page(&mut self, page_id: PageId) -> Result<Vec<u8>> {
+        fn read_page(&self, page_id: PageId) -> Result<SharedPage> {
             self.pages
                 .get(&page_id)
-                .cloned()
+                .map(|page| SharedPage::from(page.clone()))
                 .ok_or_else(|| anyhow!("missing page {page_id}"))
         }
     }

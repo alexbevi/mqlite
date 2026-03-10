@@ -953,6 +953,7 @@ dependencies = [
  "fs4",
  "mqlite-bson",
  "mqlite-catalog",
+ "parking_lot",
  "serde",
  "tempfile",
  "thiserror",

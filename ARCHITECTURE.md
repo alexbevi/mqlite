@@ -22,7 +22,8 @@ The current workspace is split into focused crates:
 - `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, and `checkpoint`.
 
 `mqlite-storage/src/v2/` is the on-disk storage engine. It contains the v2 header and superblock
-format, typed record and secondary page codecs, checkpoint writers, recovery readers, and
+format, typed record and secondary page codecs, checkpoint writers, recovery readers, a shared
+pager that serves page reads through offset-based I/O plus an in-process page cache, and
 page-backed metadata paths for `info` and `inspect`.
 
 ## Source Layout

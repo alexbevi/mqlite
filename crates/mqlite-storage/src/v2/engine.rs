@@ -3,7 +3,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -182,13 +182,8 @@ pub(crate) fn read_inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
 }
 
 pub(crate) fn open_namespace_catalog(path: impl AsRef<Path>) -> Result<PagerNamespaceCatalog> {
-    let pager = Arc::new(Mutex::new(Pager::open(path)?));
-    let namespace_root_page_id = pager
-        .lock()
-        .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?
-        .active_superblock()
-        .roots
-        .namespace_root_page_id;
+    let pager = Arc::new(Pager::open(path)?);
+    let namespace_root_page_id = pager.active_superblock().roots.namespace_root_page_id;
     Ok(PagerNamespaceCatalog::new(namespace_root_page_id, pager))
 }
 
@@ -205,31 +200,21 @@ pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
 }
 
 pub(crate) fn load_persisted_state(path: impl AsRef<Path>) -> Result<PersistedState> {
-    let pager = Arc::new(Mutex::new(Pager::open(path)?));
-    let (durable_lsn, last_checkpoint_unix_ms, roots) = {
-        let guard = pager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?;
-        (
-            guard.active_superblock().durable_lsn,
-            guard.active_superblock().last_checkpoint_unix_ms,
-            guard.active_superblock().roots.clone(),
-        )
-    };
+    let pager = Arc::new(Pager::open(path)?);
+    let durable_lsn = pager.active_superblock().durable_lsn;
+    let last_checkpoint_unix_ms = pager.active_superblock().last_checkpoint_unix_ms;
+    let roots = pager.active_superblock().roots.clone();
 
     let catalog = PagerNamespaceCatalog::new(roots.namespace_root_page_id, Arc::clone(&pager))
         .load_catalog()?;
-    let mut pager = pager
-        .lock()
-        .map_err(|_| anyhow::anyhow!("v2 pager mutex was poisoned"))?;
 
     Ok(PersistedState {
         file_format_version: FILE_FORMAT_VERSION,
         last_applied_sequence: durable_lsn,
         last_checkpoint_unix_ms,
         catalog,
-        change_events: load_change_events(&mut pager, roots.change_stream_root_page_id)?,
-        plan_cache_entries: load_plan_cache_entries(&mut pager, roots.plan_cache_root_page_id)?,
+        change_events: load_change_events(&pager, roots.change_stream_root_page_id)?,
+        plan_cache_entries: load_plan_cache_entries(&pager, roots.plan_cache_root_page_id)?,
     })
 }
 
@@ -333,7 +318,7 @@ fn build_collection_info(collection: CollectionHandle) -> Result<InfoCollection>
 }
 
 fn load_change_events(
-    pager: &mut Pager,
+    pager: &Pager,
     root_page_id: Option<u64>,
 ) -> Result<Vec<PersistedChangeEvent>> {
     let Some(mut page_id) = root_page_id else {
@@ -347,7 +332,7 @@ fn load_change_events(
                 "v2 change-event page chain contains a cycle"
             ));
         }
-        let page = ChangeEventsPage::decode(&pager.read_page_bytes(page_id)?)?;
+        let page = ChangeEventsPage::decode(pager.read_page_bytes(page_id)?.as_ref())?;
         events.extend(page.events);
         let Some(next_page_id) = page.next_page_id else {
             break;
@@ -358,7 +343,7 @@ fn load_change_events(
 }
 
 fn load_plan_cache_entries(
-    pager: &mut Pager,
+    pager: &Pager,
     root_page_id: Option<u64>,
 ) -> Result<Vec<PersistedPlanCacheEntry>> {
     let Some(mut page_id) = root_page_id else {
@@ -370,7 +355,7 @@ fn load_plan_cache_entries(
         if !seen.insert(page_id) {
             return Err(anyhow::anyhow!("v2 plan-cache page chain contains a cycle"));
         }
-        let page = PlanCachePage::decode(&pager.read_page_bytes(page_id)?)?;
+        let page = PlanCachePage::decode(pager.read_page_bytes(page_id)?.as_ref())?;
         entries.extend(page.entries);
         let Some(next_page_id) = page.next_page_id else {
             break;

@@ -13,6 +13,7 @@ ciborium.workspace = true
 fs4.workspace = true
 mqlite-bson = { path = "../mqlite-bson" }
 mqlite-catalog = { path = "../mqlite-catalog" }
+parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
