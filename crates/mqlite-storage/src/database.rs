@@ -20,7 +20,7 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::engine::StorageEngine;
+use crate::{engine::StorageEngine, v2::engine as v2_engine};
 
 pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR7";
 pub const FILE_FORMAT_VERSION: u32 = 7;
@@ -1143,6 +1143,9 @@ impl DatabaseFile {
 
     pub fn info(path: impl AsRef<Path>) -> Result<InfoReport> {
         let path = path.as_ref().to_path_buf();
+        if v2_engine::is_v2_file(&path)? {
+            return v2_engine::read_info(&path);
+        }
         let mut file = OpenOptions::new().read(true).open(&path)?;
         let loaded = load_state(&mut file)?;
         build_info_report(path, &loaded)
@@ -4986,6 +4989,7 @@ mod tests {
         WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC, decode_page, decode_snapshot_state,
         read_superblock,
     };
+    use crate::v2::engine as v2_engine;
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
         collection
@@ -5280,6 +5284,21 @@ mod tests {
         assert_eq!(sku_index.checkpoint.entry_count, 2);
         assert!(sku_index.bytes > 0);
         assert!(sku_index.checkpoint.page_bytes > 0);
+    }
+
+    #[test]
+    fn info_uses_metadata_only_v2_reader_for_v2_files() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("info-v2.mongodb");
+
+        v2_engine::create_empty(&path).expect("create v2 file");
+
+        let report = DatabaseFile::info(&path).expect("info");
+        assert_eq!(report.file_format_version, 8);
+        assert_eq!(report.summary.database_count, 0);
+        assert_eq!(report.summary.record_count, 0);
+        assert_eq!(report.last_checkpoint.active_superblock_slot, 0);
+        assert_eq!(report.last_checkpoint.valid_superblocks, 1);
     }
 
     #[test]
