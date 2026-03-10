@@ -1,13 +1,116 @@
 use anyhow::Result;
-use mqlite_catalog::Catalog;
+use bson::{Bson, Document};
+use mqlite_catalog::{
+    Catalog, CollectionCatalog, CollectionRecord, IndexBounds, IndexCatalog, IndexEntry,
+};
 
 use crate::{
     CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, PersistedChangeEvent,
     PersistedPlanCacheEntry, WalMutation,
 };
 
+pub trait CollectionReadView: Send + Sync {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>>;
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>>;
+    fn index_names(&self) -> Vec<String>;
+    fn index(&self, name: &str) -> Option<&dyn IndexReadView>;
+}
+
+pub trait IndexReadView: Send + Sync {
+    fn name(&self) -> &str;
+    fn key_pattern(&self) -> &Document;
+    fn entry_count(&self) -> usize;
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>>;
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize;
+    fn covers_paths(&self, paths: &std::collections::BTreeSet<String>) -> bool;
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize>;
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize>;
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize>;
+    fn present_count(&self, field: &str) -> Option<usize>;
+}
+
+impl CollectionReadView for CollectionCatalog {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
+        Ok(self.records.clone())
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
+        Ok(self
+            .record_position(record_id)
+            .and_then(|position| self.records.get(position))
+            .map(|record| record.document.clone()))
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn IndexReadView> {
+        self.indexes
+            .get(name)
+            .map(|index| index as &dyn IndexReadView)
+    }
+}
+
+impl IndexReadView for IndexCatalog {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn key_pattern(&self) -> &Document {
+        &self.key
+    }
+
+    fn entry_count(&self) -> usize {
+        IndexCatalog::entry_count(self)
+    }
+
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>> {
+        Ok(IndexCatalog::scan_entries(self, bounds))
+    }
+
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        IndexCatalog::estimate_bounds_count(self, bounds)
+    }
+
+    fn covers_paths(&self, paths: &std::collections::BTreeSet<String>) -> bool {
+        IndexCatalog::covers_paths(self, paths)
+    }
+
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize> {
+        IndexCatalog::estimate_value_count(self, field, value)
+    }
+
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize> {
+        IndexCatalog::estimate_values_count(self, field, values)
+    }
+
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        IndexCatalog::estimate_range_count(self, field, lower, upper)
+    }
+
+    fn present_count(&self, field: &str) -> Option<usize> {
+        IndexCatalog::present_count(self, field)
+    }
+}
+
 pub trait StorageEngine: Send + Sync {
     fn catalog(&self) -> &Catalog;
+    fn collection_read_view(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<&dyn CollectionReadView>>;
     fn last_applied_sequence(&self) -> u64;
     fn durable_sequence(&self) -> u64;
     fn wal_sync_count(&self) -> usize;

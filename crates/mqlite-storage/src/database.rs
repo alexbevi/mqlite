@@ -20,7 +20,10 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{engine::StorageEngine, v2::engine as v2_engine};
+use crate::{
+    engine::{CollectionReadView, StorageEngine},
+    v2::engine as v2_engine,
+};
 
 pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR7";
 pub const FILE_FORMAT_VERSION: u32 = 7;
@@ -1262,6 +1265,18 @@ impl DatabaseFile {
 impl StorageEngine for DatabaseFile {
     fn catalog(&self) -> &Catalog {
         DatabaseFile::catalog(self)
+    }
+
+    fn collection_read_view(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<&dyn CollectionReadView>> {
+        match self.catalog().get_collection(database, collection) {
+            Ok(collection) => Ok(Some(collection)),
+            Err(CatalogError::NamespaceNotFound(_, _)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn last_applied_sequence(&self) -> u64 {

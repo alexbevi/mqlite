@@ -28,9 +28,10 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    BoxedStorageEngine, CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob,
-    DatabaseFile, EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent, PersistedPlanCacheChoice,
-    PersistedPlanCacheEntry, StorageError, WalMutation,
+    BoxedStorageEngine, CollectionChange, CollectionReadView as StorageCollectionReadView,
+    CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
+    EMPTY_BSON_DOCUMENT_BYTES, IndexReadView as StorageIndexReadView, PersistedChangeEvent,
+    PersistedPlanCacheChoice, PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -1059,11 +1060,15 @@ impl Broker {
         let storage = self.durable_storage_read()?;
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection_name}");
-        match storage.catalog().get_collection(database, collection_name) {
-            Ok(collection) => {
-                self.cached_find_plan(namespace, sequence, collection, filter, sort, projection)
+        match storage
+            .collection_read_view(database, collection_name)
+            .map_err(internal_error)?
+        {
+            Some(collection) => {
+                let collection = StorageFindCollection::new(collection);
+                self.cached_find_plan(namespace, sequence, &collection, filter, sort, projection)
             }
-            Err(CatalogError::NamespaceNotFound(_, _)) => Ok(CachedFindPlan {
+            None => Ok(CachedFindPlan {
                 plan: PlannedFind::Collection {
                     documents: Vec::new(),
                     record_ids: Vec::new(),
@@ -1072,7 +1077,6 @@ impl Broker {
                 },
                 cache_used: false,
             }),
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -1655,24 +1659,28 @@ impl Broker {
         let storage = self.durable_storage_read()?;
         let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection}");
-        let execution = match storage.catalog().get_collection(&database, collection) {
-            Ok(collection) => self
-                .cached_find_plan(
+        let execution = match storage
+            .collection_read_view(&database, collection)
+            .map_err(internal_error)?
+        {
+            Some(collection) => {
+                let collection = StorageFindCollection::new(collection);
+                self.cached_find_plan(
                     namespace,
                     sequence,
-                    collection,
+                    &collection,
                     &filter,
                     sort.as_ref(),
                     projection.as_ref(),
                 )?
                 .plan
-                .into_execution(),
-            Err(CatalogError::NamespaceNotFound(_, _)) => FindExecution {
+                .into_execution()
+            }
+            None => FindExecution {
                 documents: Vec::new(),
                 sort_covered: false,
                 projection_applied: false,
             },
-            Err(error) => return Err(error.into()),
         };
         let FindExecution {
             mut documents,
@@ -4389,6 +4397,97 @@ impl FindIndex for IndexCatalog {
 
     fn present_count(&self, field: &str) -> Option<usize> {
         IndexCatalog::present_count(self, field)
+    }
+}
+
+struct StorageFindCollection<'a> {
+    inner: &'a dyn StorageCollectionReadView,
+    indexes: BTreeMap<String, StorageFindIndex<'a>>,
+}
+
+impl<'a> StorageFindCollection<'a> {
+    fn new(inner: &'a dyn StorageCollectionReadView) -> Self {
+        let indexes = inner
+            .index_names()
+            .into_iter()
+            .filter_map(|name| {
+                inner
+                    .index(&name)
+                    .map(|index| (name, StorageFindIndex { inner: index }))
+            })
+            .collect();
+        Self { inner, indexes }
+    }
+}
+
+impl FindCollection for StorageFindCollection<'_> {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError> {
+        self.inner.scan_records().map_err(internal_error)
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>, CommandError> {
+        self.inner
+            .record_document(record_id)
+            .map_err(internal_error)
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn FindIndex> {
+        self.indexes.get(name).map(|index| index as &dyn FindIndex)
+    }
+}
+
+struct StorageFindIndex<'a> {
+    inner: &'a dyn StorageIndexReadView,
+}
+
+impl FindIndex for StorageFindIndex<'_> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn key_pattern(&self) -> &Document {
+        self.inner.key_pattern()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.inner.entry_count()
+    }
+
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError> {
+        self.inner.scan_entries(bounds).map_err(internal_error)
+    }
+
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        self.inner.estimate_bounds_count(bounds)
+    }
+
+    fn covers_paths(&self, paths: &BTreeSet<String>) -> bool {
+        self.inner.covers_paths(paths)
+    }
+
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize> {
+        self.inner.estimate_value_count(field, value)
+    }
+
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize> {
+        self.inner.estimate_values_count(field, values)
+    }
+
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        self.inner.estimate_range_count(field, lower, upper)
+    }
+
+    fn present_count(&self, field: &str) -> Option<usize> {
+        self.inner.present_count(field)
     }
 }
 

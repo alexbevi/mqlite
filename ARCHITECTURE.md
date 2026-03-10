@@ -101,7 +101,8 @@ read handles for them so later planner and broker work can avoid full catalog hy
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug
 in page-backed record and index handles later without changing the planner’s cost model or explain
-surface.
+surface. The broker’s `find` and `explain` read paths now ask the storage engine for that borrowed
+collection read view instead of reaching straight through to `Catalog` state.
 
 ## Snapshot Contents
 
