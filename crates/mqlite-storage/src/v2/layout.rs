@@ -34,6 +34,36 @@ pub enum PageKind {
     Stats = 13,
 }
 
+impl TryFrom<u16> for PageKind {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u16) -> Result<Self> {
+        Ok(match value {
+            1 => Self::NamespaceInternal,
+            2 => Self::NamespaceLeaf,
+            3 => Self::CollectionMeta,
+            4 => Self::IndexMeta,
+            5 => Self::RecordInternal,
+            6 => Self::RecordLeaf,
+            7 => Self::SecondaryInternal,
+            8 => Self::SecondaryLeaf,
+            9 => Self::ChangeEventInternal,
+            10 => Self::ChangeEventLeaf,
+            11 => Self::Freelist,
+            12 => Self::Overflow,
+            13 => Self::Stats,
+            _ => return Err(anyhow!("unknown v2 page kind {value}")),
+        })
+    }
+}
+
+pub fn page_offset(page_id: u64, page_size: u32) -> Result<u64> {
+    if page_id == 0 {
+        return Err(anyhow!("page id 0 is reserved"));
+    }
+    Ok(DATA_START_OFFSET + (page_id - 1) * u64::from(page_size))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub page_size: u32,

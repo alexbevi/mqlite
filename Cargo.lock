@@ -951,6 +951,7 @@ dependencies = [
  "ciborium",
  "criterion",
  "fs4",
+ "mqlite-bson",
  "mqlite-catalog",
  "serde",
  "tempfile",

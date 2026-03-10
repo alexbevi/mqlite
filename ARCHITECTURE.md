@@ -21,6 +21,11 @@ The current workspace is split into focused crates:
 - `mqlite-server`: command dispatch, planning, execution, and broker lifecycle.
 - `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, and `checkpoint`.
 
+`mqlite-storage/src/v2/` is the in-progress page-backed engine path. It currently contains the
+v2 header and superblock format, metadata-only `info` reads, typed record and secondary page
+codecs, and read-only record and index tree handles that can serve point and range reads directly
+from persisted pages without rehydrating a full `Catalog`.
+
 ## Source Layout
 
 The Rust workspace now follows a smaller-crate-root layout consistent with the Rust Book's
@@ -82,6 +87,16 @@ The file is versioned and self-describing.
   - append-only WAL frames after the active snapshot
 
 The current format version is encoded in the header and checkpoint snapshot. Recovery rejects unsupported versions.
+
+The in-progress v2 format uses 8 KiB fixed pages behind the same single-file model. Its page set is
+typed up front rather than being reconstructed from checkpoint snapshot references:
+
+- record internal and leaf pages keyed by stable `RecordId`
+- secondary-index internal and leaf pages keyed by persisted BSON key plus `RecordId`
+- two rotating superblocks with summary counters for metadata-only open paths
+
+Those v2 pages are not broker-default yet, but the storage crate now has direct page codecs and
+read handles for them so later planner and broker work can avoid full catalog hydration on reopen.
 
 ## Snapshot Contents
 

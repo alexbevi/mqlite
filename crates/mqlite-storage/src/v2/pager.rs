@@ -6,8 +6,11 @@ use std::{
 
 use anyhow::{Result, anyhow};
 
-use crate::v2::layout::{
-    DATA_START_OFFSET, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN, Superblock,
+use crate::v2::{
+    layout::{
+        DATA_START_OFFSET, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN, Superblock, page_offset,
+    },
+    page::PageId,
 };
 
 #[derive(Debug)]
@@ -85,10 +88,22 @@ impl Pager {
         self.file_size
     }
 
+    pub fn page_size(&self) -> u32 {
+        self.header.page_size
+    }
+
     pub fn wal_bytes(&self) -> u64 {
         self.active_superblock
             .wal_end_offset
             .saturating_sub(self.active_superblock.wal_start_offset)
+    }
+
+    pub fn read_page_bytes(&mut self, page_id: PageId) -> Result<Vec<u8>> {
+        let offset = page_offset(page_id, self.header.page_size)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; self.header.page_size as usize];
+        self.file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 
     pub fn into_file(self) -> File {
