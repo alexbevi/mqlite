@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -9,9 +10,10 @@ use anyhow::Result;
 use fs4::FileExt;
 
 use crate::{
-    InfoCheckpoint, InfoReport, InfoSummary, InfoWal,
+    InfoCheckpoint, InfoCollection, InfoCollectionCheckpoint, InfoDatabase, InfoDatabaseCheckpoint,
+    InfoIndex, InfoIndexCheckpoint, InfoReport, InfoSummary, InfoWal,
     v2::{
-        catalog::{PagerCollectionReadView, PagerNamespaceCatalog},
+        catalog::{CollectionHandle, PagerCollectionReadView, PagerNamespaceCatalog},
         layout::{
             FILE_FORMAT_VERSION, FILE_MAGIC, FileHeader, SUPERBLOCK_COUNT, SUPERBLOCK_LEN,
             Superblock,
@@ -62,6 +64,22 @@ pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
     let summary = &superblock.summary;
     let page_size = u64::from(header.page_size);
     let page_bytes = summary.page_count.saturating_mul(page_size);
+    let databases = open_namespace_catalog(&path)?
+        .collection_handles()?
+        .into_iter()
+        .fold(
+            BTreeMap::<String, Vec<CollectionHandle>>::new(),
+            |mut grouped, collection| {
+                grouped
+                    .entry(collection.meta().database.clone())
+                    .or_default()
+                    .push(collection);
+                grouped
+            },
+        )
+        .into_iter()
+        .map(|(name, collections)| build_database_info(name, collections))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(InfoReport {
         path,
@@ -112,7 +130,7 @@ pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
             bytes: pager.wal_bytes(),
             truncated_tail: false,
         },
-        databases: Vec::new(),
+        databases,
     })
 }
 
@@ -135,14 +153,118 @@ pub(crate) fn open_collection_read_view(
     open_namespace_catalog(path)?.collection_read_view(database, collection)
 }
 
+fn build_database_info(name: String, collections: Vec<CollectionHandle>) -> Result<InfoDatabase> {
+    let collections = collections
+        .into_iter()
+        .map(build_collection_info)
+        .collect::<Result<Vec<_>>>()?;
+    let collection_count = collections.len();
+    let index_count = collections
+        .iter()
+        .map(|collection| collection.index_count)
+        .sum();
+    let record_count = collections
+        .iter()
+        .map(|collection| collection.document_count)
+        .sum();
+    let index_entry_count = collections
+        .iter()
+        .map(|collection| collection.index_entry_count)
+        .sum();
+    let document_bytes = collections
+        .iter()
+        .map(|collection| collection.document_bytes)
+        .sum();
+    let index_bytes = collections
+        .iter()
+        .map(|collection| collection.index_bytes)
+        .sum();
+    let total_bytes = document_bytes + index_bytes;
+
+    Ok(InfoDatabase {
+        name,
+        collection_count,
+        index_count,
+        record_count,
+        index_entry_count,
+        document_bytes,
+        index_bytes,
+        total_bytes,
+        checkpoint: InfoDatabaseCheckpoint {
+            collection_count,
+            index_count,
+            record_count,
+            index_entry_count,
+            record_page_count: 0,
+            record_page_bytes: 0,
+            index_page_count: 0,
+            index_page_bytes: 0,
+            total_bytes,
+        },
+        collections,
+    })
+}
+
+fn build_collection_info(collection: CollectionHandle) -> Result<InfoCollection> {
+    let indexes = collection
+        .indexes()
+        .values()
+        .map(|index| {
+            Ok(InfoIndex {
+                name: index.name().to_string(),
+                key: index.key_pattern().clone(),
+                unique: index.meta().unique,
+                expire_after_seconds: index.meta().expire_after_seconds,
+                entry_count: index.meta().entry_count as usize,
+                bytes: index.meta().index_bytes,
+                checkpoint: InfoIndexCheckpoint {
+                    entry_count: index.meta().entry_count as usize,
+                    page_count: 0,
+                    page_bytes: 0,
+                    root_page_id: index.meta().root_page_id,
+                    total_bytes: index.meta().index_bytes,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let meta = collection.meta();
+    let total_bytes = meta.summary.document_bytes + meta.summary.index_bytes;
+
+    Ok(InfoCollection {
+        name: meta.collection.clone(),
+        document_count: meta.summary.record_count as usize,
+        index_count: meta.summary.index_count as usize,
+        index_entry_count: meta.summary.index_entry_count as usize,
+        document_bytes: meta.summary.document_bytes,
+        index_bytes: meta.summary.index_bytes,
+        total_bytes,
+        checkpoint: InfoCollectionCheckpoint {
+            index_count: meta.summary.index_count as usize,
+            record_count: meta.summary.record_count as usize,
+            index_entry_count: meta.summary.index_entry_count as usize,
+            record_page_count: 0,
+            record_page_bytes: 0,
+            index_page_count: 0,
+            index_page_bytes: 0,
+            total_bytes,
+        },
+        indexes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
+    use bson::doc;
+    use mqlite_catalog::{Catalog, CollectionCatalog, CollectionRecord, apply_index_specs};
     use tempfile::tempdir;
 
     use super::{create_empty, is_v2_file, read_info};
-    use crate::v2::layout::{DATA_START_OFFSET, DEFAULT_PAGE_SIZE};
+    use crate::v2::{
+        checkpoint::write_catalog_checkpoint,
+        layout::{DATA_START_OFFSET, DEFAULT_PAGE_SIZE},
+    };
 
     #[test]
     fn creates_empty_v2_file_and_reads_info() {
@@ -161,5 +283,37 @@ mod tests {
         assert_eq!(report.last_checkpoint.page_size, DEFAULT_PAGE_SIZE as usize);
         assert_eq!(report.last_checkpoint.wal_offset, DATA_START_OFFSET);
         assert_eq!(report.wal_since_checkpoint.bytes, 0);
+    }
+
+    #[test]
+    fn reads_namespace_details_from_v2_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = PathBuf::from(temp_dir.path().join("v2-info.mongodb"));
+
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }))
+            .expect("insert");
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("index");
+
+        let mut catalog = Catalog {
+            databases: BTreeMap::new(),
+        };
+        catalog.replace_collection("app", "widgets", collection);
+        write_catalog_checkpoint(&path, &catalog).expect("write checkpoint");
+
+        let report = read_info(&path).expect("read info");
+        assert_eq!(report.summary.database_count, 1);
+        assert_eq!(report.summary.collection_count, 1);
+        assert_eq!(report.summary.index_count, 2);
+        assert_eq!(report.databases.len(), 1);
+        assert_eq!(report.databases[0].name, "app");
+        assert_eq!(report.databases[0].collections.len(), 1);
+        assert_eq!(report.databases[0].collections[0].name, "widgets");
+        assert_eq!(report.databases[0].collections[0].indexes.len(), 2);
     }
 }

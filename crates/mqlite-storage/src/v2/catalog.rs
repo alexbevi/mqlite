@@ -13,8 +13,8 @@ use crate::{
     v2::{
         btree::{PageReader, RecordTree, ScanDirection, SecondaryTree},
         page::{
-            CollectionMetaPage, IndexMetaPage, NamespaceInternalPage, NamespaceLeafPage, PageId,
-            RecordSlot, page_kind,
+            CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
+            NamespaceLeafPage, PageId, RecordSlot, page_kind,
         },
         pager::Pager,
     },
@@ -335,6 +335,14 @@ impl PagerNamespaceCatalog {
             Arc::clone(&self.pager),
         )))
     }
+
+    pub fn collection_handles(&self) -> Result<Vec<CollectionHandle>> {
+        let mut pager = lock_pager(&self.pager)?;
+        scan_namespace_entries(&mut *pager, self.namespace_root_page_id)?
+            .into_iter()
+            .map(|entry| load_collection_handle(&mut *pager, entry.target_page_id))
+            .collect()
+    }
 }
 
 fn lookup_namespace_target<R: PageReader>(
@@ -414,6 +422,26 @@ fn load_index_handles<R: PageReader>(
     }
 
     Ok(indexes)
+}
+
+fn scan_namespace_entries<R: PageReader>(
+    reader: &mut R,
+    root_page_id: Option<PageId>,
+) -> Result<Vec<NamespaceEntry>> {
+    let Some(mut leaf_page_id) = leftmost_namespace_leaf(reader, root_page_id)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut entries = Vec::new();
+    loop {
+        let leaf = NamespaceLeafPage::decode(&reader.read_page(leaf_page_id)?)?;
+        entries.extend(leaf.entries);
+        match leaf.next_page_id {
+            Some(next_page_id) => leaf_page_id = next_page_id,
+            None => break,
+        }
+    }
+    Ok(entries)
 }
 
 fn leftmost_namespace_leaf<R: PageReader>(
