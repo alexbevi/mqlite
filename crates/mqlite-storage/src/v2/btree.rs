@@ -52,8 +52,9 @@ impl RecordTree {
                     let leaf = RecordLeafPage::decode(page.as_ref())?;
                     return Ok(leaf
                         .entries
-                        .into_iter()
-                        .find(|entry| entry.record_id == record_id));
+                        .binary_search_by_key(&record_id, |entry| entry.record_id)
+                        .ok()
+                        .map(|index| leaf.entries[index].clone()));
                 }
                 PageKind::RecordInternal => {
                     let internal = RecordInternalPage::decode(page.as_ref())?;
@@ -151,6 +152,50 @@ impl SecondaryTree {
         }
         Ok(entries)
     }
+
+    pub fn lookup_exact_record_id<R: PageReader>(
+        &self,
+        reader: &R,
+        key: &Document,
+    ) -> Result<Option<u64>> {
+        let Some(root_page_id) = self.root_page_id else {
+            return Ok(None);
+        };
+        let leaf_page_id = find_leaf_for_lower_bound(
+            reader,
+            root_page_id,
+            &self.key_pattern,
+            &IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            },
+        )?;
+        let mut next_page_id = Some(leaf_page_id);
+        while let Some(current_page_id) = next_page_id {
+            let leaf = SecondaryLeafPage::decode(reader.read_page(current_page_id)?.as_ref())?;
+            let start = leaf
+                .entries
+                .binary_search_by(|entry| {
+                    compare_secondary_tuple(
+                        &entry.key,
+                        entry.record_id,
+                        key,
+                        u64::MIN,
+                        &self.key_pattern,
+                    )
+                })
+                .unwrap_or_else(|position| position);
+            for entry in leaf.entries.iter().skip(start) {
+                match compare_secondary_keys(&entry.key, key, &self.key_pattern) {
+                    Ordering::Equal => return Ok(Some(entry.record_id)),
+                    Ordering::Greater => return Ok(None),
+                    Ordering::Less => {}
+                }
+            }
+            next_page_id = leaf.next_page_id;
+        }
+        Ok(None)
+    }
 }
 
 fn leftmost_secondary_leaf<R: PageReader>(reader: &R, mut page_id: PageId) -> Result<PageId> {
@@ -198,14 +243,14 @@ fn find_leaf_for_lower_bound<R: PageReader>(
 }
 
 fn child_for_record_id(page: &RecordInternalPage, record_id: u64) -> PageId {
-    let mut child_page_id = page.first_child_page_id;
-    for separator in &page.separators {
-        if record_id < separator.record_id {
-            break;
-        }
-        child_page_id = separator.child_page_id;
+    match page
+        .separators
+        .binary_search_by_key(&record_id, |separator| separator.record_id)
+    {
+        Ok(index) => page.separators[index].child_page_id,
+        Err(0) => page.first_child_page_id,
+        Err(index) => page.separators[index - 1].child_page_id,
     }
-    child_page_id
 }
 
 fn child_for_secondary_entry(
@@ -214,22 +259,19 @@ fn child_for_secondary_entry(
     record_id: u64,
     key_pattern: &Document,
 ) -> PageId {
-    let mut child_page_id = page.first_child_page_id;
-    for separator in &page.separators {
-        if compare_secondary_tuple(
-            key,
-            record_id,
+    match page.separators.binary_search_by(|separator| {
+        compare_secondary_tuple(
             &separator.key,
             separator.record_id,
+            key,
+            record_id,
             key_pattern,
         )
-        .is_lt()
-        {
-            break;
-        }
-        child_page_id = separator.child_page_id;
+    }) {
+        Ok(index) => page.separators[index].child_page_id,
+        Err(0) => page.first_child_page_id,
+        Err(index) => page.separators[index - 1].child_page_id,
     }
-    child_page_id
 }
 
 fn entry_within_bounds(
@@ -522,6 +564,83 @@ mod tests {
                 .map(|entry| entry.record_id)
                 .collect::<Vec<_>>(),
             vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn secondary_tree_looks_up_exact_record_ids() {
+        let mut reader = MemoryPageReader::default();
+        reader.insert_page(
+            1,
+            SecondaryInternalPage {
+                page_id: 1,
+                first_child_page_id: 2,
+                separators: vec![SecondarySeparator {
+                    key: doc! { "_id": 3 },
+                    record_id: 12,
+                    child_page_id: 3,
+                }],
+            }
+            .encode()
+            .expect("encode internal")
+            .to_vec(),
+        );
+        reader.insert_page(
+            2,
+            SecondaryLeafPage {
+                page_id: 2,
+                next_page_id: Some(3),
+                entries: vec![
+                    SecondaryEntry {
+                        record_id: 10,
+                        key: doc! { "_id": 1 },
+                        present_mask: 1,
+                    },
+                    SecondaryEntry {
+                        record_id: 11,
+                        key: doc! { "_id": 2 },
+                        present_mask: 1,
+                    },
+                ],
+            }
+            .encode()
+            .expect("encode leaf")
+            .to_vec(),
+        );
+        reader.insert_page(
+            3,
+            SecondaryLeafPage {
+                page_id: 3,
+                next_page_id: None,
+                entries: vec![
+                    SecondaryEntry {
+                        record_id: 12,
+                        key: doc! { "_id": 3 },
+                        present_mask: 1,
+                    },
+                    SecondaryEntry {
+                        record_id: 13,
+                        key: doc! { "_id": 4 },
+                        present_mask: 1,
+                    },
+                ],
+            }
+            .encode()
+            .expect("encode leaf")
+            .to_vec(),
+        );
+
+        let tree = SecondaryTree::new(Some(1), doc! { "_id": 1 });
+
+        assert_eq!(
+            tree.lookup_exact_record_id(&reader, &doc! { "_id": 3 })
+                .expect("lookup existing"),
+            Some(12)
+        );
+        assert_eq!(
+            tree.lookup_exact_record_id(&reader, &doc! { "_id": 5 })
+                .expect("lookup missing"),
+            None
         );
     }
 }

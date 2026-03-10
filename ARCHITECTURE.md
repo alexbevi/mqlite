@@ -181,6 +181,8 @@ Indexes are persisted separately from records and are not rebuilt from collectio
 - Checkpoints encode indexes into persisted B-tree pages:
   - leaf pages hold serialized `IndexEntry` payloads
   - internal pages hold separator keys and child page references
+- Tree navigation now routes through internal pages with binary search and serves exact `_id`
+  lookups directly from the persisted index path instead of materializing a one-entry bounds scan.
 - Each persisted index records its root page id plus the full page reference set.
 - Reopen traverses the B-tree from the persisted root and reconstructs ordered entries.
 - Reopen validates index entries against collection pages and fails instead of silently rebuilding mismatched state.

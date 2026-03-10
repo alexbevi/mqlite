@@ -125,21 +125,7 @@ impl CollectionHandle {
         let Some(index) = self.indexes.get("_id_") else {
             return Ok(None);
         };
-        let bounds = IndexBounds {
-            lower: Some(mqlite_catalog::IndexBound {
-                key: doc! { "_id": id.clone() },
-                inclusive: true,
-            }),
-            upper: Some(mqlite_catalog::IndexBound {
-                key: doc! { "_id": id.clone() },
-                inclusive: true,
-            }),
-        };
-        let Some(record_id) = index
-            .scan_bounds(reader, &bounds, ScanDirection::Forward)?
-            .into_iter()
-            .next()
-            .map(|entry| entry.record_id)
+        let Some(record_id) = index.lookup_exact_record_id(reader, &doc! { "_id": id.clone() })?
         else {
             return Ok(None);
         };
@@ -187,6 +173,15 @@ impl IndexHandle {
     ) -> Result<Vec<IndexEntry>> {
         SecondaryTree::new(self.meta.root_page_id, self.key_pattern.clone())
             .scan_bounds(reader, bounds, direction)
+    }
+
+    pub fn lookup_exact_record_id<R: PageReader>(
+        &self,
+        reader: &R,
+        key: &Document,
+    ) -> Result<Option<u64>> {
+        SecondaryTree::new(self.meta.root_page_id, self.key_pattern.clone())
+            .lookup_exact_record_id(reader, key)
     }
 }
 
@@ -432,14 +427,16 @@ fn lookup_namespace_target<R: PageReader>(
             }
             crate::v2::layout::PageKind::NamespaceInternal => {
                 let internal = NamespaceInternalPage::decode(page.as_ref())?;
-                let mut child_page_id = internal.first_child_page_id;
-                for separator in &internal.separators {
-                    if target < separator.name.as_str() {
-                        break;
-                    }
-                    child_page_id = separator.child_page_id;
-                }
-                page_id = Some(child_page_id);
+                page_id = Some(
+                    match internal
+                        .separators
+                        .binary_search_by(|separator| separator.name.as_str().cmp(target))
+                    {
+                        Ok(index) => internal.separators[index].child_page_id,
+                        Err(0) => internal.first_child_page_id,
+                        Err(index) => internal.separators[index - 1].child_page_id,
+                    },
+                );
             }
             other => return Err(anyhow!("expected namespace page, found {:?}", other)),
         }
@@ -617,8 +614,9 @@ mod tests {
             engine::create_empty,
             layout::{DEFAULT_PAGE_SIZE, page_offset},
             page::{
-                CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceLeafPage, PageId,
-                RecordLeafPage, RecordSlot, SecondaryEntry, SecondaryLeafPage, StatsPage,
+                CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
+                NamespaceLeafPage, NamespaceSeparator, PageId, RecordLeafPage, RecordSlot,
+                SecondaryEntry, SecondaryLeafPage, StatsPage,
             },
             pager::Pager,
         },
@@ -957,6 +955,103 @@ mod tests {
         let index = view.index("_id_").expect("index view");
         assert_eq!(index.estimate_value_count("_id", &Bson::Int32(7)), Some(1));
         assert_eq!(index.present_count("_id"), Some(1));
+    }
+
+    #[test]
+    fn pager_namespace_catalog_descends_internal_namespace_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("namespace-internal.mongodb");
+        create_empty(&path).expect("create v2 file");
+
+        write_page(
+            &path,
+            1,
+            &NamespaceInternalPage {
+                page_id: 1,
+                first_child_page_id: 2,
+                separators: vec![NamespaceSeparator {
+                    name: "app.widgets".to_string(),
+                    child_page_id: 3,
+                }],
+            }
+            .encode()
+            .expect("encode namespace internal"),
+        );
+        write_page(
+            &path,
+            2,
+            &NamespaceLeafPage {
+                page_id: 2,
+                next_page_id: None,
+                entries: vec![NamespaceEntry {
+                    name: "app.gadgets".to_string(),
+                    target_page_id: 4,
+                }],
+            }
+            .encode()
+            .expect("encode namespace leaf"),
+        );
+        write_page(
+            &path,
+            3,
+            &NamespaceLeafPage {
+                page_id: 3,
+                next_page_id: None,
+                entries: vec![NamespaceEntry {
+                    name: "app.widgets".to_string(),
+                    target_page_id: 5,
+                }],
+            }
+            .encode()
+            .expect("encode namespace leaf"),
+        );
+        write_page(
+            &path,
+            5,
+            &CollectionMetaPage {
+                page_id: 5,
+                meta: CollectionMeta {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    record_root_page_id: Some(6),
+                    index_directory_root_page_id: None,
+                    options_bytes: bson::to_vec(&doc! {}).expect("options"),
+                    next_record_id: 11,
+                    summary: SummaryCounters {
+                        record_count: 1,
+                        ..SummaryCounters::default()
+                    },
+                },
+            }
+            .encode()
+            .expect("encode collection meta"),
+        );
+        write_page(
+            &path,
+            6,
+            &RecordLeafPage {
+                page_id: 6,
+                next_page_id: None,
+                entries: vec![
+                    RecordSlot::from_document(10, &doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+                        .expect("record"),
+                ],
+            }
+            .encode()
+            .expect("encode records"),
+        );
+
+        let catalog =
+            PagerNamespaceCatalog::new(Some(1), Arc::new(Pager::open(&path).expect("open pager")));
+        let view = catalog
+            .collection_read_view("app", "widgets")
+            .expect("load view")
+            .expect("collection view");
+
+        assert_eq!(
+            view.record_document(10).expect("record document"),
+            Some(doc! { "_id": 7, "sku": "alpha", "qty": 4 })
+        );
     }
 
     fn write_page(path: &std::path::Path, page_id: PageId, bytes: &[u8]) {
