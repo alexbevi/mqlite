@@ -17,4 +17,10 @@ thiserror.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+mqlite-catalog = { path = "../mqlite-catalog" }
 tempfile.workspace = true
+
+[[bench]]
+name = "reopen_existing"
+harness = false
