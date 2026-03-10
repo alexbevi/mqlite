@@ -415,7 +415,7 @@ impl Broker {
         &self,
         namespace: String,
         sequence: u64,
-        collection: &CollectionCatalog,
+        collection: &dyn FindCollection,
         filter: &Document,
         sort: Option<&Document>,
         projection: Option<&Document>,
@@ -4299,8 +4299,101 @@ struct ProjectionRequirements {
     dependencies: BTreeSet<String>,
 }
 
+trait FindCollection {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError>;
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>, CommandError>;
+    fn index_names(&self) -> Vec<String>;
+    fn index(&self, name: &str) -> Option<&dyn FindIndex>;
+}
+
+trait FindIndex {
+    fn name(&self) -> &str;
+    fn key_pattern(&self) -> &Document;
+    fn entry_count(&self) -> usize;
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError>;
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize;
+    fn covers_paths(&self, paths: &BTreeSet<String>) -> bool;
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize>;
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize>;
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize>;
+    fn present_count(&self, field: &str) -> Option<usize>;
+}
+
+impl FindCollection for CollectionCatalog {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError> {
+        Ok(self.records.clone())
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>, CommandError> {
+        Ok(self
+            .record_position(record_id)
+            .and_then(|position| self.records.get(position))
+            .map(|record| record.document.clone()))
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn FindIndex> {
+        self.indexes.get(name).map(|index| index as &dyn FindIndex)
+    }
+}
+
+impl FindIndex for IndexCatalog {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn key_pattern(&self) -> &Document {
+        &self.key
+    }
+
+    fn entry_count(&self) -> usize {
+        IndexCatalog::entry_count(self)
+    }
+
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError> {
+        Ok(IndexCatalog::scan_entries(self, bounds))
+    }
+
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        IndexCatalog::estimate_bounds_count(self, bounds)
+    }
+
+    fn covers_paths(&self, paths: &BTreeSet<String>) -> bool {
+        IndexCatalog::covers_paths(self, paths)
+    }
+
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize> {
+        IndexCatalog::estimate_value_count(self, field, value)
+    }
+
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize> {
+        IndexCatalog::estimate_values_count(self, field, values)
+    }
+
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        IndexCatalog::estimate_range_count(self, field, lower, upper)
+    }
+
+    fn present_count(&self, field: &str) -> Option<usize> {
+        IndexCatalog::present_count(self, field)
+    }
+}
+
 struct FindPlanContext<'a> {
-    record_by_id: &'a BTreeMap<u64, &'a Document>,
+    collection: &'a dyn FindCollection,
     expression: &'a MatchExpr,
     filter_paths: &'a BTreeSet<String>,
     field_bounds: &'a BTreeMap<String, FieldBounds>,
@@ -4581,7 +4674,7 @@ impl PlannedFind {
 }
 
 fn plan_find(
-    collection: &CollectionCatalog,
+    collection: &dyn FindCollection,
     filter: &Document,
     sort: Option<&Document>,
     projection: Option<&Document>,
@@ -4628,7 +4721,7 @@ fn plan_find(
 }
 
 fn plan_find_simple(
-    collection: &CollectionCatalog,
+    collection: &dyn FindCollection,
     expression: &MatchExpr,
     sort: Option<&Document>,
     projection: Option<&Document>,
@@ -4637,13 +4730,8 @@ fn plan_find_simple(
     let field_bounds = extract_field_bounds(expression).unwrap_or_default();
     let filter_paths = collect_match_paths(expression);
     let projection_requirements = analyze_projection_requirements(projection)?;
-    let record_by_id = collection
-        .records
-        .iter()
-        .map(|record| (record.record_id, &record.document))
-        .collect::<BTreeMap<_, _>>();
     let context = FindPlanContext {
-        record_by_id: &record_by_id,
+        collection,
         expression,
         filter_paths: &filter_paths,
         field_bounds: &field_bounds,
@@ -4652,9 +4740,9 @@ fn plan_find_simple(
         projection_requirements: projection_requirements.as_ref(),
     };
 
-    let mut best_plan = plan_collection_scan(collection, expression, sort);
+    let mut best_plan = plan_collection_scan(collection, expression, sort)?;
     if let Some(index_name) = preferred_index {
-        if let Some(index) = collection.indexes.get(index_name) {
+        if let Some(index) = collection.index(index_name) {
             if let Some(candidate) = evaluate_index_plan(&context, index)? {
                 if candidate.cost() < best_plan.cost() {
                     best_plan = candidate;
@@ -4665,10 +4753,11 @@ fn plan_find_simple(
     }
 
     let mut estimated_candidates = collection
-        .indexes
-        .values()
-        .filter_map(|index| {
-            estimate_index_candidate(&context, index).map(|cost| (cost, index.name.clone()))
+        .index_names()
+        .into_iter()
+        .filter_map(|index_name| {
+            let index = collection.index(&index_name)?;
+            estimate_index_candidate(&context, index).map(|cost| (cost, index_name))
         })
         .collect::<Vec<_>>();
     estimated_candidates.sort_by(|(left_cost, left_name), (right_cost, right_name)| {
@@ -4681,7 +4770,7 @@ fn plan_find_simple(
         .into_iter()
         .take(MAX_ESTIMATED_INDEX_CANDIDATES)
     {
-        let Some(index) = collection.indexes.get(&index_name) else {
+        let Some(index) = collection.index(&index_name) else {
             continue;
         };
         if let Some(candidate) = evaluate_index_plan(&context, index)? {
@@ -4695,26 +4784,27 @@ fn plan_find_simple(
 }
 
 fn plan_collection_scan(
-    collection: &CollectionCatalog,
+    collection: &dyn FindCollection,
     expression: &MatchExpr,
     sort: Option<&Document>,
-) -> PlannedFind {
-    let (record_ids, documents) = collection
-        .records
-        .iter()
+) -> Result<PlannedFind, CommandError> {
+    let records = collection.scan_records()?;
+    let docs_examined = records.len();
+    let (record_ids, documents) = records
+        .into_iter()
         .filter(|record| document_matches_expression(&record.document, expression))
-        .map(|record| (record.record_id, record.document.clone()))
+        .map(|record| (record.record_id, record.document))
         .unzip::<_, _, Vec<_>, Vec<_>>();
-    PlannedFind::Collection {
+    Ok(PlannedFind::Collection {
         documents,
         record_ids,
-        docs_examined: collection.records.len(),
+        docs_examined,
         sort_required: sort.is_some(),
-    }
+    })
 }
 
 fn plan_or_find(
-    collection: &CollectionCatalog,
+    collection: &dyn FindCollection,
     branches: &[MatchExpr],
     sort: Option<&Document>,
     preferred_choices: Option<&[PersistedPlanCacheChoice]>,
@@ -4722,12 +4812,6 @@ fn plan_or_find(
     if branches.is_empty() || branches.len() > MAX_OR_BRANCHES {
         return Ok(None);
     }
-
-    let record_by_id = collection
-        .records
-        .iter()
-        .map(|record| (record.record_id, &record.document))
-        .collect::<BTreeMap<_, _>>();
     let mut planned_branches = Vec::with_capacity(branches.len());
     for (index, branch) in branches.iter().enumerate() {
         let preferred_index = preferred_choices
@@ -4757,7 +4841,7 @@ fn plan_or_find(
 
     let documents = record_ids
         .iter()
-        .map(|record_id| fetch_record_document(&record_by_id, *record_id))
+        .map(|record_id| fetch_record_document(collection, *record_id))
         .collect::<Result<Vec<_>, _>>()?;
     let filter_covered = planned_branches.iter().all(PlannedFind::filter_covered);
     let keys_examined = planned_branches
@@ -4785,7 +4869,7 @@ fn plan_or_find(
 
 fn evaluate_index_plan(
     context: &FindPlanContext<'_>,
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
 ) -> Result<Option<PlannedFind>, CommandError> {
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
@@ -4808,7 +4892,7 @@ fn evaluate_index_plan(
     let scan_direction = sort_plan
         .map(|plan| plan.direction)
         .unwrap_or(ScanDirection::Forward);
-    let (entries, keys_examined) = scan_index_intervals(index, &bounds, scan_direction);
+    let (entries, keys_examined) = scan_index_intervals(index, &bounds, scan_direction)?;
 
     let matched_fields = filter_plan
         .as_ref()
@@ -4829,7 +4913,7 @@ fn evaluate_index_plan(
             document_matches_expression(&index_document, context.expression)
         } else {
             filter_covered = false;
-            let document = fetch_record_document(context.record_by_id, entry.record_id)?;
+            let document = fetch_record_document(context.collection, entry.record_id)?;
             docs_examined += 1;
             let is_match = document_matches_expression(&document, context.expression);
             fetched = Some(document);
@@ -4851,7 +4935,7 @@ fn evaluate_index_plan(
                 Some(document) => document,
                 None => {
                     docs_examined += 1;
-                    fetch_record_document(context.record_by_id, entry.record_id)?
+                    fetch_record_document(context.collection, entry.record_id)?
                 }
             }
         };
@@ -4860,7 +4944,7 @@ fn evaluate_index_plan(
     }
 
     Ok(Some(PlannedFind::Index {
-        index_name: index.name.clone(),
+        index_name: index.name().to_string(),
         bounds,
         documents,
         record_ids,
@@ -4878,7 +4962,7 @@ fn evaluate_index_plan(
 
 fn estimate_index_candidate(
     context: &FindPlanContext<'_>,
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
 ) -> Option<PlanCost> {
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
@@ -4899,7 +4983,7 @@ fn estimate_index_candidate(
         .map(|plan| plan.bounds.as_slice())
         .unwrap_or(&[]);
     let estimated_keys_examined = if bounds.is_empty() {
-        index.stats.entry_count
+        index.entry_count()
     } else {
         bounds
             .iter()
@@ -4933,7 +5017,7 @@ fn estimate_index_candidate(
 }
 
 fn estimate_filter_matches(
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
     field_bounds: &BTreeMap<String, FieldBounds>,
     filter_paths: &BTreeSet<String>,
     filter_supported: bool,
@@ -4943,7 +5027,7 @@ fn estimate_filter_matches(
         return base_count;
     }
 
-    let mut estimates = vec![base_count.min(index.stats.entry_count)];
+    let mut estimates = vec![base_count.min(index.entry_count())];
     for path in filter_paths {
         let Some(bounds) = field_bounds.get(path) else {
             continue;
@@ -4976,7 +5060,7 @@ fn estimate_filter_matches(
 }
 
 fn projection_supported<'a>(
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
     context: &FindPlanContext<'a>,
     sort_plan: Option<SortPlan>,
 ) -> Option<&'a ProjectionRequirements> {
@@ -4994,10 +5078,10 @@ fn full_range_bounds() -> IndexBounds {
 }
 
 fn scan_index_intervals(
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
     bounds: &[IndexBounds],
     scan_direction: ScanDirection,
-) -> (Vec<IndexEntry>, usize) {
+) -> Result<(Vec<IndexEntry>, usize), CommandError> {
     let intervals = if bounds.is_empty() {
         vec![full_range_bounds()]
     } else {
@@ -5006,7 +5090,7 @@ fn scan_index_intervals(
     let mut keys_examined = 0_usize;
     let mut entry_by_record_id = BTreeMap::<u64, IndexEntry>::new();
     for interval in intervals {
-        let entries = index.scan_entries(&interval);
+        let entries = index.scan_entries(&interval)?;
         keys_examined += entries.len();
         for entry in entries {
             entry_by_record_id.entry(entry.record_id).or_insert(entry);
@@ -5014,11 +5098,43 @@ fn scan_index_intervals(
     }
 
     let mut entries = entry_by_record_id.into_values().collect::<Vec<_>>();
-    index.sort_entries(&mut entries);
+    sort_index_entries(&mut entries, index.key_pattern());
     if scan_direction == ScanDirection::Backward {
         entries.reverse();
     }
-    (entries, keys_examined)
+    Ok((entries, keys_examined))
+}
+
+fn sort_index_entries(entries: &mut [IndexEntry], key_pattern: &Document) {
+    entries.sort_by(|left, right| compare_index_entries(left, right, key_pattern));
+}
+
+fn compare_index_entries(
+    left: &IndexEntry,
+    right: &IndexEntry,
+    key_pattern: &Document,
+) -> std::cmp::Ordering {
+    compare_index_keys(&left.key, &right.key, key_pattern)
+        .then_with(|| left.record_id.cmp(&right.record_id))
+}
+
+fn compare_index_keys(
+    left: &Document,
+    right: &Document,
+    key_pattern: &Document,
+) -> std::cmp::Ordering {
+    for (field, direction) in key_pattern {
+        let left_value = left.get(field).unwrap_or(&Bson::Null);
+        let right_value = right.get(field).unwrap_or(&Bson::Null);
+        let mut ordering = compare_bson(left_value, right_value);
+        if direction_sign(direction).unwrap_or(1) < 0 {
+            ordering = ordering.reverse();
+        }
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn extract_field_bounds(expression: &MatchExpr) -> Option<BTreeMap<String, FieldBounds>> {
@@ -5350,12 +5466,11 @@ fn materialize_index_document(entry: &IndexEntry) -> Result<Document, CommandErr
 }
 
 fn fetch_record_document(
-    record_by_id: &BTreeMap<u64, &Document>,
+    collection: &dyn FindCollection,
     record_id: u64,
 ) -> Result<Document, CommandError> {
-    record_by_id
-        .get(&record_id)
-        .map(|document| (*document).clone())
+    collection
+        .record_document(record_id)?
         .ok_or_else(|| CommandError::new(8, "UnknownError", "missing record for index entry"))
 }
 
@@ -5530,11 +5645,11 @@ fn dnf_branches(expression: &MatchExpr) -> Option<Vec<Vec<MatchExpr>>> {
 }
 
 fn build_index_bounds(
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
     field_bounds: &BTreeMap<String, FieldBounds>,
 ) -> Option<IndexBoundsPlan> {
     let key_fields = index
-        .key
+        .key_pattern()
         .iter()
         .map(|(field, direction)| (field.clone(), direction_sign(direction).unwrap_or(1)))
         .collect::<Vec<_>>();
@@ -5667,7 +5782,7 @@ fn push_prefix_interval(
 }
 
 fn analyze_sort(
-    index: &IndexCatalog,
+    index: &dyn FindIndex,
     field_bounds: &BTreeMap<String, FieldBounds>,
     sort: Option<&Document>,
 ) -> Option<SortPlan> {
@@ -5683,7 +5798,7 @@ fn analyze_sort(
     }
 
     let index_fields = index
-        .key
+        .key_pattern()
         .iter()
         .map(|(field, direction)| direction_sign(direction).map(|sign| (field.clone(), sign)))
         .collect::<Option<Vec<_>>>()?;

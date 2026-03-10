@@ -98,6 +98,11 @@ typed up front rather than being reconstructed from checkpoint snapshot referenc
 Those v2 pages are not broker-default yet, but the storage crate now has direct page codecs and
 read handles for them so later planner and broker work can avoid full catalog hydration on reopen.
 
+The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
+planning and costing paths target a narrower collection and index read view so the broker can plug
+in page-backed record and index handles later without changing the planner’s cost model or explain
+surface.
+
 ## Snapshot Contents
 
 Each checkpoint snapshot stores the minimum metadata needed to reopen the durable state without rebuilding it from user documents.
