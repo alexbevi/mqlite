@@ -1,4 +1,5 @@
 mod database;
+mod engine;
 
 pub use database::{
     CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
@@ -8,3 +9,4 @@ pub use database::{
     PersistedPlanCacheChoice, PersistedPlanCacheEntry, PersistedState, StorageError, VerifyReport,
     WalMutation,
 };
+pub use engine::{BoxedStorageEngine, StorageEngine};

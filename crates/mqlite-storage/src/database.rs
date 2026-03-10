@@ -20,6 +20,8 @@ use mqlite_catalog::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::engine::StorageEngine;
+
 pub const FILE_MAGIC: &[u8; 8] = b"MQLTHDR7";
 pub const FILE_FORMAT_VERSION: u32 = 7;
 pub const PAGE_SIZE: usize = 4096;
@@ -1251,6 +1253,75 @@ impl DatabaseFile {
         self.durable_sequence = self.state.last_applied_sequence;
         self.checkpoint_counts = completed.checkpoint_counts;
         Ok(())
+    }
+}
+
+impl StorageEngine for DatabaseFile {
+    fn catalog(&self) -> &Catalog {
+        DatabaseFile::catalog(self)
+    }
+
+    fn last_applied_sequence(&self) -> u64 {
+        DatabaseFile::last_applied_sequence(self)
+    }
+
+    fn durable_sequence(&self) -> u64 {
+        DatabaseFile::durable_sequence(self)
+    }
+
+    fn wal_sync_count(&self) -> usize {
+        DatabaseFile::wal_sync_count(self)
+    }
+
+    fn change_events(&self) -> &[PersistedChangeEvent] {
+        DatabaseFile::change_events(self)
+    }
+
+    fn has_pending_wal(&self) -> bool {
+        DatabaseFile::has_pending_wal(self)
+    }
+
+    fn has_concurrent_checkpoint(&self) -> bool {
+        DatabaseFile::has_concurrent_checkpoint(self)
+    }
+
+    fn persisted_plan_cache_entries(&self) -> &[PersistedPlanCacheEntry] {
+        DatabaseFile::persisted_plan_cache_entries(self)
+    }
+
+    fn set_persisted_plan_cache_entries(&mut self, entries: Vec<PersistedPlanCacheEntry>) {
+        DatabaseFile::set_persisted_plan_cache_entries(self, entries);
+    }
+
+    fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
+        DatabaseFile::commit_mutation(self, mutation)
+    }
+
+    fn commit_mutation_unflushed(&mut self, mutation: WalMutation) -> Result<u64> {
+        DatabaseFile::commit_mutation_unflushed(self, mutation)
+    }
+
+    fn sync_pending_wal(&mut self) -> Result<u64> {
+        DatabaseFile::sync_pending_wal(self)
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        DatabaseFile::checkpoint(self)
+    }
+
+    fn prepare_concurrent_checkpoint(&mut self) -> Result<Option<ConcurrentCheckpointJob>> {
+        DatabaseFile::prepare_concurrent_checkpoint(self)
+    }
+
+    fn finish_concurrent_checkpoint(
+        &mut self,
+        completed: CompletedConcurrentCheckpoint,
+    ) -> Result<bool> {
+        DatabaseFile::finish_concurrent_checkpoint(self, completed)
+    }
+
+    fn abort_concurrent_checkpoint(&mut self) -> bool {
+        DatabaseFile::abort_concurrent_checkpoint(self)
     }
 }
 

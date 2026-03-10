@@ -28,8 +28,8 @@ use mqlite_query::{
     upsert_seed_from_query,
 };
 use mqlite_storage::{
-    CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
-    EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent, PersistedPlanCacheChoice,
+    BoxedStorageEngine, CollectionChange, CompletedConcurrentCheckpoint, ConcurrentCheckpointJob,
+    DatabaseFile, EMPTY_BSON_DOCUMENT_BYTES, PersistedChangeEvent, PersistedPlanCacheChoice,
     PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
@@ -77,7 +77,7 @@ impl BrokerConfig {
 pub struct Broker {
     config: BrokerConfig,
     paths: BrokerPaths,
-    storage: Arc<RwLock<DatabaseFile>>,
+    storage: Arc<RwLock<BoxedStorageEngine>>,
     wal_commit: Arc<WalCommitCoordinator>,
     cursors: Arc<Mutex<CursorManager>>,
     plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
@@ -237,7 +237,7 @@ impl Broker {
         Ok(Self {
             config,
             paths,
-            storage: Arc::new(RwLock::new(storage)),
+            storage: Arc::new(RwLock::new(Box::new(storage))),
             wal_commit: Arc::new(WalCommitCoordinator::new(durable_sequence)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
             plan_cache: Arc::new(Mutex::new(plan_cache)),
@@ -464,7 +464,7 @@ impl Broker {
 
     fn durable_storage_read(
         &self,
-    ) -> Result<parking_lot::RwLockReadGuard<'_, DatabaseFile>, CommandError> {
+    ) -> Result<parking_lot::RwLockReadGuard<'_, BoxedStorageEngine>, CommandError> {
         loop {
             let storage = self.storage.read();
             let visible_sequence = storage.last_applied_sequence();
