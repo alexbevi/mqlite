@@ -11,6 +11,7 @@ file:///absolute/path/to/database.mongodb?db=app
 The driver still speaks `OP_MSG` exclusively. The only difference is that the remote socket becomes a local IPC stream backed by a per-file `mqlite` broker.
 
 For direct local validation outside a driver, the CLI also exposes `mqlite info --file <path>` for per-database, per-collection, and per-index size and count summaries plus last-checkpoint metadata, while `mqlite inspect` remains the lower-level file-layout view. `mqlite` now creates and writes only the page-backed v2 format. Both metadata commands answer from checkpoint metadata plus a metadata-only WAL fold when needed, instead of rebuilding every collection and index into memory first. Older pre-v2 files are rejected explicitly. `mqlite verify` remains the command that does the full structural walk.
+`mqlite bench --file <path>` is the broker-level latency probe for local validation; it now reports broker startup latency, per-phase throughput, point-query field selection, first and worst point-query latency, and explicit startup / first-point-query budget verdicts.
 
 On the storage side, the page-backed v2 read path now persists per-index value-frequency and field-presence stats through checkpoint and reopen, so broker planning can reuse those estimates without rebuilding them first.
 V2 checkpoints also now persist change-stream history and plan-cache entries alongside the page graph, so broker-visible durable state can round-trip through the new superblock roots without the old snapshot wrapper.

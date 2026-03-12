@@ -356,12 +356,36 @@ fn bench_command_reports_write_and_read_metrics() {
     assert!(collection_name.starts_with("quick_"));
     assert_eq!(response["index"]["field"], "sku");
     assert_eq!(response["index"]["unique"], true);
+    assert!(
+        response["startup"]["elapsedMs"]
+            .as_f64()
+            .expect("startup elapsed")
+            >= 0.0
+    );
+    assert_eq!(response["startup"]["targetMs"], 300.0);
     assert_eq!(response["writes"]["documents"], 3);
     assert_eq!(response["writes"]["commands"], 2);
     assert_eq!(response["writes"]["batchSize"], 2);
     assert_eq!(response["reads"]["documents"], 3);
     assert_eq!(response["reads"]["commands"], 3);
     assert_eq!(response["reads"]["batchSize"], 1);
+    assert_eq!(response["reads"]["queryField"], "sku");
+    assert!(
+        response["reads"]["firstQueryElapsedMs"]
+            .as_f64()
+            .expect("first query elapsed")
+            >= 0.0
+    );
+    assert!(
+        response["reads"]["maxQueryElapsedMs"]
+            .as_f64()
+            .expect("max query elapsed")
+            >= 0.0
+    );
+    assert_eq!(response["targets"]["startupMs"], 300.0);
+    assert_eq!(response["targets"]["firstPointQueryMs"], 500.0);
+    assert_eq!(response["budgets"]["startup"]["targetMs"], 300.0);
+    assert_eq!(response["budgets"]["firstPointQuery"]["targetMs"], 500.0);
     assert_eq!(response["totals"]["documents"], 6);
     assert!(
         response["writes"]["elapsedMs"]

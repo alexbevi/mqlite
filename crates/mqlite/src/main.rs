@@ -342,6 +342,9 @@ struct BenchmarkOptions<'a> {
     idle_shutdown_secs: u64,
 }
 
+const BENCH_STARTUP_TARGET_MS: f64 = 300.0;
+const BENCH_FIRST_POINT_QUERY_TARGET_MS: f64 = 500.0;
+
 async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<serde_json::Value> {
     let BenchmarkOptions {
         db,
@@ -364,7 +367,9 @@ async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<ser
         .as_micros()
         .to_string();
     let collection = format!("{collection_prefix}_{run_id}");
+    let startup_started_at = Instant::now();
     let mut stream = connect_or_spawn_broker(file, idle_shutdown_secs).await?;
+    let startup_elapsed = startup_started_at.elapsed();
 
     send_checked_command(
         &mut stream,
@@ -422,19 +427,24 @@ async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<ser
 
     let readable = reads.min(writes);
     let read_started_at = Instant::now();
+    let mut first_read_elapsed = None;
+    let mut max_read_elapsed = Duration::ZERO;
+    let query_field = index_field.unwrap_or("_id");
     for sequence in 0..readable {
+        let query_started_at = Instant::now();
         let response = send_checked_command(
             &mut stream,
             doc! {
                 "find": collection.as_str(),
-                "filter": {
-                    "_id": format!("{run_id}-{sequence}"),
-                },
+                "filter": benchmark_filter(&run_id, sequence, index_field),
                 "limit": 1,
                 "$db": db,
             },
         )
         .await?;
+        let query_elapsed = query_started_at.elapsed();
+        first_read_elapsed.get_or_insert(query_elapsed);
+        max_read_elapsed = max_read_elapsed.max(query_elapsed);
         let first_batch = response
             .get_document("cursor")
             .context("find reply missing cursor")?
@@ -449,26 +459,51 @@ async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<ser
     }
     let read_elapsed = read_started_at.elapsed();
     let total_elapsed = write_elapsed + read_elapsed;
+    let first_read_elapsed = first_read_elapsed.unwrap_or(Duration::ZERO);
 
     Ok(json!({
         "file": file.display().to_string(),
         "db": db,
         "collection": collection,
         "runId": run_id,
+        "startup": benchmark_budget_report(startup_elapsed, BENCH_STARTUP_TARGET_MS),
         "index": index_field.map(|field| {
             json!({
                 "field": field,
                 "unique": unique_index,
             })
         }),
-        "writes": benchmark_phase_report(write_elapsed, writes, write_commands, write_batch_size),
-        "reads": benchmark_phase_report(read_elapsed, readable, readable, 1),
+        "writes": benchmark_phase_report(
+            write_elapsed,
+            writes,
+            write_commands,
+            write_batch_size,
+            "n/a",
+            Duration::ZERO,
+            Duration::ZERO,
+        ),
+        "reads": benchmark_phase_report(read_elapsed, readable, readable, 1, query_field, first_read_elapsed, max_read_elapsed),
+        "targets": {
+            "startupMs": BENCH_STARTUP_TARGET_MS,
+            "firstPointQueryMs": BENCH_FIRST_POINT_QUERY_TARGET_MS,
+        },
+        "budgets": {
+            "startup": benchmark_budget_report(startup_elapsed, BENCH_STARTUP_TARGET_MS),
+            "firstPointQuery": benchmark_budget_report(first_read_elapsed, BENCH_FIRST_POINT_QUERY_TARGET_MS),
+        },
         "totals": {
             "documents": writes + readable,
             "elapsedMs": duration_ms(total_elapsed),
             "docsPerSec": rate_per_second(writes + readable, total_elapsed),
         }
     }))
+}
+
+fn benchmark_filter(run_id: &str, sequence: u32, index_field: Option<&str>) -> Document {
+    match index_field {
+        Some(field) => doc! { field: format!("{run_id}-{sequence}") },
+        None => doc! { "_id": format!("{run_id}-{sequence}") },
+    }
 }
 
 fn benchmark_document(run_id: &str, sequence: u32, index_field: Option<&str>) -> Bson {
@@ -489,12 +524,18 @@ fn benchmark_phase_report(
     documents: u32,
     commands: u32,
     batch_size: u32,
+    query_field: &str,
+    first_query_elapsed: Duration,
+    max_query_elapsed: Duration,
 ) -> serde_json::Value {
     json!({
         "documents": documents,
         "commands": commands,
         "batchSize": batch_size,
+        "queryField": query_field,
         "elapsedMs": duration_ms(elapsed),
+        "firstQueryElapsedMs": duration_ms(first_query_elapsed),
+        "maxQueryElapsedMs": duration_ms(max_query_elapsed),
         "docsPerSec": rate_per_second(documents, elapsed),
         "commandsPerSec": rate_per_second(commands, elapsed),
     })
@@ -504,10 +545,49 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn benchmark_budget_report(elapsed: Duration, target_ms: f64) -> serde_json::Value {
+    let elapsed_ms = duration_ms(elapsed);
+    json!({
+        "elapsedMs": elapsed_ms,
+        "targetMs": target_ms,
+        "withinTarget": elapsed_ms <= target_ms,
+    })
+}
+
 fn rate_per_second(count: u32, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
     if seconds == 0.0 {
         return f64::INFINITY;
     }
     f64::from(count) / seconds
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bson::doc;
+    use serde_json::json;
+
+    use super::{benchmark_budget_report, benchmark_filter};
+
+    #[test]
+    fn benchmark_filter_targets_secondary_index_when_present() {
+        assert_eq!(
+            benchmark_filter("run", 7, Some("sku")),
+            doc! { "sku": "run-7" }
+        );
+        assert_eq!(benchmark_filter("run", 7, None), doc! { "_id": "run-7" });
+    }
+
+    #[test]
+    fn benchmark_budget_report_flags_threshold_crossing() {
+        let within = benchmark_budget_report(Duration::from_millis(120), 300.0);
+        assert_eq!(within["withinTarget"], json!(true));
+        assert_eq!(within["targetMs"], json!(300.0));
+
+        let over = benchmark_budget_report(Duration::from_millis(620), 500.0);
+        assert_eq!(over["withinTarget"], json!(false));
+        assert_eq!(over["elapsedMs"], json!(620.0));
+    }
 }

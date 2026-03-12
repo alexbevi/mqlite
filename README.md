@@ -70,7 +70,7 @@ The CLI is intentionally small and focused:
 | --- | --- |
 | `mqlite serve --file <path>` | Run a broker for one `.mongodb` file. |
 | `mqlite command --file <path>` | Send one MongoDB command over a real `OP_MSG` request and print the reply as JSON. |
-| `mqlite bench --file <path>` | Run a quick local write/read benchmark through the broker. |
+| `mqlite bench --file <path>` | Run a quick local broker benchmark and report startup, write, and point-query latency against the selected index path. |
 | `mqlite checkpoint --file <path>` | Force a checkpoint and print storage metadata. |
 | `mqlite info --file <path>` | Print current database, collection, and index counts and sizes plus last-checkpoint details. |
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
@@ -83,6 +83,8 @@ You can also pipe JSON into `mqlite command`:
 ```text
 printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongodb --db app
 ```
+
+`mqlite bench` now reports broker startup latency, per-phase throughput, the query field used for point reads, the first and slowest point-query latency it observed, and explicit startup / first-point-query budget verdicts so storage changes can be checked against the local startup SLO.
 
 ## What Works Today
 
