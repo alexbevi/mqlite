@@ -8,480 +8,397 @@
 - Clients talk to the broker with MongoDB `OP_MSG` over local IPC only.
 - The `.mongodb` file is the durable system of record.
 - Sidecars such as manifests and socket or pipe endpoints are ephemeral.
+- New files are always written as v2 storage files. Pre-v2 files are rejected.
 
-The current workspace is split into focused crates:
+`ARCHITECTURE.md` describes the runtime, storage, planner, and durability model. The exhaustive
+supported and unsupported command, query, and aggregation surface lives under `capabilities/` and
+is enforced separately by tests.
 
-- `mqlite-bson`: BSON ordering, dotted-path helpers, and `_id` generation support.
-- `mqlite-wire`: `OP_MSG` framing and parsing.
-- `mqlite-ipc`: manifest discovery plus Unix socket or Windows named-pipe transport.
-- `mqlite-catalog`: databases, collections, records, and in-memory index metadata.
-- `mqlite-storage`: file format, recovery, checkpoints, pages, and persisted planner cache state.
-- `mqlite-query`: filter parsing, projection, updates, and aggregation semantics.
-- `mqlite-exec`: cursor batching and cursor lifecycle.
-- `mqlite-server`: command dispatch, planning, execution, and broker lifecycle.
-- `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, and `checkpoint`.
+## Workspace Layout
 
-`mqlite-storage/src/v2/` is the on-disk storage engine. It contains the v2 header and superblock
-format, typed record and secondary page codecs, checkpoint writers, recovery readers, a shared
-pager that serves page reads through offset-based I/O plus an in-process page cache, validates page
-checksums when pages enter that cache, and
-page-backed metadata paths for `info` and `inspect`.
+The workspace is split into focused crates:
 
-## Source Layout
+- `mqlite-bson`: BSON ordering, dotted-path helpers, hashing, and `_id` generation support
+- `mqlite-wire`: `OP_MSG` framing and parsing
+- `mqlite-ipc`: manifest discovery plus Unix socket or Windows named-pipe transport
+- `mqlite-catalog`: in-memory databases, collections, records, and index metadata used by the
+  mutable runtime
+- `mqlite-storage`: v2 file format, WAL, recovery, checkpoints, page codecs, pager, and metadata
+  readers
+- `mqlite-query`: filter parsing, projection, updates, expression evaluation, and aggregation
+  semantics
+- `mqlite-exec`: cursor batching and cursor lifecycle
+- `mqlite-server`: broker lifecycle, command dispatch, planning, execution, and group commit
+- `mqlite`: CLI entrypoints such as `serve`, `command`, `info`, `inspect`, `verify`, `checkpoint`,
+  and `bench`
 
-The Rust workspace now follows a smaller-crate-root layout consistent with the Rust Book's
-guidance on packages, crates, and modules:
-
-- `src/lib.rs` is kept intentionally small and primarily declares modules plus the public re-exports
-  that define the crate surface.
-- Large implementation files were moved behind semantically named modules so a reader can discover
-  the crate API before reading implementation details.
-- Domain-heavy crates expose the concepts Rust developers would expect first:
-  - `mqlite-query` separates capabilities, error types, expression evaluation, filter parsing,
-    projection handling, updates, and pipeline execution.
-  - `mqlite-server` exposes the broker from a small crate root and keeps broker command handling in
-    `broker.rs`.
-  - `mqlite-storage`, `mqlite-catalog`, and `mqlite-capabilities` re-export from named module files
-    instead of placing their entire implementation directly in `lib.rs`.
-- Tests remain in-crate for internal behavior-heavy crates, but the public crate root is no longer
-  mixed with implementation and test code.
-
-This keeps the module tree readable for first-time contributors while preserving the existing
-behavior and test surface.
-
-## Broker Model
+## Runtime Model
 
 The broker is the only writer for a database file.
 
-- Reads are served from in-process state loaded from the file plus any applied WAL mutations.
-- Clean checkpointed indexed reads can now skip full engine hydration: the broker may start with no mutable storage engine loaded, resolve the namespace from file metadata, and answer `find`/`explain` through page-backed v2 read handles directly from the durable file.
-- Writes append WAL records, update in-memory state, and become durable before command success. Concurrent writers share a short group-commit sync barrier so multiple acknowledged commands can ride the same `fsync`.
-- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. If the last client disconnects and the broker stays quiet, it now hands off a checkpoint promptly instead of waiting for idle shutdown. A loaded broker also triggers that same background checkpoint path when the WAL tail crosses a byte threshold, even if an IPC client is still connected, so the next startup can stay on the clean checkpointed fast path. The broker captures checkpoint state briefly under the storage lock, then publishes a new page-root snapshot on a background worker so later commands can keep running. That published snapshot rewrites only dirty collection/index page subtrees plus fresh namespace metadata, reuses clean collection pages from the previously published roots, and advances the superblock so reopen can start from the newer page graph instead of the older WAL start. Writes that arrive after that capture remain in the WAL tail and are preserved across the publication.
-- Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
-- CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
-- Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
-- The attach or spawn path treats the manifest as the readiness signal, but if `serve` exits before publishing it the caller reports that startup error directly instead of waiting out the manifest timeout. Broker startup now initializes from lightweight startup metadata first and opens the mutable storage engine lazily on the first write or on read paths that cannot be satisfied from the clean checkpointed page graph alone.
-- Auto-spawned brokers can also receive a watched parent pid; once that launcher process has died and the broker has no active IPC connections left, the broker exits immediately instead of waiting for the normal idle timeout.
+- Clients discover or spawn the broker through the manifest flow.
+- The manifest is the readiness signal for attach-or-spawn callers.
+- The broker can start listening before the mutable storage engine is opened.
+- Reads on clean checkpointed files can use page-backed v2 read handles directly from disk.
+- Writes, dirty-file recovery, and full validation still use the mutable `DatabaseFile` runtime,
+  which hydrates a `Catalog` plus persisted change events and plan-cache entries.
 
-The CLI surfaces split along intent:
-- `mqlite command` is the direct wire-protocol validation path.
-- `mqlite info` summarizes the recovered current catalog state, per-namespace sizes and counts, WAL backlog, and the most recent checkpoint.
-- `mqlite inspect` stays focused on lower-level file, superblock, WAL, and catalog metadata.
-- `mqlite` now creates and writes only the page-backed v2 file format. `mqlite info` and `mqlite inspect` answer from checkpoint metadata and, when needed, fold in the WAL tail with a metadata-only scan instead of hydrating every collection and index page first. Pre-v2 files are rejected explicitly. `mqlite verify` remains the slower full validation path.
+This means the current runtime is intentionally hybrid:
 
-## Durable File Layout
+- Fast path: clean checkpointed metadata and indexed reads can stay page-backed.
+- Fallback path: writes or pending WAL require opening the mutable engine and replaying the WAL
+  tail.
 
-The v2 file is versioned and self-describing.
+```mermaid
+flowchart TD
+    A[Broker::new] --> B[Read startup metadata]
+    B --> C{Database file exists?}
+    C -- no --> D[Start broker with no storage loaded]
+    C -- yes --> E{Pending WAL after active superblock?}
+    D --> F[Bind IPC endpoint and publish manifest]
+    E -- no --> F
+    E -- yes --> F
+    F --> G{Command type}
+    G -- clean read --> H[Open page-backed collection read view]
+    G -- write --> I[Open mutable DatabaseFile]
+    G -- dirty read --> I
+    H --> J[Serve from v2 pager and page graph]
+    I --> K[Load persisted state and replay WAL tail]
+```
 
-- Fixed header:
-  - magic and file format version
-  - reserved metadata region
-- Dual rotating superblocks:
-  - generation number
-  - durable sequence
-  - checkpoint time
-  - WAL start and end offsets
-  - durable root page ids
-  - persisted summary counters
-- Data region:
-  - namespace internal and leaf pages
-  - collection-meta, index-meta, and stats pages
-  - record internal and leaf pages
-  - secondary-index internal and leaf pages
-  - change-event and plan-cache pages
-  - append-only WAL frames after the checkpointed page graph
+### Broker Behavior
 
-The current format version is encoded in the header and active superblock. Recovery rejects unsupported versions.
+- The broker tracks active connections and active commands separately.
+- A shared WAL sync barrier lets multiple acknowledged writes ride the same `fsync`.
+- Auto-spawned brokers can watch a parent pid and exit once that parent is gone and all IPC
+  connections have drained.
+- The broker can serve `find`, `explain`, `count`, and `distinct` from page-backed read views when
+  the file is clean.
+- Persisted plan-cache entries are loaded lazily, not during broker startup.
 
-The v2 format uses 8 KiB fixed pages behind the same single-file model. Its page set is typed up
-front rather than being reconstructed from checkpoint snapshot references:
+## Durable File Format
+
+The durable store is a single v2 file. The current format version is `9`.
+
+- File magic: `MQLTHD09`
+- Superblock magic: `MQLTSB09`
+- Page magic: `MQLTPG09`
+- Fixed page size: `8192` bytes
+- Fixed header length: `4096` bytes
+- Two rotating superblocks
+
+The file is self-describing:
+
+- The header stores magic, file format version, page size, layout constants, and file id.
+- Each superblock stores generation, durable LSN, last checkpoint time, WAL offsets, root page
+  ids, and summary counters.
+- The published page graph stores the latest checkpointed namespace, collection, index, stats,
+  change-event, and plan-cache state.
+- The WAL tail stores durable mutations written after the active published roots.
+
+```mermaid
+flowchart LR
+    H[Header<br/>magic, version, page size, file id]
+    SB0[Superblock A<br/>generation, durable LSN,<br/>roots, summary, WAL offsets]
+    SB1[Superblock B<br/>older or newer generation]
+    PG[Published page graph<br/>namespace tree<br/>meta pages<br/>record and index trees<br/>stats, change events, plan cache]
+    WAL[Append-only WAL tail<br/>typed mutations]
+    H --> SB0 --> PG --> WAL
+    H --> SB1
+```
+
+### Page Types
+
+The active v2 storage engine centers on these page kinds:
 
 - namespace internal and leaf pages keyed by namespace or index-name strings
-- collection-meta and index-meta pages for page roots, key patterns, and counters
-- stats pages for persisted per-index value frequencies and field-presence counts
+- collection-meta and index-meta pages with page roots, key patterns, and counters
+- stats pages with persisted per-index value frequencies and field-presence counts
 - record internal and leaf pages keyed by stable `RecordId`
-- secondary-index internal pages keyed by prefix-compressed normalized sort-key bytes plus
+- secondary-index internal and leaf pages keyed by normalized comparable key bytes plus
   `RecordId`
-- secondary-index leaf pages keyed by prefix-compressed normalized sort-key bytes, storing the raw
-  BSON key once per key plus duplicate-key posting lists of `RecordId` and presence-mask pairs
-- two rotating superblocks with summary counters for metadata-only open paths
+- change-event internal and leaf pages
+- plan-cache pages
 
-The storage crate resolves collections through persisted namespace metadata, serves page-backed
-collection and index read views without full catalog hydration on reopen, and emits full v2
-checkpoints by writing namespace, meta, record, secondary-index, stats, change-event, and
-plan-cache pages plus a new superblock summary. The v2 `info` path builds its per-database,
-per-collection, and per-index report from that persisted namespace and meta page graph and folds
-in any WAL tail with a metadata-only pass. Page-backed v2 index read views preserve histogram-style
-value frequencies and field-presence counts through checkpoint and reopen, so planning can keep
-using persisted estimates instead of rebuilding in-memory stats. The same v2 page graph can also
-be materialized back into a full `Catalog` when a broker path still needs collection-owned mutable
-state instead of a borrowed page-backed read view.
-Background checkpoint publication now uses those same page codecs incrementally: it can reuse
-published collection meta pages for clean namespaces, append only the dirty collection/index page
-subtrees plus a fresh namespace tree, and then rotate the superblock to the newer roots. That is
-the current dirty-file startup optimization, because reopen only needs to replay WAL written after
-the latest published roots rather than the entire tail since the previous full checkpoint.
-The broker-facing storage trait is also being split so metadata commands can ask for database
-names, collection metadata, and index descriptors without reaching through a full `Catalog`
-materialization path.
+The page-kind enum also reserves freelist and overflow slots, but the current runtime is built
+around the page types listed above.
 
-The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
-planning and costing paths target a narrower collection and index read view so the broker can plug
-in page-backed record and index handles later without changing the planner’s cost model or explain
-surface. The broker’s `find` and `explain` read paths now ask the storage engine for that borrowed
-collection read view instead of reaching straight through to `Catalog` state. The v2 collection and
-index handles now also implement that shared read-view surface over a pager, so the remaining gap
-is write-side durability and full broker cutover rather than planner compatibility.
+## Read Paths
 
-## Snapshot Contents
+### Metadata Commands
 
-Each checkpoint snapshot stores the minimum metadata needed to reopen the durable state without rebuilding it from user documents.
+`mqlite info` and `mqlite inspect` are metadata-first commands.
 
-- Database and collection catalog structure
-- Collection options
-- Record page references per collection
-- Index page references, root page ids, key patterns, and uniqueness flags
-- Persisted plan-cache entries keyed by namespace and query shape
-- Persisted change-event page references plus change-event counts
+- On clean files they answer from the header, active superblock, namespace tree, and meta pages.
+- They do not hydrate all records or indexes.
+- If the file still has a WAL tail, they fold in WAL metadata with a metadata-only pass rather than
+  reopening the full mutable engine.
 
-The snapshot does not inline all records and index entries directly. Those live in fixed-size pages referenced by the snapshot metadata.
+`mqlite verify` is intentionally slower. It opens the mutable engine, loads the persisted state,
+replays the WAL tail, and validates the result.
 
-## Change-Event Storage
+### Page-Backed Read Fast Path
 
-`$changeStream` is backed by a persisted local change-event log inside the main `.mongodb` file.
+The page-backed read path is designed for clean checkpointed files:
 
-- Change events are stored separately from collection records and index pages.
-- Checkpoints encode them as slotted BSON pages so reopen does not depend on the transient WAL.
-- WAL mutations carry both the collection change and the associated change-event entries together.
-- Recovery replays change events and collection state from the same WAL records, so a crash cannot leave the catalog ahead of the change-stream history or vice versa.
+- broker startup reads only lightweight startup metadata
+- the broker opens a `PagerCollectionReadView` lazily on the first clean read
+- namespace resolution comes from the persisted namespace tree
+- `_id` lookups can route directly through the persisted `_id_` secondary tree
+- `find`, `count`, `distinct`, and `explain` can read collection and index state without opening
+  the mutable engine
 
-Each persisted change event records:
+The current page-backed path is read-only. As soon as a command needs write access or the file has
+pending WAL, the broker opens the mutable engine instead.
 
-- a local resume token
-- `clusterTime` and `wallTime`
-- namespace scope
-- operation type
-- optional `documentKey`
-- optional post-image and pre-image documents
-- optional update description
-- whether the event is part of the expanded-event surface
-- extra stage-visible metadata such as rename targets or index specs
+### Pager
 
-## Record Storage
+The v2 pager is a shared read-side component:
 
-Collections are stored as slotted pages of BSON documents.
+- offset-based reads use `read_at` or `seek_read`, not a shared mutable file cursor
+- pages are cached in-process with an LRU-like bounded page cache
+- cached pages are checksum-validated once when they enter the cache
+- repeated reads of the same page reuse the cached bytes
+- the pager exposes the active superblock, file size, and WAL length without full recovery
 
-- Each record has a stable `RecordId`.
-- Slotted pages keep compact page-local metadata plus BSON payload offsets.
-- Checkpoints write record pages first, then reference them from the snapshot.
-- Reopen reconstructs `CollectionCatalog.records` from those pages and preserves `RecordId` stability.
+## Mutable Runtime And WAL
 
-Current behavior:
+`DatabaseFile` is still the write-time runtime.
 
-- Inserts allocate the next `RecordId`.
-- Updates preserve `RecordId`.
-- Deletes remove records and corresponding index entries.
-- Recovery replays WAL mutations on top of the newest valid checkpoint.
+- It owns the file lock.
+- It keeps an in-memory `Catalog`, change-event log, and persisted plan-cache state.
+- It validates write plans and unique-index constraints before mutating the live state.
+- It applies committed WAL mutations to the in-memory state immediately after append succeeds.
+- Command success waits for the WAL sync barrier, not just the append.
 
-## Index Storage
+Current WAL behavior:
 
-Indexes are persisted separately from records and are not rebuilt from collection scans during load.
-
-- Each index stores ordered `IndexEntry` values:
-  - indexed BSON key document
-  - `RecordId`
-  - `present_fields` metadata to distinguish explicit `null` from missing paths
-- Checkpoints encode indexes into persisted B-tree pages:
-  - leaf pages hold serialized `IndexEntry` payloads
-  - internal pages hold separator keys and child page references
-- Tree navigation now routes through internal pages with binary search and serves exact `_id`
-  lookups directly from the persisted index path instead of materializing a one-entry bounds scan.
-- Each persisted index records its root page id plus the full page reference set.
-- Reopen traverses the B-tree from the persisted root and reconstructs ordered entries.
-- Reopen validates index entries against collection pages and fails instead of silently rebuilding mismatched state.
-
-Current index capabilities:
-
-- `_id_` is always present
-- single-field and compound B-tree indexes
-- unique index enforcement
-- ascending and descending key parts
-- stable BSON ordering plus `RecordId` tie-breaking
-- persisted missing-vs-null metadata
-
-## Aggregation Execution
-
-Aggregation execution lives in `mqlite-query` and is intentionally split between pure document
-transforms and broker-backed collection resolution.
-
-- `run_pipeline()` executes stages against an in-memory document stream only.
-- `run_pipeline_with_resolver()` adds a `CollectionResolver` so stages can read sibling namespaces
-  from the same broker-owned file.
-- `PipelineContext` carries:
-  - the active database
-  - the active source collection, if any
-  - whether execution is inside `$facet`
-  - the collection resolver
-  - expression variables for correlated subpipelines
-- Expression evaluation treats `$$CURRENT` as the source for ordinary `"$field.path"` lookups,
-  so scoped operators and correlated subpipelines can rebind field-path resolution without
-  rewriting inner expressions.
-
-Current cross-namespace aggregation behavior:
-
-- `$unionWith` resolves a foreign collection from the same `.mongodb` file or runs a collectionless
-  subpipeline that starts with `$documents`.
-- `$lookup` resolves a foreign collection from the same `.mongodb` file and supports:
-  - `localField` and `foreignField` equality joins
-  - optional `pipeline` filters or reshaping on the joined documents
-  - `let` variables for correlated subpipelines
-  - collectionless `$documents` subpipelines when `from` is omitted
-- `$changeStream` resolves the persisted local change-event log from the same `.mongodb` file and supports:
-  - collection, database, and cluster scopes
-  - `resumeAfter`, `startAfter`, and `startAtOperationTime`
-  - `fullDocument` and `fullDocumentBeforeChange`
-  - `showExpandedEvents`
-  - finite historical reads over the durable local log at aggregate start time
-- `$changeStreamSplitLargeEvent` runs as the final stage in a `$changeStream` pipeline and:
-  - splits oversized change events into deterministic top-level-field fragments
-  - emits fragment `_id` tokens that extend the base change-event token with `fragmentNum`
-  - adds `splitEvent: { fragment, of }` metadata to each fragment
-  - enforces fatal resume errors when a resumed pipeline no longer reproduces the referenced split event
-- `$setWindowFields` executes locally over the in-memory document stream after the stage-level
-  sort and partition step, with:
-  - `partitionBy` expression partitioning
-  - `sortBy`-driven document order
-  - document windows
-  - single-sort-key numeric or date range windows
-  - supported accumulator-style window functions, ranking functions, `$shift`, `$locf`, and `$linearFill`
-  - explicit parse-time rejection for unsupported window functions
-- Nested lookup-style subpipelines inherit outer variables by value so correlated `$expr` filters
-  continue to work in nested stages.
-- Aggregation control flow currently includes `$cond` and `$switch`, while scoped expressions
-  include `$let`, `$map`, `$filter`, `$reduce` with optional `limit`. Set-style array expressions
-  currently include `$setDifference`, `$setEquals`, `$setIntersection`, `$setIsSubset`, and
-  `$setUnion`. Accumulator-style expressions currently include `$sum`, `$avg`, `$min`, and
-  `$max`, while statistical expressions currently include `$stdDevPop`, `$stdDevSamp`,
-  `$percentile`, and `$median`, with local `approximate`, `discrete`, and `continuous`
-  percentile evaluators over per-document scalar or array inputs. Metadata expressions currently
-  include `$meta` over broker-local `geoNearDistance`, `geoNearPoint`, `indexKey`, `recordId`,
-  `sortKey`, `randVal`, and `textScore` slots when upstream stages or planners attach them to the
-  in-flight document stream. Hashed-key expressions currently include `$toHashedIndexKey`, using
-  Mongo-compatible MD5 hashing over canonical BSON type tags, field-name recursion, and
-  `safeNumberLongForHash`-style numeric coercion so local hashed-key derivation matches server
-  results. Array-selection `N`
-  expressions include `$firstN`, `$lastN`, `$minN`, and `$maxN`. Date-part expressions currently include `$year`, `$month`, `$dayOfMonth`,
-  `$dayOfWeek`, `$dayOfYear`, `$hour`, `$minute`, `$second`, `$millisecond`, `$week`,
-  `$isoDayOfWeek`, `$isoWeek`, and `$isoWeekYear`, while date construction, parsing, formatting,
-  and arithmetic currently include `$dateFromString`, `$dateToString`, `$dateFromParts`,
-  `$dateToParts`, `$dateAdd`, `$dateSubtract`, `$dateDiff`, and `$dateTrunc`, including
-  Mongo-style named timezone arguments over UTC, fixed-offset, and Olson timezone names plus
-  ISO-week construction and week-boundary handling through `startOfWeek`. Basic ASCII string case
-  expressions currently include `$toLower`, `$toUpper`,
-  and `$strcasecmp`. Size introspection currently includes `$binarySize` and `$bsonSize`. String
-  trimming currently includes `$trim`, `$ltrim`, and `$rtrim`. Logarithmic and power expressions
-  currently include `$exp`, `$ln`, `$log`, `$log10`, `$pow`, and `$sqrt`. Trigonometric and
-  angular-conversion expressions currently include `$acos`, `$acosh`, `$asin`, `$asinh`, `$atan`,
-  `$atan2`, `$atanh`, `$cos`, `$cosh`, `$sin`, `$sinh`, `$tan`, `$tanh`, `$degreesToRadians`,
-  and `$radiansToDegrees`. String-length, string-position, substring, regex, split, and replacement
-  expressions currently include `$strLenBytes`, `$strLenCP`, `$indexOfBytes`, `$indexOfCP`,
-  `$substr`, `$substrBytes`, `$substrCP`, `$regexFind`, `$regexFindAll`, `$regexMatch`, `$split`,
-  `$replaceOne`, and `$replaceAll`,
-  conversion expressions currently include `$convert`, `$toBool`, `$toDate`, `$toDecimal`,
-  `$toDouble`, `$toInt`, `$toLong`, `$toObjectId`, and `$toString`,
-  utility expressions currently include `$rand`, `$sortArray`, `$tsSecond`, `$tsIncrement`, and
-  `$zip`,
-  while integer bitwise expressions include `$bitAnd`, `$bitOr`, `$bitXor`, and `$bitNot`,
-  alongside literal field access and mutation via `$getField`, `$setField`, and `$unsetField`,
-  all executed in-process without a separate expression VM. Nullable numeric operators share a
-  common evaluator path so nullish inputs return `null` consistently while domain violations fail
-  explicitly. String replacement and split currently support string operands only; regex-backed
-  variants remain out of scope until the feature-flagged upstream behavior is intentionally adopted.
-  `$convert` currently supports the core scalar target families plus `onError` and `onNull`;
-  feature-flagged or BinData-oriented variants such as `base`, `format`, `byteOrder`, and subtype
-  conversions are still rejected explicitly.
-- `$out` is a broker-backed terminal write stage that replaces a same-file target namespace
-  through a fresh-collection rewrite WAL frame, preserving collection options but resetting the
-  namespace to a new `_id_` index plus the pipeline output documents, and returns an empty cursor
-  result to the client.
-- `$merge` is a broker-backed terminal write stage that merges pipeline results into a same-file
-  target namespace using supported `whenMatched` and `whenNotMatched` string modes plus optional
-  `on` fields. It reuses the same ordered delta persistence path as CRUD writes instead of
-  replacing the whole target collection image.
-- The current implementation does not federate across files or processes.
-
-## WAL And Recovery
-
-Mutations are durable through an append-only WAL.
-
-- CRUD writes append ordered typed per-record insert, update, and delete deltas, creating collections through the same WAL path when needed.
-- Ordered CRUD deltas and index create/drop operations use typed WAL frames. `$out`-style namespace resets use a fresh-collection rewrite frame that rebuilds the target from collection options plus ordered inserts, while collection replacement and drop remain collection-level WAL frames where a full collection image still has to move as one unit.
-- WAL frames include a sequence number and checksum.
-- WAL frames and checkpoint snapshots encode their control metadata in a compact CBOR envelope while preserving embedded MongoDB documents as raw BSON bytes, so exact BSON typing survives recovery without paying BSON-document overhead for the whole envelope.
-- Checkpoint pages, snapshot metadata, and large WAL payloads can be wrapped in a small zstd envelope when low-level compression saves meaningful space. Logical record and index pages still decode back to fixed 4 KiB pages, and checksums always cover the stored bytes on disk.
-- Broker-built `CollectionRecord`s can carry cached raw BSON bytes into storage so insert and update writes can reuse the same document encoding for change-event construction, WAL record encoding, and later checkpoint page encoding instead of serializing the same document repeatedly.
-- Checkpoint page builders size record, change-event, and index payloads from already-encoded BSON bytes and then write those bytes directly into slotted pages, avoiding the older “encode to measure, then encode again to insert” path.
-- When the broker already hands storage pre-encoded change-event byte fields, WAL append serialization borrows those byte slices directly into the compact CBOR frame instead of cloning a second owned copy before the write.
-- Persisted change events also keep `documentKey`, `fullDocument`, `fullDocumentBeforeChange`, `updateDescription`, `extraFields`, and the resume-token document as raw BSON blobs, materializing nested `Document`s only when a `$changeStream` reader asks for them.
-- The broker applies the mutation to in-memory state immediately after the WAL append succeeds, then waits for a shared WAL sync barrier before acknowledging command success.
-- Read paths borrow storage only after the visible sequence is durable, so queries and metadata commands do not observe broker-local writes that are still waiting on the shared WAL sync.
-- Applying CRUD deltas batches touched record state and index-entry maintenance in memory, keeps runtime secondary indexes as leaf-sized in-memory pages, updates only the touched leaves during inserts, keeps per-index planner histogram stats incrementally, and avoids rebuilding a query-only in-memory tree on every mutation.
-- Storage also keeps an in-memory per-collection unique-key validation cache derived from the catalog at open time, keyed by structured BSON index keys, then applies small insert/update/delete deltas to that cache after each durable write instead of rebuilding duplicate-key state from every unique index on every command. Per-command validation overlays borrow the batch's write documents directly so insert-heavy workloads do not clone a second copy of every document just to validate uniqueness.
-- After that storage validation succeeds on the live write path, collection delta application uses a trusted catalog mutation path that skips re-running the same unique-key duplicate probes during commit. WAL replay still uses the fully validating path so reopen continues to reject inconsistent persisted mutations.
-- Each collection persists its next `RecordId` high-water mark in the checkpoint metadata and reconstructs a transient `record_id -> record vector position` map on load so later writes can allocate ids and find target rows without rescanning the collection.
-- Checkpoints carry forward unchanged record, index, and change-event pages from the active snapshot. Dirty collections are diffed against the active snapshot so unchanged prefix/suffix record pages, unchanged index trees, and unchanged change-event page ranges can still be reused instead of forcing a full namespace rewrite.
-- Checkpoints can reuse the inactive superblock slot's preserved snapshot or stale WAL region when the next snapshot fits there, while keeping new WAL appends after the preserved fallback checkpoint region.
-- Recovery loads the newest valid checkpoint, then replays WAL frames with sequence numbers greater than the checkpoint sequence.
+- CRUD writes append typed insert, update, delete, and DDL mutations.
+- Collection change events are appended atomically with the collection mutation that caused them.
+- WAL records carry sequence numbers and checksums.
+- Recovery replays WAL records with sequence numbers greater than the active superblock durable
+  sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.
-- If the newest checkpoint is corrupt, recovery can fall back to the older superblock and continue from there.
 
-## Planner And Persisted Plan Cache
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Broker
+    participant Storage as DatabaseFile
+    participant File as .mongodb file
+    participant Publisher as Background publisher
 
-`find` planning is intentionally local but no longer purely heuristic.
+    Client->>Broker: write command
+    Broker->>Storage: commit_mutation(...)
+    Storage->>File: append WAL frame(s)
+    Storage->>Storage: apply mutation to mutable state
+    Storage->>File: fsync through group-commit barrier
+    Broker-->>Client: command success
 
-- Candidate ranking uses:
-  - histogram-style value frequencies derived from persisted index entries
-  - interval cardinality estimates from index bounds
-  - sort work
-  - projection coverage
-  - expected document fetches
-- V2 persisted index read views answer whole-index, exact unique-key, and single-field range
-  cardinality estimates from metadata or persisted stats before falling back to an index scan.
-- `update` and `delete` reuse the same indexed candidate planning path as `find`, then reconcile those base candidates against the command-local insert, update, and delete overlay so ordered multi-op writes preserve in-request visibility.
-- A sequence-keyed plan cache stores the last winning choice for each query shape:
-  - namespace
-  - filter shape
-  - sort shape
-  - projection shape
-- The broker keeps this cache in memory during execution.
-- Idle checkpoint persists the cache into the snapshot so it survives broker restart.
-- Cache reuse is valid only when the collection state sequence matches.
+    Note over Broker,Publisher: Later: 60s interval, quiet drain, WAL pressure, or shutdown
 
-Current cached choices can represent:
+    Broker->>Storage: prepare_concurrent_checkpoint()
+    Broker->>Publisher: run publication job
+    Publisher->>File: rewrite dirty page subtrees
+    Publisher->>File: rebuild fresh namespace tree
+    Publisher->>File: rotate to newer superblock roots
+    Publisher->>File: preserve WAL appended after capture
+```
 
-- collection scan
-- single index scan
-- branch-union `OR` plans with one cached choice per branch
+## Checkpoints And Published Page-Root Snapshots
 
-## Query Planning
+There are two checkpoint-style write paths today.
 
-There are currently three major `find` planning modes.
+### Foreground Full Checkpoint
 
-### 1. Collection Scan
+The foreground checkpoint path writes the current in-memory state back into a fresh page graph and
+rotates the active superblock.
 
-Fallback when no useful index plan exists.
+- It is used for explicit checkpoint requests and final broker shutdown cleanup.
+- It rewrites the full checkpoint state, not just the dirty parts.
 
-- Scans records in collection order
-- Applies filter against full documents
-- Outer sort and projection are applied later if needed
+### Background Published Snapshot
 
-### 2. Single Index Plan
+The background publication path exists to reduce restart cost and WAL replay cost without blocking
+normal command handling for the full checkpoint duration.
 
-Used when one index can serve the whole query shape.
+- The broker captures a durable in-memory state under the storage lock.
+- A background worker writes only the dirty collection and index subtrees.
+- Fresh namespace metadata is always rewritten.
+- Clean collection meta pages from the previous published roots are reused.
+- Change-event pages and plan-cache pages are reused unless those areas were dirty.
+- The superblock is rotated to the newer roots after the page graph is safely written.
+- WAL appended after the capture is preserved after the new published roots.
 
-- Supports compound-prefix equality and range planning
-- Supports reverse scans for compatible descending sort patterns
-- Supports multi-interval scans for:
-  - `$in`
-  - collapsed `$or` cases that share one indexed shape
-- Supports covered filtering and projection when the index contains the required paths
-- Uses `present_fields` to keep explicit `null` distinct from missing values during covered reads
+This is the main current startup optimization for dirty workloads: reopen only has to replay the
+WAL written after the latest published roots, not the full tail since the last foreground
+checkpoint.
 
-### 3. Branch-Union `OR` Plan
+### Checkpoint Triggers
 
-Used for non-collapsible disjunctions.
+The broker can checkpoint or publish on:
 
-- The filter is expanded into DNF-style branches with a branch-count safety cap.
-- Each branch is planned independently.
-- Branch plans may choose different indexes or fall back to collection scan.
-- Result `RecordId`s are unioned and deduplicated across branches.
-- The outer query applies final sort and projection semantics.
+- the periodic checkpoint interval, currently about every 60 seconds
+- a quiet period after the last client disconnects
+- WAL backlog pressure while the broker is still loaded
+- graceful shutdown
 
-This is the mechanism that handles broader `OR` shapes that cannot be represented as one shared interval scan.
+## Recovery
+
+Recovery is bounded by the active superblock plus the WAL tail that follows it.
+
+1. Read and validate the file header.
+2. Read both superblocks and choose the newest valid generation.
+3. Open the page graph rooted by that superblock.
+4. If the mutable engine is required, materialize the persisted catalog, change events, and plan
+   cache entries from the page graph.
+5. Replay WAL records newer than the superblock durable sequence.
+6. Rebuild transient validation state and dirty-namespace tracking from the recovered state.
+
+Important recovery invariants:
+
+- reopen validates persisted index pages against collection pages
+- recovery never silently rebuilds indexes from a collection scan
+- if the newest superblock is corrupt, recovery can fall back to the older valid superblock
+
+## Record And Index Storage
+
+### Records
+
+Collections are persisted as slotted record pages keyed by stable `RecordId`.
+
+- each record keeps a stable `RecordId`
+- record pages store raw BSON bytes
+- inserts allocate the next `RecordId`
+- updates preserve `RecordId`
+- deletes remove the record and all matching index entries
+
+### Secondary Indexes
+
+Indexes are stored separately from records and persist their ordering on disk.
+
+The current v2 secondary format uses:
+
+- normalized comparable key bytes for navigation and bound checks
+- prefix-compressed separator keys in internal pages
+- prefix-compressed keys in leaf pages
+- duplicate-key posting lists in leaf pages for repeated non-unique keys
+- `RecordId` tie-breaking
+- persisted field-presence masks so covered reads can distinguish explicit `null` from missing
+
+Tree navigation is page-native:
+
+- internal node routing uses binary search
+- exact `_id` lookups can route directly to the first matching posting
+- range scans walk leaf chains in key order
+
+### Index Statistics
+
+Each persisted index can also keep stats pages with:
+
+- entry counts
+- per-field presence counts
+- per-field value-frequency summaries
+
+These stats are used by the planner after reopen instead of rebuilding histogram-like data from
+index scans.
+
+## Planner And Plan Cache
+
+`find` planning is local and cost-aware.
+
+Candidate ranking considers:
+
+- histogram-style value frequencies from persisted index stats
+- interval cardinality estimates from index bounds
+- expected keys examined
+- expected docs examined
+- sort work
+- coverage of filter and projection paths
+
+Current plan shapes:
+
+- `COLLSCAN`
+- `IXSCAN`
+- branch-union `OR`
+
+Important planner behavior:
+
+- compound-prefix and sort-aware planning follow persisted index key order
+- descending key parts are preserved across checkpoint and reopen
+- covered execution preserves explicit `null` versus missing semantics through persisted
+  presence-mask metadata
+- disjunctions can prefer branch-local plans on different indexes instead of collapsing to a
+  collection scan
+
+The broker also maintains a sequence-keyed persisted plan cache.
+
+- cache keys include namespace, filter shape, sort shape, and projection shape
+- plan-cache entries are persisted in checkpoint state
+- the broker loads persisted plan-cache entries lazily
+- cached choices are reused only when they still match the visible collection sequence
+
+## Aggregation And Cross-Namespace Resolution
+
+Aggregation execution is split between pure document transforms and broker-backed namespace
+resolution.
+
+- `run_pipeline()` executes stages over an in-memory document stream
+- `run_pipeline_with_resolver()` adds same-file namespace resolution
+- cross-namespace stages resolve foreign collections from the same broker-owned `.mongodb` file
+
+The current architecture explicitly supports these broker-backed aggregation families:
+
+- `$lookup` against same-file collections, including correlated subpipelines
+- `$unionWith` against same-file collections or collectionless `$documents` subpipelines
+- `$changeStream` over the persisted local change-event log
+- `$setWindowFields` as a local in-memory execution path
+- terminal write stages such as `$out` and `$merge` against same-file targets
+
+`$changeStream` is backed by persisted history visible when the aggregate starts. It is not yet a
+live `awaitData` stream.
+
+For the exact supported stage and expression surface, use the generated capability snapshots under
+`capabilities/`.
 
 ## Command Execution Flow
 
 The broker command path is:
 
-1. Client or CLI opens a local IPC stream.
+1. The client or CLI opens a local IPC stream.
 2. The broker reads an `OP_MSG`.
 3. `mqlite-wire` materializes the body and document sequences.
-4. `mqlite-server` rejects unsupported envelope fields such as sessions or read concern.
+4. `mqlite-server` rejects unsupported envelope features such as sessions or read concern.
 5. The command dispatcher selects a handler by command name.
-6. Handlers interact with the current `DatabaseFile` state:
-   - reads use the loaded catalog and planner
-   - writes update collection state and commit a WAL mutation
-7. `find` and `explain` use the planner:
-   - parse filter
-   - analyze bounds and projection dependencies
-   - consult the sequence-keyed plan cache
-   - choose a collection, index, or branch-union `OR` plan
-   - execute the plan and return documents or explain metadata
-8. `aggregate` uses the pipeline runner:
-   - parse each stage into the supported Rust-native semantics
-   - resolve persisted local change-event input for `$changeStream`
-   - synthesize collectionless metadata-stage input for supported first stages such as `$currentOp`
-   - synthesize collection metadata-stage input for supported first stages such as `$collStats`
-   - synthesize collection index metadata-stage input for supported first stages such as `$indexStats`
-   - synthesize collection catalog metadata-stage input for supported first stages such as `$listCatalog`
-   - synthesize cluster-catalog metadata-stage input for supported first stages such as `$listClusterCatalog`
-   - synthesize auth-diagnostic metadata-stage input for supported first stages such as `$listCachedAndActiveUsers`
-   - synthesize session-metadata input for supported first stages such as `$listLocalSessions` and `$listSessions`
-   - synthesize query-sampling metadata input for supported first stages such as `$listSampledQueries`
-   - synthesize search-index metadata input for supported first stages such as `$listSearchIndexes`
-   - synthesize query-settings metadata input for supported first stages such as `$querySettings`
-   - synthesize collectionless capability-metadata input for supported first stages such as `$listMqlEntities`
-   - synthesize collection plan-cache metadata-stage input for supported first stages such as `$planCacheStats`
-   - execute pure document stages in memory
-   - resolve same-file foreign namespaces for `$unionWith` and `$lookup`
-   - thread `$lookup` `let` variables through correlated subpipelines
-9. Cursor-producing commands hand results to `mqlite-exec`.
-10. The broker writes the reply back as `OP_MSG`.
+6. Read commands either:
+   - use a clean page-backed read view, or
+   - open the mutable storage engine and read from the recovered `Catalog`
+7. Write commands append a WAL mutation, apply it to the mutable runtime, wait for durability, and
+   then reply.
+8. Cursor-producing commands hand their results to `mqlite-exec`.
+9. The broker writes the reply back as `OP_MSG`.
 
-## Explain Surface
+## CLI And Validation Paths
 
-`explain` is the primary way to observe planner behavior.
+The CLI surfaces split along intent:
 
-The current `winningPlan` output can report:
+- `mqlite command`: direct broker protocol validation path
+- `mqlite info`: metadata-focused summary of catalog size, counts, and last checkpoint state
+- `mqlite inspect`: lower-level file, superblock, WAL, and page-graph metadata
+- `mqlite verify`: slower full reopen and validation path
+- `mqlite checkpoint`: force a foreground checkpoint
+- `mqlite bench`: measure broker startup and simple query latency budgets
 
-- `COLLSCAN`
-- `IXSCAN`
-- `OR`
+`mqlite command` remains the default direct validation path before any driver patching work.
 
-And may include:
-
-- `planCacheUsed`
-- `keysExamined`
-- `docsExamined`
-- `requiresSort`
-- `filterCovered`
-- `projectionCovered`
-- `sortCovered`
-- `scanDirection`
-- single-interval bounds
-- multi-interval arrays
-- `inputStages` for branch-union `OR` plans
-
-## Unsupported Architectural Areas
+## Out Of Scope
 
 These remain intentionally out of scope for the current design:
 
 - distributed topology features such as replication and sharding
 - sessions and multi-document transactions
 - TCP networking, TLS, auth, and wire compression
-- cost-based optimization from persisted collection statistics beyond current per-index value frequencies
-- page-level incremental B-tree maintenance that avoids rebuilding the persisted entry set during checkpoint
-
-## Validation Path
-
-The default direct validation path is `mqlite command`.
-
-It exercises:
-
-- broker discovery or spawn
-- real local IPC
-- real `OP_MSG`
-- real command dispatch
-- real storage reopen and recovery
-
-This remains the primary design validation path before any driver patching work.
+- server-side JavaScript such as `$where` and `$function`
+- cross-file federation
+- silently rebuilding persisted index state from collection data during reopen
+- live awaitable change streams
