@@ -640,6 +640,9 @@ pub struct ConcurrentCheckpointJob {
     active_generation: u64,
     previous_wal_start_offset: u64,
     captured_wal_bytes: u64,
+    dirty_collections: Arc<BTreeSet<(String, String)>>,
+    change_events_dirty: bool,
+    plan_cache_dirty: bool,
 }
 
 #[derive(Debug)]
@@ -864,10 +867,12 @@ impl DatabaseFile {
         state.last_checkpoint_unix_ms = last_checkpoint_unix_ms;
 
         let dirty_collections = Arc::new(std::mem::take(&mut self.dirty_collections));
+        let change_events_dirty = self.change_events_dirty;
+        let plan_cache_dirty = self.checkpoint_plan_cache_entries != self.state.plan_cache_entries;
         let pending = PendingConcurrentCheckpoint {
             sequence: state.last_applied_sequence,
             dirty_collections: Arc::clone(&dirty_collections),
-            change_events_dirty: self.change_events_dirty,
+            change_events_dirty,
             wal_records_since_checkpoint: self.wal_records_since_checkpoint,
             wal_bytes_since_checkpoint: self.wal_bytes_since_checkpoint,
         };
@@ -884,6 +889,9 @@ impl DatabaseFile {
             active_generation: self.active_superblock.generation,
             previous_wal_start_offset: self.active_superblock.wal_start_offset,
             captured_wal_bytes,
+            dirty_collections,
+            change_events_dirty,
+            plan_cache_dirty,
         }))
     }
 
@@ -1220,11 +1228,16 @@ impl ConcurrentCheckpointJob {
             file.read_exact(&mut preserved_wal)?;
         }
 
-        let completed = v2_checkpoint::write_state_checkpoint_to_file(
+        let completed = v2_checkpoint::publish_state_snapshot_to_file(
+            &self.path,
             &mut file,
             &self.state,
             self.active_slot,
             self.active_generation,
+            self.previous_wal_start_offset,
+            &self.dirty_collections,
+            self.change_events_dirty,
+            self.plan_cache_dirty,
         )?;
         let mut active_superblock = completed.active_superblock.clone();
         let mut checkpoint_file_size = completed.file_size;
@@ -3667,7 +3680,11 @@ mod tests {
         VerifyReport, WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC,
     };
     use crate::StorageEngine;
-    use crate::v2::engine as v2_engine;
+    use crate::v2::{
+        engine as v2_engine,
+        page::{NamespaceInternalPage, NamespaceLeafPage, page_kind_unchecked},
+        pager::Pager as V2Pager,
+    };
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
         collection
@@ -3689,6 +3706,42 @@ mod tests {
         let mut payload = vec![0_u8; payload_len as usize];
         file.read_exact(&mut payload).expect("read wal payload");
         payload
+    }
+
+    fn namespace_meta_page_ids(path: &std::path::Path) -> BTreeMap<String, u64> {
+        let pager = V2Pager::open(path).expect("open pager");
+        let mut page_id = pager.active_superblock().roots.namespace_root_page_id;
+        while let Some(current_page_id) = page_id {
+            let page = pager.read_page_bytes(current_page_id).expect("read page");
+            match page_kind_unchecked(page.as_ref()).expect("page kind") {
+                crate::v2::layout::PageKind::NamespaceLeaf => break,
+                crate::v2::layout::PageKind::NamespaceInternal => {
+                    page_id = Some(
+                        NamespaceInternalPage::decode(page.as_ref())
+                            .expect("decode internal")
+                            .first_child_page_id,
+                    );
+                }
+                other => panic!("expected namespace page, found {other:?}"),
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        let mut next_page_id = page_id;
+        while let Some(current_page_id) = next_page_id {
+            let leaf = NamespaceLeafPage::decode(
+                pager
+                    .read_page_bytes(current_page_id)
+                    .expect("read leaf")
+                    .as_ref(),
+            )
+            .expect("decode leaf");
+            next_page_id = leaf.next_page_id;
+            for entry in leaf.entries {
+                entries.insert(entry.name, entry.target_page_id);
+            }
+        }
+        entries
     }
 
     fn sample_change_event(sequence: i64, operation_type: &str) -> PersistedChangeEvent {
@@ -5078,6 +5131,92 @@ mod tests {
             .map(|record| record.document.get_i64("_id").expect("_id"))
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn concurrent_snapshot_publication_reuses_clean_collection_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("concurrent-published-snapshot.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1_i64, "sku": "alpha" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: Vec::new(),
+                })
+                .expect("seed widgets");
+
+            let mut gadgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut gadgets, 1, doc! { "_id": 10_i64, "sku": "stable" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "gadgets".to_string(),
+                    collection_state: gadgets,
+                    change_events: Vec::new(),
+                })
+                .expect("seed gadgets");
+
+            database.checkpoint().expect("base checkpoint");
+        }
+
+        let before = namespace_meta_page_ids(&path);
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("reopen");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        2,
+                        doc! { "_id": 2_i64, "sku": "beta" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("mutate widgets");
+
+            let completed = database
+                .prepare_concurrent_checkpoint()
+                .expect("prepare concurrent checkpoint")
+                .expect("checkpoint job")
+                .run()
+                .expect("run concurrent checkpoint")
+                .expect("completed checkpoint");
+            assert!(
+                database
+                    .finish_concurrent_checkpoint(completed)
+                    .expect("finish checkpoint"),
+                "expected published snapshot to apply"
+            );
+        }
+
+        let after = namespace_meta_page_ids(&path);
+        assert_eq!(
+            after.get("app.gadgets"),
+            before.get("app.gadgets"),
+            "unchanged collection should keep its published meta page"
+        );
+        assert_ne!(
+            after.get("app.widgets"),
+            before.get("app.widgets"),
+            "dirty collection should publish a new meta page"
+        );
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
     }
 
     #[test]

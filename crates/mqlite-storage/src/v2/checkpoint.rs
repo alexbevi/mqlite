@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -26,8 +26,9 @@ use crate::v2::{
         ChangeEventsPage, CollectionMetaPage, IndexMetaPage, NamespaceEntry, NamespaceInternalPage,
         NamespaceLeafPage, NamespaceSeparator, PageId, PlanCachePage, RecordInternalPage,
         RecordLeafPage, RecordSeparator, RecordSlot, SecondaryEntry, SecondaryInternalPage,
-        SecondaryLeafPage, SecondarySeparator, StatsPage,
+        SecondaryLeafPage, SecondarySeparator, StatsPage, page_kind_unchecked,
     },
+    pager::Pager,
 };
 use crate::{PersistedChangeEvent, PersistedPlanCacheEntry, PersistedState};
 
@@ -112,6 +113,139 @@ pub(crate) fn write_state_checkpoint_to_file(
     )
 }
 
+pub(crate) fn publish_state_snapshot_to_file(
+    path: impl AsRef<Path>,
+    file: &mut File,
+    state: &PersistedState,
+    active_superblock_slot: usize,
+    current_generation: u64,
+    base_file_len: u64,
+    dirty_collections: &BTreeSet<(String, String)>,
+    change_events_dirty: bool,
+    plan_cache_dirty: bool,
+) -> Result<CheckpointWriteResult> {
+    let base_snapshot = load_base_snapshot(path)?;
+    let mut writer =
+        CheckpointWriter::with_next_page_id(next_page_id_after_file_len(base_file_len));
+    let mut summary = SummaryCounters {
+        database_count: state.catalog.databases.len() as u64,
+        change_event_count: state.change_events.len() as u64,
+        plan_cache_entry_count: state.plan_cache_entries.len() as u64,
+        ..SummaryCounters::default()
+    };
+    let mut namespace_entries = Vec::new();
+    let mut reused_page_count = 0_u64;
+
+    for (database_name, database) in &state.catalog.databases {
+        for (collection_name, collection) in &database.collections {
+            summary.collection_count += 1;
+            let namespace = format!("{database_name}.{collection_name}");
+            if !dirty_collections.contains(&(database_name.clone(), collection_name.clone())) {
+                if let Some(existing) = base_snapshot.collections.get(&namespace) {
+                    let meta = &existing.meta;
+                    summary.record_count += meta.summary.record_count;
+                    summary.index_count += meta.summary.index_count;
+                    summary.index_entry_count += meta.summary.index_entry_count;
+                    summary.document_bytes += meta.summary.document_bytes;
+                    summary.index_bytes += meta.summary.index_bytes;
+                    reused_page_count += meta.summary.page_count;
+                    namespace_entries.push(NamespaceEntry {
+                        name: namespace,
+                        target_page_id: existing.meta_page_id,
+                    });
+                    continue;
+                }
+            }
+
+            let written =
+                write_collection_snapshot(&mut writer, database_name, collection_name, collection)?;
+            summary.record_count += written.summary.record_count;
+            summary.index_count += written.summary.index_count;
+            summary.index_entry_count += written.summary.index_entry_count;
+            summary.document_bytes += written.summary.document_bytes;
+            summary.index_bytes += written.summary.index_bytes;
+            namespace_entries.push(NamespaceEntry {
+                name: namespace,
+                target_page_id: written.meta_page_id,
+            });
+        }
+    }
+
+    let pages_before_namespace = writer.page_count();
+    let namespace_root_page_id = writer.write_namespace_tree(namespace_entries)?;
+    let namespace_pages = writer.page_count().saturating_sub(pages_before_namespace);
+
+    let (change_stream_root_page_id, change_event_pages) = if change_events_dirty {
+        let before = writer.page_count();
+        let root = writer.write_change_events(&state.change_events)?;
+        (root, writer.page_count().saturating_sub(before))
+    } else {
+        (
+            base_snapshot.change_stream_root_page_id,
+            base_snapshot.change_event_page_count,
+        )
+    };
+
+    let (plan_cache_root_page_id, plan_cache_pages) = if plan_cache_dirty {
+        let before = writer.page_count();
+        let root = writer.write_plan_cache(&state.plan_cache_entries)?;
+        (root, writer.page_count().saturating_sub(before))
+    } else {
+        (
+            base_snapshot.plan_cache_root_page_id,
+            base_snapshot.plan_cache_page_count,
+        )
+    };
+
+    summary.page_count =
+        reused_page_count + namespace_pages + change_event_pages + plan_cache_pages;
+    summary.page_count += writer
+        .page_count()
+        .saturating_sub(namespace_pages + change_event_pages + plan_cache_pages);
+
+    let next_page_id = writer.next_page_id.max(1);
+    let wal_offset = page_offset(next_page_id, DEFAULT_PAGE_SIZE)?;
+    let next_slot = if current_generation == 0 {
+        0
+    } else {
+        (active_superblock_slot + 1) % SUPERBLOCK_COUNT
+    };
+    let superblock = Superblock {
+        generation: current_generation + 1,
+        durable_lsn: state.last_applied_sequence,
+        last_checkpoint_unix_ms: state.last_checkpoint_unix_ms,
+        wal_start_offset: wal_offset,
+        wal_end_offset: wal_offset,
+        roots: RootSet {
+            namespace_root_page_id,
+            change_stream_root_page_id,
+            plan_cache_root_page_id,
+            stats_root_page_id: None,
+            freelist_root_page_id: None,
+            next_page_id,
+        },
+        summary,
+    };
+
+    file.set_len(base_file_len)?;
+    for (page_id, page) in writer.pages {
+        file.seek(SeekFrom::Start(page_offset(page_id, DEFAULT_PAGE_SIZE)?))?;
+        file.write_all(&page)?;
+    }
+    file.seek(SeekFrom::Start(
+        HEADER_LEN as u64 + next_slot as u64 * SUPERBLOCK_LEN as u64,
+    ))?;
+    file.write_all(&superblock.encode())?;
+    file.set_len(wal_offset)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(CheckpointWriteResult {
+        active_superblock_slot: next_slot,
+        active_superblock: superblock,
+        file_size: wal_offset,
+    })
+}
+
 fn write_checkpoint_state_to_file(
     file: &mut File,
     durable_lsn: u64,
@@ -146,62 +280,16 @@ fn write_checkpoint_state_to_file(
     for (database_name, database) in &catalog.databases {
         for (collection_name, collection) in &database.collections {
             summary.collection_count += 1;
-            summary.record_count += collection.records.len() as u64;
-            summary.index_count += collection.indexes.len() as u64;
-
-            let collection_page_start = writer.page_count();
-            let (record_root_page_id, document_bytes) = writer.write_record_tree(collection)?;
-            summary.document_bytes += document_bytes;
-            let mut index_entry_count = 0_u64;
-            let mut index_bytes = 0_u64;
-            let mut index_directory_entries = Vec::new();
-            for (index_name, index) in &collection.indexes {
-                let (root_page_id, entry_count, bytes) = writer.write_secondary_tree(index)?;
-                let stats_page_id =
-                    writer.write_index_stats(build_persisted_index_stats(index)?)?;
-                index_entry_count += entry_count;
-                index_bytes += bytes;
-                summary.index_entry_count += entry_count;
-
-                let index_meta_page_id = writer.write_index_meta(IndexMeta {
-                    name: index_name.clone(),
-                    root_page_id,
-                    key_pattern_bytes: bson::to_vec(&index.key)?,
-                    unique: index.unique,
-                    expire_after_seconds: index.expire_after_seconds,
-                    entry_count,
-                    index_bytes: bytes,
-                    stats_page_id: Some(stats_page_id),
-                })?;
-                index_directory_entries.push(NamespaceEntry {
-                    name: index_name.clone(),
-                    target_page_id: index_meta_page_id,
-                });
-            }
-            summary.index_bytes += index_bytes;
-            let index_directory_root_page_id =
-                writer.write_namespace_tree(index_directory_entries)?;
-            let collection_meta_page_id = writer.write_collection_meta(CollectionMeta {
-                database: database_name.clone(),
-                collection: collection_name.clone(),
-                record_root_page_id,
-                index_directory_root_page_id,
-                options_bytes: bson::to_vec(&collection.options)?,
-                next_record_id: collection.next_record_id(),
-                summary: SummaryCounters {
-                    collection_count: 1,
-                    index_count: collection.indexes.len() as u64,
-                    record_count: collection.records.len() as u64,
-                    index_entry_count,
-                    document_bytes,
-                    index_bytes,
-                    page_count: writer.page_count().saturating_sub(collection_page_start),
-                    ..SummaryCounters::default()
-                },
-            })?;
+            let written =
+                write_collection_snapshot(&mut writer, database_name, collection_name, collection)?;
+            summary.record_count += written.summary.record_count;
+            summary.index_count += written.summary.index_count;
+            summary.index_entry_count += written.summary.index_entry_count;
+            summary.document_bytes += written.summary.document_bytes;
+            summary.index_bytes += written.summary.index_bytes;
             namespace_entries.push(NamespaceEntry {
                 name: format!("{database_name}.{collection_name}"),
-                target_page_id: collection_meta_page_id,
+                target_page_id: written.meta_page_id,
             });
         }
     }
@@ -254,6 +342,70 @@ fn write_checkpoint_state_to_file(
     })
 }
 
+#[derive(Debug)]
+struct WrittenCollection {
+    meta_page_id: PageId,
+    summary: SummaryCounters,
+}
+
+fn write_collection_snapshot(
+    writer: &mut CheckpointWriter,
+    database_name: &str,
+    collection_name: &str,
+    collection: &CollectionCatalog,
+) -> Result<WrittenCollection> {
+    let collection_page_start = writer.page_count();
+    let (record_root_page_id, document_bytes) = writer.write_record_tree(collection)?;
+    let mut index_entry_count = 0_u64;
+    let mut index_bytes = 0_u64;
+    let mut index_directory_entries = Vec::new();
+    for (index_name, index) in &collection.indexes {
+        let (root_page_id, entry_count, bytes) = writer.write_secondary_tree(index)?;
+        let stats_page_id = writer.write_index_stats(build_persisted_index_stats(index)?)?;
+        index_entry_count += entry_count;
+        index_bytes += bytes;
+
+        let index_meta_page_id = writer.write_index_meta(IndexMeta {
+            name: index_name.clone(),
+            root_page_id,
+            key_pattern_bytes: bson::to_vec(&index.key)?,
+            unique: index.unique,
+            expire_after_seconds: index.expire_after_seconds,
+            entry_count,
+            index_bytes: bytes,
+            stats_page_id: Some(stats_page_id),
+        })?;
+        index_directory_entries.push(NamespaceEntry {
+            name: index_name.clone(),
+            target_page_id: index_meta_page_id,
+        });
+    }
+    let index_directory_root_page_id = writer.write_namespace_tree(index_directory_entries)?;
+    let summary = SummaryCounters {
+        collection_count: 1,
+        index_count: collection.indexes.len() as u64,
+        record_count: collection.records.len() as u64,
+        index_entry_count,
+        document_bytes,
+        index_bytes,
+        page_count: writer.page_count().saturating_sub(collection_page_start),
+        ..SummaryCounters::default()
+    };
+    let meta_page_id = writer.write_collection_meta(CollectionMeta {
+        database: database_name.to_string(),
+        collection: collection_name.to_string(),
+        record_root_page_id,
+        index_directory_root_page_id,
+        options_bytes: bson::to_vec(&collection.options)?,
+        next_record_id: collection.next_record_id(),
+        summary: summary.clone(),
+    })?;
+    Ok(WrittenCollection {
+        meta_page_id,
+        summary,
+    })
+}
+
 fn read_active_superblock_position(file: &mut File) -> Result<(usize, u64)> {
     let file_size = file.metadata()?.len();
     if file_size < DATA_START_OFFSET {
@@ -287,6 +439,135 @@ fn read_active_superblock_position(file: &mut File) -> Result<(usize, u64)> {
     Ok(active.unwrap_or((0, 0)))
 }
 
+#[derive(Debug)]
+struct BaseCollectionSnapshot {
+    meta_page_id: PageId,
+    meta: CollectionMeta,
+}
+
+#[derive(Debug, Default)]
+struct BaseSnapshot {
+    collections: BTreeMap<String, BaseCollectionSnapshot>,
+    change_stream_root_page_id: Option<PageId>,
+    change_event_page_count: u64,
+    plan_cache_root_page_id: Option<PageId>,
+    plan_cache_page_count: u64,
+}
+
+fn load_base_snapshot(path: impl AsRef<Path>) -> Result<BaseSnapshot> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(BaseSnapshot::default());
+    }
+
+    let pager = Pager::open(path)?;
+    let superblock = pager.active_superblock().clone();
+    let mut collections = BTreeMap::new();
+    for entry in load_namespace_entries(&pager, superblock.roots.namespace_root_page_id)? {
+        let page = pager.read_page_bytes(entry.target_page_id)?;
+        let meta = CollectionMetaPage::decode(page.as_ref())?.meta;
+        collections.insert(
+            entry.name,
+            BaseCollectionSnapshot {
+                meta_page_id: entry.target_page_id,
+                meta,
+            },
+        );
+    }
+
+    Ok(BaseSnapshot {
+        collections,
+        change_stream_root_page_id: superblock.roots.change_stream_root_page_id,
+        change_event_page_count: count_change_event_pages(
+            &pager,
+            superblock.roots.change_stream_root_page_id,
+        )?,
+        plan_cache_root_page_id: superblock.roots.plan_cache_root_page_id,
+        plan_cache_page_count: count_plan_cache_pages(
+            &pager,
+            superblock.roots.plan_cache_root_page_id,
+        )?,
+    })
+}
+
+fn load_namespace_entries(
+    pager: &Pager,
+    root_page_id: Option<PageId>,
+) -> Result<Vec<NamespaceEntry>> {
+    let Some(mut page_id) = leftmost_namespace_leaf(pager, root_page_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    loop {
+        let leaf = NamespaceLeafPage::decode(pager.read_page_bytes(page_id)?.as_ref())?;
+        entries.extend(leaf.entries);
+        match leaf.next_page_id {
+            Some(next_page_id) => page_id = next_page_id,
+            None => break,
+        }
+    }
+    Ok(entries)
+}
+
+fn leftmost_namespace_leaf(pager: &Pager, mut page_id: Option<PageId>) -> Result<Option<PageId>> {
+    while let Some(current_page_id) = page_id {
+        let page = pager.read_page_bytes(current_page_id)?;
+        match page_kind_unchecked(page.as_ref())? {
+            crate::v2::layout::PageKind::NamespaceLeaf => return Ok(Some(current_page_id)),
+            crate::v2::layout::PageKind::NamespaceInternal => {
+                page_id = Some(NamespaceInternalPage::decode(page.as_ref())?.first_child_page_id);
+            }
+            other => return Err(anyhow!("expected namespace page, found {:?}", other)),
+        }
+    }
+    Ok(None)
+}
+
+fn count_change_event_pages(pager: &Pager, root_page_id: Option<PageId>) -> Result<u64> {
+    let Some(mut page_id) = root_page_id else {
+        return Ok(0);
+    };
+    let mut seen = HashSet::new();
+    let mut count = 0_u64;
+    loop {
+        if !seen.insert(page_id) {
+            return Err(anyhow!("change-event page chain contains a cycle"));
+        }
+        let page = ChangeEventsPage::decode(pager.read_page_bytes(page_id)?.as_ref())?;
+        count += 1;
+        match page.next_page_id {
+            Some(next_page_id) => page_id = next_page_id,
+            None => break,
+        }
+    }
+    Ok(count)
+}
+
+fn count_plan_cache_pages(pager: &Pager, root_page_id: Option<PageId>) -> Result<u64> {
+    let Some(mut page_id) = root_page_id else {
+        return Ok(0);
+    };
+    let mut seen = HashSet::new();
+    let mut count = 0_u64;
+    loop {
+        if !seen.insert(page_id) {
+            return Err(anyhow!("plan-cache page chain contains a cycle"));
+        }
+        let page = PlanCachePage::decode(pager.read_page_bytes(page_id)?.as_ref())?;
+        count += 1;
+        match page.next_page_id {
+            Some(next_page_id) => page_id = next_page_id,
+            None => break,
+        }
+    }
+    Ok(count)
+}
+
+fn next_page_id_after_file_len(base_file_len: u64) -> PageId {
+    let used_bytes = base_file_len.saturating_sub(DATA_START_OFFSET);
+    used_bytes.div_ceil(u64::from(DEFAULT_PAGE_SIZE)) + 1
+}
+
 #[derive(Default)]
 struct CheckpointWriter {
     next_page_id: PageId,
@@ -294,6 +575,13 @@ struct CheckpointWriter {
 }
 
 impl CheckpointWriter {
+    fn with_next_page_id(next_page_id: PageId) -> Self {
+        Self {
+            next_page_id: next_page_id.max(1),
+            pages: Vec::new(),
+        }
+    }
+
     fn page_count(&self) -> u64 {
         self.pages.len() as u64
     }

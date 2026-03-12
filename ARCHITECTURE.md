@@ -56,7 +56,7 @@ The broker is the only writer for a database file.
 - Reads are served from in-process state loaded from the file plus any applied WAL mutations.
 - Clean checkpointed indexed reads can now skip full engine hydration: the broker may start with no mutable storage engine loaded, resolve the namespace from file metadata, and answer `find`/`explain` through page-backed v2 read handles directly from the durable file.
 - Writes append WAL records, update in-memory state, and become durable before command success. Concurrent writers share a short group-commit sync barrier so multiple acknowledged commands can ride the same `fsync`.
-- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. If the last client disconnects and the broker stays quiet, it now hands off a checkpoint promptly instead of waiting for idle shutdown. A loaded broker also triggers that same background checkpoint path when the WAL tail crosses a byte threshold, even if an IPC client is still connected, so the next startup can stay on the clean checkpointed fast path. The broker captures checkpoint state briefly under the storage lock, then writes the checkpoint on a background worker so later commands can keep running. Writes that arrive after that capture remain in the WAL tail and are preserved across the checkpoint.
+- Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. If the last client disconnects and the broker stays quiet, it now hands off a checkpoint promptly instead of waiting for idle shutdown. A loaded broker also triggers that same background checkpoint path when the WAL tail crosses a byte threshold, even if an IPC client is still connected, so the next startup can stay on the clean checkpointed fast path. The broker captures checkpoint state briefly under the storage lock, then publishes a new page-root snapshot on a background worker so later commands can keep running. That published snapshot rewrites only dirty collection/index page subtrees plus fresh namespace metadata, reuses clean collection pages from the previously published roots, and advances the superblock so reopen can start from the newer page graph instead of the older WAL start. Writes that arrive after that capture remain in the WAL tail and are preserved across the publication.
 - Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
 - CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
@@ -116,6 +116,11 @@ value frequencies and field-presence counts through checkpoint and reopen, so pl
 using persisted estimates instead of rebuilding in-memory stats. The same v2 page graph can also
 be materialized back into a full `Catalog` when a broker path still needs collection-owned mutable
 state instead of a borrowed page-backed read view.
+Background checkpoint publication now uses those same page codecs incrementally: it can reuse
+published collection meta pages for clean namespaces, append only the dirty collection/index page
+subtrees plus a fresh namespace tree, and then rotate the superblock to the newer roots. That is
+the current dirty-file startup optimization, because reopen only needs to replay WAL written after
+the latest published roots rather than the entire tail since the previous full checkpoint.
 The broker-facing storage trait is also being split so metadata commands can ask for database
 names, collection metadata, and index descriptors without reaching through a full `Catalog`
 materialization path.
