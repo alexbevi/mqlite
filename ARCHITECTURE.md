@@ -115,6 +115,9 @@ value frequencies and field-presence counts through checkpoint and reopen, so pl
 using persisted estimates instead of rebuilding in-memory stats. The same v2 page graph can also
 be materialized back into a full `Catalog` when a broker path still needs collection-owned mutable
 state instead of a borrowed page-backed read view.
+The broker-facing storage trait is also being split so metadata commands can ask for database
+names, collection metadata, and index descriptors without reaching through a full `Catalog`
+materialization path.
 
 The `find` planner is now being split away from direct `CollectionCatalog` assumptions. Its
 planning and costing paths target a narrower collection and index read view so the broker can plug

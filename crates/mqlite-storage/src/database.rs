@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    engine::{CollectionReadView, StorageEngine},
+    engine::{CollectionMetadata, CollectionReadView, IndexMetadata, StorageEngine},
     v2::{
         checkpoint as v2_checkpoint, engine as v2_engine, layout as v2_layout,
         pager::Pager as V2Pager,
@@ -1027,6 +1027,51 @@ impl DatabaseFile {
 impl StorageEngine for DatabaseFile {
     fn catalog(&self) -> &Catalog {
         DatabaseFile::catalog(self)
+    }
+
+    fn database_names(&self) -> Result<Vec<String>> {
+        Ok(self.catalog().database_names())
+    }
+
+    fn collection_names(&self, database: &str) -> Result<Vec<String>> {
+        match self.catalog().collection_names(database) {
+            Ok(names) => Ok(names),
+            Err(CatalogError::DatabaseNotFound(_)) => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn collection_metadata(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<CollectionMetadata>> {
+        match self.catalog().get_collection(database, collection) {
+            Ok(collection) => Ok(Some(CollectionMetadata {
+                options: collection.options.clone(),
+            })),
+            Err(CatalogError::NamespaceNotFound(_, _)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn list_indexes(&self, database: &str, collection: &str) -> Result<Option<Vec<IndexMetadata>>> {
+        match self.catalog().get_collection(database, collection) {
+            Ok(collection) => Ok(Some(
+                collection
+                    .indexes
+                    .values()
+                    .map(|index| IndexMetadata {
+                        name: index.name.clone(),
+                        key_pattern: index.key.clone(),
+                        unique: index.unique,
+                        expire_after_seconds: index.expire_after_seconds,
+                    })
+                    .collect(),
+            )),
+            Err(CatalogError::NamespaceNotFound(_, _)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn collection_read_view(
@@ -3566,6 +3611,7 @@ mod tests {
         PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, VerifyReport,
         WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC,
     };
+    use crate::StorageEngine;
     use crate::v2::engine as v2_engine;
 
     fn insert_record(collection: &mut CollectionCatalog, record_id: u64, document: bson::Document) {
@@ -4753,6 +4799,61 @@ mod tests {
             error.to_string().contains("supported v2 mqlite database"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn storage_metadata_surface_reports_namespaces_and_indexes() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("metadata-surface.mongodb");
+
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+        let mut collection =
+            CollectionCatalog::new(doc! { "validator": { "sku": { "$exists": true } } });
+        insert_record(
+            &mut collection,
+            1,
+            doc! { "_id": 1_i64, "sku": "alpha", "qty": 2_i64 },
+        );
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: collection,
+                change_events: Vec::new(),
+            })
+            .expect("seed collection");
+
+        assert_eq!(
+            StorageEngine::database_names(&database).expect("database names"),
+            vec!["app".to_string()]
+        );
+        assert_eq!(
+            StorageEngine::collection_names(&database, "app").expect("collection names"),
+            vec!["widgets".to_string()]
+        );
+        assert_eq!(
+            StorageEngine::collection_metadata(&database, "app", "widgets")
+                .expect("collection metadata")
+                .expect("collection exists")
+                .options,
+            doc! { "validator": { "sku": { "$exists": true } } }
+        );
+
+        let indexes = StorageEngine::list_indexes(&database, "app", "widgets")
+            .expect("list indexes")
+            .expect("indexes");
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0].name, "_id_");
+        assert_eq!(indexes[0].key_pattern, doc! { "_id": 1 });
+        assert!(indexes[0].unique);
+        assert_eq!(indexes[1].name, "sku_1");
+        assert_eq!(indexes[1].key_pattern, doc! { "sku": 1 });
+        assert!(indexes[1].unique);
     }
 
     #[test]

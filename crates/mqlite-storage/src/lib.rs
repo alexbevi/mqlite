@@ -10,4 +10,7 @@ pub use database::{
     PersistedPlanCacheChoice, PersistedPlanCacheEntry, PersistedState, StorageError, VerifyReport,
     WalMutation,
 };
-pub use engine::{BoxedStorageEngine, CollectionReadView, IndexReadView, StorageEngine};
+pub use engine::{
+    BoxedStorageEngine, CollectionMetadata, CollectionReadView, IndexMetadata, IndexReadView,
+    StorageEngine,
+};

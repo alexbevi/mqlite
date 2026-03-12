@@ -34,6 +34,19 @@ pub trait IndexReadView: Send + Sync {
     fn present_count(&self, field: &str) -> Option<usize>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionMetadata {
+    pub options: Document,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMetadata {
+    pub name: String,
+    pub key_pattern: Document,
+    pub unique: bool,
+    pub expire_after_seconds: Option<i64>,
+}
+
 impl CollectionReadView for CollectionCatalog {
     fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
         Ok(self.records.clone())
@@ -106,6 +119,14 @@ impl IndexReadView for IndexCatalog {
 
 pub trait StorageEngine: Send + Sync {
     fn catalog(&self) -> &Catalog;
+    fn database_names(&self) -> Result<Vec<String>>;
+    fn collection_names(&self, database: &str) -> Result<Vec<String>>;
+    fn collection_metadata(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<CollectionMetadata>>;
+    fn list_indexes(&self, database: &str, collection: &str) -> Result<Option<Vec<IndexMetadata>>>;
     fn collection_read_view(
         &self,
         database: &str,

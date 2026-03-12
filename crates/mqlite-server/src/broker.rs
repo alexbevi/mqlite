@@ -30,8 +30,9 @@ use mqlite_query::{
 use mqlite_storage::{
     BoxedStorageEngine, CollectionChange, CollectionReadView as StorageCollectionReadView,
     CompletedConcurrentCheckpoint, ConcurrentCheckpointJob, DatabaseFile,
-    EMPTY_BSON_DOCUMENT_BYTES, IndexReadView as StorageIndexReadView, PersistedChangeEvent,
-    PersistedPlanCacheChoice, PersistedPlanCacheEntry, StorageError, WalMutation,
+    EMPTY_BSON_DOCUMENT_BYTES, IndexMetadata as StorageIndexMetadata,
+    IndexReadView as StorageIndexReadView, PersistedChangeEvent, PersistedPlanCacheChoice,
+    PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -769,8 +770,8 @@ impl Broker {
         let name_only = body.get_bool("nameOnly").unwrap_or(false);
         let storage = self.durable_storage_read()?;
         let databases = storage
-            .catalog()
             .database_names()
+            .map_err(internal_error)?
             .into_iter()
             .map(|name| {
                 if name_only {
@@ -798,22 +799,18 @@ impl Broker {
         let filter = body.get_document("filter").ok().cloned();
         let storage = self.durable_storage_read()?;
         let collections = storage
-            .catalog()
             .collection_names(&database)
-            .or_else(|error| match error {
-                CatalogError::DatabaseNotFound(_) => Ok(Vec::new()),
-                _ => Err(error),
-            })?
+            .map_err(internal_error)?
             .into_iter()
             .map(|name| {
                 let collection = storage
-                    .catalog()
-                    .get_collection(&database, &name)
+                    .collection_metadata(&database, &name)
+                    .expect("collection metadata")
                     .expect("collection exists");
                 doc! {
                     "name": name,
                     "type": "collection",
-                    "options": collection.options.clone(),
+                    "options": collection.options,
                     "info": { "readOnly": false },
                     "idIndex": { "name": "_id_", "key": { "_id": 1 }, "unique": true },
                 }
@@ -841,10 +838,13 @@ impl Broker {
         })?;
         let storage = self.durable_storage_read()?;
         let indexes = storage
-            .catalog()
-            .list_indexes(&database, collection)?
+            .list_indexes(&database, collection)
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                CatalogError::NamespaceNotFound(database.clone(), collection.to_string())
+            })?
             .into_iter()
-            .map(index_to_document)
+            .map(index_metadata_to_document)
             .collect::<Vec<_>>();
         let cursor = self.cursors.lock().open(
             format!("{database}.{collection}"),
@@ -1114,9 +1114,9 @@ impl Broker {
 
         let mut storage = self.storage.write();
         if storage
-            .catalog()
-            .get_collection(&database, collection)
-            .is_ok()
+            .collection_metadata(&database, collection)
+            .map_err(internal_error)?
+            .is_some()
         {
             return Err(CatalogError::NamespaceExists(database, collection.to_string()).into());
         }
@@ -1158,10 +1158,7 @@ impl Broker {
         let database = database_name(body)?;
         let collections = {
             let storage = self.durable_storage_read()?;
-            storage
-                .catalog()
-                .collection_names(&database)
-                .unwrap_or_default()
+            storage.collection_names(&database).unwrap_or_default()
         };
 
         let mut storage = self.storage.write();
@@ -1237,9 +1234,11 @@ impl Broker {
         })?;
         let mut storage = self.storage.write();
         let index_count = storage
-            .catalog()
-            .get_collection(&database, collection)?
-            .indexes
+            .list_indexes(&database, collection)
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                CatalogError::NamespaceNotFound(database.clone(), collection.to_string())
+            })?
             .len() as i32;
         let sequence = storage.last_applied_sequence() + 1;
         let sequence = storage
@@ -6342,6 +6341,20 @@ fn index_to_document(index: IndexCatalog) -> Document {
     let mut document = Document::new();
     document.insert("v", 2);
     document.insert("key", index.key);
+    document.insert("name", index.name);
+    if index.unique {
+        document.insert("unique", true);
+    }
+    if let Some(expire_after_seconds) = index.expire_after_seconds {
+        document.insert("expireAfterSeconds", expire_after_seconds);
+    }
+    document
+}
+
+fn index_metadata_to_document(index: StorageIndexMetadata) -> Document {
+    let mut document = Document::new();
+    document.insert("v", 2);
+    document.insert("key", index.key_pattern);
     document.insert("name", index.name);
     if index.unique {
         document.insert("unique", true);
