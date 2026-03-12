@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -50,7 +50,7 @@ const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
-const DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
+const DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD: u64 = 1024 * 1024;
 const DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(1);
 const MQLITE_DEBUG_FIELD: &str = "$mqliteDebug";
@@ -95,6 +95,7 @@ pub struct Broker {
     fail_command: Arc<Mutex<Option<FailCommandState>>>,
     active_connections: Arc<AtomicUsize>,
     active_commands: Arc<AtomicUsize>,
+    checkpoint_requested: Arc<AtomicBool>,
     last_activity: Arc<Mutex<Instant>>,
 }
 
@@ -250,6 +251,7 @@ impl Broker {
             fail_command: Arc::new(Mutex::new(None)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
+            checkpoint_requested: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
     }
@@ -309,6 +311,25 @@ impl Broker {
                     let watched_parent_exited = self.watched_parent_has_exited();
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
+                        && active_commands == 0
+                        && self.checkpoint_requested.swap(false, Ordering::SeqCst)
+                    {
+                        if let Some(job) = self.prepare_background_checkpoint()? {
+                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
+                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
+                                if checkpoint_test_delay_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(
+                                        checkpoint_test_delay_ms,
+                                    ));
+                                }
+                                job.run()
+                            }));
+                            last_checkpoint = Instant::now();
+                            continue;
+                        }
+                    }
+                    if checkpoint_task.is_none()
+                        && !watched_parent_exited
                         && self.storage_is_loaded()
                         && self
                             .storage_read()
@@ -316,7 +337,6 @@ impl Broker {
                             .wal_backlog_bytes()
                             >= self.config.checkpoint_wal_bytes_threshold
                         && active_commands == 0
-                        && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
                             let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
@@ -336,7 +356,6 @@ impl Broker {
                         && !watched_parent_exited
                         && active_connections == 0
                         && active_commands == 0
-                        && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
                             let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
@@ -701,9 +720,11 @@ impl Broker {
             drop(state);
 
             thread::sleep(GROUP_COMMIT_WAIT);
-            let sync_result = {
+            let (sync_result, wal_backlog_bytes) = {
                 let mut storage = self.storage_write()?;
-                storage.sync_pending_wal()
+                let sync_result = storage.sync_pending_wal();
+                let wal_backlog_bytes = storage.wal_backlog_bytes();
+                (sync_result, wal_backlog_bytes)
             };
 
             let mut state = self.wal_commit.state.lock();
@@ -712,6 +733,9 @@ impl Broker {
                 state.durable_sequence = state.durable_sequence.max(*durable_sequence);
             }
             self.wal_commit.ready.notify_all();
+            if wal_backlog_bytes >= self.config.checkpoint_wal_bytes_threshold {
+                self.checkpoint_requested.store(true, Ordering::SeqCst);
+            }
             sync_result.map_err(internal_error)?;
         }
     }
@@ -7431,6 +7455,61 @@ mod tests {
 
         let ping = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
         assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn requests_wal_pressure_checkpoint_without_waiting_for_quiet_period() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("wal-threshold-immediate-checkpoint.mongodb");
+        let mut config = BrokerConfig::new(&database_path, 3);
+        config.checkpoint_interval_secs = 60;
+        config.checkpoint_wal_bytes_threshold = 64;
+
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert_started_at = Instant::now();
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1_i64, "payload": "x".repeat(1024) }],
+                "$db": "app",
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let deadline = Instant::now() + Duration::from_millis(900);
+        loop {
+            let inspect =
+                DatabaseFile::inspect(&database_path).expect("inspect after wal pressure");
+            if inspect.wal_records_since_checkpoint == 0 {
+                assert!(
+                    insert_started_at.elapsed() < Duration::from_secs(1),
+                    "checkpoint should be requested before the one-second quiet period elapses"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the broker to request checkpoint before the quiet-period gate"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)

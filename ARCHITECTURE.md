@@ -241,9 +241,13 @@ checkpoint.
 The broker can checkpoint or publish on:
 
 - the periodic checkpoint interval, currently about every 60 seconds
-- a quiet period after the last client disconnects
+- the moment the last client disconnects
 - WAL backlog pressure while the broker is still loaded
 - graceful shutdown
+
+WAL backlog pressure is now edge-triggered from the durable write path. Once a write becomes
+durable and the pending WAL bytes cross the configured threshold, the broker requests background
+publication immediately instead of waiting for a one-second quiet-period poll.
 
 ## Recovery
 
