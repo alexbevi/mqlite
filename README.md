@@ -79,7 +79,7 @@ The CLI is intentionally small and focused:
 
 `mqlite` now creates and writes only the page-backed v2 file format. `mqlite info` summarizes the current state recovered from the file, including per-database, per-collection, and per-index sizes and counts, and separates that from the most recent checkpoint metadata. `mqlite inspect` remains the lower-level file-layout report. Both commands answer from persisted checkpoint metadata and, when needed, fold in the WAL tail with a metadata-only scan instead of rehydrating every record and index page first, so they return quickly even on large files. Older pre-v2 files are rejected explicitly. Use `mqlite verify` when you want the slower full page-validation pass.
 
-`mqlite command --debug` keeps the normal command reply on stdout and emits a structured debug report on stderr. That report combines client-side IPC and wire timings with broker-side server, query, storage, catalog, exec, and BSON spans, plus counters such as page-cache hits and misses, WAL replay counts, and lightweight process snapshots.
+`mqlite command --debug` keeps the normal command reply on stdout and emits a structured debug report on stderr. That report combines client-side IPC and wire timings with broker-side server, query, storage, catalog, exec, and BSON spans, plus counters such as page-cache hits and misses, WAL replay counts, per-mutation replay bytes and document counts, and lightweight process snapshots.
 
 You can also pipe JSON into `mqlite command`:
 

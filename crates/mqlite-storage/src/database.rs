@@ -5,7 +5,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -16,7 +16,7 @@ use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexCatalog,
     IndexEntry, build_index_specs, validate_collection_indexes, validate_drop_indexes,
 };
-use mqlite_debug::{Component, add_counter, span};
+use mqlite_debug::{Component, add_counter, record_duration, set_metadata, span};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -386,6 +386,56 @@ pub enum StorageError {
 struct WalEntry {
     sequence: u64,
     mutation: WalMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalMutationKind {
+    ReplaceCollection,
+    RewriteCollection,
+    ApplyCollectionChanges,
+    CreateIndexes,
+    DropIndexes,
+    DropCollection,
+}
+
+impl WalMutationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplaceCollection => "replaceCollection",
+            Self::RewriteCollection => "rewriteCollection",
+            Self::ApplyCollectionChanges => "applyCollectionChanges",
+            Self::CreateIndexes => "createIndexes",
+            Self::DropIndexes => "dropIndexes",
+            Self::DropCollection => "dropCollection",
+        }
+    }
+
+    fn replay_apply_operation(self) -> &'static str {
+        match self {
+            Self::ReplaceCollection => "replay_apply_replace_collection",
+            Self::RewriteCollection => "replay_apply_rewrite_collection",
+            Self::ApplyCollectionChanges => "replay_apply_collection_changes",
+            Self::CreateIndexes => "replay_apply_create_indexes",
+            Self::DropIndexes => "replay_apply_drop_indexes",
+            Self::DropCollection => "replay_apply_drop_collection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalMutationReplayStats {
+    kind: WalMutationKind,
+    touched_documents: u64,
+    touched_document_bytes: u64,
+    change_events: u64,
+    index_specs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedWalEntry {
+    entry: WalEntry,
+    decoded_len: usize,
+    compressed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1945,14 +1995,20 @@ fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
     maybe_encode_zstd_blob(&bytes, WAL_COMPRESSION_MIN_LEN, WAL_COMPRESSION_MIN_SAVINGS)
 }
 
-fn decode_wal_entry(bytes: &[u8]) -> Result<WalEntry> {
+fn decode_wal_entry(bytes: &[u8]) -> Result<DecodedWalEntry> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let decoded_len = bytes.as_ref().len();
+    let compressed = matches!(&bytes, Cow::Owned(_));
     let mut cursor = Cursor::new(bytes.as_ref());
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
     if cursor.position() != bytes.as_ref().len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
-    compact_wal_entry.into_wal_entry()
+    Ok(DecodedWalEntry {
+        entry: compact_wal_entry.into_wal_entry()?,
+        decoded_len,
+        compressed,
+    })
 }
 
 fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
@@ -2002,6 +2058,10 @@ fn replay_wal(
     let mut recovery = WalRecovery::default();
     let mut last_applied_sequence = state.last_applied_sequence;
     let mut offset = start_offset;
+    let mut largest_payload_bytes = 0_u64;
+    let mut largest_payload_kind = None;
+    let mut decoded_bytes = 0_u64;
+    let mut compressed_frames = 0_u64;
     while offset < file_size {
         if file_size - offset < WAL_HEADER_LEN as u64 {
             recovery.truncated_tail = true;
@@ -2032,25 +2092,226 @@ fn replay_wal(
             return Err(StorageError::InvalidWalChecksum.into());
         }
 
-        let entry = decode_wal_entry(&payload)?;
-        if entry.sequence > last_applied_sequence {
+        let decoded = decode_wal_entry(&payload)?;
+        if decoded.entry.sequence > last_applied_sequence {
+            let mutation_stats = wal_mutation_replay_stats(&decoded.entry.mutation);
+            let payload_len_u64 = payload_len as u64;
+            let frame_bytes = WAL_HEADER_LEN as u64 + payload_len_u64;
+            let kind = mutation_stats.kind.as_str();
+            if payload_len_u64 > largest_payload_bytes {
+                largest_payload_bytes = payload_len_u64;
+                largest_payload_kind = Some(kind);
+            }
+            if decoded.compressed {
+                compressed_frames += 1;
+                add_counter(Component::Storage, "walReplayCompressedFrames", 1);
+            }
+            decoded_bytes += decoded.decoded_len as u64;
             mark_mutation_dirty(
                 &mut recovery.dirty_collections,
                 &mut recovery.change_events_dirty,
-                &entry.mutation,
+                &decoded.entry.mutation,
             );
-            apply_mutation(state, entry.sequence, &entry.mutation)?;
-            last_applied_sequence = entry.sequence;
-            recovery.last_sequence = Some(entry.sequence);
             recovery.records += 1;
             add_counter(Component::Storage, "walReplayRecords", 1);
+            add_counter(Component::Storage, "walReplayFrameBytes", frame_bytes);
+            add_counter(Component::Storage, "walReplayPayloadBytes", payload_len_u64);
+            add_counter(
+                Component::Storage,
+                "walReplayDecodedBytes",
+                decoded.decoded_len as u64,
+            );
+            add_counter(Component::Storage, &format!("walReplayMutations.{kind}"), 1);
+            add_counter(
+                Component::Storage,
+                &format!("walReplayPayloadBytes.{kind}"),
+                payload_len_u64,
+            );
+            add_counter(
+                Component::Storage,
+                &format!("walReplayDecodedBytes.{kind}"),
+                decoded.decoded_len as u64,
+            );
+            if mutation_stats.touched_documents > 0 {
+                add_counter(
+                    Component::Storage,
+                    "walReplayTouchedDocuments",
+                    mutation_stats.touched_documents,
+                );
+                add_counter(
+                    Component::Storage,
+                    &format!("walReplayTouchedDocuments.{kind}"),
+                    mutation_stats.touched_documents,
+                );
+            }
+            if mutation_stats.touched_document_bytes > 0 {
+                add_counter(
+                    Component::Storage,
+                    "walReplayTouchedDocumentBytes",
+                    mutation_stats.touched_document_bytes,
+                );
+                add_counter(
+                    Component::Storage,
+                    &format!("walReplayTouchedDocumentBytes.{kind}"),
+                    mutation_stats.touched_document_bytes,
+                );
+            }
+            if mutation_stats.change_events > 0 {
+                add_counter(
+                    Component::Storage,
+                    "walReplayChangeEvents",
+                    mutation_stats.change_events,
+                );
+                add_counter(
+                    Component::Storage,
+                    &format!("walReplayChangeEvents.{kind}"),
+                    mutation_stats.change_events,
+                );
+            }
+            if mutation_stats.index_specs > 0 {
+                add_counter(
+                    Component::Storage,
+                    "walReplayIndexSpecs",
+                    mutation_stats.index_specs,
+                );
+                add_counter(
+                    Component::Storage,
+                    &format!("walReplayIndexSpecs.{kind}"),
+                    mutation_stats.index_specs,
+                );
+            }
+            let applied_at = Instant::now();
+            apply_mutation(state, decoded.entry.sequence, &decoded.entry.mutation)?;
+            record_duration(
+                Component::Storage,
+                mutation_stats.kind.replay_apply_operation(),
+                applied_at.elapsed(),
+            );
+            last_applied_sequence = decoded.entry.sequence;
+            recovery.last_sequence = Some(decoded.entry.sequence);
         }
 
         offset = payload_end;
     }
 
     recovery.bytes = offset.saturating_sub(start_offset);
+    set_metadata("walReplayDecodedBytes", decoded_bytes.to_string());
+    set_metadata("walReplayCompressedFrames", compressed_frames.to_string());
+    set_metadata(
+        "walReplayLargestPayloadBytes",
+        largest_payload_bytes.to_string(),
+    );
+    if let Some(kind) = largest_payload_kind {
+        set_metadata("walReplayLargestPayloadMutation", kind);
+    }
     Ok(recovery)
+}
+
+fn wal_mutation_replay_stats(mutation: &WalMutation) -> WalMutationReplayStats {
+    match mutation {
+        WalMutation::ReplaceCollection {
+            collection_state,
+            change_events,
+            ..
+        } => WalMutationReplayStats {
+            kind: WalMutationKind::ReplaceCollection,
+            touched_documents: collection_state.records.len() as u64,
+            touched_document_bytes: collection_state
+                .records
+                .iter()
+                .map(|record| {
+                    record
+                        .encoded_document_bytes()
+                        .ok()
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0)
+                })
+                .sum(),
+            change_events: change_events.len() as u64,
+            index_specs: collection_state.indexes.len() as u64,
+        },
+        WalMutation::RewriteCollection {
+            changes,
+            change_events,
+            ..
+        } => collection_change_replay_stats(
+            WalMutationKind::RewriteCollection,
+            changes,
+            change_events.len() as u64,
+            0,
+        ),
+        WalMutation::ApplyCollectionChanges {
+            changes,
+            inserts,
+            updates,
+            deletes,
+            change_events,
+            ..
+        } => {
+            let resolved = resolved_collection_changes(changes, inserts, updates, deletes);
+            collection_change_replay_stats(
+                WalMutationKind::ApplyCollectionChanges,
+                &resolved,
+                change_events.len() as u64,
+                0,
+            )
+        }
+        WalMutation::CreateIndexes {
+            specs,
+            change_events,
+            ..
+        } => WalMutationReplayStats {
+            kind: WalMutationKind::CreateIndexes,
+            touched_documents: 0,
+            touched_document_bytes: 0,
+            change_events: change_events.len() as u64,
+            index_specs: specs.len() as u64,
+        },
+        WalMutation::DropIndexes { change_events, .. } => WalMutationReplayStats {
+            kind: WalMutationKind::DropIndexes,
+            touched_documents: 0,
+            touched_document_bytes: 0,
+            change_events: change_events.len() as u64,
+            index_specs: 1,
+        },
+        WalMutation::DropCollection { change_events, .. } => WalMutationReplayStats {
+            kind: WalMutationKind::DropCollection,
+            touched_documents: 0,
+            touched_document_bytes: 0,
+            change_events: change_events.len() as u64,
+            index_specs: 0,
+        },
+    }
+}
+
+fn collection_change_replay_stats(
+    kind: WalMutationKind,
+    changes: &[CollectionChange],
+    change_events: u64,
+    index_specs: u64,
+) -> WalMutationReplayStats {
+    let mut touched_documents = 0_u64;
+    let mut touched_document_bytes = 0_u64;
+    for change in changes {
+        touched_documents += 1;
+        match change {
+            CollectionChange::Insert(record) | CollectionChange::Update(record) => {
+                touched_document_bytes += record
+                    .encoded_document_bytes()
+                    .ok()
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0);
+            }
+            CollectionChange::Delete(_) => {}
+        }
+    }
+    WalMutationReplayStats {
+        kind,
+        touched_documents,
+        touched_document_bytes,
+        change_events,
+        index_specs,
+    }
 }
 
 fn apply_mutation(state: &mut PersistedState, sequence: u64, mutation: &WalMutation) -> Result<()> {
@@ -3694,6 +3955,7 @@ mod tests {
     use mqlite_catalog::{
         CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, apply_index_specs,
     };
+    use mqlite_debug::{Component, install, session};
     use tempfile::tempdir;
 
     use super::{
@@ -3787,6 +4049,18 @@ mod tests {
         .expect("sample change event")
     }
 
+    fn counter_value(
+        report: &mqlite_debug::DebugReport,
+        component: Component,
+        name: &str,
+    ) -> Option<u64> {
+        report
+            .counters
+            .iter()
+            .find(|counter| counter.component == component && counter.name == name)
+            .map(|counter| counter.value)
+    }
+
     fn validation_index_keys(
         database: &DatabaseFile,
         db: &str,
@@ -3867,6 +4141,126 @@ mod tests {
         assert_eq!(inspect.last_applied_sequence, 1);
         assert_eq!(inspect.wal_records_since_checkpoint, 1);
         assert_eq!(inspect.databases, vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn replay_wal_reports_mutation_breakdown_to_debug_session() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("wal-replay-debug.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1, "sku": "alpha" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2, "sku": "beta" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: vec![sample_change_event(1, "insert")],
+                })
+                .expect("commit changes");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "sku": 1_i32 }, "name": "sku_1" }],
+                    change_events: vec![sample_change_event(2, "createIndexes")],
+                })
+                .expect("commit indexes");
+        }
+
+        let replay_session = session("wal-replay-debug");
+        let _install = install(&replay_session);
+        let database = DatabaseFile::open_or_create(&path).expect("reopen database");
+        drop(database);
+
+        let report = replay_session.report();
+        assert_eq!(
+            counter_value(&report, Component::Storage, "walReplayRecords"),
+            Some(2)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayMutations.applyCollectionChanges",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayMutations.createIndexes"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayTouchedDocuments.applyCollectionChanges",
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayIndexSpecs.createIndexes",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayChangeEvents.applyCollectionChanges",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "walReplayChangeEvents.createIndexes",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            report
+                .spans
+                .iter()
+                .any(|span| span.operation == "replay_apply_collection_changes"),
+            true
+        );
+        assert_eq!(
+            report
+                .spans
+                .iter()
+                .any(|span| span.operation == "replay_apply_create_indexes"),
+            true
+        );
+        assert_eq!(
+            report
+                .metadata
+                .get("walReplayLargestPayloadMutation")
+                .map(String::as_str),
+            Some("applyCollectionChanges")
+        );
     }
 
     #[test]

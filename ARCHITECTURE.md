@@ -383,7 +383,7 @@ stderr. That report combines:
 
 - client-side IPC and wire timings
 - broker-side server, query, storage, catalog, exec, and BSON spans
-- counters such as page-cache hits and misses, page bytes read, and WAL replay counts
+- counters such as page-cache hits and misses, page bytes read, WAL replay counts, and WAL replay bytes/documents grouped by mutation kind
 - lightweight process snapshots for the client and broker processes
 
 ## CLI And Validation Paths
