@@ -10,6 +10,7 @@ anyhow.workspace = true
 bson.workspace = true
 mqlite-bson = { path = "../mqlite-bson" }
 mqlite-catalog = { path = "../mqlite-catalog" }
+mqlite-debug = { path = "../mqlite-debug" }
 mqlite-exec = { path = "../mqlite-exec" }
 mqlite-ipc = { path = "../mqlite-ipc" }
 mqlite-query = { path = "../mqlite-query" }

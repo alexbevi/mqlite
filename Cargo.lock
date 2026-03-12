@@ -834,6 +834,7 @@ dependencies = [
  "assert_cmd",
  "bson",
  "clap",
+ "mqlite-debug",
  "mqlite-ipc",
  "mqlite-server",
  "mqlite-storage",
@@ -849,6 +850,7 @@ name = "mqlite-bson"
 version = "0.1.0"
 dependencies = [
  "bson",
+ "mqlite-debug",
  "pretty_assertions",
  "proptest",
  "thiserror",
@@ -881,10 +883,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqlite-debug"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "parking_lot",
+ "serde",
+]
+
+[[package]]
 name = "mqlite-exec"
 version = "0.1.0"
 dependencies = [
  "bson",
+ "mqlite-debug",
  "parking_lot",
  "pretty_assertions",
  "thiserror",
@@ -912,6 +924,7 @@ dependencies = [
  "chrono-tz",
  "md-5",
  "mqlite-bson",
+ "mqlite-debug",
  "pretty_assertions",
  "regex",
  "serde_json",
@@ -927,6 +940,7 @@ dependencies = [
  "libc",
  "mqlite-bson",
  "mqlite-catalog",
+ "mqlite-debug",
  "mqlite-exec",
  "mqlite-ipc",
  "mqlite-query",
@@ -953,6 +967,7 @@ dependencies = [
  "fs4",
  "mqlite-bson",
  "mqlite-catalog",
+ "mqlite-debug",
  "parking_lot",
  "serde",
  "tempfile",
@@ -967,6 +982,7 @@ dependencies = [
  "bson",
  "bytes",
  "mqlite-bson",
+ "mqlite-debug",
  "pretty_assertions",
  "thiserror",
  "tokio",

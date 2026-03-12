@@ -9,6 +9,7 @@ rust-version.workspace = true
 bson.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+mqlite-debug = { path = "../mqlite-debug" }
 mqlite-bson = { path = "../mqlite-bson" }
 md-5.workspace = true
 regex.workspace = true

@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use mqlite_debug::{Component, add_counter, span};
 use parking_lot::Mutex;
 
 use crate::v2::{
@@ -55,6 +56,7 @@ impl Pager {
         path: impl AsRef<Path>,
         cache_page_capacity: Option<usize>,
     ) -> Result<Self> {
+        let _span = span(Component::Storage, "pager_open");
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_size = file.metadata()?.len();
         if file_size < DATA_START_OFFSET {
@@ -132,14 +134,19 @@ impl Pager {
     }
 
     pub fn read_page_bytes(&self, page_id: PageId) -> Result<SharedPage> {
+        let _span = span(Component::Storage, "pager_read_page_bytes");
+        add_counter(Component::Storage, "pageReadRequests", 1);
         if let Some(bytes) = self.cache.lock().get(page_id) {
+            add_counter(Component::Storage, "pageCacheHits", 1);
             return Ok(bytes);
         }
 
+        add_counter(Component::Storage, "pageCacheMisses", 1);
         let offset = page_offset(page_id, self.header.page_size)?;
         let mut bytes = vec![0_u8; self.header.page_size as usize];
         read_exact_at(&self.file, &mut bytes, offset)?;
         validate_page(&bytes)?;
+        add_counter(Component::Storage, "pageBytesRead", bytes.len() as u64);
         let bytes: SharedPage = bytes.into();
 
         Ok(self.cache.lock().insert(page_id, bytes))

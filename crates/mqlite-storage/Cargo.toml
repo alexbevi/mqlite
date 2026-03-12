@@ -11,6 +11,7 @@ blake3.workspace = true
 bson.workspace = true
 ciborium.workspace = true
 fs4.workspace = true
+mqlite-debug = { path = "../mqlite-debug" }
 mqlite-bson = { path = "../mqlite-bson" }
 mqlite-catalog = { path = "../mqlite-catalog" }
 parking_lot.workspace = true

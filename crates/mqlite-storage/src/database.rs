@@ -16,6 +16,7 @@ use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexCatalog,
     IndexEntry, build_index_specs, validate_collection_indexes, validate_drop_indexes,
 };
+use mqlite_debug::{Component, add_counter, span};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -657,6 +658,7 @@ pub struct CompletedConcurrentCheckpoint {
 
 impl DatabaseFile {
     pub fn startup_metadata(path: impl AsRef<Path>) -> Result<StartupMetadata> {
+        let _span = span(Component::Storage, "startup_metadata");
         let path = path.as_ref();
         if !path.exists() {
             return Ok(StartupMetadata {
@@ -687,6 +689,7 @@ impl DatabaseFile {
         database: &str,
         collection: &str,
     ) -> Result<Option<Box<dyn CollectionReadView>>> {
+        let _span = span(Component::Storage, "open_page_backed_collection_read_view");
         Ok(
             v2_engine::open_collection_read_view(path, database, collection)?
                 .map(|view| Box::new(view) as Box<dyn CollectionReadView>),
@@ -694,10 +697,12 @@ impl DatabaseFile {
     }
 
     pub fn read_plan_cache_entries(path: impl AsRef<Path>) -> Result<Vec<PersistedPlanCacheEntry>> {
+        let _span = span(Component::Storage, "read_plan_cache_entries");
         v2_engine::load_plan_cache_entries_only(path)
     }
 
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
+        let _span = span(Component::Storage, "open_or_create");
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -797,12 +802,14 @@ impl DatabaseFile {
     }
 
     pub fn commit_mutation(&mut self, mutation: WalMutation) -> Result<u64> {
+        let _span = span(Component::Storage, "commit_mutation");
         let sequence = self.commit_mutation_unflushed(mutation)?;
         self.sync_pending_wal()?;
         Ok(sequence)
     }
 
     pub fn commit_mutation_unflushed(&mut self, mutation: WalMutation) -> Result<u64> {
+        let _span = span(Component::Storage, "commit_mutation_unflushed");
         let sequence = self.state.last_applied_sequence + 1;
         let validation_plan = validate_mutation(&self.state, &self.validation_state, &mutation)?;
 
@@ -826,10 +833,13 @@ impl DatabaseFile {
         self.wal_records_since_checkpoint += 1;
         self.wal_bytes_since_checkpoint += appended_bytes;
         self.truncated_wal_tail = false;
+        add_counter(Component::Storage, "walAppendedRecords", 1);
+        add_counter(Component::Storage, "walAppendedBytes", appended_bytes);
         Ok(sequence)
     }
 
     pub fn sync_pending_wal(&mut self) -> Result<u64> {
+        let _span = span(Component::Storage, "sync_pending_wal");
         if self.durable_sequence >= self.state.last_applied_sequence {
             return Ok(self.durable_sequence);
         }
@@ -842,6 +852,7 @@ impl DatabaseFile {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        let _span = span(Component::Storage, "foreground_checkpoint");
         if self.concurrent_checkpoint.is_some() {
             return Err(StorageError::ConcurrentCheckpointInProgress.into());
         }
@@ -933,6 +944,7 @@ impl DatabaseFile {
     }
 
     pub fn inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
+        let _span = span(Component::Storage, "inspect");
         let path = path.as_ref().to_path_buf();
         if !v2_engine::is_v2_file(&path)? {
             return Err(anyhow::anyhow!(
@@ -961,6 +973,7 @@ impl DatabaseFile {
     }
 
     pub fn info(path: impl AsRef<Path>) -> Result<InfoReport> {
+        let _span = span(Component::Storage, "info");
         let path = path.as_ref().to_path_buf();
         if !v2_engine::is_v2_file(&path)? {
             return Err(anyhow::anyhow!(
@@ -989,6 +1002,7 @@ impl DatabaseFile {
     }
 
     pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport> {
+        let _span = span(Component::Storage, "verify");
         let path = path.as_ref();
         if !v2_engine::is_v2_file(path)? {
             return Err(anyhow::anyhow!(
@@ -1026,12 +1040,14 @@ impl DatabaseFile {
     }
 
     fn initialize_file(&mut self) -> Result<()> {
+        let _span = span(Component::Storage, "initialize_file");
         v2_checkpoint::initialize_empty_file(&mut self.file)?;
         self.write_checkpoint()?;
         self.reload_from_disk()
     }
 
     fn reload_from_disk(&mut self) -> Result<()> {
+        let _span = span(Component::Storage, "reload_from_disk");
         let loaded = load_v2_state(&self.path, &mut self.file)?;
         self.state = loaded.state;
         self.validation_state = ValidationState::build(&self.state.catalog)?;
@@ -1055,6 +1071,7 @@ impl DatabaseFile {
     }
 
     fn write_checkpoint(&mut self) -> Result<()> {
+        let _span = span(Component::Storage, "write_checkpoint");
         self.state.file_format_version = v2_layout::FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
         let completed = v2_checkpoint::write_state_checkpoint_to_file(
@@ -1280,6 +1297,7 @@ fn v2_checkpoint_counts(superblock: &v2_layout::Superblock) -> CheckpointCounts 
 }
 
 fn load_v2_state(path: &Path, file: &mut File) -> Result<LoadedV2State> {
+    let _span = span(Component::Storage, "load_v2_state");
     let pager = V2Pager::open(path)?;
     let mut state = v2_engine::load_persisted_state(path)?;
     let wal_recovery = replay_wal(file, pager.active_superblock().wal_start_offset, &mut state)?;
@@ -1975,6 +1993,7 @@ fn replay_wal(
     start_offset: u64,
     state: &mut PersistedState,
 ) -> Result<WalRecovery> {
+    let _span = span(Component::Storage, "replay_wal");
     let file_size = file.metadata()?.len();
     if start_offset > file_size {
         return Err(StorageError::Truncated.into());
@@ -2024,6 +2043,7 @@ fn replay_wal(
             last_applied_sequence = entry.sequence;
             recovery.last_sequence = Some(entry.sequence);
             recovery.records += 1;
+            add_counter(Component::Storage, "walReplayRecords", 1);
         }
 
         offset = payload_end;
@@ -3278,6 +3298,7 @@ fn apply_wal_catalog_metadata(
     start_offset: u64,
     metadata: &mut WalCatalogMetadata,
 ) -> Result<WalMetadata> {
+    let _span = span(Component::Storage, "apply_wal_catalog_metadata");
     let file_size = file.metadata()?.len();
     if start_offset > file_size {
         return Err(StorageError::Truncated.into());
@@ -3318,6 +3339,7 @@ fn apply_wal_catalog_metadata(
         let entry = decode_compact_wal_entry(&payload)?;
         apply_wal_metadata_mutation(metadata, entry.mutation)?;
         wal.records += 1;
+        add_counter(Component::Storage, "walMetadataRecords", 1);
         offset = payload_end;
     }
 

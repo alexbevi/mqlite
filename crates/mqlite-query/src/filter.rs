@@ -7,6 +7,7 @@ use std::{
 
 use bson::{Bson, Document};
 use mqlite_bson::compare_bson;
+use mqlite_debug::{Component, span};
 use regex::{Regex as RustRegex, RegexBuilder};
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
 };
 
 pub fn parse_filter(document: &Document) -> Result<MatchExpr, QueryError> {
+    let _span = span(Component::Query, "parse_filter");
     parse_filter_with_context(document, true)
 }
 

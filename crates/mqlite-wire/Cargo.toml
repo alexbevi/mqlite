@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bson.workspace = true
 bytes.workspace = true
+mqlite-debug = { path = "../mqlite-debug" }
 mqlite-bson = { path = "../mqlite-bson" }
 thiserror.workspace = true
 tokio.workspace = true

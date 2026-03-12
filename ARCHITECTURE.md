@@ -378,11 +378,20 @@ The broker command path is:
 8. Cursor-producing commands hand their results to `mqlite-exec`.
 9. The broker writes the reply back as `OP_MSG`.
 
+When `mqlite command --debug` is used, the direct CLI path also emits a separate debug report on
+stderr. That report combines:
+
+- client-side IPC and wire timings
+- broker-side server, query, storage, catalog, exec, and BSON spans
+- counters such as page-cache hits and misses, page bytes read, and WAL replay counts
+- lightweight process snapshots for the client and broker processes
+
 ## CLI And Validation Paths
 
 The CLI surfaces split along intent:
 
 - `mqlite command`: direct broker protocol validation path
+- `mqlite command --debug`: same command path plus a structured diagnostics report on stderr
 - `mqlite info`: metadata-focused summary of catalog size, counts, and last checkpoint state
 - `mqlite inspect`: lower-level file, superblock, WAL, and page-graph metadata
 - `mqlite verify`: slower full reopen and validation path

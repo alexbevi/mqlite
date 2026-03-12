@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use bson::{Bson, Document, doc};
 use clap::{Parser, Subcommand};
+use mqlite_debug::{Component, SessionHandle, install, session};
 use mqlite_ipc::{BoxedStream, BrokerPaths, broker_paths, connect, read_manifest, remove_manifest};
 use mqlite_server::{Broker, BrokerConfig};
 use mqlite_storage::DatabaseFile;
@@ -19,6 +20,8 @@ use serde_json::json;
 #[command(name = "mqlite")]
 #[command(about = "A local MongoDB-compatible broker for file-backed databases")]
 struct Cli {
+    #[arg(long, global = true)]
+    debug: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -85,6 +88,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let debug = cli.debug;
 
     match cli.command {
         Command::Serve {
@@ -98,30 +102,64 @@ async fn main() -> Result<()> {
             broker.serve().await?;
         }
         Command::Checkpoint { file } => {
-            let mut database = DatabaseFile::open_or_create(file)?;
-            database.checkpoint()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&DatabaseFile::inspect(database.path())?)?
-            );
+            let session = debug.then(|| session("cli.checkpoint"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("command", "checkpoint");
+                session.insert_metadata("file", file.display().to_string());
+            }
+            let inspect = {
+                let _install = session.as_ref().map(install);
+                let mut database = DatabaseFile::open_or_create(file)?;
+                database.checkpoint()?;
+                DatabaseFile::inspect(database.path())?
+            };
+            println!("{}", serde_json::to_string_pretty(&inspect)?);
+            emit_local_debug_report(session.as_ref())?;
         }
         Command::Verify { file } => {
+            let session = debug.then(|| session("cli.verify"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("command", "verify");
+                session.insert_metadata("file", file.display().to_string());
+            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&DatabaseFile::verify(file)?)?
+                serde_json::to_string_pretty(&{
+                    let _install = session.as_ref().map(install);
+                    DatabaseFile::verify(file)?
+                })?
             );
+            emit_local_debug_report(session.as_ref())?;
         }
         Command::Inspect { file } => {
+            let session = debug.then(|| session("cli.inspect"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("command", "inspect");
+                session.insert_metadata("file", file.display().to_string());
+            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&DatabaseFile::inspect(file)?)?
+                serde_json::to_string_pretty(&{
+                    let _install = session.as_ref().map(install);
+                    DatabaseFile::inspect(file)?
+                })?
             );
+            emit_local_debug_report(session.as_ref())?;
         }
         Command::Info { file } => {
+            let session = debug.then(|| session("cli.info"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("command", "info");
+                session.insert_metadata("file", file.display().to_string());
+            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&DatabaseFile::info(file)?)?
+                serde_json::to_string_pretty(&{
+                    let _install = session.as_ref().map(install);
+                    DatabaseFile::info(file)?
+                })?
             );
+            emit_local_debug_report(session.as_ref())?;
         }
         Command::Request {
             file,
@@ -129,14 +167,47 @@ async fn main() -> Result<()> {
             eval,
             idle_shutdown_secs,
         } => {
-            let mut command = parse_command_document(eval)?;
+            let session = debug.then(|| session("cli.command"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("file", file.display().to_string());
+            }
+            let parse_started = Instant::now();
+            let mut command = {
+                let _install = session.as_ref().map(install);
+                parse_command_document(eval)?
+            };
+            if let Some(session) = session.as_ref() {
+                session.record_duration(
+                    Component::Cli,
+                    "parse_command_document",
+                    parse_started.elapsed(),
+                );
+            }
             if !command.contains_key("$db") {
                 command.insert("$db", db.unwrap_or_else(|| "admin".to_string()));
             }
+            if let Some(session) = session.as_ref() {
+                if let Ok(database) = command.get_str("$db") {
+                    session.insert_metadata("database", database);
+                }
+                if let Some(command_name) =
+                    command.keys().find(|key| !key.starts_with('$')).cloned()
+                {
+                    session.insert_metadata("command", command_name);
+                }
+            }
+            if debug {
+                command.insert("$mqliteDebug", true);
+            }
 
-            let mut stream = connect_or_spawn_broker(&file, idle_shutdown_secs).await?;
-            let response = send_command(&mut stream, command).await?;
+            let mut stream =
+                connect_or_spawn_broker(&file, idle_shutdown_secs, session.as_ref()).await?;
+            let mut response = send_command(&mut stream, command, session.as_ref()).await?;
+            let broker_debug = response
+                .remove("$mqliteDebug")
+                .and_then(|value| value.as_document().cloned());
             println!("{}", serde_json::to_string_pretty(&response)?);
+            emit_command_debug_report(session.as_ref(), broker_debug.as_ref())?;
             if response.get_f64("ok").unwrap_or(0.0) == 0.0 {
                 bail!(
                     "{}",
@@ -157,6 +228,12 @@ async fn main() -> Result<()> {
             unique_index,
             idle_shutdown_secs,
         } => {
+            let session = debug.then(|| session("cli.bench"));
+            if let Some(session) = session.as_ref() {
+                session.insert_metadata("command", "bench");
+                session.insert_metadata("file", file.display().to_string());
+            }
+            let bench_started = Instant::now();
             let report = run_benchmark(
                 &file,
                 BenchmarkOptions {
@@ -171,7 +248,11 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
+            if let Some(session) = session.as_ref() {
+                session.record_duration(Component::Cli, "run_benchmark", bench_started.elapsed());
+            }
             println!("{}", serde_json::to_string_pretty(&report)?);
+            emit_local_debug_report(session.as_ref())?;
         }
     }
 
@@ -200,19 +281,33 @@ fn parse_command_document(eval: Option<String>) -> Result<Document> {
     Ok(document)
 }
 
-async fn connect_or_spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<BoxedStream> {
+async fn connect_or_spawn_broker(
+    file: &Path,
+    idle_shutdown_secs: u64,
+    debug: Option<&SessionHandle>,
+) -> Result<BoxedStream> {
     let paths = broker_paths(file)?;
 
-    if let Some(stream) = try_connect_existing(&paths).await? {
+    if let Some(stream) = try_connect_existing(&paths, debug).await? {
         return Ok(stream);
     }
 
-    let child = spawn_broker(&paths.database_path, idle_shutdown_secs)?;
-    wait_for_broker(&paths, child, Duration::from_secs(5)).await
+    if let Some(debug) = debug {
+        debug.insert_metadata("brokerLaunch", "spawned");
+    }
+    let child = spawn_broker(&paths.database_path, idle_shutdown_secs, debug)?;
+    wait_for_broker(&paths, child, Duration::from_secs(5), debug).await
 }
 
-async fn try_connect_existing(paths: &BrokerPaths) -> Result<Option<BoxedStream>> {
+async fn try_connect_existing(
+    paths: &BrokerPaths,
+    debug: Option<&SessionHandle>,
+) -> Result<Option<BoxedStream>> {
+    let started = Instant::now();
     if !paths.manifest_path.exists() {
+        if let Some(debug) = debug {
+            debug.record_duration(Component::Ipc, "try_connect_existing", started.elapsed());
+        }
         return Ok(None);
     }
 
@@ -220,20 +315,37 @@ async fn try_connect_existing(paths: &BrokerPaths) -> Result<Option<BoxedStream>
         Ok(manifest) => manifest,
         Err(_) => {
             let _ = remove_manifest(&paths.manifest_path);
+            if let Some(debug) = debug {
+                debug.record_duration(Component::Ipc, "try_connect_existing", started.elapsed());
+            }
             return Ok(None);
         }
     };
 
     match connect(&manifest.endpoint).await {
-        Ok(stream) => Ok(Some(stream)),
+        Ok(stream) => {
+            if let Some(debug) = debug {
+                debug.record_duration(Component::Ipc, "try_connect_existing", started.elapsed());
+                debug.insert_metadata("brokerLaunch", "existing");
+            }
+            Ok(Some(stream))
+        }
         Err(_) => {
             let _ = remove_manifest(&paths.manifest_path);
+            if let Some(debug) = debug {
+                debug.record_duration(Component::Ipc, "try_connect_existing", started.elapsed());
+            }
             Ok(None)
         }
     }
 }
 
-fn spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<Child> {
+fn spawn_broker(
+    file: &Path,
+    idle_shutdown_secs: u64,
+    debug: Option<&SessionHandle>,
+) -> Result<Child> {
+    let started = Instant::now();
     let current_executable =
         std::env::current_exe().context("failed to locate mqlite executable")?;
     let child = ProcessCommand::new(current_executable)
@@ -246,6 +358,9 @@ fn spawn_broker(file: &Path, idle_shutdown_secs: u64) -> Result<Child> {
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn mqlite broker")?;
+    if let Some(debug) = debug {
+        debug.record_duration(Component::Ipc, "spawn_broker", started.elapsed());
+    }
     Ok(child)
 }
 
@@ -253,11 +368,16 @@ async fn wait_for_broker(
     paths: &BrokerPaths,
     mut child: Child,
     timeout: Duration,
+    debug: Option<&SessionHandle>,
 ) -> Result<BoxedStream> {
+    let started = Instant::now();
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(manifest) = read_manifest(&paths.manifest_path) {
             if let Ok(stream) = connect(&manifest.endpoint).await {
+                if let Some(debug) = debug {
+                    debug.record_duration(Component::Ipc, "wait_for_broker", started.elapsed());
+                }
                 return Ok(stream);
             }
         }
@@ -308,10 +428,32 @@ fn broker_startup_error(
     }
 }
 
-async fn send_command(stream: &mut BoxedStream, body: Document) -> Result<Document> {
+async fn send_command(
+    stream: &mut BoxedStream,
+    body: Document,
+    debug: Option<&SessionHandle>,
+) -> Result<Document> {
+    let request_fields = body.len() as u64;
     let request = OpMsg::new(1, 0, vec![PayloadSection::Body(body)]);
+    let write_started = Instant::now();
     write_op_msg(stream, &request).await?;
+    if let Some(debug) = debug {
+        debug.record_duration(
+            Component::Wire,
+            "client_write_op_msg",
+            write_started.elapsed(),
+        );
+        debug.record_counter(Component::Wire, "clientRequestFields", request_fields);
+    }
+    let read_started = Instant::now();
     let response = read_op_msg(stream).await?;
+    if let Some(debug) = debug {
+        debug.record_duration(
+            Component::Wire,
+            "client_read_op_msg",
+            read_started.elapsed(),
+        );
+    }
     response
         .body()
         .cloned()
@@ -319,7 +461,7 @@ async fn send_command(stream: &mut BoxedStream, body: Document) -> Result<Docume
 }
 
 async fn send_checked_command(stream: &mut BoxedStream, body: Document) -> Result<Document> {
-    let response = send_command(stream, body).await?;
+    let response = send_command(stream, body, None).await?;
     if response.get_f64("ok").unwrap_or(0.0) == 0.0 {
         bail!(
             "{}",
@@ -329,6 +471,43 @@ async fn send_checked_command(stream: &mut BoxedStream, body: Document) -> Resul
         );
     }
     Ok(response)
+}
+
+fn emit_local_debug_report(session: Option<&SessionHandle>) -> Result<()> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "debug": {
+                "client": session.report(),
+            }
+        }))?
+    );
+    Ok(())
+}
+
+fn emit_command_debug_report(
+    session: Option<&SessionHandle>,
+    broker_debug: Option<&Document>,
+) -> Result<()> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    let mut debug = serde_json::Map::new();
+    debug.insert(
+        "client".to_string(),
+        serde_json::to_value(session.report())?,
+    );
+    if let Some(broker_debug) = broker_debug {
+        debug.insert("broker".to_string(), serde_json::to_value(broker_debug)?);
+    }
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "debug": debug }))?
+    );
+    Ok(())
 }
 
 struct BenchmarkOptions<'a> {
@@ -368,7 +547,7 @@ async fn run_benchmark(file: &Path, options: BenchmarkOptions<'_>) -> Result<ser
         .to_string();
     let collection = format!("{collection_prefix}_{run_id}");
     let startup_started_at = Instant::now();
-    let mut stream = connect_or_spawn_broker(file, idle_shutdown_secs).await?;
+    let mut stream = connect_or_spawn_broker(file, idle_shutdown_secs, None).await?;
     let startup_elapsed = startup_started_at.elapsed();
 
     send_checked_command(

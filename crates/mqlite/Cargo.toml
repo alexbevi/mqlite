@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 bson.workspace = true
 clap.workspace = true
+mqlite-debug = { path = "../mqlite-debug" }
 mqlite-ipc = { path = "../mqlite-ipc" }
 mqlite-server = { path = "../mqlite-server" }
 mqlite-storage = { path = "../mqlite-storage" }

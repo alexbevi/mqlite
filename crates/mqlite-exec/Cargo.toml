@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 bson.workspace = true
+mqlite-debug = { path = "../mqlite-debug" }
 parking_lot.workspace = true
 thiserror.workspace = true
 

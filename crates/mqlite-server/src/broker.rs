@@ -17,6 +17,7 @@ use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
     IndexCatalog, IndexEntry, build_index_specs, validate_drop_indexes,
 };
+use mqlite_debug::{Component, SessionHandle, add_counter, install, set_metadata, span};
 use mqlite_exec::{CursorError, CursorManager};
 use mqlite_ipc::{
     BoxedStream, BrokerManifest, BrokerPaths, IpcListener, broker_paths, cleanup_endpoint,
@@ -51,6 +52,7 @@ const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 const DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
 const CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const MQLITE_DEBUG_FIELD: &str = "$mqliteDebug";
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -480,6 +482,7 @@ impl Broker {
         sort: Option<&Document>,
         projection: Option<&Document>,
     ) -> Result<CachedFindPlan, CommandError> {
+        let _span = span(Component::Server, "cached_find_plan");
         self.ensure_plan_cache_loaded()?;
         let cache_key = build_plan_cache_key(&namespace, filter, sort, projection)?;
         let preferred_choice = self
@@ -532,6 +535,7 @@ impl Broker {
     }
 
     fn ensure_storage_open(&self) -> Result<(), CommandError> {
+        let _span = span(Component::Storage, "ensure_storage_open");
         if self.storage_is_loaded() {
             return Ok(());
         }
@@ -566,6 +570,7 @@ impl Broker {
     }
 
     fn ensure_plan_cache_loaded(&self) -> Result<(), CommandError> {
+        let _span = span(Component::Server, "ensure_plan_cache_loaded");
         if self.plan_cache.lock().loaded {
             return Ok(());
         }
@@ -602,7 +607,9 @@ impl Broker {
         collection: &str,
         f: impl FnOnce(u64, Option<&dyn StorageCollectionReadView>) -> Result<T, CommandError>,
     ) -> Result<T, CommandError> {
+        let _span = span(Component::Server, "with_query_collection");
         if self.storage_is_loaded() {
+            set_metadata("readPath", "mutableStorageLoaded");
             let storage = self.durable_storage_read()?;
             let sequence = storage.last_applied_sequence();
             let view = storage
@@ -612,12 +619,14 @@ impl Broker {
         }
 
         if !self.paths.database_path.exists() {
+            set_metadata("readPath", "missingFile");
             return f(0, None);
         }
 
         let startup =
             DatabaseFile::startup_metadata(&self.paths.database_path).map_err(internal_error)?;
         if startup.has_pending_wal {
+            set_metadata("readPath", "mutableStoragePendingWal");
             let storage = self.durable_storage_read()?;
             let sequence = storage.last_applied_sequence();
             let view = storage
@@ -632,12 +641,14 @@ impl Broker {
             collection,
         )
         .map_err(internal_error)?;
+        set_metadata("readPath", "pageBacked");
         f(startup.durable_sequence, view.as_deref())
     }
 
     fn durable_storage_read(
         &self,
     ) -> Result<MappedRwLockReadGuard<'_, BoxedStorageEngine>, CommandError> {
+        let _span = span(Component::Storage, "durable_storage_read");
         loop {
             let storage = self.storage_read()?;
             let visible_sequence = storage.last_applied_sequence();
@@ -681,6 +692,7 @@ impl Broker {
 
     async fn handle_connection(&self, mut stream: BoxedStream) -> Result<()> {
         loop {
+            let read_started = Instant::now();
             let request = match read_op_msg(&mut stream).await {
                 Ok(message) => message,
                 Err(mqlite_wire::WireError::Io(error))
@@ -697,11 +709,23 @@ impl Broker {
             };
 
             let body = request.materialize_command()?;
+            let (body, debug_session) =
+                command_debug_session(&body, self.storage_is_loaded(), read_started.elapsed())?;
             let _command_guard = ActiveCommandGuard::new(
                 Arc::clone(&self.active_commands),
                 Arc::clone(&self.last_activity),
             );
-            let response_body = match self.maybe_apply_fail_command(&body).await {
+            let fail_started = Instant::now();
+            let fail_action = self.maybe_apply_fail_command(&body).await;
+            if let Some(session) = debug_session.as_ref() {
+                session.record_duration(
+                    Component::Server,
+                    "maybe_apply_fail_command",
+                    fail_started.elapsed(),
+                );
+            }
+            let _debug_install = debug_session.as_ref().map(install);
+            let mut response_body = match fail_action {
                 Ok(FailCommandAction::Continue) => match self.dispatch(&body) {
                     Ok(document) => ok_response(document),
                     Err(error) => error.to_document(),
@@ -710,16 +734,28 @@ impl Broker {
                 Ok(FailCommandAction::CloseConnection) => return Ok(()),
                 Err(error) => error.to_document(),
             };
+            if let Some(session) = debug_session.as_ref() {
+                attach_debug_report(&mut response_body, session)?;
+            }
             let response = OpMsg::new(
                 request.request_id + 1,
                 request.request_id,
                 vec![PayloadSection::Body(response_body)],
             );
+            let write_started = Instant::now();
             write_op_msg(&mut stream, &response).await?;
+            if let Some(session) = debug_session.as_ref() {
+                session.record_duration(
+                    Component::Wire,
+                    "server_write_op_msg",
+                    write_started.elapsed(),
+                );
+            }
         }
     }
 
     fn dispatch(&self, body: &Document) -> Result<Document, CommandError> {
+        let _span = span(Component::Server, "dispatch");
         let command_name = command_name(body)
             .ok_or_else(|| CommandError::new(9, "FailedToParse", "command body is empty"))?;
         if command_name != "hello" && command_name != "isMaster" && command_name != "ismaster" {
@@ -1807,6 +1843,7 @@ impl Broker {
     }
 
     fn handle_find(&self, body: &Document) -> Result<Document, CommandError> {
+        let _span = span(Component::Server, "handle_find");
         let database = database_name(body)?;
         let collection = body.get_str("find").map_err(|_| {
             CommandError::new(9, "FailedToParse", "find requires a collection name")
@@ -1822,6 +1859,9 @@ impl Broker {
         let limit = body.get_i64("limit").unwrap_or(0);
         let batch_size = body.get_i64("batchSize").ok();
         let single_batch = body.get_bool("singleBatch").unwrap_or(false);
+        set_metadata("database", database.clone());
+        set_metadata("collection", collection.to_string());
+        set_metadata("command", "find");
 
         // Validate the query shape even when the collection does not exist so unsupported
         // operators never degrade into an empty successful result.
@@ -2225,6 +2265,7 @@ impl Broker {
     }
 
     fn handle_count(&self, body: &Document) -> Result<Document, CommandError> {
+        let _span = span(Component::Server, "handle_count");
         let database = database_name(body)?;
         let collection_name = body.get_str("count").map_err(|_| {
             CommandError::new(9, "FailedToParse", "count requires a collection name")
@@ -2256,6 +2297,7 @@ impl Broker {
     }
 
     fn handle_distinct(&self, body: &Document) -> Result<Document, CommandError> {
+        let _span = span(Component::Server, "handle_distinct");
         let database = database_name(body)?;
         let collection_name = body.get_str("distinct").map_err(|_| {
             CommandError::new(9, "FailedToParse", "distinct requires a collection name")
@@ -4599,10 +4641,18 @@ impl<'a> StorageFindCollection<'a> {
 
 impl FindCollection for StorageFindCollection<'_> {
     fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError> {
-        self.inner.scan_records().map_err(internal_error)
+        let _span = span(Component::Catalog, "find_collection_scan_records");
+        let records = self.inner.scan_records().map_err(internal_error)?;
+        add_counter(
+            Component::Catalog,
+            "findCollectionRecords",
+            records.len() as u64,
+        );
+        Ok(records)
     }
 
     fn record_document(&self, record_id: u64) -> Result<Option<Document>, CommandError> {
+        let _span = span(Component::Catalog, "find_collection_record_document");
         self.inner
             .record_document(record_id)
             .map_err(internal_error)
@@ -4635,7 +4685,10 @@ impl FindIndex for StorageFindIndex<'_> {
     }
 
     fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError> {
-        self.inner.scan_entries(bounds).map_err(internal_error)
+        let _span = span(Component::Catalog, "find_index_scan_entries");
+        let entries = self.inner.scan_entries(bounds).map_err(internal_error)?;
+        add_counter(Component::Catalog, "findIndexEntries", entries.len() as u64);
+        Ok(entries)
     }
 
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
@@ -4956,6 +5009,7 @@ fn plan_find(
     projection: Option<&Document>,
     preferred_choice: Option<&PersistedPlanCacheChoice>,
 ) -> Result<PlannedFind, CommandError> {
+    let _span = span(Component::Query, "plan_find");
     let expression = parse_filter(filter)?;
     let simple_preferred_index = match preferred_choice {
         Some(PersistedPlanCacheChoice::CollectionScan) => None,
@@ -5003,6 +5057,7 @@ fn plan_find_simple(
     projection: Option<&Document>,
     preferred_index: Option<&str>,
 ) -> Result<PlannedFind, CommandError> {
+    let _span = span(Component::Query, "plan_find_simple");
     let field_bounds = extract_field_bounds(expression).unwrap_or_default();
     let filter_paths = collect_match_paths(expression);
     let projection_requirements = analyze_projection_requirements(projection)?;
@@ -5064,7 +5119,13 @@ fn plan_collection_scan(
     expression: &MatchExpr,
     sort: Option<&Document>,
 ) -> Result<PlannedFind, CommandError> {
+    let _span = span(Component::Query, "plan_collection_scan");
     let records = collection.scan_records()?;
+    add_counter(
+        Component::Query,
+        "collectionScanRecords",
+        records.len() as u64,
+    );
     let docs_examined = records.len();
     let (record_ids, documents) = records
         .into_iter()
@@ -5085,6 +5146,7 @@ fn plan_or_find(
     sort: Option<&Document>,
     preferred_choices: Option<&[PersistedPlanCacheChoice]>,
 ) -> Result<Option<PlannedFind>, CommandError> {
+    let _span = span(Component::Query, "plan_or_find");
     if branches.is_empty() || branches.len() > MAX_OR_BRANCHES {
         return Ok(None);
     }
@@ -5147,6 +5209,7 @@ fn evaluate_index_plan(
     context: &FindPlanContext<'_>,
     index: &dyn FindIndex,
 ) -> Result<Option<PlannedFind>, CommandError> {
+    let _span = span(Component::Query, "evaluate_index_plan");
     let filter_plan = build_index_bounds(index, context.field_bounds);
     let sort_plan = analyze_sort(index, context.field_bounds, context.sort);
     let filter_supported =
@@ -5358,6 +5421,7 @@ fn scan_index_intervals(
     bounds: &[IndexBounds],
     scan_direction: ScanDirection,
 ) -> Result<(Vec<IndexEntry>, usize), CommandError> {
+    let _span = span(Component::Query, "scan_index_intervals");
     let intervals = if bounds.is_empty() {
         vec![full_range_bounds()]
     } else {
@@ -5378,6 +5442,7 @@ fn scan_index_intervals(
     if scan_direction == ScanDirection::Backward {
         entries.reverse();
     }
+    add_counter(Component::Query, "indexKeysExamined", keys_examined as u64);
     Ok((entries, keys_examined))
 }
 
@@ -5745,6 +5810,7 @@ fn fetch_record_document(
     collection: &dyn FindCollection,
     record_id: u64,
 ) -> Result<Document, CommandError> {
+    let _span = span(Component::Catalog, "fetch_record_document");
     collection
         .record_document(record_id)?
         .ok_or_else(|| CommandError::new(8, "UnknownError", "missing record for index entry"))
@@ -5762,6 +5828,49 @@ fn build_plan_cache_key(
         sort_shape: sort_shape(sort),
         projection_shape: projection_shape(projection),
     })
+}
+
+fn command_debug_session(
+    body: &Document,
+    storage_loaded: bool,
+    read_elapsed: Duration,
+) -> Result<(Document, Option<SessionHandle>), CommandError> {
+    let mut body = body.clone();
+    let Some(debug_flag) = body.remove(MQLITE_DEBUG_FIELD) else {
+        return Ok((body, None));
+    };
+    let debug_enabled = debug_flag.as_bool().ok_or_else(|| {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            format!("{MQLITE_DEBUG_FIELD} must be a boolean"),
+        )
+    })?;
+    if !debug_enabled {
+        return Ok((body, None));
+    }
+
+    let session = mqlite_debug::session("broker.command");
+    session.record_duration(Component::Wire, "server_read_op_msg", read_elapsed);
+    session.insert_metadata("brokerPid", std::process::id().to_string());
+    session.insert_metadata("storageLoadedAtStart", storage_loaded.to_string());
+    if let Some(command) = command_name(&body) {
+        session.insert_metadata("command", command);
+    }
+    if let Ok(database) = database_name(&body) {
+        session.insert_metadata("database", database);
+    }
+    Ok((body, Some(session)))
+}
+
+fn attach_debug_report(
+    response: &mut Document,
+    session: &SessionHandle,
+) -> Result<(), CommandError> {
+    let debug_document = bson::to_document(&session.report())
+        .map_err(|error| internal_error(anyhow!("failed to serialize debug report: {error}")))?;
+    response.insert(MQLITE_DEBUG_FIELD, Bson::Document(debug_document));
+    Ok(())
 }
 
 fn plan_cache_key_from_entry(entry: &PersistedPlanCacheEntry) -> PlanCacheKey {
@@ -6595,6 +6704,7 @@ fn zero_write_concern_timeout(value: &Bson) -> bool {
 }
 
 fn sort_documents(documents: &mut [Document], sort: &Document) {
+    let _span = span(Component::Query, "sort_documents");
     documents.sort_by(|left, right| {
         for (field, direction) in sort {
             let left_value = lookup_path_owned(left, field).unwrap_or(Bson::Null);

@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use anyhow::{Result, anyhow};
 use bson::Document;
 use mqlite_catalog::{IndexBounds, IndexEntry};
+use mqlite_debug::{Component, add_counter, span};
 
 use crate::v2::{
     keycodec::{compare_encoded_index_keys, encode_index_key},
@@ -47,6 +48,7 @@ impl RecordTree {
     }
 
     pub fn lookup<R: PageReader>(&self, reader: &R, record_id: u64) -> Result<Option<RecordSlot>> {
+        let _span = span(Component::Storage, "record_tree_lookup");
         let Some(mut page_id) = self.root_page_id else {
             return Ok(None);
         };
@@ -77,6 +79,7 @@ impl RecordTree {
     }
 
     pub fn scan<R: PageReader>(&self, reader: &R) -> Result<Vec<RecordSlot>> {
+        let _span = span(Component::Storage, "record_tree_scan");
         let Some(mut page_id) = self.root_page_id else {
             return Ok(Vec::new());
         };
@@ -103,6 +106,11 @@ impl RecordTree {
             next_page_id = page.next_page_id;
             records.extend(page.entries);
         }
+        add_counter(
+            Component::Storage,
+            "recordTreeScanRecords",
+            records.len() as u64,
+        );
         Ok(records)
     }
 }
@@ -127,6 +135,7 @@ impl SecondaryTree {
         bounds: &IndexBounds,
         direction: ScanDirection,
     ) -> Result<Vec<IndexEntry>> {
+        let _span = span(Component::Storage, "secondary_tree_scan_bounds");
         let Some(root_page_id) = self.root_page_id else {
             return Ok(Vec::new());
         };
@@ -157,6 +166,11 @@ impl SecondaryTree {
         if direction == ScanDirection::Backward {
             entries.reverse();
         }
+        add_counter(
+            Component::Storage,
+            "secondaryTreeScanEntries",
+            entries.len() as u64,
+        );
         Ok(entries)
     }
 
@@ -165,6 +179,7 @@ impl SecondaryTree {
         reader: &R,
         key: &Document,
     ) -> Result<Option<u64>> {
+        let _span = span(Component::Storage, "secondary_tree_lookup_exact_record_id");
         let Some(root_page_id) = self.root_page_id else {
             return Ok(None);
         };

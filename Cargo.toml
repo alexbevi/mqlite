@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mqlite",
+    "crates/mqlite-debug",
     "crates/mqlite-capabilities",
     "crates/mqlite-bson",
     "crates/mqlite-wire",
@@ -31,6 +32,7 @@ chrono-tz = "=0.10.1"
 clap = { version = "=4.5.32", features = ["derive"] }
 criterion = "=0.5.1"
 fs4 = "=0.8.4"
+libc = "=0.2.182"
 parking_lot = "=0.12.3"
 pretty_assertions = "=1.4.1"
 predicates = "=3.1.4"

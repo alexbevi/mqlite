@@ -68,6 +68,83 @@ fn inspect_and_verify_commands_work() {
 }
 
 #[test]
+fn command_debug_flag_emits_combined_client_and_broker_report() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("debug-cli.mongodb");
+
+    let mut create = Command::cargo_bin("mqlite").expect("binary");
+    create
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"create":"widgets"}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    wait_for_broker_exit(&database_path);
+
+    let mut debug_find = Command::cargo_bin("mqlite").expect("binary");
+    let output = debug_find
+        .args([
+            "--debug",
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"find":"widgets","filter":{},"limit":1}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let response: Value =
+        serde_json::from_slice(&output.stdout).expect("debug command stdout response");
+    assert_json_number_close(&response["ok"], 1.0);
+    assert_eq!(
+        response["cursor"]["firstBatch"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let debug: Value = serde_json::from_slice(&output.stderr).expect("debug command stderr report");
+    assert_eq!(debug["debug"]["client"]["metadata"]["command"], "find");
+    assert_eq!(debug["debug"]["broker"]["metadata"]["command"], "find");
+    assert_eq!(
+        debug["debug"]["broker"]["metadata"]["readPath"],
+        "pageBacked"
+    );
+    assert!(
+        debug["debug"]["broker"]["spans"]
+            .as_array()
+            .expect("broker spans")
+            .iter()
+            .any(|span| span["operation"] == "handle_find"),
+        "expected handle_find span in broker debug report"
+    );
+}
+
+#[test]
 fn info_command_reports_current_and_checkpoint_state() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("info-cli.mongodb");

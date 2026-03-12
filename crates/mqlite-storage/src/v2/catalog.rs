@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use bson::{Bson, Document, doc};
 use mqlite_bson::compare_bson;
 use mqlite_catalog::{CollectionCatalog, CollectionRecord, IndexBounds, IndexCatalog, IndexEntry};
+use mqlite_debug::{Component, add_counter, span};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -118,6 +119,7 @@ impl CollectionHandle {
     }
 
     pub fn scan_records<R: PageReader>(&self, reader: &R) -> Result<Vec<RecordSlot>> {
+        let _span = span(Component::Catalog, "collection_scan_records");
         self.record_tree.scan(reader)
     }
 
@@ -243,6 +245,7 @@ impl PagerCollectionReadView {
 
 impl CollectionReadView for PagerCollectionReadView {
     fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
+        let _span = span(Component::Catalog, "pager_collection_scan_records");
         self.collection
             .scan_records(&*self.pager)?
             .into_iter()
@@ -257,6 +260,7 @@ impl CollectionReadView for PagerCollectionReadView {
     }
 
     fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
+        let _span = span(Component::Catalog, "pager_collection_record_document");
         self.collection
             .record_by_id(&*self.pager, record_id)?
             .map(|record| record.decode_document())
@@ -294,8 +298,16 @@ impl IndexReadView for PagerIndexReadView {
     }
 
     fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>> {
-        self.index
-            .scan_bounds(&*self.pager, bounds, ScanDirection::Forward)
+        let _span = span(Component::Catalog, "pager_index_scan_entries");
+        let entries = self
+            .index
+            .scan_bounds(&*self.pager, bounds, ScanDirection::Forward)?;
+        add_counter(
+            Component::Catalog,
+            "indexEntriesScanned",
+            entries.len() as u64,
+        );
+        Ok(entries)
     }
 
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
@@ -363,6 +375,7 @@ impl PagerNamespaceCatalog {
         database: &str,
         collection: &str,
     ) -> Result<Option<PagerCollectionReadView>> {
+        let _span = span(Component::Catalog, "namespace_collection_read_view");
         let Some(collection_meta_page_id) = lookup_namespace_target(
             &*self.pager,
             self.namespace_root_page_id,
@@ -379,6 +392,7 @@ impl PagerNamespaceCatalog {
     }
 
     pub fn collection_handles(&self) -> Result<Vec<CollectionHandle>> {
+        let _span = span(Component::Catalog, "namespace_collection_handles");
         scan_namespace_entries(&*self.pager, self.namespace_root_page_id)?
             .into_iter()
             .map(|entry| load_collection_handle(&*self.pager, entry.target_page_id))
@@ -386,6 +400,7 @@ impl PagerNamespaceCatalog {
     }
 
     pub fn load_catalog(&self) -> Result<mqlite_catalog::Catalog> {
+        let _span = span(Component::Catalog, "namespace_load_catalog");
         let mut catalog = mqlite_catalog::Catalog::new();
         for entry in scan_namespace_entries(&*self.pager, self.namespace_root_page_id)? {
             let collection = load_collection_catalog(&*self.pager, entry.target_page_id)?;

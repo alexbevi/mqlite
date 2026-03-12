@@ -9,6 +9,7 @@ use std::{
 use anyhow::Result;
 use fs4::FileExt;
 use mqlite_catalog::Catalog;
+use mqlite_debug::{Component, span};
 
 use crate::{
     InfoCheckpoint, InfoCollection, InfoCollectionCheckpoint, InfoDatabase, InfoDatabaseCheckpoint,
@@ -26,6 +27,7 @@ use crate::{
 };
 
 pub(crate) fn is_v2_file(path: impl AsRef<Path>) -> Result<bool> {
+    let _span = span(Component::Storage, "is_v2_file");
     let mut file = OpenOptions::new().read(true).open(path)?;
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
@@ -33,6 +35,7 @@ pub(crate) fn is_v2_file(path: impl AsRef<Path>) -> Result<bool> {
 }
 
 pub(crate) fn create_empty(path: impl AsRef<Path>) -> Result<()> {
+    let _span = span(Component::Storage, "create_empty_v2_file");
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -60,6 +63,7 @@ pub(crate) fn create_empty(path: impl AsRef<Path>) -> Result<()> {
 }
 
 pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
+    let _span = span(Component::Storage, "read_info_checkpoint");
     let path = path.as_ref().to_path_buf();
     let pager = Pager::open(&path)?;
     let header = pager.header();
@@ -138,6 +142,7 @@ pub(crate) fn read_info(path: impl AsRef<Path>) -> Result<InfoReport> {
 }
 
 pub(crate) fn read_inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
+    let _span = span(Component::Storage, "read_inspect_checkpoint");
     let path = path.as_ref().to_path_buf();
     let pager = Pager::open(&path)?;
     let header = pager.header();
@@ -182,6 +187,7 @@ pub(crate) fn read_inspect(path: impl AsRef<Path>) -> Result<InspectReport> {
 }
 
 pub(crate) fn open_namespace_catalog(path: impl AsRef<Path>) -> Result<PagerNamespaceCatalog> {
+    let _span = span(Component::Catalog, "open_namespace_catalog");
     let pager = Arc::new(Pager::open(path)?);
     let namespace_root_page_id = pager.active_superblock().roots.namespace_root_page_id;
     Ok(PagerNamespaceCatalog::new(namespace_root_page_id, pager))
@@ -192,22 +198,26 @@ pub(crate) fn open_collection_read_view(
     database: &str,
     collection: &str,
 ) -> Result<Option<PagerCollectionReadView>> {
+    let _span = span(Component::Catalog, "open_collection_read_view");
     open_namespace_catalog(path)?.collection_read_view(database, collection)
 }
 
 pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
+    let _span = span(Component::Catalog, "load_catalog");
     open_namespace_catalog(path)?.load_catalog()
 }
 
 pub(crate) fn load_plan_cache_entries_only(
     path: impl AsRef<Path>,
 ) -> Result<Vec<PersistedPlanCacheEntry>> {
+    let _span = span(Component::Storage, "load_plan_cache_entries_only");
     let pager = Arc::new(Pager::open(path)?);
     let root_page_id = pager.active_superblock().roots.plan_cache_root_page_id;
     load_plan_cache_entries(&pager, root_page_id)
 }
 
 pub(crate) fn load_persisted_state(path: impl AsRef<Path>) -> Result<PersistedState> {
+    let _span = span(Component::Storage, "load_persisted_state");
     let pager = Arc::new(Pager::open(path)?);
     let durable_lsn = pager.active_superblock().durable_lsn;
     let last_checkpoint_unix_ms = pager.active_superblock().last_checkpoint_unix_ms;

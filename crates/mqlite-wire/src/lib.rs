@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use bson::Document;
+use mqlite_debug::{Component, add_counter, span};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -84,6 +85,7 @@ impl OpMsg {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let _span = span(Component::Wire, "op_msg_encode");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0_i32.to_le_bytes());
         bytes.extend_from_slice(&self.request_id.to_le_bytes());
@@ -118,10 +120,13 @@ impl OpMsg {
 
         let message_length = bytes.len() as i32;
         bytes[..4].copy_from_slice(&message_length.to_le_bytes());
+        add_counter(Component::Wire, "encodedMessageBytes", bytes.len() as u64);
         Ok(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let _span = span(Component::Wire, "op_msg_decode");
+        add_counter(Component::Wire, "decodedMessageBytes", bytes.len() as u64);
         if bytes.len() < 20 {
             return Err(WireError::Truncated);
         }
@@ -242,6 +247,8 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, WireError> {
 }
 
 pub fn decode_document(bytes: &[u8]) -> Result<Document, WireError> {
+    let _span = span(Component::Wire, "decode_document");
+    add_counter(Component::Wire, "decodedDocumentBytes", bytes.len() as u64);
     let mut cursor = Cursor::new(bytes);
     Ok(Document::from_reader(&mut cursor)?)
 }

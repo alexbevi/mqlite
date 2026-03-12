@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 
 use bson::{Bson, Document, oid::ObjectId};
+use mqlite_debug::{Component, add_counter, span};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,10 +11,15 @@ pub enum BsonToolsError {
 }
 
 pub fn serialize_document(document: &Document) -> bson::ser::Result<Vec<u8>> {
-    bson::to_vec(document)
+    let _span = span(Component::Bson, "serialize_document");
+    let bytes = bson::to_vec(document)?;
+    add_counter(Component::Bson, "serializedBytes", bytes.len() as u64);
+    Ok(bytes)
 }
 
 pub fn deserialize_document(bytes: &[u8]) -> bson::de::Result<Document> {
+    let _span = span(Component::Bson, "deserialize_document");
+    add_counter(Component::Bson, "deserializedBytes", bytes.len() as u64);
     bson::from_slice(bytes)
 }
 

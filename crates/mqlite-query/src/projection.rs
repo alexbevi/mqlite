@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use bson::{Bson, Document};
 use mqlite_bson::{lookup_path, remove_path, set_path};
+use mqlite_debug::{Component, span};
 
 use crate::{
     QueryError,
@@ -12,6 +13,7 @@ pub fn apply_projection(
     document: &Document,
     projection: Option<&Document>,
 ) -> Result<Document, QueryError> {
+    let _span = span(Component::Query, "apply_projection");
     apply_projection_with_variables(document, projection, &BTreeMap::new())
 }
 

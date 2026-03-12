@@ -7,6 +7,7 @@ use std::{
 use bson::{Bson, Document, doc};
 use chrono::{DateTime, Datelike, Duration, Months, Utc};
 use mqlite_bson::{compare_bson, lookup_path, lookup_path_owned, remove_path, set_path};
+use mqlite_debug::{Component, span};
 
 use crate::{
     QueryError,
@@ -48,6 +49,7 @@ pub fn run_pipeline(
     documents: Vec<Document>,
     pipeline: &[Document],
 ) -> Result<Vec<Document>, QueryError> {
+    let _span = span(Component::Query, "run_pipeline");
     let resolver = NoopResolver;
     run_pipeline_with_resolver(documents, pipeline, "", None, &resolver)
 }
@@ -59,6 +61,7 @@ pub fn run_pipeline_with_resolver<R: CollectionResolver>(
     source_collection: Option<&str>,
     resolver: &R,
 ) -> Result<Vec<Document>, QueryError> {
+    let _span = span(Component::Query, "run_pipeline_with_resolver");
     let context = PipelineContext {
         inside_facet: false,
         database,

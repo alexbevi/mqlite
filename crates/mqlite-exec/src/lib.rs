@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use bson::Document;
+use mqlite_debug::{Component, add_counter, span};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +45,12 @@ impl CursorManager {
         batch_size: Option<i64>,
         single_batch: bool,
     ) -> CursorBatch {
+        let _span = span(Component::Exec, "cursor_open");
+        add_counter(
+            Component::Exec,
+            "cursorOpenDocuments",
+            documents.len() as u64,
+        );
         let namespace = namespace.into();
         let resolved_batch_size = normalize_batch_size(batch_size, documents.len());
         let first_batch = documents
@@ -82,6 +89,7 @@ impl CursorManager {
         cursor_id: i64,
         batch_size: Option<i64>,
     ) -> Result<CursorBatch, CursorError> {
+        let _span = span(Component::Exec, "cursor_get_more");
         let state = self
             .cursors
             .get_mut(&cursor_id)
@@ -112,6 +120,7 @@ impl CursorManager {
     }
 
     pub fn kill(&mut self, cursor_id: i64) -> bool {
+        let _span = span(Component::Exec, "cursor_kill");
         self.cursors.remove(&cursor_id).is_some()
     }
 
