@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use fs4::FileExt;
-use mqlite_catalog::Catalog;
+use mqlite_catalog::{Catalog, CollectionCatalog};
 use mqlite_debug::{Component, span};
 
 use crate::{
@@ -200,6 +200,15 @@ pub(crate) fn open_collection_read_view(
 ) -> Result<Option<PagerCollectionReadView>> {
     let _span = span(Component::Catalog, "open_collection_read_view");
     open_namespace_catalog(path)?.collection_read_view(database, collection)
+}
+
+pub(crate) fn open_collection_catalog(
+    path: impl AsRef<Path>,
+    database: &str,
+    collection: &str,
+) -> Result<Option<CollectionCatalog>> {
+    let _span = span(Component::Catalog, "open_collection_catalog");
+    open_namespace_catalog(path)?.load_collection_catalog(database, collection)
 }
 
 pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {

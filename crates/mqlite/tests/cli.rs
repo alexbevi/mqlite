@@ -8,7 +8,7 @@ use std::{
 use assert_cmd::Command;
 use bson::{Binary, Bson, doc, spec::BinarySubtype};
 use mqlite_ipc::broker_paths;
-use mqlite_storage::DatabaseFile;
+use mqlite_storage::{CollectionChange, DatabaseFile, WalMutation};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -258,6 +258,70 @@ fn info_command_reports_current_and_checkpoint_state() {
     assert_eq!(sku_index["unique"], true);
     assert_eq!(sku_index["entry_count"], 3);
     assert_eq!(sku_index["checkpoint"]["entry_count"], 2);
+}
+
+#[test]
+fn command_debug_uses_pending_wal_overlay_read_path() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("pending-wal-overlay-cli.mongodb");
+
+    {
+        let mut database = DatabaseFile::open_or_create(&database_path).expect("create database");
+        database
+            .commit_mutation(WalMutation::ApplyCollectionChanges {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                create_options: Some(doc! {}),
+                changes: vec![CollectionChange::Insert(
+                    mqlite_catalog::CollectionRecord::new(1, doc! { "_id": 1, "sku": "alpha" }),
+                )],
+                inserts: Vec::new(),
+                updates: Vec::new(),
+                deletes: Vec::new(),
+                change_events: Vec::new(),
+            })
+            .expect("commit mutation");
+    }
+
+    let mut debug_find = Command::cargo_bin("mqlite").expect("binary");
+    let output = debug_find
+        .args([
+            "--debug",
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"find":"widgets","filter":{},"limit":1}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let response: Value =
+        serde_json::from_slice(&output.stdout).expect("overlay debug command stdout response");
+    assert_json_number_close(&response["ok"], 1.0);
+    assert_eq!(
+        response["cursor"]["firstBatch"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let debug: Value =
+        serde_json::from_slice(&output.stderr).expect("overlay debug command stderr report");
+    assert_eq!(
+        debug["debug"]["broker"]["metadata"]["readPath"],
+        "pageBackedWalOverlay"
+    );
+    assert_eq!(
+        debug["debug"]["broker"]["metadata"]["pendingWalRecords"],
+        "1"
+    );
+    assert_eq!(
+        debug["debug"]["broker"]["metadata"]["pendingWalRelevantRecords"],
+        "1"
+    );
 }
 
 #[test]

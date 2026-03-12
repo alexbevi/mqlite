@@ -706,6 +706,15 @@ pub struct CompletedConcurrentCheckpoint {
     checkpoint_plan_cache_entries: Vec<PersistedPlanCacheEntry>,
 }
 
+pub struct PendingWalCollectionReadView {
+    pub last_sequence: u64,
+    pub wal_records: usize,
+    pub relevant_wal_records: usize,
+    pub wal_bytes: u64,
+    pub used_overlay: bool,
+    pub view: Option<Box<dyn CollectionReadView>>,
+}
+
 impl DatabaseFile {
     pub fn startup_metadata(path: impl AsRef<Path>) -> Result<StartupMetadata> {
         let _span = span(Component::Storage, "startup_metadata");
@@ -744,6 +753,143 @@ impl DatabaseFile {
             v2_engine::open_collection_read_view(path, database, collection)?
                 .map(|view| Box::new(view) as Box<dyn CollectionReadView>),
         )
+    }
+
+    pub fn open_pending_wal_collection_read_view(
+        path: impl AsRef<Path>,
+        database: &str,
+        collection: &str,
+        max_wal_bytes: u64,
+    ) -> Result<Option<PendingWalCollectionReadView>> {
+        let _span = span(Component::Storage, "open_pending_wal_collection_read_view");
+        let path = path.as_ref();
+        let pager = V2Pager::open(path)?;
+        let superblock = pager.active_superblock().clone();
+        let file_size = std::fs::metadata(path)?.len();
+        let wal_bytes = file_size.saturating_sub(superblock.wal_start_offset);
+        if wal_bytes == 0 {
+            return Ok(Some(PendingWalCollectionReadView {
+                last_sequence: superblock.durable_lsn,
+                wal_records: 0,
+                relevant_wal_records: 0,
+                wal_bytes: 0,
+                used_overlay: false,
+                view: Self::open_page_backed_collection_read_view(path, database, collection)?,
+            }));
+        }
+        if wal_bytes > max_wal_bytes {
+            return Ok(None);
+        }
+
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut offset = superblock.wal_start_offset;
+        let mut last_sequence = superblock.durable_lsn;
+        let mut wal_records = 0_usize;
+        let mut relevant_wal_records = 0_usize;
+        let mut overlay_state: Option<PersistedState> = None;
+
+        while offset < file_size {
+            if file_size - offset < WAL_HEADER_LEN as u64 {
+                break;
+            }
+
+            file.seek(SeekFrom::Start(offset))?;
+            let mut header = [0_u8; WAL_HEADER_LEN];
+            file.read_exact(&mut header)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if &header[..4] != WAL_FRAME_MAGIC {
+                break;
+            }
+
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+            let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+            if payload_end > file_size {
+                break;
+            }
+
+            let mut payload = vec![0_u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if hash_bytes(&payload) != header[8..40] {
+                return Err(StorageError::InvalidWalChecksum.into());
+            }
+
+            let compact = decode_compact_wal_entry(&payload)?;
+            if compact.sequence <= last_sequence {
+                offset = payload_end;
+                continue;
+            }
+
+            wal_records += 1;
+            last_sequence = compact.sequence;
+            if compact_mutation_targets_namespace(&compact.mutation, database, collection) {
+                relevant_wal_records += 1;
+                let sequence = compact.sequence;
+                let mutation = compact.into_wal_entry()?.mutation;
+                if overlay_state.is_none() {
+                    overlay_state = Some(build_pending_collection_overlay_state(
+                        path,
+                        database,
+                        collection,
+                        superblock.durable_lsn,
+                        superblock.last_checkpoint_unix_ms,
+                    )?);
+                }
+                apply_mutation(
+                    overlay_state.as_mut().expect("overlay state"),
+                    sequence,
+                    &mutation,
+                )?;
+            }
+
+            offset = payload_end;
+        }
+
+        add_counter(
+            Component::Storage,
+            "pendingWalOverlayScannedRecords",
+            wal_records as u64,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalOverlayRelevantRecords",
+            relevant_wal_records as u64,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalOverlayScannedBytes",
+            wal_bytes,
+        );
+
+        if relevant_wal_records == 0 {
+            return Ok(Some(PendingWalCollectionReadView {
+                last_sequence,
+                wal_records,
+                relevant_wal_records,
+                wal_bytes,
+                used_overlay: false,
+                view: Self::open_page_backed_collection_read_view(path, database, collection)?,
+            }));
+        }
+
+        let view = overlay_state
+            .expect("overlay state initialized")
+            .catalog
+            .get_collection(database, collection)
+            .ok()
+            .cloned()
+            .map(|collection| Box::new(collection) as Box<dyn CollectionReadView>);
+
+        Ok(Some(PendingWalCollectionReadView {
+            last_sequence,
+            wal_records,
+            relevant_wal_records,
+            wal_bytes,
+            used_overlay: true,
+            view,
+        }))
     }
 
     pub fn read_plan_cache_entries(path: impl AsRef<Path>) -> Result<Vec<PersistedPlanCacheEntry>> {
@@ -2311,6 +2457,68 @@ fn collection_change_replay_stats(
         touched_document_bytes,
         change_events,
         index_specs,
+    }
+}
+
+fn build_pending_collection_overlay_state(
+    path: &Path,
+    database: &str,
+    collection: &str,
+    durable_sequence: u64,
+    last_checkpoint_unix_ms: u64,
+) -> Result<PersistedState> {
+    let _span = span(Component::Storage, "build_pending_collection_overlay_state");
+    let mut catalog = Catalog::new();
+    if let Some(collection_state) = v2_engine::open_collection_catalog(path, database, collection)?
+    {
+        catalog.replace_collection(database, collection, collection_state);
+    }
+    Ok(PersistedState {
+        file_format_version: v2_layout::FILE_FORMAT_VERSION,
+        last_applied_sequence: durable_sequence,
+        last_checkpoint_unix_ms,
+        catalog,
+        change_events: Vec::new(),
+        plan_cache_entries: Vec::new(),
+    })
+}
+
+fn compact_mutation_targets_namespace(
+    mutation: &CompactWalMutation,
+    database: &str,
+    collection: &str,
+) -> bool {
+    match mutation {
+        CompactWalMutation::ReplaceCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | CompactWalMutation::RewriteCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | CompactWalMutation::ApplyCollectionChanges {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | CompactWalMutation::CreateIndexes {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | CompactWalMutation::DropIndexes {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | CompactWalMutation::DropCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        } => mutation_database == database && mutation_collection == collection,
     }
 }
 
@@ -4261,6 +4469,99 @@ mod tests {
                 .map(String::as_str),
             Some("applyCollectionChanges")
         );
+    }
+
+    #[test]
+    fn pending_wal_collection_read_view_replays_only_target_namespace() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("pending-wal-overlay.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        1,
+                        doc! { "_id": 1, "sku": "alpha" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit base widgets");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "others".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        9,
+                        doc! { "_id": 9, "sku": "other-base" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit base others");
+            database.checkpoint().expect("checkpoint");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        2,
+                        doc! { "_id": 2, "sku": "beta" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit overlay widgets");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "others".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        10,
+                        doc! { "_id": 10, "sku": "other-overlay" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit overlay others");
+        }
+
+        let overlay =
+            DatabaseFile::open_pending_wal_collection_read_view(&path, "app", "widgets", u64::MAX)
+                .expect("open overlay")
+                .expect("overlay result");
+
+        assert!(overlay.used_overlay);
+        assert_eq!(overlay.wal_records, 2);
+        assert_eq!(overlay.relevant_wal_records, 1);
+        assert_eq!(overlay.last_sequence, 4);
+
+        let records = overlay
+            .view
+            .expect("overlay view")
+            .scan_records()
+            .expect("scan records");
+        assert_eq!(records.len(), 2);
+        let ids = records
+            .iter()
+            .map(|record| record.document.get_i32("_id").expect("_id"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

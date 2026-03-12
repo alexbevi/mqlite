@@ -51,6 +51,7 @@ const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 const DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
+const DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(1);
 const MQLITE_DEBUG_FIELD: &str = "$mqliteDebug";
 
@@ -626,6 +627,31 @@ impl Broker {
         let startup =
             DatabaseFile::startup_metadata(&self.paths.database_path).map_err(internal_error)?;
         if startup.has_pending_wal {
+            if let Some(overlay) = DatabaseFile::open_pending_wal_collection_read_view(
+                &self.paths.database_path,
+                database,
+                collection,
+                DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES,
+            )
+            .map_err(internal_error)?
+            {
+                set_metadata(
+                    "readPath",
+                    if overlay.used_overlay {
+                        "pageBackedWalOverlay"
+                    } else {
+                        "pageBackedWalCheckpointOnly"
+                    },
+                );
+                set_metadata("pendingWalRecords", overlay.wal_records.to_string());
+                set_metadata(
+                    "pendingWalRelevantRecords",
+                    overlay.relevant_wal_records.to_string(),
+                );
+                set_metadata("pendingWalBytes", overlay.wal_bytes.to_string());
+                return f(overlay.last_sequence, overlay.view.as_deref());
+            }
+
             set_metadata("readPath", "mutableStoragePendingWal");
             let storage = self.durable_storage_read()?;
             let sequence = storage.last_applied_sequence();

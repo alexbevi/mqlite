@@ -46,7 +46,7 @@ The broker is the only writer for a database file.
 This means the current runtime is intentionally hybrid:
 
 - Fast path: clean checkpointed metadata and indexed reads can stay page-backed.
-- Fallback path: writes or pending WAL require opening the mutable engine and replaying the WAL
+- Fallback path: writes or oversized pending WAL tails require opening the mutable engine and replaying the WAL
   tail.
 
 ```mermaid
@@ -148,8 +148,10 @@ The page-backed read path is designed for clean checkpointed files:
 - `find`, `count`, `distinct`, and `explain` can read collection and index state without opening
   the mutable engine
 
-The current page-backed path is read-only. As soon as a command needs write access or the file has
-pending WAL, the broker opens the mutable engine instead.
+The current page-backed path is read-only. If the file has a bounded pending WAL tail, read
+commands scan that tail and overlay only the requested namespace onto the published roots. The
+broker opens the mutable engine only for writes or when the pending WAL tail is too large for that
+bounded overlay path.
 
 ### Pager
 

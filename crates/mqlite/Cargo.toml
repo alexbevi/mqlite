@@ -19,5 +19,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+mqlite-catalog = { path = "../mqlite-catalog" }
 predicates.workspace = true
 tempfile.workspace = true

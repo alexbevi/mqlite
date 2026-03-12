@@ -834,6 +834,7 @@ dependencies = [
  "assert_cmd",
  "bson",
  "clap",
+ "mqlite-catalog",
  "mqlite-debug",
  "mqlite-ipc",
  "mqlite-server",

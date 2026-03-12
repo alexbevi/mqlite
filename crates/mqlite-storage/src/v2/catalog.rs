@@ -391,6 +391,25 @@ impl PagerNamespaceCatalog {
         )))
     }
 
+    pub fn load_collection_catalog(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<CollectionCatalog>> {
+        let _span = span(Component::Catalog, "namespace_load_collection_catalog");
+        let Some(collection_meta_page_id) = lookup_namespace_target(
+            &*self.pager,
+            self.namespace_root_page_id,
+            &format!("{database}.{collection}"),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            load_collection_catalog(&*self.pager, collection_meta_page_id)?.catalog,
+        ))
+    }
+
     pub fn collection_handles(&self) -> Result<Vec<CollectionHandle>> {
         let _span = span(Component::Catalog, "namespace_collection_handles");
         scan_namespace_entries(&*self.pager, self.namespace_root_page_id)?
