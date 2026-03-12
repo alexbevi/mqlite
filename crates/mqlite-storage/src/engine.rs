@@ -135,6 +135,7 @@ pub trait StorageEngine: Send + Sync {
     fn last_applied_sequence(&self) -> u64;
     fn durable_sequence(&self) -> u64;
     fn wal_sync_count(&self) -> usize;
+    fn wal_backlog_bytes(&self) -> u64;
     fn change_events(&self) -> &[PersistedChangeEvent];
     fn has_pending_wal(&self) -> bool;
     fn has_concurrent_checkpoint(&self) -> bool;

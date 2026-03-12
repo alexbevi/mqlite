@@ -49,6 +49,7 @@ const MAX_MULTI_INTERVALS: usize = 128;
 const MAX_ESTIMATED_INDEX_CANDIDATES: usize = 4;
 const GROUP_COMMIT_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+const DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
 const CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,7 @@ pub struct BrokerConfig {
     pub database_path: PathBuf,
     pub idle_shutdown_secs: u64,
     pub checkpoint_interval_secs: u64,
+    pub checkpoint_wal_bytes_threshold: u64,
     pub watch_parent_pid: Option<u32>,
     #[cfg(test)]
     pub checkpoint_test_delay_ms: u64,
@@ -69,6 +71,7 @@ impl BrokerConfig {
             database_path: database_path.as_ref().to_path_buf(),
             idle_shutdown_secs,
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            checkpoint_wal_bytes_threshold: DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD,
             watch_parent_pid: None,
             #[cfg(test)]
             checkpoint_test_delay_ms: 0,
@@ -301,6 +304,31 @@ impl Broker {
                     let active_commands = self.active_commands.load(Ordering::SeqCst);
                     let quiet_for = self.last_activity.lock().elapsed();
                     let watched_parent_exited = self.watched_parent_has_exited();
+                    if checkpoint_task.is_none()
+                        && !watched_parent_exited
+                        && self.storage_is_loaded()
+                        && self
+                            .storage_read()
+                            .map_err(anyhow::Error::from)?
+                            .wal_backlog_bytes()
+                            >= self.config.checkpoint_wal_bytes_threshold
+                        && active_commands == 0
+                        && quiet_for >= CHECKPOINT_QUIET_PERIOD
+                    {
+                        if let Some(job) = self.prepare_background_checkpoint()? {
+                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
+                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
+                                if checkpoint_test_delay_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(
+                                        checkpoint_test_delay_ms,
+                                    ));
+                                }
+                                job.run()
+                            }));
+                            last_checkpoint = Instant::now();
+                            continue;
+                        }
+                    }
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
                         && active_connections == 0
@@ -7208,6 +7236,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn checkpoints_when_wal_backlog_exceeds_threshold_with_open_connection() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("wal-threshold-checkpoint.mongodb");
+        let mut config = BrokerConfig::new(&database_path, 3);
+        config.checkpoint_interval_secs = 60;
+        config.checkpoint_wal_bytes_threshold = 64;
+
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+        let payload = (0..256)
+            .map(|index| format!("{index:04x}"))
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 1_i64, "payload": payload }],
+                "$db": "app",
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let inspect =
+                DatabaseFile::inspect(&database_path).expect("inspect after wal pressure");
+            if inspect.wal_records_since_checkpoint == 0 {
+                assert_eq!(inspect.current_record_count, 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the broker to checkpoint on WAL pressure"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            !serve_task.is_finished(),
+            "broker should remain running while the client stays connected"
+        );
+
+        let ping = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
+        assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
             .await
             .expect("shutdown timeout")

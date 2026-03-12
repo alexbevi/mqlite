@@ -783,6 +783,10 @@ impl DatabaseFile {
         self.wal_sync_count
     }
 
+    pub fn wal_backlog_bytes(&self) -> u64 {
+        self.wal_bytes_since_checkpoint
+    }
+
     pub fn set_persisted_plan_cache_entries(&mut self, mut entries: Vec<PersistedPlanCacheEntry>) {
         entries.sort();
         entries.dedup();
@@ -1143,6 +1147,10 @@ impl StorageEngine for DatabaseFile {
 
     fn wal_sync_count(&self) -> usize {
         DatabaseFile::wal_sync_count(self)
+    }
+
+    fn wal_backlog_bytes(&self) -> u64 {
+        DatabaseFile::wal_backlog_bytes(self)
     }
 
     fn change_events(&self) -> &[PersistedChangeEvent] {
