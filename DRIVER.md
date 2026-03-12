@@ -57,6 +57,7 @@ Local durable-file compression is internal to `mqlite` and does not change the `
 - If no live broker exists, spawn `mqlite serve --file <path> --watch-parent-pid <launcher-pid>`.
 - Re-read the manifest and connect once the endpoint is ready.
 - If the spawned broker exits before writing the manifest, surface that startup error instead of reporting only a manifest timeout.
+- On clean checkpointed files, broker startup is now lazy: it can publish the manifest before opening the mutable storage engine, and simple indexed reads can execute from page-backed v2 read handles without hydrating the full in-memory catalog first.
 - Once the broker is running, it checkpoints automatically after about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. If the last client disconnects and the broker stays quiet, it also checkpoints promptly instead of waiting for idle shutdown. Those background checkpoints are handed off to a worker so later commands can keep running; any writes that arrive after the checkpoint snapshot remain in the WAL tail until the next checkpoint.
 - Brokers are shared per file and may shut down after an idle timeout, but launcher-owned brokers should also exit promptly once their spawning process is gone and their active IPC connections have drained. They now checkpoint before that launcher-owned shutdown completes.
 

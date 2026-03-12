@@ -199,6 +199,14 @@ pub(crate) fn load_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
     open_namespace_catalog(path)?.load_catalog()
 }
 
+pub(crate) fn load_plan_cache_entries_only(
+    path: impl AsRef<Path>,
+) -> Result<Vec<PersistedPlanCacheEntry>> {
+    let pager = Arc::new(Pager::open(path)?);
+    let root_page_id = pager.active_superblock().roots.plan_cache_root_page_id;
+    load_plan_cache_entries(&pager, root_page_id)
+}
+
 pub(crate) fn load_persisted_state(path: impl AsRef<Path>) -> Result<PersistedState> {
     let pager = Arc::new(Pager::open(path)?);
     let durable_lsn = pager.active_superblock().durable_lsn;

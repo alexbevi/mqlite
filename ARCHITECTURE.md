@@ -54,12 +54,13 @@ behavior and test surface.
 The broker is the only writer for a database file.
 
 - Reads are served from in-process state loaded from the file plus any applied WAL mutations.
+- Clean checkpointed indexed reads can now skip full engine hydration: the broker may start with no mutable storage engine loaded, resolve the namespace from file metadata, and answer `find`/`explain` through page-backed v2 read handles directly from the durable file.
 - Writes append WAL records, update in-memory state, and become durable before command success. Concurrent writers share a short group-commit sync barrier so multiple acknowledged commands can ride the same `fsync`.
 - Running brokers checkpoint automatically about every 60 seconds when dirty, but only after a brief quiet window with no command in flight. If the last client disconnects and the broker stays quiet, it now hands off a checkpoint promptly instead of waiting for idle shutdown. The broker captures checkpoint state briefly under the storage lock, then writes the checkpoint on a background worker so later commands can keep running. Writes that arrive after that capture remain in the WAL tail and are preserved across the checkpoint.
 - Idle shutdown triggers a checkpoint so the current catalog, pages, and plan-cache state are written back into the main file.
 - CRUD and DDL commands also append local change-event records in the same WAL mutation as the collection change so `$changeStream` recovery stays atomic.
 - Drivers and the direct CLI both discover or spawn the broker through the same manifest flow.
-- The attach or spawn path treats the manifest as the readiness signal, but if `serve` exits before publishing it the caller reports that startup error directly instead of waiting out the manifest timeout.
+- The attach or spawn path treats the manifest as the readiness signal, but if `serve` exits before publishing it the caller reports that startup error directly instead of waiting out the manifest timeout. Broker startup now initializes from lightweight startup metadata first and opens the mutable storage engine lazily on the first write or on read paths that cannot be satisfied from the clean checkpointed page graph alone.
 - Auto-spawned brokers can also receive a watched parent pid; once that launcher process has died and the broker has no active IPC connections left, the broker exits immediately instead of waiting for the normal idle timeout.
 
 The CLI surfaces split along intent:

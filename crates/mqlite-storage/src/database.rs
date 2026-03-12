@@ -174,6 +174,12 @@ pub struct DatabaseFile {
     concurrent_checkpoint: Option<PendingConcurrentCheckpoint>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupMetadata {
+    pub durable_sequence: u64,
+    pub has_pending_wal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerifyReport {
     pub valid: bool,
@@ -647,6 +653,47 @@ pub struct CompletedConcurrentCheckpoint {
 }
 
 impl DatabaseFile {
+    pub fn startup_metadata(path: impl AsRef<Path>) -> Result<StartupMetadata> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(StartupMetadata {
+                durable_sequence: 0,
+                has_pending_wal: false,
+            });
+        }
+
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut magic = [0_u8; 8];
+        if file.read_exact(&mut magic).is_err() || &magic != FILE_MAGIC {
+            return Err(anyhow::anyhow!(
+                "existing database file is not a supported v2 mqlite database; create a new file or rewrite `{}` as v2",
+                path.display()
+            ));
+        }
+
+        let pager = V2Pager::open(path)?;
+        let file_size = std::fs::metadata(path)?.len();
+        Ok(StartupMetadata {
+            durable_sequence: pager.active_superblock().durable_lsn,
+            has_pending_wal: file_size > pager.active_superblock().wal_start_offset,
+        })
+    }
+
+    pub fn open_page_backed_collection_read_view(
+        path: impl AsRef<Path>,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<Box<dyn CollectionReadView>>> {
+        Ok(
+            v2_engine::open_collection_read_view(path, database, collection)?
+                .map(|view| Box::new(view) as Box<dyn CollectionReadView>),
+        )
+    }
+
+    pub fn read_plan_cache_entries(path: impl AsRef<Path>) -> Result<Vec<PersistedPlanCacheEntry>> {
+        v2_engine::load_plan_cache_entries_only(path)
+    }
+
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -3608,8 +3655,8 @@ mod tests {
 
     use super::{
         CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_SIZE,
-        PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, VerifyReport,
-        WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC,
+        PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, StartupMetadata,
+        VerifyReport, WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC,
     };
     use crate::StorageEngine;
     use crate::v2::engine as v2_engine;
@@ -4854,6 +4901,44 @@ mod tests {
         assert_eq!(indexes[1].name, "sku_1");
         assert_eq!(indexes[1].key_pattern, doc! { "sku": 1 });
         assert!(indexes[1].unique);
+    }
+
+    #[test]
+    fn startup_metadata_tracks_checkpointed_state_and_wal_tail() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("startup-metadata.mongodb");
+
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+        let clean = DatabaseFile::startup_metadata(&path).expect("startup metadata");
+        assert_eq!(
+            clean,
+            StartupMetadata {
+                durable_sequence: 0,
+                has_pending_wal: false,
+            }
+        );
+
+        database
+            .commit_mutation(WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: CollectionCatalog::new(doc! {}),
+                change_events: Vec::new(),
+            })
+            .expect("append wal");
+        let dirty = DatabaseFile::startup_metadata(&path).expect("startup metadata with wal");
+        assert_eq!(dirty.durable_sequence, 0);
+        assert!(dirty.has_pending_wal);
+
+        database.checkpoint().expect("checkpoint");
+        let checkpointed = DatabaseFile::startup_metadata(&path).expect("startup metadata clean");
+        assert_eq!(
+            checkpointed,
+            StartupMetadata {
+                durable_sequence: 1,
+                has_pending_wal: false,
+            }
+        );
     }
 
     #[test]

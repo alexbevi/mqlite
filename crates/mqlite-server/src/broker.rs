@@ -35,7 +35,10 @@ use mqlite_storage::{
     PersistedPlanCacheEntry, StorageError, WalMutation,
 };
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{
+    Condvar, MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
+};
 use thiserror::Error;
 
 const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
@@ -79,14 +82,20 @@ impl BrokerConfig {
 pub struct Broker {
     config: BrokerConfig,
     paths: BrokerPaths,
-    storage: Arc<RwLock<BoxedStorageEngine>>,
+    storage: Arc<RwLock<Option<BoxedStorageEngine>>>,
     wal_commit: Arc<WalCommitCoordinator>,
     cursors: Arc<Mutex<CursorManager>>,
-    plan_cache: Arc<Mutex<BTreeMap<PlanCacheKey, CachedPlan>>>,
+    plan_cache: Arc<Mutex<PlanCacheState>>,
     fail_command: Arc<Mutex<Option<FailCommandState>>>,
     active_connections: Arc<AtomicUsize>,
     active_commands: Arc<AtomicUsize>,
     last_activity: Arc<Mutex<Instant>>,
+}
+
+#[derive(Debug, Default)]
+struct PlanCacheState {
+    loaded: bool,
+    entries: BTreeMap<PlanCacheKey, CachedPlan>,
 }
 
 #[derive(Debug)]
@@ -224,25 +233,14 @@ impl From<CursorError> for CommandError {
 impl Broker {
     pub fn new(config: BrokerConfig) -> Result<Self> {
         let paths = broker_paths(&config.database_path)?;
-        let storage = DatabaseFile::open_or_create(&paths.database_path)?;
-        let durable_sequence = storage.durable_sequence();
-        let plan_cache = storage
-            .persisted_plan_cache_entries()
-            .iter()
-            .map(|entry| {
-                (
-                    plan_cache_key_from_entry(entry),
-                    cached_plan_from_entry(entry),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let startup = DatabaseFile::startup_metadata(&paths.database_path)?;
         Ok(Self {
             config,
             paths,
-            storage: Arc::new(RwLock::new(Box::new(storage))),
-            wal_commit: Arc::new(WalCommitCoordinator::new(durable_sequence)),
+            storage: Arc::new(RwLock::new(None)),
+            wal_commit: Arc::new(WalCommitCoordinator::new(startup.durable_sequence)),
             cursors: Arc::new(Mutex::new(CursorManager::new())),
-            plan_cache: Arc::new(Mutex::new(plan_cache)),
+            plan_cache: Arc::new(Mutex::new(PlanCacheState::default())),
             fail_command: Arc::new(Mutex::new(None)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
@@ -375,8 +373,11 @@ impl Broker {
     }
 
     fn checkpoint_if_needed(&self) -> Result<bool> {
+        if !self.storage_is_loaded() {
+            return Ok(false);
+        }
         loop {
-            let mut storage = self.storage.write();
+            let mut storage = self.storage_write().map_err(anyhow::Error::from)?;
             let visible_sequence = storage.last_applied_sequence();
             let durable_sequence = self.wal_commit.state.lock().durable_sequence;
             if durable_sequence < visible_sequence {
@@ -386,7 +387,9 @@ impl Broker {
                 continue;
             }
 
-            let persisted_cache = self.persisted_plan_cache_entries();
+            let persisted_cache = self
+                .persisted_plan_cache_entries()
+                .map_err(anyhow::Error::from)?;
             if !storage.has_pending_wal()
                 && storage.persisted_plan_cache_entries() == persisted_cache.as_slice()
             {
@@ -400,8 +403,13 @@ impl Broker {
     }
 
     fn prepare_background_checkpoint(&self) -> Result<Option<ConcurrentCheckpointJob>> {
-        let persisted_cache = self.persisted_plan_cache_entries();
-        let mut storage = self.storage.write();
+        if !self.storage_is_loaded() {
+            return Ok(None);
+        }
+        let persisted_cache = self
+            .persisted_plan_cache_entries()
+            .map_err(anyhow::Error::from)?;
+        let mut storage = self.storage_write().map_err(anyhow::Error::from)?;
         let visible_sequence = storage.last_applied_sequence();
         let durable_sequence = self.wal_commit.state.lock().durable_sequence;
         if durable_sequence < visible_sequence {
@@ -417,7 +425,7 @@ impl Broker {
         &self,
         result: Result<Option<CompletedConcurrentCheckpoint>>,
     ) -> Result<()> {
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write().map_err(anyhow::Error::from)?;
         match result {
             Ok(Some(completed)) => {
                 storage
@@ -444,10 +452,12 @@ impl Broker {
         sort: Option<&Document>,
         projection: Option<&Document>,
     ) -> Result<CachedFindPlan, CommandError> {
+        self.ensure_plan_cache_loaded()?;
         let cache_key = build_plan_cache_key(&namespace, filter, sort, projection)?;
         let preferred_choice = self
             .plan_cache
             .lock()
+            .entries
             .get(&cache_key)
             .filter(|cached| cached.sequence == sequence)
             .map(|cached| cached.choice.clone());
@@ -458,7 +468,7 @@ impl Broker {
             projection,
             preferred_choice.as_ref(),
         )?;
-        self.plan_cache.lock().insert(
+        self.plan_cache.lock().entries.insert(
             cache_key,
             CachedPlan {
                 sequence,
@@ -471,9 +481,12 @@ impl Broker {
         })
     }
 
-    fn persisted_plan_cache_entries(&self) -> Vec<PersistedPlanCacheEntry> {
-        self.plan_cache
+    fn persisted_plan_cache_entries(&self) -> Result<Vec<PersistedPlanCacheEntry>, CommandError> {
+        self.ensure_plan_cache_loaded()?;
+        Ok(self
+            .plan_cache
             .lock()
+            .entries
             .iter()
             .map(|(key, cached)| PersistedPlanCacheEntry {
                 namespace: key.namespace.clone(),
@@ -483,14 +496,122 @@ impl Broker {
                 sequence: cached.sequence,
                 choice: cached.choice.clone(),
             })
-            .collect()
+            .collect())
+    }
+
+    fn storage_is_loaded(&self) -> bool {
+        self.storage.read().is_some()
+    }
+
+    fn ensure_storage_open(&self) -> Result<(), CommandError> {
+        if self.storage_is_loaded() {
+            return Ok(());
+        }
+
+        let mut storage = self.storage.write();
+        if storage.is_none() {
+            let opened = Box::new(
+                DatabaseFile::open_or_create(&self.paths.database_path).map_err(internal_error)?,
+            );
+            self.wal_commit.state.lock().durable_sequence = opened.durable_sequence();
+            *storage = Some(opened);
+        }
+        Ok(())
+    }
+
+    fn storage_write(
+        &self,
+    ) -> Result<MappedRwLockWriteGuard<'_, BoxedStorageEngine>, CommandError> {
+        self.ensure_storage_open()?;
+        let storage = self.storage.write();
+        Ok(RwLockWriteGuard::map(storage, |storage| {
+            storage.as_mut().expect("storage opened")
+        }))
+    }
+
+    fn storage_read(&self) -> Result<MappedRwLockReadGuard<'_, BoxedStorageEngine>, CommandError> {
+        self.ensure_storage_open()?;
+        let storage = self.storage.read();
+        Ok(RwLockReadGuard::map(storage, |storage| {
+            storage.as_ref().expect("storage opened")
+        }))
+    }
+
+    fn ensure_plan_cache_loaded(&self) -> Result<(), CommandError> {
+        if self.plan_cache.lock().loaded {
+            return Ok(());
+        }
+
+        let entries = DatabaseFile::read_plan_cache_entries(&self.paths.database_path)
+            .or_else(|error| {
+                if self.paths.database_path.exists() {
+                    Err(error)
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+            .map_err(internal_error)?;
+
+        let mut plan_cache = self.plan_cache.lock();
+        if !plan_cache.loaded {
+            plan_cache.entries = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        plan_cache_key_from_entry(entry),
+                        cached_plan_from_entry(entry),
+                    )
+                })
+                .collect();
+            plan_cache.loaded = true;
+        }
+        Ok(())
+    }
+
+    fn with_query_collection<T>(
+        &self,
+        database: &str,
+        collection: &str,
+        f: impl FnOnce(u64, Option<&dyn StorageCollectionReadView>) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
+        if self.storage_is_loaded() {
+            let storage = self.durable_storage_read()?;
+            let sequence = storage.last_applied_sequence();
+            let view = storage
+                .collection_read_view(database, collection)
+                .map_err(internal_error)?;
+            return f(sequence, view);
+        }
+
+        if !self.paths.database_path.exists() {
+            return f(0, None);
+        }
+
+        let startup =
+            DatabaseFile::startup_metadata(&self.paths.database_path).map_err(internal_error)?;
+        if startup.has_pending_wal {
+            let storage = self.durable_storage_read()?;
+            let sequence = storage.last_applied_sequence();
+            let view = storage
+                .collection_read_view(database, collection)
+                .map_err(internal_error)?;
+            return f(sequence, view);
+        }
+
+        let view = DatabaseFile::open_page_backed_collection_read_view(
+            &self.paths.database_path,
+            database,
+            collection,
+        )
+        .map_err(internal_error)?;
+        f(startup.durable_sequence, view.as_deref())
     }
 
     fn durable_storage_read(
         &self,
-    ) -> Result<parking_lot::RwLockReadGuard<'_, BoxedStorageEngine>, CommandError> {
+    ) -> Result<MappedRwLockReadGuard<'_, BoxedStorageEngine>, CommandError> {
         loop {
-            let storage = self.storage.read();
+            let storage = self.storage_read()?;
             let visible_sequence = storage.last_applied_sequence();
             let durable_sequence = self.wal_commit.state.lock().durable_sequence;
             if durable_sequence >= visible_sequence {
@@ -516,7 +637,7 @@ impl Broker {
 
             thread::sleep(GROUP_COMMIT_WAIT);
             let sync_result = {
-                let mut storage = self.storage.write();
+                let mut storage = self.storage_write()?;
                 storage.sync_pending_wal()
             };
 
@@ -1079,27 +1200,31 @@ impl Broker {
         sort: Option<&Document>,
         projection: Option<&Document>,
     ) -> Result<CachedFindPlan, CommandError> {
-        let storage = self.durable_storage_read()?;
-        let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection_name}");
-        match storage
-            .collection_read_view(database, collection_name)
-            .map_err(internal_error)?
-        {
-            Some(collection) => {
-                let collection = StorageFindCollection::new(collection);
-                self.cached_find_plan(namespace, sequence, &collection, filter, sort, projection)
+        self.with_query_collection(database, collection_name, |sequence, collection| {
+            match collection {
+                Some(collection) => {
+                    let collection = StorageFindCollection::new(collection);
+                    self.cached_find_plan(
+                        namespace,
+                        sequence,
+                        &collection,
+                        filter,
+                        sort,
+                        projection,
+                    )
+                }
+                None => Ok(CachedFindPlan {
+                    plan: PlannedFind::Collection {
+                        documents: Vec::new(),
+                        record_ids: Vec::new(),
+                        docs_examined: 0,
+                        sort_required: sort.is_some(),
+                    },
+                    cache_used: false,
+                }),
             }
-            None => Ok(CachedFindPlan {
-                plan: PlannedFind::Collection {
-                    documents: Vec::new(),
-                    record_ids: Vec::new(),
-                    docs_examined: 0,
-                    sort_required: sort.is_some(),
-                },
-                cache_used: false,
-            }),
-        }
+        })
     }
 
     fn handle_create(&self, body: &Document) -> Result<Document, CommandError> {
@@ -1112,7 +1237,7 @@ impl Broker {
         options.remove("create");
         options.remove("$db");
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         if storage
             .collection_metadata(&database, collection)
             .map_err(internal_error)?
@@ -1161,7 +1286,7 @@ impl Broker {
             storage.collection_names(&database).unwrap_or_default()
         };
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let collection_count = collections.len();
         let mut last_sequence = None;
         for (index, collection) in collections.into_iter().enumerate() {
@@ -1232,7 +1357,7 @@ impl Broker {
         let collection = body.get_str("drop").map_err(|_| {
             CommandError::new(9, "FailedToParse", "drop requires a collection name")
         })?;
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let index_count = storage
             .list_indexes(&database, collection)
             .map_err(internal_error)?
@@ -1302,7 +1427,7 @@ impl Broker {
         let (source_database, source_collection) = parse_namespace(source_namespace)?;
         let (target_database, target_collection) = parse_namespace(target_namespace)?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let source_state = storage
             .catalog()
             .get_collection(source_database, source_collection)?
@@ -1437,7 +1562,7 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let preview_collection;
         let collection_state = match storage.catalog().get_collection(&database, collection) {
             Ok(collection_state) => collection_state,
@@ -1524,7 +1649,7 @@ impl Broker {
             CommandError::new(9, "FailedToParse", "dropIndexes requires an index target")
         })?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let removed = validate_drop_indexes(
             storage.catalog().get_collection(&database, collection)?,
             target,
@@ -1575,7 +1700,7 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let sequence = storage.last_applied_sequence() + 1;
         let inserted_total = documents.len() as i32;
         let (create_options, changes, change_events) = {
@@ -1677,32 +1802,30 @@ impl Broker {
             let _ = apply_projection(&Document::new(), Some(projection))?;
         }
 
-        let storage = self.durable_storage_read()?;
-        let sequence = storage.last_applied_sequence();
         let namespace = format!("{database}.{collection}");
-        let execution = match storage
-            .collection_read_view(&database, collection)
-            .map_err(internal_error)?
-        {
-            Some(collection) => {
-                let collection = StorageFindCollection::new(collection);
-                self.cached_find_plan(
-                    namespace,
-                    sequence,
-                    &collection,
-                    &filter,
-                    sort.as_ref(),
-                    projection.as_ref(),
-                )?
-                .plan
-                .into_execution()
-            }
-            None => FindExecution {
-                documents: Vec::new(),
-                sort_covered: false,
-                projection_applied: false,
-            },
-        };
+        let execution =
+            self.with_query_collection(&database, collection, |sequence, collection| {
+                Ok(match collection {
+                    Some(collection) => {
+                        let collection = StorageFindCollection::new(collection);
+                        self.cached_find_plan(
+                            namespace,
+                            sequence,
+                            &collection,
+                            &filter,
+                            sort.as_ref(),
+                            projection.as_ref(),
+                        )?
+                        .plan
+                        .into_execution()
+                    }
+                    None => FindExecution {
+                        documents: Vec::new(),
+                        sort_covered: false,
+                        projection_applied: false,
+                    },
+                })
+            })?;
         let FindExecution {
             mut documents,
             sort_covered,
@@ -1805,7 +1928,7 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let sequence = storage.last_applied_sequence() + 1;
         let (create_options, changes, change_events, matched, modified, upserted) = {
             let collection = storage
@@ -2008,7 +2131,7 @@ impl Broker {
             })
             .collect::<Result<Vec<_>, CommandError>>()?;
 
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let sequence = storage.last_applied_sequence() + 1;
         let (changes, change_events, deleted) = {
             let collection = match storage.catalog().get_collection(&database, collection_name) {
@@ -2082,18 +2205,20 @@ impl Broker {
         let skip = body.get_i64("skip").unwrap_or(0).max(0) as usize;
         let limit = body.get_i64("limit").unwrap_or(0);
 
-        let storage = self.durable_storage_read()?;
-        let mut matches = storage
-            .catalog()
-            .get_collection(&database, collection_name)
-            .map(|collection| {
-                collection
-                    .records
-                    .iter()
-                    .filter(|record| document_matches(&record.document, &query).unwrap_or(false))
-                    .count()
-            })
-            .unwrap_or(0);
+        let mut matches =
+            self.with_query_collection(&database, collection_name, |_sequence, collection| {
+                Ok(match collection {
+                    Some(collection) => collection
+                        .scan_records()
+                        .map_err(internal_error)?
+                        .into_iter()
+                        .filter(|record| {
+                            document_matches(&record.document, &query).unwrap_or(false)
+                        })
+                        .count(),
+                    None => 0,
+                })
+            })?;
 
         matches = matches.saturating_sub(skip);
         if limit > 0 {
@@ -2112,19 +2237,21 @@ impl Broker {
             .map_err(|_| CommandError::new(9, "FailedToParse", "distinct requires a key"))?;
         let query = body.get_document("query").ok().cloned().unwrap_or_default();
 
-        let storage = self.durable_storage_read()?;
         let mut seen = Vec::<Bson>::new();
-        if let Ok(collection) = storage.catalog().get_collection(&database, collection_name) {
-            for record in &collection.records {
-                if !document_matches(&record.document, &query).unwrap_or(false) {
-                    continue;
-                }
-                let value = lookup_path_owned(&record.document, key).unwrap_or(Bson::Null);
-                if !seen.iter().any(|existing| existing == &value) {
-                    seen.push(value);
+        self.with_query_collection(&database, collection_name, |_sequence, collection| {
+            if let Some(collection) = collection {
+                for record in collection.scan_records().map_err(internal_error)? {
+                    if !document_matches(&record.document, &query).unwrap_or(false) {
+                        continue;
+                    }
+                    let value = lookup_path_owned(&record.document, key).unwrap_or(Bson::Null);
+                    if !seen.iter().any(|existing| existing == &value) {
+                        seen.push(value);
+                    }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         Ok(doc! { "values": seen })
     }
@@ -2518,6 +2645,7 @@ impl Broker {
         merge_target: Option<MergeTarget>,
     ) -> Result<Document, CommandError> {
         let namespace = format!("{database}.{collection_name}");
+        self.ensure_plan_cache_loaded()?;
         let results = {
             let storage = self.durable_storage_read()?;
             let resolver = BrokerCollectionResolver {
@@ -2985,7 +3113,8 @@ impl Broker {
                     )
                 })?;
             parse_plan_cache_stats_stage(plan_cache_stats)?;
-            let plan_cache_documents = build_plan_cache_stats_results(&self.plan_cache, &namespace);
+            let plan_cache_documents =
+                build_plan_cache_stats_results(&self.plan_cache.lock().entries, &namespace);
             if execution_pipeline.len() > 1 {
                 run_pipeline_with_resolver(
                     plan_cache_documents,
@@ -3428,11 +3557,10 @@ fn parse_plan_cache_stats_stage(spec: &Bson) -> Result<(), CommandError> {
 }
 
 fn build_plan_cache_stats_results(
-    plan_cache: &Mutex<BTreeMap<PlanCacheKey, CachedPlan>>,
+    plan_cache: &BTreeMap<PlanCacheKey, CachedPlan>,
     namespace: &str,
 ) -> Vec<Document> {
     plan_cache
-        .lock()
         .iter()
         .filter(|(key, _)| key.namespace == namespace)
         .map(|(key, cached)| {
@@ -3667,7 +3795,7 @@ impl Broker {
         collection: &str,
         results: Vec<Document>,
     ) -> Result<(), CommandError> {
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let options = storage
             .catalog()
             .get_collection(database, collection)
@@ -3704,7 +3832,7 @@ impl Broker {
         results: Vec<Document>,
     ) -> Result<(), CommandError> {
         let database = target.database.as_deref().unwrap_or(default_database);
-        let mut storage = self.storage.write();
+        let mut storage = self.storage_write()?;
         let collection = storage
             .catalog()
             .get_collection(database, &target.collection)
@@ -6662,6 +6790,100 @@ mod tests {
     }
 
     #[test]
+    fn explain_uses_page_backed_fast_path_before_storage_opens() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("lazy-startup-find.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            let mut collection = CollectionCatalog::new(doc! {});
+            collection
+                .insert_record(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1_i64, "sku": "alpha" },
+                ))
+                .expect("insert");
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed collection");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        assert!(!broker.storage_is_loaded(), "broker should start lazily");
+
+        let planner = broker
+            .explain_find_plan("app", "widgets", &doc! { "_id": 1_i64 }, None, None)
+            .expect("explain")
+            .plan
+            .to_document();
+        assert!(
+            planner.get_str("stage").is_ok(),
+            "expected the fast path explain to return a planner stage"
+        );
+        assert!(
+            !broker.storage_is_loaded(),
+            "clean checkpointed find should not force the mutable storage engine to open"
+        );
+    }
+
+    #[test]
+    fn count_uses_page_backed_fast_path_before_storage_opens() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("lazy-startup-count.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            let mut collection = CollectionCatalog::new(doc! {});
+            collection
+                .insert_record(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1_i64, "sku": "alpha" },
+                ))
+                .expect("insert");
+            collection
+                .insert_record(CollectionRecord::new(
+                    2,
+                    doc! { "_id": 2_i64, "sku": "beta" },
+                ))
+                .expect("insert");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed collection");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let response = broker
+            .handle_count(&doc! {
+                "count": "widgets",
+                "query": { "sku": "beta" },
+                "$db": "app",
+            })
+            .expect("count");
+        assert_eq!(response.get_i64("n").expect("count"), 1);
+        assert!(
+            !broker.storage_is_loaded(),
+            "clean checkpointed count should not force the mutable storage engine to open"
+        );
+    }
+
+    #[test]
     fn write_matching_records_include_overlay_updates_and_inserts() {
         let mut collection = CollectionCatalog::new(doc! {});
         collection
@@ -6734,7 +6956,7 @@ mod tests {
             start.wait();
         });
 
-        let storage = broker.storage.read();
+        let storage = broker.storage_read().expect("storage");
         let collection = storage
             .catalog()
             .get_collection("app", "widgets")
@@ -6924,7 +7146,10 @@ mod tests {
         assert_eq!(inspect.current_record_count, 2);
         assert_eq!(inspect.wal_records_since_checkpoint, 1);
         assert!(
-            !broker.storage.read().has_concurrent_checkpoint(),
+            !broker
+                .storage_read()
+                .expect("storage")
+                .has_concurrent_checkpoint(),
             "checkpoint handoff should be deferred while commands are still active"
         );
         assert!(
@@ -7021,7 +7246,7 @@ mod tests {
 
         let capture_deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if !broker.storage.read().has_pending_wal() {
+            if !broker.storage_read().expect("storage").has_pending_wal() {
                 break;
             }
             assert!(
@@ -7031,7 +7256,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
-            broker.storage.read().has_concurrent_checkpoint(),
+            broker
+                .storage_read()
+                .expect("storage")
+                .has_concurrent_checkpoint(),
             "expected the broker to be holding an outstanding background checkpoint handoff"
         );
 
@@ -7058,7 +7286,10 @@ mod tests {
         .expect("insert should not wait for the checkpoint task");
         assert_eq!(second_insert.get_f64("ok").expect("ok"), 1.0);
         assert!(
-            broker.storage.read().has_concurrent_checkpoint(),
+            broker
+                .storage_read()
+                .expect("storage")
+                .has_concurrent_checkpoint(),
             "expected the background checkpoint to remain outstanding during the test delay"
         );
 
