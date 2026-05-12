@@ -10,18 +10,20 @@ use std::{
 
 use anyhow::Result;
 use blake3::Hasher;
+use bson::{Bson, Document, doc};
 use ciborium::{de as cbor_de, ser as cbor_ser};
 use fs4::FileExt;
 use mqlite_catalog::{
-    Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexCatalog,
-    IndexEntry, build_index_specs, validate_collection_indexes, validate_drop_indexes,
+    Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBounds,
+    IndexCatalog, IndexEntry, apply_index_specs, build_index_specs, validate_collection_indexes,
+    validate_drop_indexes,
 };
 use mqlite_debug::{Component, add_counter, record_duration, set_metadata, span};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    engine::{CollectionMetadata, CollectionReadView, IndexMetadata, StorageEngine},
+    engine::{CollectionMetadata, CollectionReadView, IndexMetadata, IndexReadView, StorageEngine},
     v2::{
         checkpoint as v2_checkpoint, engine as v2_engine, layout as v2_layout,
         pager::Pager as V2Pager,
@@ -715,6 +717,170 @@ pub struct PendingWalCollectionReadView {
     pub view: Option<Box<dyn CollectionReadView>>,
 }
 
+struct DeltaOverlayCollectionReadView {
+    base: Arc<dyn CollectionReadView>,
+    delta: CollectionCatalog,
+    indexes: BTreeMap<String, DeltaOverlayIndexReadView>,
+}
+
+struct DeltaOverlayIndexReadView {
+    name: String,
+    key_pattern: Document,
+    base: Arc<dyn CollectionReadView>,
+    delta: IndexCatalog,
+}
+
+impl DeltaOverlayCollectionReadView {
+    fn new(base: Arc<dyn CollectionReadView>, delta: CollectionCatalog) -> Self {
+        let indexes = delta
+            .indexes
+            .iter()
+            .map(|(name, index)| {
+                (
+                    name.clone(),
+                    DeltaOverlayIndexReadView {
+                        name: name.clone(),
+                        key_pattern: index.key.clone(),
+                        base: Arc::clone(&base),
+                        delta: index.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            base,
+            delta,
+            indexes,
+        }
+    }
+}
+
+impl CollectionReadView for DeltaOverlayCollectionReadView {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
+        let mut records = self.base.scan_records()?;
+        records.extend(self.delta.scan_records()?);
+        Ok(records)
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
+        if let Some(document) = self.delta.record_document(record_id)? {
+            return Ok(Some(document));
+        }
+        self.base.record_document(record_id)
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        let mut names = self.base.index_names();
+        for name in self.indexes.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn IndexReadView> {
+        self.indexes
+            .get(name)
+            .map(|index| index as &dyn IndexReadView)
+            .or_else(|| self.base.index(name))
+    }
+}
+
+impl IndexReadView for DeltaOverlayIndexReadView {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn key_pattern(&self) -> &Document {
+        &self.key_pattern
+    }
+
+    fn entry_count(&self) -> usize {
+        self.base
+            .index(&self.name)
+            .map(IndexReadView::entry_count)
+            .unwrap_or(0)
+            + self.delta.entry_count()
+    }
+
+    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>> {
+        let mut entries = self
+            .base
+            .index(&self.name)
+            .map(|index| index.scan_entries(bounds))
+            .transpose()?
+            .unwrap_or_default();
+        entries.extend(self.delta.scan_entries(bounds));
+        Ok(entries)
+    }
+
+    fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
+        self.base
+            .index(&self.name)
+            .map(|index| index.estimate_bounds_count(bounds))
+            .unwrap_or(0)
+            + self.delta.estimate_bounds_count(bounds)
+    }
+
+    fn covers_paths(&self, paths: &BTreeSet<String>) -> bool {
+        self.delta.covers_paths(paths)
+            || self
+                .base
+                .index(&self.name)
+                .is_some_and(|index| index.covers_paths(paths))
+    }
+
+    fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize> {
+        let base = self
+            .base
+            .index(&self.name)
+            .and_then(|index| index.estimate_value_count(field, value));
+        let delta = self.delta.estimate_value_count(field, value);
+        sum_optional_counts(base, delta)
+    }
+
+    fn estimate_values_count(&self, field: &str, values: &[Bson]) -> Option<usize> {
+        let base = self
+            .base
+            .index(&self.name)
+            .and_then(|index| index.estimate_values_count(field, values));
+        let delta = self.delta.estimate_values_count(field, values);
+        sum_optional_counts(base, delta)
+    }
+
+    fn estimate_range_count(
+        &self,
+        field: &str,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Option<usize> {
+        let base = self
+            .base
+            .index(&self.name)
+            .and_then(|index| index.estimate_range_count(field, lower, upper));
+        let delta = self.delta.estimate_range_count(field, lower, upper);
+        sum_optional_counts(base, delta)
+    }
+
+    fn present_count(&self, field: &str) -> Option<usize> {
+        let base = self
+            .base
+            .index(&self.name)
+            .and_then(|index| index.present_count(field));
+        let delta = self.delta.present_count(field);
+        sum_optional_counts(base, delta)
+    }
+}
+
+fn sum_optional_counts(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 impl DatabaseFile {
     pub fn startup_metadata(path: impl AsRef<Path>) -> Result<StartupMetadata> {
         let _span = span(Component::Storage, "startup_metadata");
@@ -787,6 +953,8 @@ impl DatabaseFile {
         let mut wal_records = 0_usize;
         let mut relevant_wal_records = 0_usize;
         let mut overlay_state: Option<PersistedState> = None;
+        let mut overlay_delta: Option<CollectionCatalog> = None;
+        let mut base_view: Option<Arc<dyn CollectionReadView>> = None;
 
         while offset < file_size {
             if file_size - offset < WAL_HEADER_LEN as u64 {
@@ -829,6 +997,26 @@ impl DatabaseFile {
                 let sequence = compact.sequence;
                 let mutation = compact.into_wal_entry()?.mutation;
                 if overlay_state.is_none() {
+                    if base_view.is_none() {
+                        base_view = Self::open_page_backed_collection_read_view(
+                            path, database, collection,
+                        )?
+                        .map(Arc::from);
+                    }
+                    if let (Some(base), Some(delta)) =
+                        (base_view.as_deref(), overlay_delta.as_mut())
+                    {
+                        if try_apply_insert_only_delta(delta, base, &mutation)? {
+                            offset = payload_end;
+                            continue;
+                        }
+                    } else if let Some(base) = base_view.as_deref() {
+                        if let Some(delta) = build_insert_only_delta(base, &mutation)? {
+                            overlay_delta = Some(delta);
+                            offset = payload_end;
+                            continue;
+                        }
+                    }
                     overlay_state = Some(build_pending_collection_overlay_state(
                         path,
                         database,
@@ -836,6 +1024,14 @@ impl DatabaseFile {
                         superblock.durable_lsn,
                         superblock.last_checkpoint_unix_ms,
                     )?);
+                    if let Some(delta) = overlay_delta.take() {
+                        merge_delta_into_overlay_state(
+                            overlay_state.as_mut().expect("overlay state"),
+                            database,
+                            collection,
+                            delta,
+                        )?;
+                    }
                 }
                 apply_mutation(
                     overlay_state.as_mut().expect("overlay state"),
@@ -874,13 +1070,19 @@ impl DatabaseFile {
             }));
         }
 
-        let view = overlay_state
-            .expect("overlay state initialized")
-            .catalog
-            .get_collection(database, collection)
-            .ok()
-            .cloned()
-            .map(|collection| Box::new(collection) as Box<dyn CollectionReadView>);
+        let view = if let Some(state) = overlay_state {
+            state
+                .catalog
+                .get_collection(database, collection)
+                .ok()
+                .cloned()
+                .map(|collection| Box::new(collection) as Box<dyn CollectionReadView>)
+        } else {
+            let base = base_view.expect("base view initialized for insert-only overlay");
+            let delta = overlay_delta.expect("delta initialized for insert-only overlay");
+            Some(Box::new(DeltaOverlayCollectionReadView::new(base, delta))
+                as Box<dyn CollectionReadView>)
+        };
 
         Ok(Some(PendingWalCollectionReadView {
             last_sequence,
@@ -2481,6 +2683,104 @@ fn build_pending_collection_overlay_state(
         change_events: Vec::new(),
         plan_cache_entries: Vec::new(),
     })
+}
+
+fn build_insert_only_delta(
+    base: &dyn CollectionReadView,
+    mutation: &WalMutation,
+) -> Result<Option<CollectionCatalog>> {
+    let mut delta = delta_collection_for_base(base)?;
+    if try_apply_insert_only_delta(&mut delta, base, mutation)? {
+        Ok(Some(delta))
+    } else {
+        Ok(None)
+    }
+}
+
+fn delta_collection_for_base(base: &dyn CollectionReadView) -> Result<CollectionCatalog> {
+    let mut delta = CollectionCatalog::new(Document::new());
+    for index_name in base.index_names() {
+        if index_name == "_id_" {
+            continue;
+        }
+        let Some(index) = base.index(&index_name) else {
+            continue;
+        };
+        apply_index_specs(
+            &mut delta,
+            &[doc! {
+                "name": index.name(),
+                "key": index.key_pattern().clone(),
+            }],
+        )
+        .map_err(map_catalog_error)?;
+    }
+    Ok(delta)
+}
+
+fn try_apply_insert_only_delta(
+    delta: &mut CollectionCatalog,
+    base: &dyn CollectionReadView,
+    mutation: &WalMutation,
+) -> Result<bool> {
+    let WalMutation::ApplyCollectionChanges {
+        create_options,
+        changes,
+        inserts,
+        updates,
+        deletes,
+        ..
+    } = mutation
+    else {
+        return Ok(false);
+    };
+    if create_options.is_some() || !updates.is_empty() || !deletes.is_empty() {
+        return Ok(false);
+    }
+    let changes = resolved_collection_changes(changes, inserts, updates, deletes);
+    if changes
+        .iter()
+        .any(|change| !matches!(change, CollectionChange::Insert(_)))
+    {
+        return Ok(false);
+    }
+    let mut inserted_records = 0_u64;
+    for change in changes {
+        let CollectionChange::Insert(record) = change else {
+            unreachable!("checked insert-only changes")
+        };
+        if base.record_document(record.record_id)?.is_some() {
+            return Ok(false);
+        }
+        delta
+            .insert_record(record.clone())
+            .map_err(map_catalog_error)?;
+        inserted_records += 1;
+    }
+    add_counter(
+        Component::Storage,
+        "pendingWalOverlayDeltaInserts",
+        inserted_records,
+    );
+    Ok(true)
+}
+
+fn merge_delta_into_overlay_state(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    delta: CollectionCatalog,
+) -> Result<()> {
+    for record in delta.records {
+        apply_collection_changes(
+            state,
+            database,
+            collection,
+            None,
+            &[CollectionChange::Insert(record)],
+        )?;
+    }
+    Ok(())
 }
 
 fn compact_mutation_targets_namespace(
@@ -4562,6 +4862,130 @@ mod tests {
             .map(|record| record.document.get_i32("_id").expect("_id"))
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn insert_only_pending_wal_overlay_avoids_full_collection_hydration() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("pending-wal-delta-overlay.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(Document::new());
+            for record_id in 1..=100 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i32,
+                        "sku": format!("sku-{record_id:03}"),
+                    },
+                );
+            }
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+            )
+            .expect("create sku index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("commit checkpointed collection");
+            database.checkpoint().expect("checkpoint");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        101,
+                        doc! { "_id": 101, "sku": "sku-101" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending insert");
+        }
+
+        let debug_session = session("pending-wal-delta-overlay");
+        let _install = install(&debug_session);
+        let overlay =
+            DatabaseFile::open_pending_wal_collection_read_view(&path, "app", "widgets", u64::MAX)
+                .expect("open overlay")
+                .expect("overlay result");
+
+        assert!(overlay.used_overlay);
+        assert_eq!(overlay.wal_records, 1);
+        assert_eq!(overlay.relevant_wal_records, 1);
+        let view = overlay.view.expect("overlay view");
+        assert_eq!(
+            view.record_document(1)
+                .expect("read base record")
+                .expect("base record")
+                .get_str("sku")
+                .expect("base sku"),
+            "sku-001"
+        );
+        assert_eq!(
+            view.record_document(101)
+                .expect("read delta record")
+                .expect("delta record")
+                .get_str("sku")
+                .expect("delta sku"),
+            "sku-101"
+        );
+
+        let sku_index = view.index("sku_1").expect("sku index");
+        let base_entries = sku_index
+            .scan_entries(&exact_sku_bounds("sku-001"))
+            .expect("scan base sku");
+        assert_eq!(
+            base_entries
+                .iter()
+                .map(|entry| entry.record_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let delta_entries = sku_index
+            .scan_entries(&exact_sku_bounds("sku-101"))
+            .expect("scan delta sku");
+        assert_eq!(
+            delta_entries
+                .iter()
+                .map(|entry| entry.record_id)
+                .collect::<Vec<_>>(),
+            vec![101]
+        );
+
+        let report = debug_session.report();
+        assert_eq!(
+            counter_value(&report, Component::Storage, "pendingWalOverlayDeltaInserts",),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(&report, Component::Storage, "recordTreeScanRecords"),
+            None
+        );
+    }
+
+    fn exact_sku_bounds(sku: &str) -> IndexBounds {
+        let key = doc! { "sku": sku };
+        IndexBounds {
+            lower: Some(IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key,
+                inclusive: true,
+            }),
+        }
     }
 
     #[test]

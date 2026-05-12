@@ -149,9 +149,12 @@ The page-backed read path is designed for clean checkpointed files:
   the mutable engine
 
 The current page-backed path is read-only. If the file has a bounded pending WAL tail, read
-commands scan that tail and overlay only the requested namespace onto the published roots. The
-broker opens the mutable engine only for writes or when the pending WAL tail is too large for that
-bounded overlay path.
+commands scan that tail and overlay only the requested namespace onto the published roots. For
+insert-only WAL frames, the overlay keeps a delta collection and delta indexes beside the
+page-backed base view, so an indexed point read does not hydrate the checkpointed collection or
+secondary index into memory. Mutations that update, delete, create, or rewrite state still fall back
+to materializing the requested namespace overlay. The broker opens the mutable engine only for
+writes or when the pending WAL tail is too large for that bounded overlay path.
 
 ### Pager
 
