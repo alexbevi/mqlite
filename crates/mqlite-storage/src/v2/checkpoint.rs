@@ -34,6 +34,8 @@ use crate::{PersistedChangeEvent, PersistedPlanCacheEntry, PersistedState};
 
 use super::layout::Superblock;
 
+const MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD: usize = 64;
+
 pub(crate) struct CheckpointWriteResult {
     pub active_superblock_slot: usize,
     pub active_superblock: Superblock,
@@ -1069,6 +1071,9 @@ fn build_persisted_index_stats(index: &IndexCatalog) -> Result<PersistedIndexSta
                     .expect("persisted stats values are valid bson scalars");
                 compare_bson(&left, &right)
             });
+            if frequencies.len() > MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD {
+                frequencies.truncate(MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD);
+            }
             (field, frequencies)
         })
         .collect();
@@ -1242,5 +1247,50 @@ mod tests {
             reopened.persisted_plan_cache_entries(),
             plan_cache_entries.as_slice()
         );
+    }
+
+    #[test]
+    fn checkpoints_high_cardinality_index_without_oversized_stats_page() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("checkpoint-v2-high-cardinality-index.mongodb");
+
+        let mut collection = CollectionCatalog::new(doc! {});
+        for record_id in 1..=10_000_u64 {
+            collection
+                .insert_record(CollectionRecord::new(
+                    record_id,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{record_id:08}"),
+                        "category": format!("cat-{}", record_id % 16),
+                    },
+                ))
+                .expect("insert record");
+        }
+        apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+        )
+        .expect("create index");
+
+        let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+        database
+            .commit_mutation(crate::WalMutation::ReplaceCollection {
+                database: "app".to_string(),
+                collection: "widgets".to_string(),
+                collection_state: collection,
+                change_events: Vec::new(),
+            })
+            .expect("seed collection");
+        database
+            .checkpoint()
+            .expect("checkpoint high-cardinality index");
+
+        let info = DatabaseFile::info(&path).expect("info");
+        assert_eq!(info.summary.record_count, 10_000);
+        assert_eq!(info.summary.index_entry_count, 20_000);
+        assert_eq!(info.wal_since_checkpoint.record_count, 0);
     }
 }
