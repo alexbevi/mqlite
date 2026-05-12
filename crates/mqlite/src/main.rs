@@ -103,6 +103,8 @@ enum BenchCommand {
         collection: String,
         #[arg(long)]
         reset: bool,
+        #[arg(long, default_value_t = 0)]
+        dirty_wal_records: u32,
         #[arg(long)]
         allow_large: bool,
         #[arg(long)]
@@ -300,6 +302,7 @@ async fn main() -> Result<()> {
                         db,
                         collection,
                         reset,
+                        dirty_wal_records,
                         allow_large,
                         allow_stress,
                     } => seed_benchmark_fixture(
@@ -309,6 +312,7 @@ async fn main() -> Result<()> {
                             db: &db,
                             collection: &collection,
                             reset,
+                            dirty_wal_records,
                             allow_large,
                             allow_stress,
                         },
@@ -673,6 +677,7 @@ struct BenchmarkFixtureOptions<'a> {
     db: &'a str,
     collection: &'a str,
     reset: bool,
+    dirty_wal_records: u32,
     allow_large: bool,
     allow_stress: bool,
 }
@@ -785,6 +790,26 @@ fn seed_benchmark_fixture(
         change_events: Vec::new(),
     })?;
     database.checkpoint()?;
+    if options.dirty_wal_records > 0 {
+        let changes = ((spec.documents + 1)..=(spec.documents + options.dirty_wal_records))
+            .map(|sequence| {
+                mqlite_storage::CollectionChange::Insert(CollectionRecord::new(
+                    u64::from(sequence),
+                    benchmark_fixture_document(sequence, spec.payload_bytes),
+                ))
+            })
+            .collect::<Vec<_>>();
+        database.commit_mutation(WalMutation::ApplyCollectionChanges {
+            database: options.db.to_string(),
+            collection: options.collection.to_string(),
+            create_options: None,
+            changes,
+            inserts: Vec::new(),
+            updates: Vec::new(),
+            deletes: Vec::new(),
+            change_events: Vec::new(),
+        })?;
+    }
     drop(database);
     let write_elapsed = write_started.elapsed();
     let info = DatabaseFile::info(file)?;
@@ -800,6 +825,7 @@ fn seed_benchmark_fixture(
         "documents": spec.documents,
         "pointReads": spec.point_reads,
         "payloadBytes": spec.payload_bytes,
+        "dirtyWalRecords": options.dirty_wal_records,
         "elapsedMs": duration_ms(started.elapsed()),
         "phases": {
             "buildDocumentsMs": duration_ms(build_elapsed),
@@ -892,7 +918,7 @@ impl BenchmarkScenarios {
                     scenarios.warm_point = true;
                 }
                 "metadata" => scenarios.metadata = true,
-                "startup" | "first-point" => scenarios.first_point = true,
+                "startup" | "first-point" | "dirty-read" => scenarios.first_point = true,
                 "warm-point" => scenarios.warm_point = true,
                 other => bail!("unsupported benchmark scenario `{other}`"),
             }
@@ -1313,6 +1339,10 @@ mod tests {
         assert!(selected.metadata);
         assert!(selected.first_point);
         assert!(!selected.warm_point);
+        let dirty = BenchmarkScenarios::parse("dirty-read").expect("dirty-read scenario");
+        assert!(!dirty.metadata);
+        assert!(dirty.first_point);
+        assert!(!dirty.warm_point);
         assert!(BenchmarkScenarios::parse("unknown").is_err());
     }
 }
