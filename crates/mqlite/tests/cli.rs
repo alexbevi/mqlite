@@ -573,6 +573,28 @@ fn bench_command_reports_write_and_read_metrics() {
 }
 
 #[test]
+fn bench_seed_requires_large_profile_opt_in() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("bench-extended.mongodb");
+
+    let mut bench = Command::cargo_bin("mqlite").expect("binary");
+    bench
+        .args([
+            "bench",
+            "seed",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--profile",
+            "extended",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "extended benchmark profile requires --allow-large",
+        ));
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_documents_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-documents.mongodb");

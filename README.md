@@ -72,7 +72,9 @@ The CLI is intentionally small and focused:
 | --- | --- |
 | `mqlite serve --file <path>` | Run a broker for one `.mongodb` file. |
 | `mqlite command --file <path>` | Send one MongoDB command over a real `OP_MSG` request and print the reply as JSON. |
-| `mqlite bench --file <path>` | Run a quick local broker benchmark and report startup, write, and point-query latency against the selected index path. |
+| `mqlite bench --file <path>` | Run the legacy one-shot local broker benchmark. |
+| `mqlite bench seed --file <path>` | Build or reuse a deterministic benchmark fixture. |
+| `mqlite bench run --file <path>` | Measure startup, metadata, and indexed point-read scenarios against a seeded fixture. |
 | `mqlite checkpoint --file <path>` | Force a checkpoint and print storage metadata. |
 | `mqlite info --file <path>` | Print current database, collection, and index counts and sizes plus last-checkpoint details. |
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
@@ -88,7 +90,14 @@ You can also pipe JSON into `mqlite command`:
 printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongodb --db app
 ```
 
-`mqlite bench` now reports broker startup latency, per-phase throughput, the query field used for point reads, the first and slowest point-query latency it observed, and explicit startup / first-point-query budget verdicts so storage changes can be checked against the local startup SLO.
+`mqlite bench` keeps the original one-shot write/read probe for quick compatibility checks. For storage work, prefer the reusable fixture flow:
+
+```text
+mqlite bench seed --profile smoke --file target/mqlite-bench/smoke.mongodb --reset
+mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario metadata,first-point
+```
+
+Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, and point-read latency percentiles for the selected scenario.
 
 ## What Works Today
 

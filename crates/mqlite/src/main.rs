@@ -8,11 +8,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use bson::{Bson, Document, doc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
 use mqlite_debug::{Component, SessionHandle, install, session};
 use mqlite_ipc::{BoxedStream, BrokerPaths, broker_paths, connect, read_manifest, remove_manifest};
 use mqlite_server::{Broker, BrokerConfig};
-use mqlite_storage::DatabaseFile;
+use mqlite_storage::{DatabaseFile, WalMutation};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use serde_json::json;
 
@@ -65,7 +66,11 @@ enum Command {
     },
     Bench {
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<BenchCommand>,
+        #[arg(long, value_enum, default_value_t = BenchmarkProfile::Legacy)]
+        profile: BenchmarkProfile,
         #[arg(long, default_value = "bench")]
         db: String,
         #[arg(long, default_value = "bench")]
@@ -83,6 +88,53 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchCommand {
+    Seed {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, value_enum, default_value_t = BenchmarkProfile::Smoke)]
+        profile: BenchmarkProfile,
+        #[arg(long, default_value = "bench")]
+        db: String,
+        #[arg(long, default_value = "widgets")]
+        collection: String,
+        #[arg(long)]
+        reset: bool,
+        #[arg(long)]
+        allow_large: bool,
+        #[arg(long)]
+        allow_stress: bool,
+    },
+    Run {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, value_enum, default_value_t = BenchmarkProfile::Smoke)]
+        profile: BenchmarkProfile,
+        #[arg(long, default_value = "bench")]
+        db: String,
+        #[arg(long, default_value = "widgets")]
+        collection: String,
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        #[arg(long, default_value_t = 60)]
+        idle_shutdown_secs: u64,
+        #[arg(long)]
+        allow_large: bool,
+        #[arg(long)]
+        allow_stress: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BenchmarkProfile {
+    Legacy,
+    Smoke,
+    Default,
+    Extended,
+    Stress,
 }
 
 #[tokio::main]
@@ -219,6 +271,8 @@ async fn main() -> Result<()> {
         }
         Command::Bench {
             file,
+            command,
+            profile,
             db,
             collection_prefix,
             writes,
@@ -229,6 +283,82 @@ async fn main() -> Result<()> {
             idle_shutdown_secs,
         } => {
             let session = debug.then(|| session("cli.bench"));
+            if let Some(command) = command {
+                if let Some(session) = session.as_ref() {
+                    session.insert_metadata("command", "bench");
+                    match &command {
+                        BenchCommand::Seed { file, .. } | BenchCommand::Run { file, .. } => {
+                            session.insert_metadata("file", file.display().to_string());
+                        }
+                    }
+                }
+                let bench_started = Instant::now();
+                let report = match command {
+                    BenchCommand::Seed {
+                        file,
+                        profile,
+                        db,
+                        collection,
+                        reset,
+                        allow_large,
+                        allow_stress,
+                    } => seed_benchmark_fixture(
+                        &file,
+                        BenchmarkFixtureOptions {
+                            profile,
+                            db: &db,
+                            collection: &collection,
+                            reset,
+                            allow_large,
+                            allow_stress,
+                        },
+                    )?,
+                    BenchCommand::Run {
+                        file,
+                        profile,
+                        db,
+                        collection,
+                        scenario,
+                        idle_shutdown_secs,
+                        allow_large,
+                        allow_stress,
+                    } => {
+                        run_benchmark_fixture(
+                            &file,
+                            BenchmarkRunOptions {
+                                profile,
+                                db: &db,
+                                collection: &collection,
+                                scenario: &scenario,
+                                idle_shutdown_secs,
+                                allow_large,
+                                allow_stress,
+                            },
+                        )
+                        .await?
+                    }
+                };
+                if let Some(session) = session.as_ref() {
+                    session.record_duration(
+                        Component::Cli,
+                        "run_benchmark",
+                        bench_started.elapsed(),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                emit_local_debug_report(session.as_ref())?;
+                return Ok(());
+            }
+
+            let file = file.ok_or_else(|| anyhow!("bench requires --file"))?;
+            let profile = if profile == BenchmarkProfile::Legacy {
+                profile
+            } else {
+                bail!(
+                    "bench --profile requires a bench subcommand such as `bench seed` or `bench run`"
+                );
+            };
+            let _ = profile;
             if let Some(session) = session.as_ref() {
                 session.insert_metadata("command", "bench");
                 session.insert_metadata("file", file.display().to_string());
@@ -510,6 +640,369 @@ fn emit_command_debug_report(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BenchmarkProfileSpec {
+    name: &'static str,
+    documents: u32,
+    point_reads: u32,
+    payload_bytes: usize,
+}
+
+struct BenchmarkFixtureOptions<'a> {
+    profile: BenchmarkProfile,
+    db: &'a str,
+    collection: &'a str,
+    reset: bool,
+    allow_large: bool,
+    allow_stress: bool,
+}
+
+struct BenchmarkRunOptions<'a> {
+    profile: BenchmarkProfile,
+    db: &'a str,
+    collection: &'a str,
+    scenario: &'a str,
+    idle_shutdown_secs: u64,
+    allow_large: bool,
+    allow_stress: bool,
+}
+
+fn benchmark_profile_spec(profile: BenchmarkProfile) -> Result<BenchmarkProfileSpec> {
+    Ok(match profile {
+        BenchmarkProfile::Legacy => bail!("legacy is only valid for the original bench command"),
+        BenchmarkProfile::Smoke => BenchmarkProfileSpec {
+            name: "smoke",
+            documents: 10_000,
+            point_reads: 1_000,
+            payload_bytes: 96,
+        },
+        BenchmarkProfile::Default => BenchmarkProfileSpec {
+            name: "default",
+            documents: 50_000,
+            point_reads: 5_000,
+            payload_bytes: 384,
+        },
+        BenchmarkProfile::Extended => BenchmarkProfileSpec {
+            name: "extended",
+            documents: 250_000,
+            point_reads: 10_000,
+            payload_bytes: 384,
+        },
+        BenchmarkProfile::Stress => BenchmarkProfileSpec {
+            name: "stress",
+            documents: 1_000_000,
+            point_reads: 25_000,
+            payload_bytes: 384,
+        },
+    })
+}
+
+fn validate_benchmark_profile(
+    profile: BenchmarkProfile,
+    allow_large: bool,
+    allow_stress: bool,
+) -> Result<BenchmarkProfileSpec> {
+    let spec = benchmark_profile_spec(profile)?;
+    match profile {
+        BenchmarkProfile::Extended if !allow_large => {
+            bail!("extended benchmark profile requires --allow-large")
+        }
+        BenchmarkProfile::Stress if !allow_stress => {
+            bail!("stress benchmark profile requires --allow-stress")
+        }
+        _ => Ok(spec),
+    }
+}
+
+fn seed_benchmark_fixture(
+    file: &Path,
+    options: BenchmarkFixtureOptions<'_>,
+) -> Result<serde_json::Value> {
+    let spec =
+        validate_benchmark_profile(options.profile, options.allow_large, options.allow_stress)?;
+    let started = Instant::now();
+    if options.reset && file.exists() {
+        std::fs::remove_file(file)
+            .with_context(|| format!("failed to reset benchmark fixture `{}`", file.display()))?;
+    }
+    if file.exists() && !options.reset {
+        let info = DatabaseFile::info(file)?;
+        return Ok(json!({
+            "schemaVersion": 1,
+            "command": "seed",
+            "profile": spec.name,
+            "file": file.display().to_string(),
+            "db": options.db,
+            "collection": options.collection,
+            "reused": true,
+            "elapsedMs": duration_ms(started.elapsed()),
+            "storage": benchmark_storage_summary(&info),
+        }));
+    }
+
+    let build_started = Instant::now();
+    let mut collection = CollectionCatalog::new(doc! {});
+    for record_id in 1..=u64::from(spec.documents) {
+        collection
+            .insert_record(CollectionRecord::new(
+                record_id,
+                benchmark_fixture_document(record_id as u32, spec.payload_bytes),
+            ))
+            .with_context(|| format!("failed to seed benchmark document {record_id}"))?;
+    }
+    apply_index_specs(
+        &mut collection,
+        &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+    )?;
+    let build_elapsed = build_started.elapsed();
+
+    let write_started = Instant::now();
+    let mut database = DatabaseFile::open_or_create(file)?;
+    database.commit_mutation(WalMutation::ReplaceCollection {
+        database: options.db.to_string(),
+        collection: options.collection.to_string(),
+        collection_state: collection,
+        change_events: Vec::new(),
+    })?;
+    database.checkpoint()?;
+    drop(database);
+    let write_elapsed = write_started.elapsed();
+    let info = DatabaseFile::info(file)?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "command": "seed",
+        "profile": spec.name,
+        "file": file.display().to_string(),
+        "db": options.db,
+        "collection": options.collection,
+        "reused": false,
+        "documents": spec.documents,
+        "pointReads": spec.point_reads,
+        "payloadBytes": spec.payload_bytes,
+        "elapsedMs": duration_ms(started.elapsed()),
+        "phases": {
+            "buildDocumentsMs": duration_ms(build_elapsed),
+            "writeAndCheckpointMs": duration_ms(write_elapsed),
+        },
+        "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+async fn run_benchmark_fixture(
+    file: &Path,
+    options: BenchmarkRunOptions<'_>,
+) -> Result<serde_json::Value> {
+    let spec =
+        validate_benchmark_profile(options.profile, options.allow_large, options.allow_stress)?;
+    let scenarios = BenchmarkScenarios::parse(options.scenario)?;
+    let started = Instant::now();
+    let before = DatabaseFile::info(file)?;
+    let metadata = if scenarios.metadata {
+        Some(run_benchmark_metadata_scenario(file)?)
+    } else {
+        None
+    };
+
+    let mut startup = None;
+    let mut point_reads = None;
+    if scenarios.point_reads() {
+        let startup_started = Instant::now();
+        let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
+        let startup_elapsed = startup_started.elapsed();
+        startup = Some(benchmark_budget_report(
+            startup_elapsed,
+            BENCH_STARTUP_TARGET_MS,
+        ));
+        let reads = if scenarios.warm_point {
+            spec.point_reads
+        } else {
+            1
+        };
+        point_reads = Some(
+            run_benchmark_point_reads(&mut stream, options.db, options.collection, reads).await?,
+        );
+    }
+    let after = DatabaseFile::info(file)?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "command": "run",
+        "profile": spec.name,
+        "scenario": options.scenario,
+        "file": file.display().to_string(),
+        "db": options.db,
+        "collection": options.collection,
+        "elapsedMs": duration_ms(started.elapsed()),
+        "startup": startup,
+        "metadata": metadata,
+        "pointReads": point_reads,
+        "storageBefore": benchmark_storage_summary(&before),
+        "storageAfter": benchmark_storage_summary(&after),
+        "targets": {
+            "startupMs": BENCH_STARTUP_TARGET_MS,
+            "firstPointQueryMs": BENCH_FIRST_POINT_QUERY_TARGET_MS,
+        },
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenchmarkScenarios {
+    metadata: bool,
+    first_point: bool,
+    warm_point: bool,
+}
+
+impl BenchmarkScenarios {
+    fn parse(raw: &str) -> Result<Self> {
+        let mut scenarios = Self {
+            metadata: false,
+            first_point: false,
+            warm_point: false,
+        };
+        for part in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            match part {
+                "all" => {
+                    scenarios.metadata = true;
+                    scenarios.first_point = true;
+                    scenarios.warm_point = true;
+                }
+                "metadata" => scenarios.metadata = true,
+                "startup" | "first-point" => scenarios.first_point = true,
+                "warm-point" => scenarios.warm_point = true,
+                other => bail!("unsupported benchmark scenario `{other}`"),
+            }
+        }
+        if !scenarios.metadata && !scenarios.first_point && !scenarios.warm_point {
+            bail!("at least one benchmark scenario is required");
+        }
+        Ok(scenarios)
+    }
+
+    fn point_reads(self) -> bool {
+        self.first_point || self.warm_point
+    }
+}
+
+fn run_benchmark_metadata_scenario(file: &Path) -> Result<serde_json::Value> {
+    let info_started = Instant::now();
+    let info = DatabaseFile::info(file)?;
+    let info_elapsed = info_started.elapsed();
+    let inspect_started = Instant::now();
+    let inspect = DatabaseFile::inspect(file)?;
+    let inspect_elapsed = inspect_started.elapsed();
+    Ok(json!({
+        "infoElapsedMs": duration_ms(info_elapsed),
+        "inspectElapsedMs": duration_ms(inspect_elapsed),
+        "info": benchmark_storage_summary(&info),
+        "inspect": {
+            "checkpointGeneration": inspect.checkpoint_generation,
+            "walRecordsSinceCheckpoint": inspect.wal_records_since_checkpoint,
+            "walBytesSinceCheckpoint": inspect.wal_bytes_since_checkpoint,
+        }
+    }))
+}
+
+async fn run_benchmark_point_reads(
+    stream: &mut BoxedStream,
+    db: &str,
+    collection: &str,
+    reads: u32,
+) -> Result<serde_json::Value> {
+    let mut latencies = Vec::with_capacity(reads as usize);
+    let started = Instant::now();
+    for index in 0..reads {
+        let sequence = index + 1;
+        let query_started = Instant::now();
+        let response = send_checked_command(
+            stream,
+            doc! {
+                "find": collection,
+                "filter": { "sku": format!("sku-{sequence:08}") },
+                "limit": 1,
+                "$db": db,
+            },
+        )
+        .await?;
+        let elapsed = query_started.elapsed();
+        let first_batch = response
+            .get_document("cursor")
+            .context("find reply missing cursor")?
+            .get_array("firstBatch")
+            .context("find reply missing firstBatch")?;
+        if first_batch.len() != 1 {
+            bail!(
+                "benchmark point read expected one document for sequence {sequence}, got {}",
+                first_batch.len()
+            );
+        }
+        latencies.push(elapsed);
+    }
+    let elapsed = started.elapsed();
+    Ok(json!({
+        "documents": reads,
+        "elapsedMs": duration_ms(elapsed),
+        "docsPerSec": rate_per_second(reads, elapsed),
+        "firstQueryElapsedMs": duration_ms(*latencies.first().unwrap_or(&Duration::ZERO)),
+        "p50Ms": duration_ms(percentile_duration(&latencies, 50.0)),
+        "p95Ms": duration_ms(percentile_duration(&latencies, 95.0)),
+        "maxMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+    }))
+}
+
+fn benchmark_storage_summary(info: &mqlite_storage::InfoReport) -> serde_json::Value {
+    json!({
+        "fileSize": info.file_size,
+        "lastAppliedSequence": info.last_applied_sequence,
+        "databaseCount": info.summary.database_count,
+        "collectionCount": info.summary.collection_count,
+        "indexCount": info.summary.index_count,
+        "recordCount": info.summary.record_count,
+        "indexEntryCount": info.summary.index_entry_count,
+        "documentBytes": info.summary.document_bytes,
+        "indexBytes": info.summary.index_bytes,
+        "checkpointGeneration": info.last_checkpoint.generation,
+        "checkpointPageCount": info.last_checkpoint.page_count,
+        "walRecords": info.wal_since_checkpoint.record_count,
+        "walBytes": info.wal_since_checkpoint.bytes,
+    })
+}
+
+fn benchmark_fixture_document(sequence: u32, payload_bytes: usize) -> Document {
+    doc! {
+        "_id": i64::from(sequence),
+        "sku": format!("sku-{sequence:08}"),
+        "category": format!("cat-{}", sequence % 32),
+        "qty": i64::from(sequence % 10_000),
+        "active": sequence % 2 == 0,
+        "payload": deterministic_payload(sequence, payload_bytes),
+    }
+}
+
+fn deterministic_payload(sequence: u32, len: usize) -> String {
+    let seed = format!("payload-{sequence:08}-");
+    let mut payload = String::with_capacity(len);
+    while payload.len() < len {
+        payload.push_str(&seed);
+    }
+    payload.truncate(len);
+    payload
+}
+
+fn percentile_duration(values: &[Duration], percentile: f64) -> Duration {
+    if values.is_empty() {
+        return Duration::ZERO;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let rank = ((percentile / 100.0) * (sorted.len().saturating_sub(1) as f64)).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
 struct BenchmarkOptions<'a> {
     db: &'a str,
     collection_prefix: &'a str,
@@ -748,7 +1241,10 @@ mod tests {
     use bson::doc;
     use serde_json::json;
 
-    use super::{benchmark_budget_report, benchmark_filter};
+    use super::{
+        BenchmarkProfile, BenchmarkScenarios, benchmark_budget_report, benchmark_filter,
+        validate_benchmark_profile,
+    };
 
     #[test]
     fn benchmark_filter_targets_secondary_index_when_present() {
@@ -768,5 +1264,30 @@ mod tests {
         let over = benchmark_budget_report(Duration::from_millis(620), 500.0);
         assert_eq!(over["withinTarget"], json!(false));
         assert_eq!(over["elapsedMs"], json!(620.0));
+    }
+
+    #[test]
+    fn benchmark_profile_requires_explicit_large_opt_in() {
+        assert!(validate_benchmark_profile(BenchmarkProfile::Smoke, false, false).is_ok());
+        assert!(validate_benchmark_profile(BenchmarkProfile::Default, false, false).is_ok());
+        assert!(validate_benchmark_profile(BenchmarkProfile::Extended, false, false).is_err());
+        assert!(validate_benchmark_profile(BenchmarkProfile::Extended, true, false).is_ok());
+        assert!(validate_benchmark_profile(BenchmarkProfile::Stress, true, false).is_err());
+        assert!(validate_benchmark_profile(BenchmarkProfile::Stress, true, true).is_ok());
+    }
+
+    #[test]
+    fn benchmark_scenario_parser_supports_grouped_scenarios() {
+        let all = BenchmarkScenarios::parse("all").expect("all scenarios");
+        assert!(all.metadata);
+        assert!(all.first_point);
+        assert!(all.warm_point);
+
+        let selected =
+            BenchmarkScenarios::parse("metadata,first-point").expect("selected scenarios");
+        assert!(selected.metadata);
+        assert!(selected.first_point);
+        assert!(!selected.warm_point);
+        assert!(BenchmarkScenarios::parse("unknown").is_err());
     }
 }

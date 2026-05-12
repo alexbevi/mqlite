@@ -402,7 +402,7 @@ The CLI surfaces split along intent:
 - `mqlite inspect`: lower-level file, superblock, WAL, and page-graph metadata
 - `mqlite verify`: slower full reopen and validation path
 - `mqlite checkpoint`: force a foreground checkpoint
-- `mqlite bench`: measure broker startup and simple query latency budgets
+- `mqlite bench`: measure legacy one-shot write/read latency or seed reusable benchmark fixtures and run startup, metadata, and point-read scenarios against them
 
 `mqlite command` remains the default direct validation path before any driver patching work.
 
