@@ -603,6 +603,26 @@ async fn send_checked_command(stream: &mut BoxedStream, body: Document) -> Resul
     Ok(response)
 }
 
+async fn send_checked_command_with_broker_debug(
+    stream: &mut BoxedStream,
+    mut body: Document,
+) -> Result<(Document, Option<Document>)> {
+    body.insert("$mqliteDebug", true);
+    let mut response = send_command(stream, body, None).await?;
+    let broker_debug = response
+        .remove("$mqliteDebug")
+        .and_then(|value| value.as_document().cloned());
+    if response.get_f64("ok").unwrap_or(0.0) == 0.0 {
+        bail!(
+            "{}",
+            response
+                .get_str("errmsg")
+                .unwrap_or("mqlite benchmark command returned an error")
+        );
+    }
+    Ok((response, broker_debug))
+}
+
 fn emit_local_debug_report(session: Option<&SessionHandle>) -> Result<()> {
     let Some(session) = session else {
         return Ok(());
@@ -914,20 +934,24 @@ async fn run_benchmark_point_reads(
     reads: u32,
 ) -> Result<serde_json::Value> {
     let mut latencies = Vec::with_capacity(reads as usize);
+    let mut first_query_debug = None;
     let started = Instant::now();
     for index in 0..reads {
         let sequence = index + 1;
         let query_started = Instant::now();
-        let response = send_checked_command(
-            stream,
-            doc! {
-                "find": collection,
-                "filter": { "sku": format!("sku-{sequence:08}") },
-                "limit": 1,
-                "$db": db,
-            },
-        )
-        .await?;
+        let command = doc! {
+            "find": collection,
+            "filter": { "sku": format!("sku-{sequence:08}") },
+            "limit": 1,
+            "$db": db,
+        };
+        let response = if index == 0 {
+            let (response, debug) = send_checked_command_with_broker_debug(stream, command).await?;
+            first_query_debug = debug;
+            response
+        } else {
+            send_checked_command(stream, command).await?
+        };
         let elapsed = query_started.elapsed();
         let first_batch = response
             .get_document("cursor")
@@ -951,6 +975,7 @@ async fn run_benchmark_point_reads(
         "p50Ms": duration_ms(percentile_duration(&latencies, 50.0)),
         "p95Ms": duration_ms(percentile_duration(&latencies, 95.0)),
         "maxMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "firstQueryDebug": first_query_debug,
     }))
 }
 
