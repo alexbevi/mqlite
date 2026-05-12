@@ -62,7 +62,7 @@ pub struct BrokerConfig {
     pub checkpoint_interval_secs: u64,
     pub checkpoint_wal_bytes_threshold: u64,
     pub watch_parent_pid: Option<u32>,
-    #[cfg(test)]
+    #[doc(hidden)]
     pub checkpoint_test_delay_ms: u64,
     #[cfg(test)]
     pub watch_parent_pid_alive_override: Option<fn(u32) -> bool>,
@@ -76,7 +76,6 @@ impl BrokerConfig {
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
             checkpoint_wal_bytes_threshold: DEFAULT_CHECKPOINT_WAL_BYTES_THRESHOLD,
             watch_parent_pid: None,
-            #[cfg(test)]
             checkpoint_test_delay_ms: 0,
             #[cfg(test)]
             watch_parent_pid_alive_override: None,
@@ -258,6 +257,11 @@ impl Broker {
 
     pub fn paths(&self) -> &BrokerPaths {
         &self.paths
+    }
+
+    #[doc(hidden)]
+    pub fn has_concurrent_checkpoint_for_benchmark(&self) -> Result<bool> {
+        Ok(self.storage_read()?.has_concurrent_checkpoint())
     }
 
     pub async fn serve(self) -> Result<()> {
@@ -3371,14 +3375,8 @@ impl Broker {
     }
 }
 
-#[cfg(test)]
 fn background_checkpoint_test_delay_ms(config: &BrokerConfig) -> u64 {
     config.checkpoint_test_delay_ms
-}
-
-#[cfg(not(test))]
-fn background_checkpoint_test_delay_ms(_config: &BrokerConfig) -> u64 {
-    0
 }
 
 #[cfg(test)]

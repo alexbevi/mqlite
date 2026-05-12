@@ -74,7 +74,7 @@ The CLI is intentionally small and focused:
 | `mqlite command --file <path>` | Send one MongoDB command over a real `OP_MSG` request and print the reply as JSON. |
 | `mqlite bench --file <path>` | Run the legacy one-shot local broker benchmark. |
 | `mqlite bench seed --file <path>` | Build or reuse a deterministic benchmark fixture. |
-| `mqlite bench run --file <path>` | Measure startup, metadata, and indexed point-read scenarios against a seeded fixture. |
+| `mqlite bench run --file <path>` | Measure startup, metadata, indexed point-read, write, checkpoint, checkpoint-load, and verify scenarios against a seeded fixture. |
 | `mqlite checkpoint --file <path>` | Force a checkpoint and print storage metadata. |
 | `mqlite info --file <path>` | Print current database, collection, and index counts and sizes plus last-checkpoint details. |
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
@@ -96,9 +96,10 @@ printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongo
 mqlite bench seed --profile smoke --file target/mqlite-bench/smoke.mongodb --reset
 mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario metadata,first-point
 mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario writes,checkpoint,verify --write-batch-size 100
+mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario checkpoint-load
 ```
 
-Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and `bench seed --dirty-wal-records <n>` can leave a bounded WAL tail for `bench run --scenario dirty-read`. JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, point-read latency percentiles, first-query broker diagnostics, write throughput, checkpoint duration, and verify duration for the selected scenario.
+Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and `bench seed --dirty-wal-records <n>` can leave a bounded WAL tail for `bench run --scenario dirty-read`. JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, point-read latency percentiles, first-query broker diagnostics, write throughput, checkpoint duration, checkpoint-load command latency, and verify duration for the selected scenario.
 
 ## What Works Today
 

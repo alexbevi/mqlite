@@ -123,6 +123,10 @@ enum BenchCommand {
         scenario: String,
         #[arg(long, default_value_t = 100)]
         write_batch_size: u32,
+        #[arg(long, default_value_t = 25)]
+        checkpoint_probe_commands: u32,
+        #[arg(long, default_value_t = 500)]
+        checkpoint_test_delay_ms: u64,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
         #[arg(long)]
@@ -326,6 +330,8 @@ async fn main() -> Result<()> {
                         collection,
                         scenario,
                         write_batch_size,
+                        checkpoint_probe_commands,
+                        checkpoint_test_delay_ms,
                         idle_shutdown_secs,
                         allow_large,
                         allow_stress,
@@ -338,6 +344,8 @@ async fn main() -> Result<()> {
                                 collection: &collection,
                                 scenario: &scenario,
                                 write_batch_size,
+                                checkpoint_probe_commands,
+                                checkpoint_test_delay_ms,
                                 idle_shutdown_secs,
                                 allow_large,
                                 allow_stress,
@@ -692,6 +700,8 @@ struct BenchmarkRunOptions<'a> {
     collection: &'a str,
     scenario: &'a str,
     write_batch_size: u32,
+    checkpoint_probe_commands: u32,
+    checkpoint_test_delay_ms: u64,
     idle_shutdown_secs: u64,
     allow_large: bool,
     allow_stress: bool,
@@ -897,6 +907,22 @@ async fn run_benchmark_fixture(
     } else {
         None
     };
+    let checkpoint_load = if scenarios.checkpoint_load {
+        Some(
+            run_benchmark_checkpoint_load_scenario(
+                file,
+                options.db,
+                options.collection,
+                &spec,
+                options.checkpoint_probe_commands,
+                options.checkpoint_test_delay_ms,
+                options.idle_shutdown_secs,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let verify = if scenarios.verify {
         Some(run_benchmark_verify_scenario(file)?)
     } else {
@@ -918,6 +944,7 @@ async fn run_benchmark_fixture(
         "pointReads": point_reads,
         "writes": writes,
         "checkpoint": checkpoint,
+        "checkpointLoad": checkpoint_load,
         "verify": verify,
         "storageBefore": benchmark_storage_summary(&before),
         "storageAfter": benchmark_storage_summary(&after),
@@ -935,6 +962,7 @@ struct BenchmarkScenarios {
     warm_point: bool,
     writes: bool,
     checkpoint: bool,
+    checkpoint_load: bool,
     verify: bool,
 }
 
@@ -946,6 +974,7 @@ impl BenchmarkScenarios {
             warm_point: false,
             writes: false,
             checkpoint: false,
+            checkpoint_load: false,
             verify: false,
         };
         for part in raw
@@ -964,6 +993,7 @@ impl BenchmarkScenarios {
                 "warm-point" => scenarios.warm_point = true,
                 "writes" => scenarios.writes = true,
                 "checkpoint" => scenarios.checkpoint = true,
+                "checkpoint-load" | "checkpoint-concurrent" => scenarios.checkpoint_load = true,
                 "verify" | "recovery-verify" => scenarios.verify = true,
                 other => bail!("unsupported benchmark scenario `{other}`"),
             }
@@ -973,6 +1003,7 @@ impl BenchmarkScenarios {
             && !scenarios.warm_point
             && !scenarios.writes
             && !scenarios.checkpoint
+            && !scenarios.checkpoint_load
             && !scenarios.verify
         {
             bail!("at least one benchmark scenario is required");
@@ -1147,6 +1178,141 @@ async fn run_benchmark_write_scenario(
         "p95CommandMs": duration_ms(percentile_duration(&latencies, 95.0)),
         "maxCommandMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
     }))
+}
+
+async fn run_benchmark_checkpoint_load_scenario(
+    file: &Path,
+    db: &str,
+    collection: &str,
+    spec: &BenchmarkProfileSpec,
+    probe_commands: u32,
+    checkpoint_test_delay_ms: u64,
+    idle_shutdown_secs: u64,
+) -> Result<serde_json::Value> {
+    if probe_commands == 0 {
+        bail!("--checkpoint-probe-commands must be greater than 0");
+    }
+
+    let mut config = BrokerConfig::new(file, idle_shutdown_secs.max(1));
+    config.checkpoint_interval_secs = 60;
+    config.checkpoint_wal_bytes_threshold = 64;
+    config.checkpoint_test_delay_ms = checkpoint_test_delay_ms;
+    let broker = Broker::new(config)?;
+    let paths = broker.paths().clone();
+    let _ = remove_manifest(&paths.manifest_path);
+    let serve_task = tokio::spawn(broker.clone().serve());
+    let mut stream = connect_embedded_broker(&paths, &serve_task).await?;
+
+    let run_id = benchmark_run_id()?;
+    let trigger_started = Instant::now();
+    send_checked_command(
+        &mut stream,
+        doc! {
+            "insert": collection,
+            "documents": Bson::Array(vec![Bson::Document(doc! {
+                "_id": format!("checkpoint-load-{run_id}-trigger"),
+                "sku": format!("checkpoint-load-{run_id}-trigger"),
+                "category": "checkpoint-load",
+                "qty": 1_i64,
+                "active": true,
+                "payload": deterministic_payload(30_000_000, spec.payload_bytes),
+            })]),
+            "$db": db,
+        },
+    )
+    .await?;
+    let trigger_elapsed = trigger_started.elapsed();
+
+    let capture_started = Instant::now();
+    let capture_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if broker.has_concurrent_checkpoint_for_benchmark()? {
+            break;
+        }
+        if Instant::now() >= capture_deadline {
+            drop(stream);
+            let _ = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+            bail!("timed out waiting for background checkpoint handoff");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let checkpoint_observed_after = capture_started.elapsed();
+
+    let mut probe_latencies = Vec::with_capacity(probe_commands as usize);
+    for _ in 0..probe_commands {
+        let command_started = Instant::now();
+        send_checked_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await?;
+        probe_latencies.push(command_started.elapsed());
+    }
+
+    let insert_started = Instant::now();
+    send_checked_command(
+        &mut stream,
+        doc! {
+            "insert": collection,
+            "documents": Bson::Array(vec![Bson::Document(doc! {
+                "_id": format!("checkpoint-load-{run_id}-during"),
+                "sku": format!("checkpoint-load-{run_id}-during"),
+                "category": "checkpoint-load",
+                "qty": 2_i64,
+                "active": true,
+                "payload": deterministic_payload(30_000_001, spec.payload_bytes),
+            })]),
+            "$db": db,
+        },
+    )
+    .await?;
+    let insert_during_checkpoint_elapsed = insert_started.elapsed();
+    let still_running_after_probes = broker.has_concurrent_checkpoint_for_benchmark()?;
+
+    drop(stream);
+    tokio::time::timeout(
+        Duration::from_secs(idle_shutdown_secs.max(1) + 30),
+        serve_task,
+    )
+    .await
+    .context("timed out waiting for embedded benchmark broker shutdown")?
+    .context("embedded benchmark broker join failed")?
+    .context("embedded benchmark broker failed")?;
+
+    Ok(json!({
+        "triggerInsertMs": duration_ms(trigger_elapsed),
+        "checkpointObservedAfterMs": duration_ms(checkpoint_observed_after),
+        "checkpointTestDelayMs": checkpoint_test_delay_ms,
+        "probeCommands": probe_commands,
+        "p50CommandMs": duration_ms(percentile_duration(&probe_latencies, 50.0)),
+        "p95CommandMs": duration_ms(percentile_duration(&probe_latencies, 95.0)),
+        "maxCommandMs": duration_ms(probe_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "insertDuringCheckpointMs": duration_ms(insert_during_checkpoint_elapsed),
+        "stillRunningAfterProbes": still_running_after_probes,
+    }))
+}
+
+async fn connect_embedded_broker(
+    paths: &BrokerPaths,
+    serve_task: &tokio::task::JoinHandle<Result<()>>,
+) -> Result<BoxedStream> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if serve_task.is_finished() {
+            bail!(
+                "embedded benchmark broker exited before writing its manifest at {}",
+                paths.manifest_path.display()
+            );
+        }
+        if let Ok(manifest) = read_manifest(&paths.manifest_path) {
+            if let Ok(stream) = connect(&manifest.endpoint).await {
+                return Ok(stream);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for embedded benchmark broker manifest at {}",
+                paths.manifest_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn run_benchmark_checkpoint_scenario(
@@ -1546,13 +1712,16 @@ mod tests {
         assert!(!all.checkpoint);
         assert!(!all.verify);
 
-        let selected = BenchmarkScenarios::parse("metadata,first-point,writes,checkpoint,verify")
-            .expect("selected scenarios");
+        let selected = BenchmarkScenarios::parse(
+            "metadata,first-point,writes,checkpoint,checkpoint-load,verify",
+        )
+        .expect("selected scenarios");
         assert!(selected.metadata);
         assert!(selected.first_point);
         assert!(!selected.warm_point);
         assert!(selected.writes);
         assert!(selected.checkpoint);
+        assert!(selected.checkpoint_load);
         assert!(selected.verify);
         let dirty = BenchmarkScenarios::parse("dirty-read").expect("dirty-read scenario");
         assert!(!dirty.metadata);
