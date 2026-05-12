@@ -145,6 +145,96 @@ fn command_debug_flag_emits_combined_client_and_broker_report() {
 }
 
 #[test]
+fn command_debug_indexed_find_does_not_eagerly_scan_collection() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("debug-indexed-read.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"alpha"},{"_id":2,"sku":"beta"},{"_id":3,"sku":"gamma"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_index = Command::cargo_bin("mqlite").expect("binary");
+    create_index
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut checkpoint = Command::cargo_bin("mqlite").expect("binary");
+    checkpoint
+        .args(["checkpoint", "--file"])
+        .arg(&database_path)
+        .assert()
+        .success();
+    wait_for_broker_exit(&database_path);
+
+    let mut debug_find = Command::cargo_bin("mqlite").expect("binary");
+    let output = debug_find
+        .args([
+            "--debug",
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--eval",
+            r#"{"find":"widgets","filter":{"sku":"beta"},"limit":1}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let response: Value =
+        serde_json::from_slice(&output.stdout).expect("debug command stdout response");
+    assert_eq!(response["cursor"]["firstBatch"][0]["sku"], "beta");
+
+    let debug: Value = serde_json::from_slice(&output.stderr).expect("debug command stderr report");
+    assert_eq!(
+        debug["debug"]["broker"]["metadata"]["readPath"],
+        "pageBacked"
+    );
+    let counters = debug["debug"]["broker"]["counters"]
+        .as_array()
+        .expect("broker counters");
+    assert!(
+        !counters
+            .iter()
+            .any(|counter| counter["name"] == "findCollectionRecords"),
+        "indexed point read should not hydrate all collection records"
+    );
+    assert!(
+        !counters
+            .iter()
+            .any(|counter| counter["name"] == "collectionScanRecords"),
+        "indexed point read should not execute collection scan"
+    );
+    assert!(
+        counters
+            .iter()
+            .any(|counter| counter["name"] == "indexKeysExamined" && counter["value"] == 1),
+        "indexed point read should examine one index key"
+    );
+}
+
+#[test]
 fn info_command_reports_current_and_checkpoint_state() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("info-cli.mongodb");

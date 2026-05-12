@@ -4577,6 +4577,7 @@ struct ProjectionRequirements {
 }
 
 trait FindCollection {
+    fn record_count_estimate(&self) -> usize;
     fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError>;
     fn record_document(&self, record_id: u64) -> Result<Option<Document>, CommandError>;
     fn index_names(&self) -> Vec<String>;
@@ -4602,6 +4603,10 @@ trait FindIndex {
 }
 
 impl FindCollection for CollectionCatalog {
+    fn record_count_estimate(&self) -> usize {
+        self.records.len()
+    }
+
     fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError> {
         Ok(self.records.clone())
     }
@@ -4690,6 +4695,13 @@ impl<'a> StorageFindCollection<'a> {
 }
 
 impl FindCollection for StorageFindCollection<'_> {
+    fn record_count_estimate(&self) -> usize {
+        self.index("_id_")
+            .map(FindIndex::entry_count)
+            .or_else(|| self.indexes.values().map(FindIndex::entry_count).max())
+            .unwrap_or(0)
+    }
+
     fn scan_records(&self) -> Result<Vec<CollectionRecord>, CommandError> {
         let _span = span(Component::Catalog, "find_collection_scan_records");
         let records = self.inner.scan_records().map_err(internal_error)?;
@@ -5121,16 +5133,26 @@ fn plan_find_simple(
         projection_requirements: projection_requirements.as_ref(),
     };
 
-    let mut best_plan = plan_collection_scan(collection, expression, sort)?;
+    let collection_scan_cost = PlanCost {
+        docs_examined: collection.record_count_estimate(),
+        requires_sort: sort.is_some(),
+        keys_examined: 0,
+        projection_not_covered: true,
+        collection_scan: true,
+    };
+    let mut best_index_plan = None::<PlannedFind>;
     if let Some(index_name) = preferred_index {
         if let Some(index) = collection.index(index_name) {
             if let Some(candidate) = evaluate_index_plan(&context, index)? {
-                if candidate.cost() < best_plan.cost() {
-                    best_plan = candidate;
+                if candidate.cost() < collection_scan_cost {
+                    best_index_plan = Some(candidate);
                 }
             }
         }
-        return Ok(best_plan);
+        return match best_index_plan {
+            Some(plan) => Ok(plan),
+            None => plan_collection_scan(collection, expression, sort),
+        };
     }
 
     let mut estimated_candidates = collection
@@ -5155,13 +5177,20 @@ fn plan_find_simple(
             continue;
         };
         if let Some(candidate) = evaluate_index_plan(&context, index)? {
-            if candidate.cost() < best_plan.cost() {
-                best_plan = candidate;
+            let current_best = best_index_plan
+                .as_ref()
+                .map(PlannedFind::cost)
+                .unwrap_or_else(|| collection_scan_cost.clone());
+            if candidate.cost() < current_best {
+                best_index_plan = Some(candidate);
             }
         }
     }
 
-    Ok(best_plan)
+    match best_index_plan {
+        Some(plan) => Ok(plan),
+        None => plan_collection_scan(collection, expression, sort),
+    }
 }
 
 fn plan_collection_scan(
