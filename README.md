@@ -95,9 +95,10 @@ printf '%s\n' '{"listCollections":1}' | mqlite command --file /tmp/example.mongo
 ```text
 mqlite bench seed --profile smoke --file target/mqlite-bench/smoke.mongodb --reset
 mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario metadata,first-point
+mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scenario writes,checkpoint,verify --write-batch-size 100
 ```
 
-Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and `bench seed --dirty-wal-records <n>` can leave a bounded WAL tail for `bench run --scenario dirty-read`. JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, point-read latency percentiles, and first-query broker diagnostics for the selected scenario.
+Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and `bench seed --dirty-wal-records <n>` can leave a bounded WAL tail for `bench run --scenario dirty-read`. JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, point-read latency percentiles, first-query broker diagnostics, write throughput, checkpoint duration, and verify duration for the selected scenario.
 
 ## What Works Today
 

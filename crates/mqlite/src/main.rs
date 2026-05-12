@@ -121,6 +121,8 @@ enum BenchCommand {
         collection: String,
         #[arg(long, default_value = "all")]
         scenario: String,
+        #[arg(long, default_value_t = 100)]
+        write_batch_size: u32,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
         #[arg(long)]
@@ -323,6 +325,7 @@ async fn main() -> Result<()> {
                         db,
                         collection,
                         scenario,
+                        write_batch_size,
                         idle_shutdown_secs,
                         allow_large,
                         allow_stress,
@@ -334,6 +337,7 @@ async fn main() -> Result<()> {
                                 db: &db,
                                 collection: &collection,
                                 scenario: &scenario,
+                                write_batch_size,
                                 idle_shutdown_secs,
                                 allow_large,
                                 allow_stress,
@@ -687,6 +691,7 @@ struct BenchmarkRunOptions<'a> {
     db: &'a str,
     collection: &'a str,
     scenario: &'a str,
+    write_batch_size: u32,
     idle_shutdown_secs: u64,
     allow_large: bool,
     allow_stress: bool,
@@ -849,9 +854,9 @@ async fn run_benchmark_fixture(
     } else {
         None
     };
-
     let mut startup = None;
     let mut point_reads = None;
+    let mut writes = None;
     if scenarios.point_reads() {
         let startup_started = Instant::now();
         let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
@@ -869,6 +874,34 @@ async fn run_benchmark_fixture(
             run_benchmark_point_reads(&mut stream, options.db, options.collection, reads).await?,
         );
     }
+    if scenarios.writes {
+        let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
+        writes = Some(
+            run_benchmark_write_scenario(
+                &mut stream,
+                options.db,
+                options.collection,
+                &spec,
+                options.write_batch_size,
+            )
+            .await?,
+        );
+    }
+    let checkpoint = if scenarios.checkpoint {
+        Some(run_benchmark_checkpoint_scenario(
+            file,
+            options.db,
+            options.collection,
+            &spec,
+        )?)
+    } else {
+        None
+    };
+    let verify = if scenarios.verify {
+        Some(run_benchmark_verify_scenario(file)?)
+    } else {
+        None
+    };
     let after = DatabaseFile::info(file)?;
 
     Ok(json!({
@@ -883,6 +916,9 @@ async fn run_benchmark_fixture(
         "startup": startup,
         "metadata": metadata,
         "pointReads": point_reads,
+        "writes": writes,
+        "checkpoint": checkpoint,
+        "verify": verify,
         "storageBefore": benchmark_storage_summary(&before),
         "storageAfter": benchmark_storage_summary(&after),
         "targets": {
@@ -897,6 +933,9 @@ struct BenchmarkScenarios {
     metadata: bool,
     first_point: bool,
     warm_point: bool,
+    writes: bool,
+    checkpoint: bool,
+    verify: bool,
 }
 
 impl BenchmarkScenarios {
@@ -905,6 +944,9 @@ impl BenchmarkScenarios {
             metadata: false,
             first_point: false,
             warm_point: false,
+            writes: false,
+            checkpoint: false,
+            verify: false,
         };
         for part in raw
             .split(',')
@@ -920,10 +962,19 @@ impl BenchmarkScenarios {
                 "metadata" => scenarios.metadata = true,
                 "startup" | "first-point" | "dirty-read" => scenarios.first_point = true,
                 "warm-point" => scenarios.warm_point = true,
+                "writes" => scenarios.writes = true,
+                "checkpoint" => scenarios.checkpoint = true,
+                "verify" | "recovery-verify" => scenarios.verify = true,
                 other => bail!("unsupported benchmark scenario `{other}`"),
             }
         }
-        if !scenarios.metadata && !scenarios.first_point && !scenarios.warm_point {
+        if !scenarios.metadata
+            && !scenarios.first_point
+            && !scenarios.warm_point
+            && !scenarios.writes
+            && !scenarios.checkpoint
+            && !scenarios.verify
+        {
             bail!("at least one benchmark scenario is required");
         }
         Ok(scenarios)
@@ -950,6 +1001,22 @@ fn run_benchmark_metadata_scenario(file: &Path) -> Result<serde_json::Value> {
             "walRecordsSinceCheckpoint": inspect.wal_records_since_checkpoint,
             "walBytesSinceCheckpoint": inspect.wal_bytes_since_checkpoint,
         }
+    }))
+}
+
+fn run_benchmark_verify_scenario(file: &Path) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let report = DatabaseFile::verify(file)?;
+    let elapsed = started.elapsed();
+    Ok(json!({
+        "elapsedMs": duration_ms(elapsed),
+        "valid": report.valid,
+        "checkpointGeneration": report.checkpoint_generation,
+        "pageCount": report.page_count,
+        "recordCount": report.record_count,
+        "indexEntryCount": report.index_entry_count,
+        "walRecordsSinceCheckpoint": report.wal_records_since_checkpoint,
+        "truncatedWalTail": report.truncated_wal_tail,
     }))
 }
 
@@ -1005,6 +1072,140 @@ async fn run_benchmark_point_reads(
     }))
 }
 
+async fn run_benchmark_write_scenario(
+    stream: &mut BoxedStream,
+    db: &str,
+    collection: &str,
+    spec: &BenchmarkProfileSpec,
+    write_batch_size: u32,
+) -> Result<serde_json::Value> {
+    if write_batch_size == 0 {
+        bail!("--write-batch-size must be greater than 0");
+    }
+    let write_count = benchmark_write_documents(spec);
+    let run_id = benchmark_run_id()?;
+    let target_collection = format!("{collection}_writes_{run_id}");
+    send_checked_command(
+        stream,
+        doc! {
+            "create": target_collection.as_str(),
+            "$db": db,
+        },
+    )
+    .await?;
+    send_checked_command(
+        stream,
+        doc! {
+            "createIndexes": target_collection.as_str(),
+            "indexes": Bson::Array(vec![
+                Bson::Document(doc! {
+                    "key": { "sku": 1 },
+                    "name": "sku_1",
+                    "unique": true,
+                })
+            ]),
+            "$db": db,
+        },
+    )
+    .await?;
+
+    let mut latencies = Vec::new();
+    let started = Instant::now();
+    let mut batch_start = 0_u32;
+    while batch_start < write_count {
+        let batch_end = (batch_start + write_batch_size).min(write_count);
+        let documents = (batch_start..batch_end)
+            .map(|offset| {
+                Bson::Document(benchmark_fixture_document(
+                    10_000_000_u32.saturating_add(offset),
+                    spec.payload_bytes,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let command_started = Instant::now();
+        send_checked_command(
+            stream,
+            doc! {
+                "insert": target_collection.as_str(),
+                "documents": Bson::Array(documents),
+                "$db": db,
+            },
+        )
+        .await?;
+        latencies.push(command_started.elapsed());
+        batch_start = batch_end;
+    }
+    let elapsed = started.elapsed();
+    Ok(json!({
+        "collection": target_collection,
+        "documents": write_count,
+        "commands": latencies.len(),
+        "batchSize": write_batch_size,
+        "elapsedMs": duration_ms(elapsed),
+        "docsPerSec": rate_per_second(write_count, elapsed),
+        "p50CommandMs": duration_ms(percentile_duration(&latencies, 50.0)),
+        "p95CommandMs": duration_ms(percentile_duration(&latencies, 95.0)),
+        "maxCommandMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+    }))
+}
+
+fn run_benchmark_checkpoint_scenario(
+    file: &Path,
+    db: &str,
+    collection: &str,
+    spec: &BenchmarkProfileSpec,
+) -> Result<serde_json::Value> {
+    let run_id = benchmark_run_id()?;
+    let target_collection = format!("{collection}_checkpoint_{run_id}");
+    let dirty_documents = benchmark_checkpoint_documents(spec);
+    let build_started = Instant::now();
+    let mut dirty_collection = CollectionCatalog::new(Document::new());
+    for offset in 0..dirty_documents {
+        let sequence = 20_000_000_u32.saturating_add(offset);
+        dirty_collection.insert_record(CollectionRecord::new(
+            u64::from(offset + 1),
+            benchmark_fixture_document(sequence, spec.payload_bytes),
+        ))?;
+    }
+    apply_index_specs(
+        &mut dirty_collection,
+        &[doc! { "key": { "sku": 1 }, "name": "sku_1", "unique": true }],
+    )?;
+    let build_elapsed = build_started.elapsed();
+
+    let mut database = DatabaseFile::open_or_create(file)?;
+    let mutation_started = Instant::now();
+    database.commit_mutation(WalMutation::ReplaceCollection {
+        database: db.to_string(),
+        collection: target_collection.clone(),
+        collection_state: dirty_collection,
+        change_events: Vec::new(),
+    })?;
+    let mutation_elapsed = mutation_started.elapsed();
+
+    let checkpoint_started = Instant::now();
+    database.checkpoint()?;
+    let checkpoint_elapsed = checkpoint_started.elapsed();
+    let info = DatabaseFile::info(file)?;
+
+    Ok(json!({
+        "collection": target_collection,
+        "dirtyDocuments": dirty_documents,
+        "buildDocumentsMs": duration_ms(build_elapsed),
+        "mutationElapsedMs": duration_ms(mutation_elapsed),
+        "checkpointElapsedMs": duration_ms(checkpoint_elapsed),
+        "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+fn benchmark_write_documents(spec: &BenchmarkProfileSpec) -> u32 {
+    (spec.documents / 10).clamp(1_000, 10_000)
+}
+
+fn benchmark_checkpoint_documents(spec: &BenchmarkProfileSpec) -> u32 {
+    (spec.documents / 10).clamp(1_000, 10_000)
+}
+
 fn benchmark_storage_summary(info: &mqlite_storage::InfoReport) -> serde_json::Value {
     json!({
         "fileSize": info.file_size,
@@ -1032,6 +1233,14 @@ fn benchmark_fixture_document(sequence: u32, payload_bytes: usize) -> Document {
         "active": sequence % 2 == 0,
         "payload": deterministic_payload(sequence, payload_bytes),
     }
+}
+
+fn benchmark_run_id() -> Result<String> {
+    Ok(SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_micros()
+        .to_string())
 }
 
 fn deterministic_payload(sequence: u32, len: usize) -> String {
@@ -1333,12 +1542,18 @@ mod tests {
         assert!(all.metadata);
         assert!(all.first_point);
         assert!(all.warm_point);
+        assert!(!all.writes);
+        assert!(!all.checkpoint);
+        assert!(!all.verify);
 
-        let selected =
-            BenchmarkScenarios::parse("metadata,first-point").expect("selected scenarios");
+        let selected = BenchmarkScenarios::parse("metadata,first-point,writes,checkpoint,verify")
+            .expect("selected scenarios");
         assert!(selected.metadata);
         assert!(selected.first_point);
         assert!(!selected.warm_point);
+        assert!(selected.writes);
+        assert!(selected.checkpoint);
+        assert!(selected.verify);
         let dirty = BenchmarkScenarios::parse("dirty-read").expect("dirty-read scenario");
         assert!(!dirty.metadata);
         assert!(dirty.first_point);
