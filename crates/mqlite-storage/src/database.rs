@@ -2351,6 +2351,12 @@ fn maybe_decode_zstd_blob(bytes: &[u8]) -> std::result::Result<Option<Vec<u8>>, 
     if decoded.len() != expected_len {
         return Err(());
     }
+    add_counter(Component::Storage, "zstdBlobsDecompressed", 1);
+    add_counter(
+        Component::Storage,
+        "zstdBytesDecompressed",
+        decoded.len() as u64,
+    );
     Ok(Some(decoded))
 }
 
@@ -5982,12 +5988,22 @@ mod tests {
         let payload = first_wal_payload(&path);
         assert!(payload.starts_with(ZSTD_BLOB_MAGIC));
 
+        let debug_session = session("compressed-wal-replay");
+        let _install = install(&debug_session);
         let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
         let collection = reopened
             .catalog()
             .get_collection("app", "widgets")
             .expect("collection");
         assert_eq!(collection.records.len(), 20);
+        let report = debug_session.report();
+        assert_eq!(
+            counter_value(&report, Component::Storage, "zstdBlobsDecompressed"),
+            Some(1)
+        );
+        assert!(
+            counter_value(&report, Component::Storage, "zstdBytesDecompressed").unwrap_or(0) > 0
+        );
     }
 
     #[test]
