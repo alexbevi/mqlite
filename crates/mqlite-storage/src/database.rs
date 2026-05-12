@@ -1472,12 +1472,37 @@ impl DatabaseFile {
         let _span = span(Component::Storage, "write_checkpoint");
         self.state.file_format_version = v2_layout::FILE_FORMAT_VERSION;
         self.state.last_checkpoint_unix_ms = current_unix_ms();
-        let completed = v2_checkpoint::write_state_checkpoint_to_file(
-            &mut self.file,
-            &self.state,
-            self.active_slot,
-            self.active_superblock.generation,
-        )?;
+        let plan_cache_dirty = self.checkpoint_plan_cache_entries != self.state.plan_cache_entries;
+        add_counter(
+            Component::Storage,
+            "foregroundCheckpointDirtyCollections",
+            self.dirty_collections.len() as u64,
+        );
+        let completed = if self.valid_superblocks == 0 {
+            v2_checkpoint::write_state_checkpoint_to_file(
+                &mut self.file,
+                &self.state,
+                self.active_slot,
+                self.active_superblock.generation,
+            )?
+        } else {
+            add_counter(
+                Component::Storage,
+                "foregroundCheckpointPublishedSnapshots",
+                1,
+            );
+            v2_checkpoint::publish_state_snapshot_to_file(
+                &self.path,
+                &mut self.file,
+                &self.state,
+                self.active_slot,
+                self.active_superblock.generation,
+                self.active_superblock.wal_start_offset,
+                &self.dirty_collections,
+                self.change_events_dirty,
+                plan_cache_dirty,
+            )?
+        };
         self.active_slot = completed.active_superblock_slot;
         self.active_superblock = completed.active_superblock.clone();
         self.valid_superblocks = if completed.active_superblock.generation > 1 {
@@ -6354,6 +6379,99 @@ mod tests {
             after.get("app.widgets"),
             before.get("app.widgets"),
             "dirty collection should publish a new meta page"
+        );
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
+    }
+
+    #[test]
+    fn foreground_checkpoint_reuses_clean_collection_pages() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("foreground-published-snapshot.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+
+            let mut widgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut widgets, 1, doc! { "_id": 1_i64, "sku": "alpha" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: widgets,
+                    change_events: Vec::new(),
+                })
+                .expect("seed widgets");
+
+            let mut gadgets = CollectionCatalog::new(doc! {});
+            insert_record(&mut gadgets, 1, doc! { "_id": 10_i64, "sku": "stable" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "gadgets".to_string(),
+                    collection_state: gadgets,
+                    change_events: Vec::new(),
+                })
+                .expect("seed gadgets");
+
+            database.checkpoint().expect("base checkpoint");
+        }
+
+        let before = namespace_meta_page_ids(&path);
+
+        let debug_session = session("foreground-published-snapshot");
+        {
+            let _install = install(&debug_session);
+            let mut database = DatabaseFile::open_or_create(&path).expect("reopen");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        2,
+                        doc! { "_id": 2_i64, "sku": "beta" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("mutate widgets");
+            database.checkpoint().expect("foreground checkpoint");
+        }
+
+        let after = namespace_meta_page_ids(&path);
+        assert_eq!(
+            after.get("app.gadgets"),
+            before.get("app.gadgets"),
+            "unchanged collection should keep its published meta page"
+        );
+        assert_ne!(
+            after.get("app.widgets"),
+            before.get("app.widgets"),
+            "dirty collection should publish a new meta page"
+        );
+
+        let report = debug_session.report();
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "foregroundCheckpointDirtyCollections",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &report,
+                Component::Storage,
+                "foregroundCheckpointPublishedSnapshots",
+            ),
+            Some(1)
         );
 
         let inspect = DatabaseFile::inspect(&path).expect("inspect");

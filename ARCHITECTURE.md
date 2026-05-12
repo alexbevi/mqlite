@@ -214,13 +214,15 @@ sequenceDiagram
 
 There are two checkpoint-style write paths today.
 
-### Foreground Full Checkpoint
+### Foreground Checkpoint
 
-The foreground checkpoint path writes the current in-memory state back into a fresh page graph and
+The foreground checkpoint path writes the current in-memory state into published page roots and
 rotates the active superblock.
 
 - It is used for explicit checkpoint requests and final broker shutdown cleanup.
-- It rewrites the full checkpoint state, not just the dirty parts.
+- After the first snapshot exists, it uses the same dirty-subtree publisher as background
+  publication, so clean collection pages can be reused.
+- It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
 
 ### Background Published Snapshot
 
