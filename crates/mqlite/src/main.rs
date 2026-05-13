@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use bson::{Bson, Document, doc};
+use bson::{Bson, Document, doc, oid::ObjectId};
 use clap::{Parser, Subcommand, ValueEnum};
 use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
 use mqlite_debug::{Component, SessionHandle, install, session};
@@ -165,6 +165,8 @@ enum BenchCommand {
         db: String,
         #[arg(long, default_value = "trades")]
         collection: String,
+        #[arg(long, default_value = "5597a1627df886b33f839f9b")]
+        id: String,
         #[arg(long, default_value = "z300")]
         ticket: String,
         #[arg(long, default_value = "abcd")]
@@ -432,6 +434,7 @@ async fn main() -> Result<()> {
                         file,
                         db,
                         collection,
+                        id,
                         ticket,
                         ticker,
                         reads,
@@ -444,6 +447,7 @@ async fn main() -> Result<()> {
                             TradesReadOptions {
                                 db: &db,
                                 collection: &collection,
+                                id: &id,
                                 ticket: &ticket,
                                 ticker: &ticker,
                                 reads,
@@ -823,6 +827,7 @@ struct TradesImportOptions<'a> {
 struct TradesReadOptions<'a> {
     db: &'a str,
     collection: &'a str,
+    id: &'a str,
     ticket: &'a str,
     ticker: &'a str,
     reads: u32,
@@ -1498,6 +1503,7 @@ async fn run_trades_read_benchmark(
     let startup_started = Instant::now();
     let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
     let startup_elapsed = startup_started.elapsed();
+    let id_find = run_trades_id_find_reads(&mut stream, &options).await?;
     let ticket_find =
         run_trades_field_find_reads(&mut stream, &options, "ticket", options.ticket).await?;
     let ticker_find =
@@ -1511,14 +1517,74 @@ async fn run_trades_read_benchmark(
         "file": file.display().to_string(),
         "db": options.db,
         "collection": options.collection,
+        "id": options.id,
         "ticket": options.ticket,
         "ticker": options.ticker,
         "elapsedMs": duration_ms(started.elapsed()),
         "startupMs": duration_ms(startup_elapsed),
+        "idFind": id_find,
         "ticketFind": ticket_find,
         "tickerFind": ticker_find,
         "ticketCount": count,
         "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+async fn run_trades_id_find_reads(
+    stream: &mut BoxedStream,
+    options: &TradesReadOptions<'_>,
+) -> Result<serde_json::Value> {
+    let object_id = ObjectId::parse_str(options.id).with_context(|| {
+        format!(
+            "--id must be a 24-character ObjectId hex string, got `{}`",
+            options.id
+        )
+    })?;
+    let mut latencies = Vec::with_capacity(options.reads as usize);
+    let mut first_query_debug = None;
+    let started = Instant::now();
+    for index in 0..options.reads {
+        let command = doc! {
+            "find": options.collection,
+            "filter": { "_id": Bson::ObjectId(object_id) },
+            "limit": 1,
+            "singleBatch": true,
+            "$db": options.db,
+        };
+        let query_started = Instant::now();
+        let response = if index == 0 {
+            let (response, debug) = send_checked_command_with_broker_debug(stream, command).await?;
+            first_query_debug = debug;
+            response
+        } else {
+            send_checked_command(stream, command).await?
+        };
+        latencies.push(query_started.elapsed());
+        let first_batch = response
+            .get_document("cursor")
+            .context("_id find reply missing cursor")?
+            .get_array("firstBatch")
+            .context("_id find reply missing firstBatch")?;
+        if first_batch.len() != 1 {
+            bail!(
+                "trades _id find expected one document for value `{}`, got {}",
+                options.id,
+                first_batch.len()
+            );
+        }
+    }
+
+    Ok(json!({
+        "reads": options.reads,
+        "field": "_id",
+        "value": Bson::ObjectId(object_id),
+        "elapsedMs": duration_ms(started.elapsed()),
+        "queriesPerSec": rate_per_second(options.reads, started.elapsed()),
+        "firstQueryElapsedMs": duration_ms(*latencies.first().unwrap_or(&Duration::ZERO)),
+        "p50Ms": duration_ms(percentile_duration(&latencies, 50.0)),
+        "p95Ms": duration_ms(percentile_duration(&latencies, 95.0)),
+        "maxMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "firstQueryDebug": first_query_debug,
     }))
 }
 

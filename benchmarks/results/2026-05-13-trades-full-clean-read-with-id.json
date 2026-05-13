@@ -1,0 +1,1244 @@
+{
+  "schemaVersion": 1,
+  "command": "trades-read",
+  "file": "/tmp/mqlite-trades-onepass-full.mongodb",
+  "db": "market",
+  "collection": "trades",
+  "id": "5597a1627df886b33f839f9b",
+  "ticket": "z300",
+  "ticker": "abcd",
+  "elapsedMs": 841.001073,
+  "startupMs": 27.946058999999998,
+  "idFind": {
+    "reads": 100,
+    "field": "_id",
+    "value": {
+      "$oid": "5597a1627df886b33f839f9b"
+    },
+    "elapsedMs": 283.984416,
+    "queriesPerSec": 352.125035149121,
+    "firstQueryElapsedMs": 6.720879,
+    "p50Ms": 2.693585,
+    "p95Ms": 3.827449,
+    "maxMs": 6.720879,
+    "firstQueryDebug": {
+      "label": "broker.command",
+      "wallMs": 4.3376459999999994,
+      "processStart": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 8,
+        "systemCpuMs": 6,
+        "maxRss": 8306688,
+        "maxRssUnit": "bytes"
+      },
+      "processEnd": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 11,
+        "systemCpuMs": 7,
+        "maxRss": 11366400,
+        "maxRssUnit": "bytes"
+      },
+      "processDelta": {
+        "userCpuMs": 3,
+        "systemCpuMs": 1
+      },
+      "metadata": {
+        "brokerPid": "69105",
+        "collection": "trades",
+        "command": "find",
+        "database": "market",
+        "readPath": "pageBacked",
+        "storageLoadedAtStart": "false"
+      },
+      "spans": [
+        {
+          "component": "wire",
+          "operation": "server_read_op_msg",
+          "calls": 1,
+          "totalMs": 0.638792,
+          "avgMs": 0.638792,
+          "maxMs": 0.638792
+        },
+        {
+          "component": "server",
+          "operation": "cached_find_plan",
+          "calls": 1,
+          "totalMs": 1.43599,
+          "avgMs": 1.43599,
+          "maxMs": 1.43599
+        },
+        {
+          "component": "server",
+          "operation": "dispatch",
+          "calls": 1,
+          "totalMs": 4.213138,
+          "avgMs": 4.213138,
+          "maxMs": 4.213138
+        },
+        {
+          "component": "server",
+          "operation": "ensure_plan_cache_loaded",
+          "calls": 1,
+          "totalMs": 0.132685,
+          "avgMs": 0.132685,
+          "maxMs": 0.132685
+        },
+        {
+          "component": "server",
+          "operation": "handle_find",
+          "calls": 1,
+          "totalMs": 4.189399,
+          "avgMs": 4.189399,
+          "maxMs": 4.189399
+        },
+        {
+          "component": "server",
+          "operation": "maybe_apply_fail_command",
+          "calls": 1,
+          "totalMs": 0.003539,
+          "avgMs": 0.003539,
+          "maxMs": 0.003539
+        },
+        {
+          "component": "server",
+          "operation": "with_query_collection",
+          "calls": 1,
+          "totalMs": 3.79703,
+          "avgMs": 3.79703,
+          "maxMs": 3.79703
+        },
+        {
+          "component": "storage",
+          "operation": "find_pending_wal_document_by_field_eq",
+          "calls": 1,
+          "totalMs": 0.07113,
+          "avgMs": 0.07113,
+          "maxMs": 0.07113
+        },
+        {
+          "component": "storage",
+          "operation": "find_pending_wal_document_by_id",
+          "calls": 1,
+          "totalMs": 0.115948,
+          "avgMs": 0.115948,
+          "maxMs": 0.115948
+        },
+        {
+          "component": "storage",
+          "operation": "load_plan_cache_entries_only",
+          "calls": 1,
+          "totalMs": 0.095414,
+          "avgMs": 0.095414,
+          "maxMs": 0.095414
+        },
+        {
+          "component": "storage",
+          "operation": "open_page_backed_collection_read_view",
+          "calls": 1,
+          "totalMs": 2.063967,
+          "avgMs": 2.063967,
+          "maxMs": 2.063967
+        },
+        {
+          "component": "storage",
+          "operation": "pager_open",
+          "calls": 5,
+          "totalMs": 0.33486,
+          "avgMs": 0.066972,
+          "maxMs": 0.090851
+        },
+        {
+          "component": "storage",
+          "operation": "pager_read_page_bytes",
+          "calls": 17,
+          "totalMs": 0.557489,
+          "avgMs": 0.03279347058823529,
+          "maxMs": 0.139244
+        },
+        {
+          "component": "storage",
+          "operation": "read_plan_cache_entries",
+          "calls": 1,
+          "totalMs": 0.09755,
+          "avgMs": 0.09755,
+          "maxMs": 0.09755
+        },
+        {
+          "component": "storage",
+          "operation": "record_tree_lookup",
+          "calls": 1,
+          "totalMs": 0.137362,
+          "avgMs": 0.137362,
+          "maxMs": 0.137362
+        },
+        {
+          "component": "storage",
+          "operation": "secondary_tree_scan_bounds",
+          "calls": 1,
+          "totalMs": 0.610138,
+          "avgMs": 0.610138,
+          "maxMs": 0.610138
+        },
+        {
+          "component": "storage",
+          "operation": "startup_metadata",
+          "calls": 1,
+          "totalMs": 0.087205,
+          "avgMs": 0.087205,
+          "maxMs": 0.087205
+        },
+        {
+          "component": "catalog",
+          "operation": "fetch_record_document",
+          "calls": 1,
+          "totalMs": 0.258561,
+          "avgMs": 0.258561,
+          "maxMs": 0.258561
+        },
+        {
+          "component": "catalog",
+          "operation": "find_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.257068,
+          "avgMs": 0.257068,
+          "maxMs": 0.257068
+        },
+        {
+          "component": "catalog",
+          "operation": "find_index_scan_entries",
+          "calls": 1,
+          "totalMs": 0.6189060000000001,
+          "avgMs": 0.6189060000000001,
+          "maxMs": 0.6189060000000001
+        },
+        {
+          "component": "catalog",
+          "operation": "namespace_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.9920099999999998,
+          "avgMs": 1.9920099999999998,
+          "maxMs": 1.9920099999999998
+        },
+        {
+          "component": "catalog",
+          "operation": "open_collection_read_view",
+          "calls": 1,
+          "totalMs": 2.058304,
+          "avgMs": 2.058304,
+          "maxMs": 2.058304
+        },
+        {
+          "component": "catalog",
+          "operation": "open_namespace_catalog",
+          "calls": 1,
+          "totalMs": 0.06140299999999999,
+          "avgMs": 0.06140299999999999,
+          "maxMs": 0.06140299999999999
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.254388,
+          "avgMs": 0.254388,
+          "maxMs": 0.254388
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_index_scan_entries",
+          "calls": 1,
+          "totalMs": 0.616506,
+          "avgMs": 0.616506,
+          "maxMs": 0.616506
+        },
+        {
+          "component": "query",
+          "operation": "apply_projection",
+          "calls": 1,
+          "totalMs": 0.011332,
+          "avgMs": 0.011332,
+          "maxMs": 0.011332
+        },
+        {
+          "component": "query",
+          "operation": "evaluate_index_plan",
+          "calls": 1,
+          "totalMs": 1.028877,
+          "avgMs": 1.028877,
+          "maxMs": 1.028877
+        },
+        {
+          "component": "query",
+          "operation": "parse_filter",
+          "calls": 3,
+          "totalMs": 0.043274,
+          "avgMs": 0.014424666666666667,
+          "maxMs": 0.037514
+        },
+        {
+          "component": "query",
+          "operation": "plan_find",
+          "calls": 1,
+          "totalMs": 1.272235,
+          "avgMs": 1.272235,
+          "maxMs": 1.272235
+        },
+        {
+          "component": "query",
+          "operation": "plan_find_simple",
+          "calls": 1,
+          "totalMs": 1.262764,
+          "avgMs": 1.262764,
+          "maxMs": 1.262764
+        },
+        {
+          "component": "query",
+          "operation": "scan_index_intervals",
+          "calls": 1,
+          "totalMs": 0.654892,
+          "avgMs": 0.654892,
+          "maxMs": 0.654892
+        },
+        {
+          "component": "exec",
+          "operation": "cursor_open",
+          "calls": 1,
+          "totalMs": 0.011423,
+          "avgMs": 0.011423,
+          "maxMs": 0.011423
+        }
+      ],
+      "counters": [
+        {
+          "component": "storage",
+          "name": "pageBytesRead",
+          "value": 122880
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheHits",
+          "value": 2
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheMisses",
+          "value": 15
+        },
+        {
+          "component": "storage",
+          "name": "pageReadRequests",
+          "value": 17
+        },
+        {
+          "component": "storage",
+          "name": "secondaryTreeScanEntries",
+          "value": 1
+        },
+        {
+          "component": "catalog",
+          "name": "findIndexEntries",
+          "value": 1
+        },
+        {
+          "component": "catalog",
+          "name": "indexEntriesScanned",
+          "value": 1
+        },
+        {
+          "component": "query",
+          "name": "indexKeysExamined",
+          "value": 1
+        },
+        {
+          "component": "exec",
+          "name": "cursorOpenDocuments",
+          "value": 1
+        }
+      ]
+    }
+  },
+  "ticketFind": {
+    "reads": 100,
+    "field": "ticket",
+    "value": "z300",
+    "elapsedMs": 248.476694,
+    "queriesPerSec": 402.44755078147585,
+    "firstQueryElapsedMs": 15.990177000000001,
+    "p50Ms": 2.084139,
+    "p95Ms": 3.1797869999999997,
+    "maxMs": 15.990177000000001,
+    "firstDocumentId": {
+      "$oid": "5597a1627df886b33f83a062"
+    },
+    "firstQueryDebug": {
+      "label": "broker.command",
+      "wallMs": 14.399631,
+      "processStart": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 237,
+        "systemCpuMs": 42,
+        "maxRss": 13058048,
+        "maxRssUnit": "bytes"
+      },
+      "processEnd": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 247,
+        "systemCpuMs": 44,
+        "maxRss": 14790656,
+        "maxRssUnit": "bytes"
+      },
+      "processDelta": {
+        "userCpuMs": 10,
+        "systemCpuMs": 2
+      },
+      "metadata": {
+        "brokerPid": "69105",
+        "collection": "trades",
+        "command": "find",
+        "database": "market",
+        "readPath": "pageBacked",
+        "storageLoadedAtStart": "false"
+      },
+      "spans": [
+        {
+          "component": "wire",
+          "operation": "server_read_op_msg",
+          "calls": 1,
+          "totalMs": 0.8614160000000001,
+          "avgMs": 0.8614160000000001,
+          "maxMs": 0.8614160000000001
+        },
+        {
+          "component": "server",
+          "operation": "cached_find_plan",
+          "calls": 1,
+          "totalMs": 12.194234,
+          "avgMs": 12.194234,
+          "maxMs": 12.194234
+        },
+        {
+          "component": "server",
+          "operation": "dispatch",
+          "calls": 1,
+          "totalMs": 14.354894999999999,
+          "avgMs": 14.354894999999999,
+          "maxMs": 14.354894999999999
+        },
+        {
+          "component": "server",
+          "operation": "ensure_plan_cache_loaded",
+          "calls": 1,
+          "totalMs": 0.0008759999999999999,
+          "avgMs": 0.0008759999999999999,
+          "maxMs": 0.0008759999999999999
+        },
+        {
+          "component": "server",
+          "operation": "handle_find",
+          "calls": 1,
+          "totalMs": 14.34821,
+          "avgMs": 14.34821,
+          "maxMs": 14.34821
+        },
+        {
+          "component": "server",
+          "operation": "maybe_apply_fail_command",
+          "calls": 1,
+          "totalMs": 0.001534,
+          "avgMs": 0.001534,
+          "maxMs": 0.001534
+        },
+        {
+          "component": "server",
+          "operation": "with_query_collection",
+          "calls": 1,
+          "totalMs": 14.184315,
+          "avgMs": 14.184315,
+          "maxMs": 14.184315
+        },
+        {
+          "component": "storage",
+          "operation": "find_pending_wal_document_by_field_eq",
+          "calls": 1,
+          "totalMs": 0.086619,
+          "avgMs": 0.086619,
+          "maxMs": 0.086619
+        },
+        {
+          "component": "storage",
+          "operation": "open_page_backed_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.822268,
+          "avgMs": 1.822268,
+          "maxMs": 1.822268
+        },
+        {
+          "component": "storage",
+          "operation": "pager_open",
+          "calls": 3,
+          "totalMs": 0.171869,
+          "avgMs": 0.05728966666666666,
+          "maxMs": 0.078045
+        },
+        {
+          "component": "storage",
+          "operation": "pager_read_page_bytes",
+          "calls": 28,
+          "totalMs": 0.876659,
+          "avgMs": 0.03130925,
+          "maxMs": 0.110585
+        },
+        {
+          "component": "storage",
+          "operation": "record_tree_lookup",
+          "calls": 1,
+          "totalMs": 0.120519,
+          "avgMs": 0.120519,
+          "maxMs": 0.120519
+        },
+        {
+          "component": "storage",
+          "operation": "secondary_tree_scan_bounds",
+          "calls": 2,
+          "totalMs": 10.031386999999999,
+          "avgMs": 5.015693499999999,
+          "maxMs": 9.727708
+        },
+        {
+          "component": "storage",
+          "operation": "startup_metadata",
+          "calls": 1,
+          "totalMs": 0.0872,
+          "avgMs": 0.0872,
+          "maxMs": 0.0872
+        },
+        {
+          "component": "catalog",
+          "operation": "fetch_record_document",
+          "calls": 1,
+          "totalMs": 0.194563,
+          "avgMs": 0.194563,
+          "maxMs": 0.194563
+        },
+        {
+          "component": "catalog",
+          "operation": "find_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.192939,
+          "avgMs": 0.192939,
+          "maxMs": 0.192939
+        },
+        {
+          "component": "catalog",
+          "operation": "find_index_scan_entries",
+          "calls": 1,
+          "totalMs": 0.309966,
+          "avgMs": 0.309966,
+          "maxMs": 0.309966
+        },
+        {
+          "component": "catalog",
+          "operation": "namespace_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.7646389999999998,
+          "avgMs": 1.7646389999999998,
+          "maxMs": 1.7646389999999998
+        },
+        {
+          "component": "catalog",
+          "operation": "open_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.819907,
+          "avgMs": 1.819907,
+          "maxMs": 1.819907
+        },
+        {
+          "component": "catalog",
+          "operation": "open_namespace_catalog",
+          "calls": 1,
+          "totalMs": 0.050137,
+          "avgMs": 0.050137,
+          "maxMs": 0.050137
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.188619,
+          "avgMs": 0.188619,
+          "maxMs": 0.188619
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_index_scan_entries",
+          "calls": 2,
+          "totalMs": 10.043333,
+          "avgMs": 5.0216665,
+          "maxMs": 9.736073
+        },
+        {
+          "component": "query",
+          "operation": "apply_projection",
+          "calls": 1,
+          "totalMs": 0.009218,
+          "avgMs": 0.009218,
+          "maxMs": 0.009218
+        },
+        {
+          "component": "query",
+          "operation": "evaluate_index_plan",
+          "calls": 1,
+          "totalMs": 0.5698139999999999,
+          "avgMs": 0.5698139999999999,
+          "maxMs": 0.5698139999999999
+        },
+        {
+          "component": "query",
+          "operation": "parse_filter",
+          "calls": 3,
+          "totalMs": 0.009455,
+          "avgMs": 0.0031516666666666668,
+          "maxMs": 0.0047339999999999995
+        },
+        {
+          "component": "query",
+          "operation": "plan_find",
+          "calls": 1,
+          "totalMs": 12.162076,
+          "avgMs": 12.162076,
+          "maxMs": 12.162076
+        },
+        {
+          "component": "query",
+          "operation": "plan_find_simple",
+          "calls": 1,
+          "totalMs": 12.156439,
+          "avgMs": 12.156439,
+          "maxMs": 12.156439
+        },
+        {
+          "component": "query",
+          "operation": "scan_index_intervals",
+          "calls": 1,
+          "totalMs": 0.32539599999999996,
+          "avgMs": 0.32539599999999996,
+          "maxMs": 0.32539599999999996
+        },
+        {
+          "component": "exec",
+          "operation": "cursor_open",
+          "calls": 1,
+          "totalMs": 0.008412,
+          "avgMs": 0.008412,
+          "maxMs": 0.008412
+        }
+      ],
+      "counters": [
+        {
+          "component": "storage",
+          "name": "pageBytesRead",
+          "value": 172032
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheHits",
+          "value": 7
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheMisses",
+          "value": 21
+        },
+        {
+          "component": "storage",
+          "name": "pageReadRequests",
+          "value": 28
+        },
+        {
+          "component": "storage",
+          "name": "secondaryTreeScanEntries",
+          "value": 2501
+        },
+        {
+          "component": "catalog",
+          "name": "findIndexEntries",
+          "value": 1
+        },
+        {
+          "component": "catalog",
+          "name": "indexEntriesScanned",
+          "value": 2501
+        },
+        {
+          "component": "query",
+          "name": "indexKeysExamined",
+          "value": 1
+        },
+        {
+          "component": "exec",
+          "name": "cursorOpenDocuments",
+          "value": 1
+        }
+      ]
+    }
+  },
+  "tickerFind": {
+    "reads": 100,
+    "field": "ticker",
+    "value": "abcd",
+    "elapsedMs": 210.955335,
+    "queriesPerSec": 474.0274415718397,
+    "firstQueryElapsedMs": 3.290632,
+    "p50Ms": 1.928343,
+    "p95Ms": 2.767066,
+    "maxMs": 4.177065,
+    "firstDocumentId": {
+      "$oid": "5597a1617df886b33f839f9a"
+    },
+    "firstQueryDebug": {
+      "label": "broker.command",
+      "wallMs": 1.9267480000000001,
+      "processStart": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 438,
+        "systemCpuMs": 73,
+        "maxRss": 14987264,
+        "maxRssUnit": "bytes"
+      },
+      "processEnd": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 440,
+        "systemCpuMs": 73,
+        "maxRss": 14991360,
+        "maxRssUnit": "bytes"
+      },
+      "processDelta": {
+        "userCpuMs": 2,
+        "systemCpuMs": 0
+      },
+      "metadata": {
+        "brokerPid": "69105",
+        "collection": "trades",
+        "command": "find",
+        "database": "market",
+        "readPath": "pageBacked",
+        "storageLoadedAtStart": "false"
+      },
+      "spans": [
+        {
+          "component": "wire",
+          "operation": "server_read_op_msg",
+          "calls": 1,
+          "totalMs": 0.502783,
+          "avgMs": 0.502783,
+          "maxMs": 0.502783
+        },
+        {
+          "component": "server",
+          "operation": "cached_find_plan",
+          "calls": 1,
+          "totalMs": 0.51707,
+          "avgMs": 0.51707,
+          "maxMs": 0.51707
+        },
+        {
+          "component": "server",
+          "operation": "dispatch",
+          "calls": 1,
+          "totalMs": 1.889638,
+          "avgMs": 1.889638,
+          "maxMs": 1.889638
+        },
+        {
+          "component": "server",
+          "operation": "ensure_plan_cache_loaded",
+          "calls": 1,
+          "totalMs": 0.000442,
+          "avgMs": 0.000442,
+          "maxMs": 0.000442
+        },
+        {
+          "component": "server",
+          "operation": "handle_find",
+          "calls": 1,
+          "totalMs": 1.885051,
+          "avgMs": 1.885051,
+          "maxMs": 1.885051
+        },
+        {
+          "component": "server",
+          "operation": "maybe_apply_fail_command",
+          "calls": 1,
+          "totalMs": 0.0009220000000000001,
+          "avgMs": 0.0009220000000000001,
+          "maxMs": 0.0009220000000000001
+        },
+        {
+          "component": "server",
+          "operation": "with_query_collection",
+          "calls": 1,
+          "totalMs": 1.767423,
+          "avgMs": 1.767423,
+          "maxMs": 1.767423
+        },
+        {
+          "component": "storage",
+          "operation": "find_pending_wal_document_by_field_eq",
+          "calls": 1,
+          "totalMs": 0.06307700000000001,
+          "avgMs": 0.06307700000000001,
+          "maxMs": 0.06307700000000001
+        },
+        {
+          "component": "storage",
+          "operation": "open_page_backed_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.130443,
+          "avgMs": 1.130443,
+          "maxMs": 1.130443
+        },
+        {
+          "component": "storage",
+          "operation": "pager_open",
+          "calls": 3,
+          "totalMs": 0.132383,
+          "avgMs": 0.04412766666666667,
+          "maxMs": 0.056926
+        },
+        {
+          "component": "storage",
+          "operation": "pager_read_page_bytes",
+          "calls": 17,
+          "totalMs": 0.298667,
+          "avgMs": 0.01756864705882353,
+          "maxMs": 0.027440000000000003
+        },
+        {
+          "component": "storage",
+          "operation": "record_tree_lookup",
+          "calls": 1,
+          "totalMs": 0.096434,
+          "avgMs": 0.096434,
+          "maxMs": 0.096434
+        },
+        {
+          "component": "storage",
+          "operation": "secondary_tree_scan_bounds",
+          "calls": 1,
+          "totalMs": 0.25358200000000003,
+          "avgMs": 0.25358200000000003,
+          "maxMs": 0.25358200000000003
+        },
+        {
+          "component": "storage",
+          "operation": "startup_metadata",
+          "calls": 1,
+          "totalMs": 0.069321,
+          "avgMs": 0.069321,
+          "maxMs": 0.069321
+        },
+        {
+          "component": "catalog",
+          "operation": "fetch_record_document",
+          "calls": 1,
+          "totalMs": 0.14995899999999998,
+          "avgMs": 0.14995899999999998,
+          "maxMs": 0.14995899999999998
+        },
+        {
+          "component": "catalog",
+          "operation": "find_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.148593,
+          "avgMs": 0.148593,
+          "maxMs": 0.148593
+        },
+        {
+          "component": "catalog",
+          "operation": "find_index_scan_entries",
+          "calls": 1,
+          "totalMs": 0.258345,
+          "avgMs": 0.258345,
+          "maxMs": 0.258345
+        },
+        {
+          "component": "catalog",
+          "operation": "namespace_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.0850440000000001,
+          "avgMs": 1.0850440000000001,
+          "maxMs": 1.0850440000000001
+        },
+        {
+          "component": "catalog",
+          "operation": "open_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.128792,
+          "avgMs": 1.128792,
+          "maxMs": 1.128792
+        },
+        {
+          "component": "catalog",
+          "operation": "open_namespace_catalog",
+          "calls": 1,
+          "totalMs": 0.04018,
+          "avgMs": 0.04018,
+          "maxMs": 0.04018
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_collection_record_document",
+          "calls": 1,
+          "totalMs": 0.145438,
+          "avgMs": 0.145438,
+          "maxMs": 0.145438
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_index_scan_entries",
+          "calls": 1,
+          "totalMs": 0.25667700000000004,
+          "avgMs": 0.25667700000000004,
+          "maxMs": 0.25667700000000004
+        },
+        {
+          "component": "query",
+          "operation": "apply_projection",
+          "calls": 1,
+          "totalMs": 0.006783,
+          "avgMs": 0.006783,
+          "maxMs": 0.006783
+        },
+        {
+          "component": "query",
+          "operation": "evaluate_index_plan",
+          "calls": 1,
+          "totalMs": 0.452094,
+          "avgMs": 0.452094,
+          "maxMs": 0.452094
+        },
+        {
+          "component": "query",
+          "operation": "parse_filter",
+          "calls": 3,
+          "totalMs": 0.005231,
+          "avgMs": 0.0017436666666666668,
+          "maxMs": 0.002311
+        },
+        {
+          "component": "query",
+          "operation": "plan_find",
+          "calls": 1,
+          "totalMs": 0.504159,
+          "avgMs": 0.504159,
+          "maxMs": 0.504159
+        },
+        {
+          "component": "query",
+          "operation": "plan_find_simple",
+          "calls": 1,
+          "totalMs": 0.50004,
+          "avgMs": 0.50004,
+          "maxMs": 0.50004
+        },
+        {
+          "component": "query",
+          "operation": "scan_index_intervals",
+          "calls": 1,
+          "totalMs": 0.267029,
+          "avgMs": 0.267029,
+          "maxMs": 0.267029
+        },
+        {
+          "component": "exec",
+          "operation": "cursor_open",
+          "calls": 1,
+          "totalMs": 0.005806,
+          "avgMs": 0.005806,
+          "maxMs": 0.005806
+        }
+      ],
+      "counters": [
+        {
+          "component": "storage",
+          "name": "pageBytesRead",
+          "value": 122880
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheHits",
+          "value": 2
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheMisses",
+          "value": 15
+        },
+        {
+          "component": "storage",
+          "name": "pageReadRequests",
+          "value": 17
+        },
+        {
+          "component": "storage",
+          "name": "secondaryTreeScanEntries",
+          "value": 1
+        },
+        {
+          "component": "catalog",
+          "name": "findIndexEntries",
+          "value": 1
+        },
+        {
+          "component": "catalog",
+          "name": "indexEntriesScanned",
+          "value": 1
+        },
+        {
+          "component": "query",
+          "name": "indexKeysExamined",
+          "value": 1
+        },
+        {
+          "component": "exec",
+          "name": "cursorOpenDocuments",
+          "value": 1
+        }
+      ]
+    }
+  },
+  "ticketCount": {
+    "reads": 10,
+    "expectedCount": 2500,
+    "elapsedMs": 66.47353,
+    "queriesPerSec": 150.4329120735424,
+    "firstQueryElapsedMs": 8.103691999999999,
+    "p50Ms": 6.555446000000001,
+    "p95Ms": 8.103691999999999,
+    "maxMs": 8.103691999999999,
+    "firstQueryDebug": {
+      "label": "broker.command",
+      "wallMs": 7.250105,
+      "processStart": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 614,
+        "systemCpuMs": 95,
+        "maxRss": 15069184,
+        "maxRssUnit": "bytes"
+      },
+      "processEnd": {
+        "pid": 69105,
+        "availableParallelism": 12,
+        "userCpuMs": 620,
+        "systemCpuMs": 96,
+        "maxRss": 15802368,
+        "maxRssUnit": "bytes"
+      },
+      "processDelta": {
+        "userCpuMs": 6,
+        "systemCpuMs": 1
+      },
+      "metadata": {
+        "brokerPid": "69105",
+        "command": "count",
+        "database": "market",
+        "readPath": "indexedEqualityCount",
+        "storageLoadedAtStart": "false"
+      },
+      "spans": [
+        {
+          "component": "wire",
+          "operation": "server_read_op_msg",
+          "calls": 1,
+          "totalMs": 0.525523,
+          "avgMs": 0.525523,
+          "maxMs": 0.525523
+        },
+        {
+          "component": "server",
+          "operation": "dispatch",
+          "calls": 1,
+          "totalMs": 7.209595,
+          "avgMs": 7.209595,
+          "maxMs": 7.209595
+        },
+        {
+          "component": "server",
+          "operation": "handle_count",
+          "calls": 1,
+          "totalMs": 7.204811,
+          "avgMs": 7.204811,
+          "maxMs": 7.204811
+        },
+        {
+          "component": "server",
+          "operation": "maybe_apply_fail_command",
+          "calls": 1,
+          "totalMs": 0.000829,
+          "avgMs": 0.000829,
+          "maxMs": 0.000829
+        },
+        {
+          "component": "server",
+          "operation": "with_query_collection",
+          "calls": 1,
+          "totalMs": 7.1177280000000005,
+          "avgMs": 7.1177280000000005,
+          "maxMs": 7.1177280000000005
+        },
+        {
+          "component": "storage",
+          "operation": "count_pending_wal_field_eq",
+          "calls": 1,
+          "totalMs": 0.056201,
+          "avgMs": 0.056201,
+          "maxMs": 0.056201
+        },
+        {
+          "component": "storage",
+          "operation": "open_page_backed_collection_read_view",
+          "calls": 1,
+          "totalMs": 2.018078,
+          "avgMs": 2.018078,
+          "maxMs": 2.018078
+        },
+        {
+          "component": "storage",
+          "operation": "pager_open",
+          "calls": 3,
+          "totalMs": 0.12062099999999999,
+          "avgMs": 0.040207,
+          "maxMs": 0.048195999999999996
+        },
+        {
+          "component": "storage",
+          "operation": "pager_read_page_bytes",
+          "calls": 20,
+          "totalMs": 0.581531,
+          "avgMs": 0.02907655,
+          "maxMs": 0.0976
+        },
+        {
+          "component": "storage",
+          "operation": "secondary_tree_scan_bounds",
+          "calls": 1,
+          "totalMs": 3.5804169999999997,
+          "avgMs": 3.5804169999999997,
+          "maxMs": 3.5804169999999997
+        },
+        {
+          "component": "storage",
+          "operation": "startup_metadata",
+          "calls": 1,
+          "totalMs": 0.06522700000000001,
+          "avgMs": 0.06522700000000001,
+          "maxMs": 0.06522700000000001
+        },
+        {
+          "component": "catalog",
+          "operation": "find_index_scan_entries",
+          "calls": 1,
+          "totalMs": 3.590586,
+          "avgMs": 3.590586,
+          "maxMs": 3.590586
+        },
+        {
+          "component": "catalog",
+          "operation": "namespace_collection_read_view",
+          "calls": 1,
+          "totalMs": 1.974234,
+          "avgMs": 1.974234,
+          "maxMs": 1.974234
+        },
+        {
+          "component": "catalog",
+          "operation": "open_collection_read_view",
+          "calls": 1,
+          "totalMs": 2.016316,
+          "avgMs": 2.016316,
+          "maxMs": 2.016316
+        },
+        {
+          "component": "catalog",
+          "operation": "open_namespace_catalog",
+          "calls": 1,
+          "totalMs": 0.038538,
+          "avgMs": 0.038538,
+          "maxMs": 0.038538
+        },
+        {
+          "component": "catalog",
+          "operation": "pager_index_scan_entries",
+          "calls": 1,
+          "totalMs": 3.585013,
+          "avgMs": 3.585013,
+          "maxMs": 3.585013
+        }
+      ],
+      "counters": [
+        {
+          "component": "storage",
+          "name": "pageBytesRead",
+          "value": 147456
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheHits",
+          "value": 2
+        },
+        {
+          "component": "storage",
+          "name": "pageCacheMisses",
+          "value": 18
+        },
+        {
+          "component": "storage",
+          "name": "pageReadRequests",
+          "value": 20
+        },
+        {
+          "component": "storage",
+          "name": "secondaryTreeScanEntries",
+          "value": 2500
+        },
+        {
+          "component": "catalog",
+          "name": "findIndexEntries",
+          "value": 2500
+        },
+        {
+          "component": "catalog",
+          "name": "indexEntriesScanned",
+          "value": 2500
+        }
+      ]
+    }
+  },
+  "storage": {
+    "fileSize": 1378144256,
+    "lastAppliedSequence": 1002,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 3,
+    "recordCount": 1000001,
+    "indexEntryCount": 3000003,
+    "documentBytes": 243000226,
+    "indexBytes": 22008857,
+    "checkpointGeneration": 3,
+    "checkpointPageCount": 168228,
+    "walRecords": 0,
+    "walBytes": 0
+  },
+  "timeMaxRssBytes": 10739712,
+  "timeRealSeconds": 0.85,
+  "timeUserSeconds": 0.07,
+  "timeSysSeconds": 0.01,
+  "timePeakMemoryFootprintBytes": 4288512
+}

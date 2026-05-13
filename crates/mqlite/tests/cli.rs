@@ -769,6 +769,45 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
         .clone();
     let response: Value = serde_json::from_slice(&output).expect("json response");
     assert_eq!(response["n"], 1);
+
+    let mut read = Command::cargo_bin("mqlite").expect("binary");
+    let output = read
+        .args([
+            "bench",
+            "trades-read",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--id",
+            "5597a1627df886b33f839f9b",
+            "--ticket",
+            "z300",
+            "--ticker",
+            "abcd",
+            "--reads",
+            "2",
+            "--count-reads",
+            "1",
+            "--expected-ticket-count",
+            "1",
+            "--idle-shutdown-secs",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["command"], "trades-read");
+    assert_eq!(response["id"], "5597a1627df886b33f839f9b");
+    assert_eq!(response["idFind"]["field"], "_id");
+    assert_eq!(
+        response["idFind"]["value"]["$oid"],
+        "5597a1627df886b33f839f9b"
+    );
+    assert_eq!(response["idFind"]["reads"], 2);
+    assert_eq!(response["ticketFind"]["reads"], 2);
+    assert_eq!(response["tickerFind"]["reads"], 2);
 }
 
 #[test]

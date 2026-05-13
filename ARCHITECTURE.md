@@ -473,7 +473,7 @@ The CLI surfaces split along intent:
 - `mqlite inspect`: lower-level file, superblock, WAL, and page-graph metadata
 - `mqlite verify`: slower full reopen and validation path
 - `mqlite checkpoint`: force a foreground checkpoint
-- `mqlite bench`: measure legacy one-shot write/read latency, seed reusable benchmark fixtures and run startup, metadata, point-read, write-throughput, checkpoint, checkpoint-load, and verify scenarios against them, or stream the shared trades NDJSON fixture through one broker connection with count verification, final storage-metadata completion checks, optional foreground or background checkpoint publication, and structured import timings
+- `mqlite bench`: measure legacy one-shot write/read latency, seed reusable benchmark fixtures and run startup, metadata, point-read, write-throughput, checkpoint, checkpoint-load, and verify scenarios against them, or stream the shared trades NDJSON fixture through one broker connection with count verification, final storage-metadata completion checks, optional foreground or background checkpoint publication, structured import timings, and reusable `_id`/secondary-index read timings
 
 The trades import harness is intentionally stricter than a generic import command. Before it emits
 successful benchmark JSON, it validates that final storage metadata reports the imported document

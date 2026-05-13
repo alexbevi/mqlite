@@ -151,11 +151,13 @@ before reporting success. Add `--checkpoint` when the run should force and time
 broker checkpoint publication before reporting storage counters.
 
 After creating `ticker_1` and `ticket_1`, use `trades-read` to measure warm
-read latency over one broker connection:
+`_id`, `ticket`, and `ticker` point-read latency plus `ticket` count latency
+over one broker connection:
 
 ```sh
 target/debug/mqlite bench trades-read \
   --file /tmp/mqlite-trades.mongodb \
+  --id 5597a1627df886b33f839f9b \
   --reads 100 \
   --count-reads 10
 ```
@@ -244,6 +246,7 @@ First-class harness results from this patch:
 | `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path; later streaming count stopped after 165.03s | 49.51ms warm p50, 51.18ms p95 over 10 counts | Fresh `createIndexes` WAL frames carry index value-frequency metadata, and the metadata prefix is stored outside compressed mutation payloads. Debug output reported `readPath=pendingWalEqualityCount`, scanned 1,002 WAL metadata records, and returned `n=2500` without full collection hydration. |
 | Forced checkpoint after import | not measured | timed out at 360.93s, 11.2 GB max RSS | The foreground checkpoint path still does not complete on the full fixture. After timeout, `mqlite info` still reported checkpoint LSN 0 and 1,002 WAL records, so the file did not appear clean after the interrupted checkpoint. |
 | One-pass import, index build, and checkpoint | standalone checkpoint timed out after replaying the WAL-backed file | 653.21s total; 1,531 docs/s including index/checkpoint phases | `bench trades-import --create-indexes --checkpoint` completed the full fixture in one broker session, verified 1,000,001 documents, built 3,000,003 index entries, and left `walRecords=0` with checkpoint LSN 1002. Import inserts took 258.12s, chunked non-unique index build took 41.84s, and checkpoint publication took 287.99s. The previous one-pass run was 679.07s total with 39.59s index build and 314.71s checkpoint. |
+| Clean checkpointed `_id:ObjectId("5597a1627df886b33f839f9b")` point read | `_id` coverage was only a cold CLI read against the WAL-backed indexed file | 2.69ms warm p50, 3.83ms p95 over 100 reads | `bench trades-read` now includes `_id` point reads in the reusable warm harness. The clean run reported `readPath=pageBacked`, `storageLoadedAtStart=false`, one key examined, one document opened, and a 6.72ms first query. |
 | Clean checkpointed `ticket:"z300"` point read | clean read coverage was blocked before checkpoint completion | 2.00ms warm p50, 2.89ms p95 over 100 reads | `bench trades-read` on the clean one-pass file reported `readPath=pageBacked`, `storageLoadedAtStart=false`, one document fetched, and bounded index scan execution. The first cold query was 12.86ms. |
 | Clean checkpointed `ticker:"abcd"` point read | clean read coverage was blocked before checkpoint completion | 1.94ms warm p50, 3.00ms p95 over 100 reads | The low-cardinality `ticker_1` read now stops after the first matching posting instead of expanding every `abcd` record id. Debug counters reported one index entry scanned and one document opened. |
 | Clean checkpointed `ticket:"z300"` count | clean read coverage was blocked before checkpoint completion | 7.26ms warm p50, 8.23ms p95 over 10 counts | Clean equality count now uses `readPath=indexedEqualityCount`; because `z300` is outside the bounded persisted frequency sample, it scanned 2,500 matching index entries and did not hydrate collection records. |
@@ -288,6 +291,8 @@ The full one-pass run after chunked non-unique index builds is checked in at
 `benchmarks/results/2026-05-13-trades-full-chunked-nonunique-index-build.json`.
 The clean page-backed read/count run is checked in at
 `benchmarks/results/2026-05-13-trades-full-clean-read-page-backed.json`.
+The clean page-backed read/count run with `_id` coverage is checked in at
+`benchmarks/results/2026-05-13-trades-full-clean-read-with-id.json`.
 The explicit background checkpoint-load smoke run is checked in at
 `benchmarks/results/2026-05-13-smoke-explicit-background-checkpoint-load.json`.
 The post-index-memory-reduction 10k import/index/checkpoint smoke run is checked
