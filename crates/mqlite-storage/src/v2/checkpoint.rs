@@ -127,8 +127,9 @@ pub(crate) fn publish_state_snapshot_to_file(
     plan_cache_dirty: bool,
 ) -> Result<CheckpointWriteResult> {
     let base_snapshot = load_base_snapshot(path)?;
+    file.set_len(base_file_len)?;
     let mut writer =
-        CheckpointWriter::with_next_page_id(next_page_id_after_file_len(base_file_len));
+        CheckpointWriter::with_next_page_id(file, next_page_id_after_file_len(base_file_len));
     let mut summary = SummaryCounters {
         database_count: state.catalog.databases.len() as u64,
         change_event_count: state.change_events.len() as u64,
@@ -229,11 +230,7 @@ pub(crate) fn publish_state_snapshot_to_file(
         summary,
     };
 
-    file.set_len(base_file_len)?;
-    for (page_id, page) in writer.pages {
-        file.seek(SeekFrom::Start(page_offset(page_id, DEFAULT_PAGE_SIZE)?))?;
-        file.write_all(&page)?;
-    }
+    drop(writer);
     file.seek(SeekFrom::Start(
         HEADER_LEN as u64 + next_slot as u64 * SUPERBLOCK_LEN as u64,
     ))?;
@@ -270,7 +267,8 @@ fn write_checkpoint_state_to_file(
     }
     FileHeader::decode(&header_bytes)?;
 
-    let mut writer = CheckpointWriter::default();
+    file.set_len(DATA_START_OFFSET)?;
+    let mut writer = CheckpointWriter::with_next_page_id(file, 1);
     let mut summary = SummaryCounters {
         database_count: catalog.databases.len() as u64,
         change_event_count: change_events.len() as u64,
@@ -325,11 +323,7 @@ fn write_checkpoint_state_to_file(
         summary,
     };
 
-    file.set_len(DATA_START_OFFSET)?;
-    for (page_id, page) in writer.pages {
-        file.seek(SeekFrom::Start(page_offset(page_id, DEFAULT_PAGE_SIZE)?))?;
-        file.write_all(&page)?;
-    }
+    drop(writer);
     file.seek(SeekFrom::Start(
         HEADER_LEN as u64 + next_slot as u64 * SUPERBLOCK_LEN as u64,
     ))?;
@@ -570,22 +564,23 @@ fn next_page_id_after_file_len(base_file_len: u64) -> PageId {
     used_bytes.div_ceil(u64::from(DEFAULT_PAGE_SIZE)) + 1
 }
 
-#[derive(Default)]
-struct CheckpointWriter {
+struct CheckpointWriter<'a> {
+    file: &'a mut File,
     next_page_id: PageId,
-    pages: Vec<(PageId, Vec<u8>)>,
+    page_count: u64,
 }
 
-impl CheckpointWriter {
-    fn with_next_page_id(next_page_id: PageId) -> Self {
+impl<'a> CheckpointWriter<'a> {
+    fn with_next_page_id(file: &'a mut File, next_page_id: PageId) -> Self {
         Self {
+            file,
             next_page_id: next_page_id.max(1),
-            pages: Vec::new(),
+            page_count: 0,
         }
     }
 
     fn page_count(&self) -> u64 {
-        self.pages.len() as u64
+        self.page_count
     }
 
     fn allocate_page_id(&mut self) -> PageId {
@@ -594,26 +589,29 @@ impl CheckpointWriter {
         page_id
     }
 
+    fn push_page(&mut self, page_id: PageId, page: [u8; DEFAULT_PAGE_SIZE as usize]) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start(page_offset(page_id, DEFAULT_PAGE_SIZE)?))?;
+        self.file.write_all(&page)?;
+        self.page_count += 1;
+        Ok(())
+    }
+
     fn write_collection_meta(&mut self, meta: CollectionMeta) -> Result<PageId> {
         let page_id = self.allocate_page_id();
-        self.pages.push((
-            page_id,
-            CollectionMetaPage { page_id, meta }.encode()?.to_vec(),
-        ));
+        self.push_page(page_id, CollectionMetaPage { page_id, meta }.encode()?)?;
         Ok(page_id)
     }
 
     fn write_index_meta(&mut self, meta: IndexMeta) -> Result<PageId> {
         let page_id = self.allocate_page_id();
-        self.pages
-            .push((page_id, IndexMetaPage { page_id, meta }.encode()?.to_vec()));
+        self.push_page(page_id, IndexMetaPage { page_id, meta }.encode()?)?;
         Ok(page_id)
     }
 
     fn write_index_stats(&mut self, stats: PersistedIndexStats) -> Result<PageId> {
         let page_id = self.allocate_page_id();
-        self.pages
-            .push((page_id, StatsPage { page_id, stats }.encode()?.to_vec()));
+        self.push_page(page_id, StatsPage { page_id, stats }.encode()?)?;
         Ok(page_id)
     }
 
@@ -691,17 +689,15 @@ impl CheckpointWriter {
         next_page_id: Option<PageId>,
         events: Vec<PersistedChangeEvent>,
     ) -> Result<()> {
-        self.pages.push((
+        self.push_page(
             page_id,
             ChangeEventsPage {
                 page_id,
                 next_page_id,
                 events,
             }
-            .encode()?
-            .to_vec(),
-        ));
-        Ok(())
+            .encode()?,
+        )
     }
 
     fn push_plan_cache_page(
@@ -710,17 +706,15 @@ impl CheckpointWriter {
         next_page_id: Option<PageId>,
         entries: Vec<PersistedPlanCacheEntry>,
     ) -> Result<()> {
-        self.pages.push((
+        self.push_page(
             page_id,
             PlanCachePage {
                 page_id,
                 next_page_id,
                 entries,
             }
-            .encode()?
-            .to_vec(),
-        ));
-        Ok(())
+            .encode()?,
+        )
     }
 
     fn write_namespace_tree(&mut self, mut entries: Vec<NamespaceEntry>) -> Result<Option<PageId>> {
@@ -746,16 +740,15 @@ impl CheckpointWriter {
             let page_id = leaf_ids[index];
             let next_page_id = leaf_ids.get(index + 1).copied();
             let first_name = chunk.first().expect("namespace chunk").name.clone();
-            self.pages.push((
+            self.push_page(
                 page_id,
                 NamespaceLeafPage {
                     page_id,
                     next_page_id,
                     entries: chunk,
                 }
-                .encode()?
-                .to_vec(),
-            ));
+                .encode()?,
+            )?;
             children.push(NamespaceChild {
                 page_id,
                 first_name,
@@ -793,7 +786,7 @@ impl CheckpointWriter {
         for chunk in chunks {
             let page_id = self.allocate_page_id();
             let first_name = chunk[0].first_name.clone();
-            self.pages.push((
+            self.push_page(
                 page_id,
                 NamespaceInternalPage {
                     page_id,
@@ -807,9 +800,8 @@ impl CheckpointWriter {
                         })
                         .collect(),
                 }
-                .encode()?
-                .to_vec(),
-            ));
+                .encode()?,
+            )?;
             parents.push(NamespaceChild {
                 page_id,
                 first_name,
@@ -889,16 +881,15 @@ impl CheckpointWriter {
         first_record_id: u64,
         children: &mut Vec<RecordChild>,
     ) -> Result<()> {
-        self.pages.push((
+        self.push_page(
             page_id,
             RecordLeafPage {
                 page_id,
                 next_page_id,
                 entries,
             }
-            .encode()?
-            .to_vec(),
-        ));
+            .encode()?,
+        )?;
         children.push(RecordChild {
             page_id,
             first_record_id,
@@ -927,7 +918,7 @@ impl CheckpointWriter {
         for chunk in chunks {
             let page_id = self.allocate_page_id();
             let first_record_id = chunk[0].first_record_id;
-            self.pages.push((
+            self.push_page(
                 page_id,
                 RecordInternalPage {
                     page_id,
@@ -941,9 +932,8 @@ impl CheckpointWriter {
                         })
                         .collect(),
                 }
-                .encode()?
-                .to_vec(),
-            ));
+                .encode()?,
+            )?;
             parents.push(RecordChild {
                 page_id,
                 first_record_id,
@@ -1040,16 +1030,15 @@ impl CheckpointWriter {
         children: &mut Vec<SecondaryChild>,
     ) -> Result<()> {
         let first_entry = entries[0].clone();
-        self.pages.push((
+        self.push_page(
             page_id,
             SecondaryLeafPage {
                 page_id,
                 next_page_id,
                 entries,
             }
-            .encode()?
-            .to_vec(),
-        ));
+            .encode()?,
+        )?;
         children.push(SecondaryChild {
             page_id,
             first_entry,
@@ -1078,7 +1067,7 @@ impl CheckpointWriter {
         for chunk in chunks {
             let page_id = self.allocate_page_id();
             let first_entry = chunk[0].first_entry.clone();
-            self.pages.push((
+            self.push_page(
                 page_id,
                 SecondaryInternalPage {
                     page_id,
@@ -1091,9 +1080,8 @@ impl CheckpointWriter {
                         })
                         .collect(),
                 }
-                .encode()?
-                .to_vec(),
-            ));
+                .encode()?,
+            )?;
             parents.push(SecondaryChild {
                 page_id,
                 first_entry,
