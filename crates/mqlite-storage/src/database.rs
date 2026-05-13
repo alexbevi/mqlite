@@ -798,6 +798,14 @@ pub struct PendingWalIdLookup {
     pub document: Option<Document>,
 }
 
+pub struct PendingWalEqualityCount {
+    pub last_sequence: u64,
+    pub wal_records: usize,
+    pub relevant_wal_records: usize,
+    pub wal_bytes: u64,
+    pub count: usize,
+}
+
 struct DeltaOverlayCollectionReadView {
     base: Arc<dyn CollectionReadView>,
     delta: CollectionCatalog,
@@ -1348,6 +1356,140 @@ impl DatabaseFile {
             document: found.map(|(_, document)| document),
         }))
     }
+
+    pub fn count_pending_wal_field_eq(
+        path: impl AsRef<Path>,
+        database: &str,
+        collection: &str,
+        field: &str,
+        value: &Bson,
+        max_wal_bytes: u64,
+    ) -> Result<Option<PendingWalEqualityCount>> {
+        let _span = span(Component::Storage, "count_pending_wal_field_eq");
+        let path = path.as_ref();
+        let pager = V2Pager::open(path)?;
+        let superblock = pager.active_superblock().clone();
+        if superblock.summary.record_count != 0 {
+            return Ok(None);
+        }
+        let file_size = std::fs::metadata(path)?.len();
+        let wal_bytes = file_size.saturating_sub(superblock.wal_start_offset);
+        if wal_bytes == 0 || wal_bytes > max_wal_bytes {
+            return Ok(None);
+        }
+
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut offset = superblock.wal_start_offset;
+        let mut last_sequence = superblock.durable_lsn;
+        let mut scanned_records = 0_u64;
+        let mut relevant_records = 0_u64;
+        let mut count = 0_usize;
+
+        while offset < file_size {
+            if file_size - offset < WAL_HEADER_LEN as u64 {
+                break;
+            }
+
+            file.seek(SeekFrom::Start(offset))?;
+            let mut header = [0_u8; WAL_HEADER_LEN];
+            file.read_exact(&mut header)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if &header[..4] != WAL_FRAME_MAGIC {
+                break;
+            }
+
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+            let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+            if payload_end > file_size {
+                break;
+            }
+
+            let mut payload = vec![0_u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if hash_bytes(&payload) != header[8..40] {
+                return Err(StorageError::InvalidWalChecksum.into());
+            }
+
+            let compact = decode_compact_wal_entry(&payload)?;
+            if compact.sequence <= last_sequence {
+                offset = payload_end;
+                continue;
+            }
+
+            scanned_records += 1;
+            last_sequence = compact.sequence;
+            if !compact_mutation_targets_namespace(&compact.mutation, database, collection) {
+                offset = payload_end;
+                continue;
+            }
+            relevant_records += 1;
+
+            match compact.mutation {
+                CompactWalMutation::ApplyCollectionChanges {
+                    changes,
+                    inserts,
+                    updates,
+                    deletes,
+                    ..
+                } => {
+                    if !updates.is_empty() || !deletes.is_empty() {
+                        return Ok(None);
+                    }
+                    if !changes.is_empty() {
+                        for change in changes {
+                            let CompactCollectionChange::Insert(record) = change else {
+                                return Ok(None);
+                            };
+                            if compact_record_field_eq(&record, field, value)? {
+                                count += 1;
+                            }
+                        }
+                        offset = payload_end;
+                        continue;
+                    }
+                    for record in inserts {
+                        if compact_record_field_eq(&record, field, value)? {
+                            count += 1;
+                        }
+                    }
+                }
+                CompactWalMutation::CreateIndexes { .. } => {}
+                CompactWalMutation::ReplaceCollection { .. }
+                | CompactWalMutation::RewriteCollection { .. }
+                | CompactWalMutation::DropIndexes { .. }
+                | CompactWalMutation::DropCollection { .. } => return Ok(None),
+            }
+
+            offset = payload_end;
+        }
+
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityCountScannedRecords",
+            scanned_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityCountRelevantRecords",
+            relevant_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityCountScannedBytes",
+            wal_bytes,
+        );
+
+        Ok(Some(PendingWalEqualityCount {
+            last_sequence,
+            wal_records: scanned_records as usize,
+            relevant_wal_records: relevant_records as usize,
+            wal_bytes,
+            count,
+        }))
+    }
 }
 
 fn apply_compact_id_lookup_changes(
@@ -1401,6 +1543,103 @@ fn apply_compact_id_lookup_record(
         *found = Some((record.record_id, document));
     }
     Ok(())
+}
+
+fn compact_record_field_eq(
+    record: &CompactCollectionRecord,
+    field: &str,
+    value: &Bson,
+) -> Result<bool> {
+    if let Some(matches) = top_level_string_field_eq(&record.document, field, value) {
+        return Ok(matches);
+    }
+    let document = decode_document_bytes(&record.document)?;
+    Ok(mqlite_bson::lookup_path_owned(&document, field).as_ref() == Some(value))
+}
+
+fn top_level_string_field_eq(document: &[u8], field: &str, value: &Bson) -> Option<bool> {
+    let Bson::String(expected) = value else {
+        return None;
+    };
+    if field.contains('.') || document.len() < 5 {
+        return None;
+    }
+    let document_len = i32::from_le_bytes(document.get(0..4)?.try_into().ok()?) as usize;
+    if document_len > document.len() || document_len < 5 {
+        return None;
+    }
+
+    let mut offset = 4_usize;
+    while offset < document_len.saturating_sub(1) {
+        let element_type = *document.get(offset)?;
+        offset += 1;
+        let key_start = offset;
+        while offset < document_len {
+            if *document.get(offset)? == 0 {
+                break;
+            }
+            offset += 1;
+        }
+        if offset >= document_len {
+            return None;
+        }
+        let key = std::str::from_utf8(document.get(key_start..offset)?).ok()?;
+        offset += 1;
+
+        if element_type == 0x02 {
+            let string_len =
+                i32::from_le_bytes(document.get(offset..offset + 4)?.try_into().ok()?) as usize;
+            let value_start = offset + 4;
+            let value_end = value_start.checked_add(string_len.checked_sub(1)?)?;
+            if value_end >= document_len {
+                return None;
+            }
+            if key == field {
+                let actual = std::str::from_utf8(document.get(value_start..value_end)?).ok()?;
+                return Some(actual == expected);
+            }
+            offset = value_end + 1;
+            continue;
+        }
+
+        if key == field {
+            return Some(false);
+        }
+        offset = skip_bson_element_value(document, offset, document_len, element_type)?;
+    }
+    Some(false)
+}
+
+fn skip_bson_element_value(
+    document: &[u8],
+    offset: usize,
+    document_len: usize,
+    element_type: u8,
+) -> Option<usize> {
+    let next = match element_type {
+        0x01 | 0x09 | 0x11 | 0x12 => offset.checked_add(8)?,
+        0x02 | 0x0d | 0x0e => {
+            let len =
+                i32::from_le_bytes(document.get(offset..offset + 4)?.try_into().ok()?) as usize;
+            offset.checked_add(4)?.checked_add(len)?
+        }
+        0x03 | 0x04 => {
+            let len =
+                i32::from_le_bytes(document.get(offset..offset + 4)?.try_into().ok()?) as usize;
+            offset.checked_add(len)?
+        }
+        0x05 => {
+            let len =
+                i32::from_le_bytes(document.get(offset..offset + 4)?.try_into().ok()?) as usize;
+            offset.checked_add(5)?.checked_add(len)?
+        }
+        0x07 => offset.checked_add(12)?,
+        0x08 => offset.checked_add(1)?,
+        0x0a => offset,
+        0x10 => offset.checked_add(4)?,
+        _ => return None,
+    };
+    (next <= document_len).then_some(next)
 }
 
 fn apply_compact_id_lookup_delete(found: &mut Option<(u64, Document)>, record_id: u64) {
@@ -6077,6 +6316,56 @@ mod tests {
         .expect("supported lookup");
         let document = lookup.document.expect("document");
         assert_eq!(document.get_str("sku").expect("sku"), "beta");
+    }
+
+    #[test]
+    fn pending_wal_equality_count_streams_insert_batches() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("pending-wal-equality-count.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database.checkpoint().expect("checkpoint empty file");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "ticket": "z300" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "ticket": "x100" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            3,
+                            doc! { "_id": 3_i64, "ticket": "z300" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending inserts");
+        }
+
+        let count = DatabaseFile::count_pending_wal_field_eq(
+            &path,
+            "app",
+            "widgets",
+            "ticket",
+            &Bson::String("z300".to_string()),
+            u64::MAX,
+        )
+        .expect("count")
+        .expect("supported count");
+        assert_eq!(count.count, 2);
+        assert_eq!(count.wal_records, 1);
+        assert_eq!(count.relevant_wal_records, 1);
     }
 
     fn exact_sku_bounds(sku: &str) -> IndexBounds {

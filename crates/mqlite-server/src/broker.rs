@@ -2402,6 +2402,35 @@ impl Broker {
             return Ok(doc! { "n": matches as i64 });
         }
 
+        if let Some((field, value)) = simple_equality_filter(&query)
+            .filter(|_| !self.storage_is_loaded() && self.paths.database_path.exists())
+        {
+            if let Some(count) = DatabaseFile::count_pending_wal_field_eq(
+                &self.paths.database_path,
+                &database,
+                collection_name,
+                &field,
+                &value,
+                DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES,
+            )
+            .map_err(internal_error)?
+            {
+                let mut matches = count.count;
+                matches = matches.saturating_sub(skip);
+                if limit > 0 {
+                    matches = matches.min(limit as usize);
+                }
+                set_metadata("readPath", "pendingWalEqualityCount");
+                set_metadata("pendingWalRecords", count.wal_records.to_string());
+                set_metadata(
+                    "pendingWalRelevantRecords",
+                    count.relevant_wal_records.to_string(),
+                );
+                set_metadata("pendingWalBytes", count.wal_bytes.to_string());
+                return Ok(doc! { "n": matches as i64 });
+            }
+        }
+
         let mut matches =
             self.with_query_collection(&database, collection_name, |_sequence, collection| {
                 Ok(match collection {
@@ -6015,6 +6044,17 @@ fn simple_id_filter(filter: &Document) -> Option<Bson> {
     }
 }
 
+fn simple_equality_filter(filter: &Document) -> Option<(String, Bson)> {
+    if filter.len() != 1 {
+        return None;
+    }
+    let (field, value) = filter.iter().next()?;
+    match value {
+        Bson::Document(_) => None,
+        value => Some((field.clone(), value.clone())),
+    }
+}
+
 fn build_plan_cache_key(
     namespace: &str,
     filter: &Document,
@@ -7333,6 +7373,58 @@ mod tests {
         assert!(
             !broker.storage_is_loaded(),
             "pending WAL _id lookup should not force mutable storage"
+        );
+    }
+
+    #[test]
+    fn count_simple_equality_streams_pending_wal_before_storage_opens() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("lazy-startup-pending-equality-count.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            database.checkpoint().expect("checkpoint empty file");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "ticket": "z300" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "ticket": "x100" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            3,
+                            doc! { "_id": 3_i64, "ticket": "z300" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending inserts");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let response = broker
+            .handle_count(&doc! {
+                "count": "widgets",
+                "query": { "ticket": "z300" },
+                "$db": "app",
+            })
+            .expect("count");
+        assert_eq!(response.get_i64("n").expect("count"), 2);
+        assert!(
+            !broker.storage_is_loaded(),
+            "pending WAL equality count should not force mutable storage"
         );
     }
 

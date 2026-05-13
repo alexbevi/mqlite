@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "status": "streaming-count-stopped",
+  "command": "target/debug/mqlite command --file /tmp/mqlite-trades-walmeta.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"count\":\"trades\",\"query\":{\"ticket\":\"z300\"}}'",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-walmeta.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "filter": {
+    "ticket": "z300"
+  },
+  "processTime": {
+    "realSecondsStopped": 165.03,
+    "maxResidentSetBytes": 7340032,
+    "peakMemoryFootprintBytes": 3227648
+  },
+  "result": null,
+  "notes": [
+    "The streaming equality-count path bounded memory and avoided materializing a full dirty-WAL collection overlay.",
+    "It still did not complete promptly on the full fixture because it scans inserted documents linearly.",
+    "The next milestone should make pending createIndexes expose secondary index entries or value-frequency metadata so ticket counts do not scan every record."
+  ]
+}

@@ -147,6 +147,11 @@ then scans supported pending WAL frames for matching inserts/updates while using
 skip later insert-only/index-only frames after a match. Mutations that could invalidate the result
 fall back to the normal read path.
 
+`count` with a single equality predicate can stream supported insert-only pending WAL records
+without building a full collection overlay. This bounds memory, but it is still a linear document
+scan until secondary index entries or value frequencies from pending `createIndexes` frames become
+queryable.
+
 ### Page-Backed Read Fast Path
 
 The page-backed read path is designed for clean checkpointed files:

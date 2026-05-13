@@ -49,7 +49,7 @@ Results:
 | Count all docs | p50 216.42ms | 2.20s cold CLI on WAL-backed indexed file via metadata path | mqlite 10.2x slower than MongoDB p50, but no full record hydration |
 | `_id` point read, 1000 iterations | p50 0.72ms, p95 1.08ms | 1.61s cold CLI for first fixture `_id` on WAL-backed indexed file | mqlite remains far slower than MongoDB warm p50, but avoids full record hydration |
 | `ticket: "z300"` indexed point read, 1000 iterations | p50 1.33ms, p95 4.44ms | blocked by mqlite index build | pending |
-| `ticket: "z300"` indexed count, 10 iterations | p50 2.44ms, result 2500 | blocked by mqlite index build | pending |
+| `ticket: "z300"` indexed count, 10 iterations | p50 2.44ms, result 2500 | stopped after 165.03s on bounded streaming WAL equality count | pending secondary-index metadata/entry access |
 
 Storage size after MongoDB import and secondary indexes:
 
@@ -223,6 +223,7 @@ First-class harness results from this patch:
 | Build `ticker_1` and `ticket_1` after import | did not complete within 318.89s; interrupted near 11.8 GiB RSS in the original probe | 331.65s, observed broker RSS roughly 4.0 GiB at 3:47 | Existing-record index builds now collect keys linearly, sort once, and apply the validation-built indexes instead of rebuilding them again during mutation apply. The command completed and reopen metadata reported 3 indexes and 3,000,003 entries. It remains far slower than MongoDB and still needs a page-backed or external-sort bulk builder. |
 | Count all documents after import and index build | manually stopped after 107.73s after falling back to dirty-WAL record overlay | 2.20s real, 7.7 MB CLI max RSS | Empty-filter `count` now answers from metadata folded across checkpoint and WAL prefixes. Debug output reported `readPath=metadataCount` and returned `n=1,000,001`. |
 | `_id` point read after import and index build | manually stopped after 40.84s on the generic dirty-WAL overlay path | 1.61s real, 7.8 MB CLI max RSS | Simple `_id` equality can use the pending-WAL id lookup. Debug output reported `readPath=pendingWalIdLookup` while scanning 1002 WAL records. The measured id is the first fixture `_id`; the earlier MongoDB baseline id was not a useful mqlite fixture probe. |
+| `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path | streaming equality count stopped after 165.03s, 7.3 MB CLI max RSS | The streaming path bounds memory and avoids collection materialization, but still scans every inserted document. The next useful optimization needs pending secondary-index entries or value-frequency metadata from `createIndexes`. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 | WAL-backed metadata fold, full fixture | not measured | 1.41s real, 25.8 MB max RSS | New WAL frames carry a metadata prefix, so `mqlite info` folded 1001 import batches and reported 1,000,001 records without deserializing the full mutation payloads. A 10k-prefix smoke also completed in 0.02s real with 10.9 MB max RSS. |
 
@@ -238,6 +239,8 @@ The metadata-backed count-all run is checked in at
 `benchmarks/results/2026-05-13-trades-count-metadata.json`.
 The pending-WAL `_id` lookup run is checked in at
 `benchmarks/results/2026-05-13-trades-id-lookup.json`.
+The bounded but incomplete `ticket:"z300"` streaming-count probe is checked in at
+`benchmarks/results/2026-05-13-trades-ticket-count-streaming-stopped.json`.
 
 ## Next Work Items
 
