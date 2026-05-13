@@ -430,9 +430,6 @@ impl Broker {
     }
 
     fn checkpoint_if_needed(&self) -> Result<bool> {
-        if !self.storage_is_loaded() {
-            return Ok(false);
-        }
         loop {
             let mut storage = self.storage_write().map_err(anyhow::Error::from)?;
             let visible_sequence = storage.last_applied_sequence();
@@ -7002,10 +6999,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use bson::{Bson, doc, oid::ObjectId};
+    use bson::{Bson, Document, doc, oid::ObjectId};
     use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
     use mqlite_ipc::{connect, read_manifest};
-    use mqlite_storage::{DatabaseFile, WalMutation};
+    use mqlite_storage::{CollectionChange, DatabaseFile, WalMutation};
     use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
@@ -7442,6 +7439,58 @@ mod tests {
             .expect("shutdown timeout")
             .expect("join")
             .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn explicit_checkpoint_loads_lazy_storage_before_publishing() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("explicit-lazy-checkpoint.mongodb");
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("database");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        1,
+                        doc! { "_id": 1_i64, "sku": "alpha" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("wal mutation");
+        }
+
+        let mut config = BrokerConfig::new(&database_path, 3);
+        config.checkpoint_interval_secs = 60;
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let checkpoint =
+            send_command(&mut stream, doc! { "mqliteCheckpoint": 1, "$db": "admin" }).await;
+        assert_eq!(checkpoint.get_f64("ok").expect("ok"), 1.0);
+        assert_eq!(
+            checkpoint.get_bool("checkpointed").expect("checkpointed"),
+            true
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect");
+        assert_eq!(inspect.current_record_count, 1);
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
     }
 
     #[tokio::test]
