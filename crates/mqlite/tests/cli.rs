@@ -685,6 +685,79 @@ fn bench_seed_requires_large_profile_opt_in() {
 }
 
 #[test]
+fn bench_trades_import_streams_fixture_over_one_broker_connection() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("trades-import.mongodb");
+    let fixture_path = temp_dir.path().join("trades.json");
+    fs::write(
+        &fixture_path,
+        concat!(
+            r#"{"_id":{"$oid":"5597a1617df886b33f839f9a"},"ticker":"abcd","ticket":"z300","price":110}"#,
+            "\n",
+            r#"{"_id":{"$oid":"5597a1627df886b33f839f9b"},"ticker":"wxyz","shares":200}"#,
+            "\n",
+            r#"{"_id":{"$oid":"5597a1637df886b33f839f9c"},"ticker":"abcd","ticket":"z301"}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+
+    let mut bench = Command::cargo_bin("mqlite").expect("binary");
+    let output = bench
+        .args([
+            "bench",
+            "trades-import",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--fixture",
+            fixture_path.to_str().expect("path"),
+            "--batch-size",
+            "2",
+            "--reset",
+            "--idle-shutdown-secs",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["command"], "trades-import");
+    assert_eq!(response["db"], "market");
+    assert_eq!(response["collection"], "trades");
+    assert_eq!(response["batchSize"], 2);
+    assert_eq!(response["documents"], 3);
+    assert_eq!(response["verifiedCount"], 3);
+    assert_eq!(response["batches"], 2);
+    assert!(response["docsPerSec"].as_f64().expect("docs/sec") > 0.0);
+    assert_eq!(response["storage"]["recordCount"], 3);
+    wait_for_broker_exit(&database_path);
+
+    let mut count = Command::cargo_bin("mqlite").expect("binary");
+    let output = count
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "market",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"count":"trades","query":{"ticket":"z300"}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["n"], 1);
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_documents_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-documents.mongodb");

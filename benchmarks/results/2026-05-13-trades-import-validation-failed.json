@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "status": "failed-validation",
+  "command": "target/debug/mqlite bench trades-import --file /tmp/mqlite-trades-import-harness.mongodb --fixture benchmarks/trades.json.zst --batch-size 1000 --reset --idle-shutdown-secs 3600",
+  "date": "2026-05-13",
+  "fixture": "benchmarks/trades.json.zst",
+  "databaseFile": "/tmp/mqlite-trades-import-harness.mongodb",
+  "batchSize": 1000,
+  "documentsSent": 1000001,
+  "batches": 1001,
+  "elapsedMsBeforeValidation": 362290.242295,
+  "docsPerSecBeforeValidation": 2760.220627708032,
+  "startupMs": 29.757883,
+  "parseMs": 66691.707489,
+  "insertMs": 293119.90365000005,
+  "insertP50Ms": 279.97294700000003,
+  "insertP95Ms": 301.51876599999997,
+  "insertMaxMs": 8638.70427,
+  "postImportCount": 316000,
+  "postImportInfo": {
+    "fileSize": 479694848,
+    "lastAppliedSequence": 316,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 1,
+    "recordCount": 316000,
+    "indexEntryCount": 316000,
+    "documentBytes": 76787983,
+    "indexBytes": 6952000,
+    "checkpointGeneration": 5,
+    "checkpointPageCount": 41107,
+    "walRecords": 0,
+    "walBytes": 0
+  },
+  "notes": [
+    "The first-class harness removed per-batch client process startup from the import path and reached 362.29s before validation, versus the prior 412.17s Python-loop baseline.",
+    "The run is not a successful full-fixture import because a post-import count returned 316000 documents instead of 1000001.",
+    "The harness now refuses to report success unless the final count matches the sent document count."
+  ]
+}

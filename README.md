@@ -75,6 +75,7 @@ The CLI is intentionally small and focused:
 | `mqlite bench --file <path>` | Run the legacy one-shot local broker benchmark. |
 | `mqlite bench seed --file <path>` | Build or reuse a deterministic benchmark fixture. |
 | `mqlite bench run --file <path>` | Measure startup, metadata, indexed point-read, write, checkpoint, checkpoint-load, and verify scenarios against a seeded fixture. |
+| `mqlite bench trades-import --file <path> --fixture <path>` | Stream the trades NDJSON or `.zst` benchmark fixture through one broker connection and report structured import timings. |
 | `mqlite checkpoint --file <path>` | Force a checkpoint and print storage metadata. |
 | `mqlite info --file <path>` | Print current database, collection, and index counts and sizes plus last-checkpoint details. |
 | `mqlite verify --file <path>` | Validate the durable file structure that can be checked on open. |
@@ -100,6 +101,8 @@ mqlite bench run --profile smoke --file target/mqlite-bench/smoke.mongodb --scen
 ```
 
 Profiles are `smoke`, `default`, `extended`, and `stress`. `extended` requires `--allow-large`, and `stress` requires `--allow-stress`, so large fixtures are never created by accident. Seeded fixtures are reused unless `--reset` is supplied, and `bench seed --dirty-wal-records <n>` can leave a bounded WAL tail for `bench run --scenario dirty-read`. JSON output includes fixture metadata, file/WAL/page counters, startup latency, metadata latency, point-read latency percentiles, first-query broker diagnostics, write throughput, checkpoint duration, checkpoint-load command latency, and verify duration for the selected scenario.
+
+For the shared trades fixture, use `mqlite bench trades-import --file /tmp/mqlite-trades.mongodb --fixture benchmarks/trades.json.zst --reset`. The command keeps one broker connection open, decompresses `.zst` input when needed, sends batched inserts, verifies the final count before reporting success, and reports document count, batch count, docs/sec, startup time, parse time, count-verification time, insert latency percentiles, and storage counters as JSON.
 
 ## What Works Today
 

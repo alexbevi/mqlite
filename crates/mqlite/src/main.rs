@@ -1,5 +1,5 @@
 use std::{
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
     time::SystemTime,
@@ -133,6 +133,22 @@ enum BenchCommand {
         allow_large: bool,
         #[arg(long)]
         allow_stress: bool,
+    },
+    TradesImport {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long, default_value = "market")]
+        db: String,
+        #[arg(long, default_value = "trades")]
+        collection: String,
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+        #[arg(long)]
+        reset: bool,
+        #[arg(long, default_value_t = 60)]
+        idle_shutdown_secs: u64,
     },
 }
 
@@ -295,7 +311,9 @@ async fn main() -> Result<()> {
                 if let Some(session) = session.as_ref() {
                     session.insert_metadata("command", "bench");
                     match &command {
-                        BenchCommand::Seed { file, .. } | BenchCommand::Run { file, .. } => {
+                        BenchCommand::Seed { file, .. }
+                        | BenchCommand::Run { file, .. }
+                        | BenchCommand::TradesImport { file, .. } => {
                             session.insert_metadata("file", file.display().to_string());
                         }
                     }
@@ -349,6 +367,28 @@ async fn main() -> Result<()> {
                                 idle_shutdown_secs,
                                 allow_large,
                                 allow_stress,
+                            },
+                        )
+                        .await?
+                    }
+                    BenchCommand::TradesImport {
+                        file,
+                        fixture,
+                        db,
+                        collection,
+                        batch_size,
+                        reset,
+                        idle_shutdown_secs,
+                    } => {
+                        run_trades_import_benchmark(
+                            &file,
+                            TradesImportOptions {
+                                fixture: &fixture,
+                                db: &db,
+                                collection: &collection,
+                                batch_size,
+                                reset,
+                                idle_shutdown_secs,
                             },
                         )
                         .await?
@@ -707,6 +747,15 @@ struct BenchmarkRunOptions<'a> {
     allow_stress: bool,
 }
 
+struct TradesImportOptions<'a> {
+    fixture: &'a Path,
+    db: &'a str,
+    collection: &'a str,
+    batch_size: usize,
+    reset: bool,
+    idle_shutdown_secs: u64,
+}
+
 fn benchmark_profile_spec(profile: BenchmarkProfile) -> Result<BenchmarkProfileSpec> {
     Ok(match profile {
         BenchmarkProfile::Legacy => bail!("legacy is only valid for the original bench command"),
@@ -1049,6 +1098,180 @@ fn run_benchmark_verify_scenario(file: &Path) -> Result<serde_json::Value> {
         "walRecordsSinceCheckpoint": report.wal_records_since_checkpoint,
         "truncatedWalTail": report.truncated_wal_tail,
     }))
+}
+
+async fn run_trades_import_benchmark(
+    file: &Path,
+    options: TradesImportOptions<'_>,
+) -> Result<serde_json::Value> {
+    if options.batch_size == 0 {
+        bail!("--batch-size must be greater than 0");
+    }
+    if options.reset && file.exists() {
+        std::fs::remove_file(file)
+            .with_context(|| format!("failed to reset benchmark database `{}`", file.display()))?;
+    }
+
+    let started = Instant::now();
+    let startup_started = Instant::now();
+    let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
+    let startup_elapsed = startup_started.elapsed();
+
+    let mut reader = open_trades_fixture(options.fixture)?;
+    let mut line = String::new();
+    let mut batch = Vec::with_capacity(options.batch_size);
+    let mut documents = 0_u64;
+    let mut batches = 0_u64;
+    let mut parse_elapsed = Duration::ZERO;
+    let mut insert_elapsed = Duration::ZERO;
+    let mut insert_latencies = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed to read `{}`", options.fixture.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parse_started = Instant::now();
+        let document = parse_ndjson_bson_document(line.trim_end())?;
+        parse_elapsed += parse_started.elapsed();
+        batch.push(Bson::Document(document));
+        if batch.len() == options.batch_size {
+            flush_trades_import_batch(
+                &mut stream,
+                options.db,
+                options.collection,
+                &mut batch,
+                &mut documents,
+                &mut batches,
+                &mut insert_elapsed,
+                &mut insert_latencies,
+            )
+            .await?;
+        }
+    }
+    if !batch.is_empty() {
+        flush_trades_import_batch(
+            &mut stream,
+            options.db,
+            options.collection,
+            &mut batch,
+            &mut documents,
+            &mut batches,
+            &mut insert_elapsed,
+            &mut insert_latencies,
+        )
+        .await?;
+    }
+    let count_started = Instant::now();
+    let count_response = send_checked_command(
+        &mut stream,
+        doc! {
+            "count": options.collection,
+            "query": {},
+            "$db": options.db,
+        },
+    )
+    .await?;
+    let count_elapsed = count_started.elapsed();
+    let visible_count = bson_numeric_i64(
+        count_response
+            .get("n")
+            .ok_or_else(|| anyhow!("count response missing `n`"))?,
+    )
+    .context("count response `n` must be numeric")? as u64;
+    if visible_count != documents {
+        bail!(
+            "trades import sent {documents} documents but count returned {visible_count}; refusing to report a successful benchmark"
+        );
+    }
+
+    let elapsed = started.elapsed();
+    let info = DatabaseFile::info(file)?;
+    Ok(json!({
+        "schemaVersion": 1,
+        "command": "trades-import",
+        "file": file.display().to_string(),
+        "fixture": options.fixture.display().to_string(),
+        "db": options.db,
+        "collection": options.collection,
+        "batchSize": options.batch_size,
+        "documents": documents,
+        "verifiedCount": visible_count,
+        "batches": batches,
+        "elapsedMs": duration_ms(elapsed),
+        "docsPerSec": rate_per_second_u64(documents, elapsed),
+        "startupMs": duration_ms(startup_elapsed),
+        "parseMs": duration_ms(parse_elapsed),
+        "insertMs": duration_ms(insert_elapsed),
+        "countVerificationMs": duration_ms(count_elapsed),
+        "insertP50Ms": duration_ms(percentile_duration(&insert_latencies, 50.0)),
+        "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
+        "insertMaxMs": duration_ms(insert_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+async fn flush_trades_import_batch(
+    stream: &mut BoxedStream,
+    db: &str,
+    collection: &str,
+    batch: &mut Vec<Bson>,
+    documents: &mut u64,
+    batches: &mut u64,
+    insert_elapsed: &mut Duration,
+    insert_latencies: &mut Vec<Duration>,
+) -> Result<()> {
+    let batch_len = batch.len() as u64;
+    let command = doc! {
+        "insert": collection,
+        "documents": std::mem::take(batch),
+        "$db": db,
+    };
+    let started = Instant::now();
+    send_checked_command(stream, command).await?;
+    let elapsed = started.elapsed();
+    *insert_elapsed += elapsed;
+    insert_latencies.push(elapsed);
+    *documents += batch_len;
+    *batches += 1;
+    Ok(())
+}
+
+fn open_trades_fixture(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open trades fixture `{}`", path.display()))?;
+    if path.extension().and_then(|extension| extension.to_str()) == Some("zst") {
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("failed to open zstd fixture `{}`", path.display()))?;
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+fn parse_ndjson_bson_document(line: &str) -> Result<Document> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).context("trades fixture line must be valid JSON")?;
+    bson::to_bson(&value)
+        .context("failed to convert trades JSON line to BSON")?
+        .as_document()
+        .cloned()
+        .ok_or_else(|| anyhow!("trades fixture line must be a JSON object"))
+}
+
+fn bson_numeric_i64(value: &Bson) -> Result<i64> {
+    match value {
+        Bson::Int32(value) => Ok(i64::from(*value)),
+        Bson::Int64(value) => Ok(*value),
+        Bson::Double(value) if value.fract() == 0.0 => Ok(*value as i64),
+        _ => bail!("expected numeric BSON value"),
+    }
 }
 
 async fn run_benchmark_point_reads(
@@ -1658,6 +1881,14 @@ fn rate_per_second(count: u32, elapsed: Duration) -> f64 {
         return f64::INFINITY;
     }
     f64::from(count) / seconds
+}
+
+fn rate_per_second_u64(count: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds == 0.0 {
+        return f64::INFINITY;
+    }
+    count as f64 / seconds
 }
 
 #[cfg(test)]

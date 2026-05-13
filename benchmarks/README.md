@@ -129,6 +129,28 @@ print(JSON.stringify({
 
 ## Reproducing mqlite Import Baseline
 
+The current first-class import harness keeps one broker connection open and
+streams the committed fixture directly, including `.zst` decompression:
+
+```sh
+rm -f /tmp/mqlite-trades.mongodb
+target/debug/mqlite bench trades-import \
+  --file /tmp/mqlite-trades.mongodb \
+  --fixture benchmarks/trades.json.zst \
+  --batch-size 1000 \
+  --reset \
+  --idle-shutdown-secs 3600
+```
+
+It verifies the final count before reporting success, then prints structured
+JSON with document count, batch count, wall time, docs/sec, startup time, parse
+time, count-verification time, insert latency percentiles, and file/WAL/storage
+counters.
+
+The older baseline below used a Python loop that spawned `mqlite command` for
+each batch against a long-lived broker. Keep it as the comparison point for the
+2026-05-12 baseline.
+
 Start a long-lived broker before importing. Auto-spawning a broker per command
 is not representative for this dataset.
 
@@ -192,10 +214,19 @@ Current mqlite import result from the local run:
 }
 ```
 
+First-class harness result from this patch:
+
+| Operation | Previous Python loop | `bench trades-import` | Notes |
+| --- | ---: | ---: | --- |
+| Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 362.29s, 2,760 docs/s before validation failed | Single broker connection removed per-batch client spawn overhead, but the post-import count returned only 316,000 documents. Treat this as a failed correctness run, not a successful full-fixture import. |
+
+The failed structured result is checked in at
+`benchmarks/results/2026-05-13-trades-import-validation-failed.json`.
+
 ## Next Work Items
 
-- Add a first-class mqlite import benchmark command that streams NDJSON without
-  spawning a client process for every batch.
+- Run the first-class `mqlite bench trades-import` command against the full
+  fixture again after the checkpoint/count mismatch is fixed.
 - Make mqlite index builds page-backed and bounded in memory; the current
   secondary-index build exceeded 5 minutes and reached roughly 11.8 GiB RSS.
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
