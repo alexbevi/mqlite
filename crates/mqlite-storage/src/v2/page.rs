@@ -277,6 +277,28 @@ pub(crate) struct SecondaryLeafPage {
 }
 
 impl SecondaryLeafPage {
+    pub(crate) fn entries_fit(entries: &[SecondaryEntry]) -> Result<bool> {
+        let slot_area_end = page_slot_area_end(entries.len(), SECONDARY_LEAF_SLOT_LEN)?;
+        let mut payload_bytes = 0_usize;
+        let mut previous_key = Vec::new();
+        for entry in entries {
+            let shared_prefix_len = shared_prefix_len(&previous_key, &entry.normalized_key)?;
+            let normalized_suffix_len = entry.normalized_key.len() - shared_prefix_len as usize;
+            let postings_len = entry
+                .postings
+                .len()
+                .checked_mul(SECONDARY_POSTING_LEN)
+                .ok_or_else(|| anyhow!("secondary leaf page payload overflows"))?;
+            payload_bytes = payload_bytes
+                .checked_add(postings_len)
+                .and_then(|total| total.checked_add(entry.key_bytes.len()))
+                .and_then(|total| total.checked_add(normalized_suffix_len))
+                .ok_or_else(|| anyhow!("secondary leaf page payload overflows"))?;
+            previous_key = entry.normalized_key.clone();
+        }
+        Ok(PAGE_LEN.saturating_sub(payload_bytes) >= slot_area_end)
+    }
+
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut bytes = [0_u8; PAGE_LEN];
         encode_header(
@@ -1115,6 +1137,7 @@ mod tests {
                 .expect("entry"),
             ],
         };
+        assert!(SecondaryLeafPage::entries_fit(&leaf.entries).expect("secondary leaf fit check"));
         let decoded_leaf =
             SecondaryLeafPage::decode(&leaf.encode().expect("encode leaf")).expect("decode leaf");
         assert_eq!(decoded_leaf, leaf);

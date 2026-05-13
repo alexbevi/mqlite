@@ -913,77 +913,108 @@ impl CheckpointWriter {
     }
 
     fn write_secondary_tree(&mut self, index: &IndexCatalog) -> Result<(Option<PageId>, u64, u64)> {
-        let entries = index.entries_snapshot();
-        if entries.is_empty() {
+        if index.entry_count() == 0 {
             return Ok((None, 0, 0));
         }
         let mut index_bytes = 0_u64;
-        let mut secondary_entries = Vec::new();
+        let mut entry_count = 0_u64;
+        let mut children = Vec::new();
+        let mut current_page_id = self.allocate_page_id();
+        let mut current_leaf_entries = Vec::new();
         let mut current_group = Vec::new();
         let mut current_key: Option<Vec<u8>> = None;
-        for entry in entries.iter().cloned() {
+        index.try_for_each_entry(|entry| -> Result<()> {
+            entry_count += 1;
             let encoded_key = encode_index_key(&entry.key, &index.key)?;
             match current_key.as_ref() {
-                Some(existing) if *existing == encoded_key => current_group.push(entry),
+                Some(existing) if *existing == encoded_key => current_group.push(entry.clone()),
                 _ => {
                     if !current_group.is_empty() {
-                        secondary_entries.push(SecondaryEntry::from_index_entries(
-                            &current_group,
-                            &index.key,
-                        )?);
+                        let secondary_entry =
+                            SecondaryEntry::from_index_entries(&current_group, &index.key)?;
+                        self.push_secondary_entry_to_leaf(
+                            secondary_entry,
+                            &mut current_page_id,
+                            &mut current_leaf_entries,
+                            &mut children,
+                        )?;
                         current_group.clear();
                     }
                     index_bytes += bson::to_vec(&entry.key)?.len() as u64;
                     current_key = Some(encoded_key);
-                    current_group.push(entry);
+                    current_group.push(entry.clone());
                 }
             }
-        }
-        if !current_group.is_empty() {
-            secondary_entries.push(SecondaryEntry::from_index_entries(
-                &current_group,
-                &index.key,
-            )?);
-        }
-        let entry_count = entries.len() as u64;
-
-        let leaf_chunks = chunk_by_encode_adaptive(secondary_entries, 128, |chunk| {
-            SecondaryLeafPage {
-                page_id: 1,
-                next_page_id: None,
-                entries: chunk.to_vec(),
-            }
-            .encode()
-            .map(|_| ())
+            Ok(())
         })?;
-        let leaf_ids = (0..leaf_chunks.len())
-            .map(|_| self.allocate_page_id())
-            .collect::<Vec<_>>();
-        let mut children = Vec::new();
-        for (index, chunk) in leaf_chunks.into_iter().enumerate() {
-            let page_id = leaf_ids[index];
-            let next_page_id = leaf_ids.get(index + 1).copied();
-            let first_entry = chunk[0].clone();
-            self.pages.push((
-                page_id,
-                SecondaryLeafPage {
-                    page_id,
-                    next_page_id,
-                    entries: chunk,
-                }
-                .encode()?
-                .to_vec(),
-            ));
-            children.push(SecondaryChild {
-                page_id,
-                first_entry,
-            });
+        if !current_group.is_empty() {
+            let secondary_entry = SecondaryEntry::from_index_entries(&current_group, &index.key)?;
+            self.push_secondary_entry_to_leaf(
+                secondary_entry,
+                &mut current_page_id,
+                &mut current_leaf_entries,
+                &mut children,
+            )?;
         }
+
+        self.push_secondary_leaf_page(current_page_id, None, current_leaf_entries, &mut children)?;
 
         while children.len() > 1 {
             children = self.write_secondary_level(children)?;
         }
         Ok((Some(children[0].page_id), entry_count, index_bytes))
+    }
+
+    fn push_secondary_entry_to_leaf(
+        &mut self,
+        entry: SecondaryEntry,
+        current_page_id: &mut PageId,
+        current_leaf_entries: &mut Vec<SecondaryEntry>,
+        children: &mut Vec<SecondaryChild>,
+    ) -> Result<()> {
+        current_leaf_entries.push(entry);
+        if !SecondaryLeafPage::entries_fit(current_leaf_entries)? {
+            if current_leaf_entries.len() == 1 {
+                return Err(anyhow!("item exceeds v2 page capacity"));
+            }
+            let overflow = current_leaf_entries
+                .pop()
+                .expect("overflowing secondary entry");
+            let next_page_id = self.allocate_page_id();
+            let entries = std::mem::take(current_leaf_entries);
+            self.push_secondary_leaf_page(*current_page_id, Some(next_page_id), entries, children)?;
+            *current_page_id = next_page_id;
+            current_leaf_entries.push(overflow);
+            if !SecondaryLeafPage::entries_fit(current_leaf_entries)? {
+                return Err(anyhow!("item exceeds v2 page capacity"));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_secondary_leaf_page(
+        &mut self,
+        page_id: PageId,
+        next_page_id: Option<PageId>,
+        entries: Vec<SecondaryEntry>,
+        children: &mut Vec<SecondaryChild>,
+    ) -> Result<()> {
+        let first_entry = entries[0].clone();
+        self.pages.push((
+            page_id,
+            SecondaryLeafPage {
+                page_id,
+                next_page_id,
+                entries,
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        children.push(SecondaryChild {
+            page_id,
+            first_entry,
+        });
+        Ok(())
     }
 
     fn write_secondary_level(
