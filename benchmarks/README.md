@@ -48,8 +48,8 @@ Results:
 | Build `ticker_1` and `ticket_1` | 3.00s server-side, 8.92s including `mongosh` startup | Did not complete within 318.89s; interrupted | mqlite >106x slower to current cutoff |
 | Count all docs | p50 216.42ms | 2.20s cold CLI on WAL-backed indexed file via metadata path | mqlite 10.2x slower than MongoDB p50, but no full record hydration |
 | `_id` point read, 1000 iterations | p50 0.72ms, p95 1.08ms | 1.61s cold CLI for first fixture `_id` on WAL-backed indexed file | mqlite remains far slower than MongoDB warm p50, but avoids full record hydration |
-| `ticket: "z300"` indexed point read, 1000 iterations | p50 1.33ms, p95 4.44ms | blocked by mqlite index build | pending |
-| `ticket: "z300"` indexed count, 10 iterations | p50 2.44ms, result 2500 | stopped after 165.03s on bounded streaming WAL equality count | pending secondary-index metadata/entry access |
+| `ticket: "z300"` indexed point read, 1000 iterations | p50 1.33ms, p95 4.44ms | 1.09s cold CLI pending-WAL equality lookup | mqlite cold CLI remains far slower than MongoDB warm p50, but avoids full hydration |
+| `ticket: "z300"` indexed count, 10 iterations | p50 2.44ms, result 2500 | 0.10s cold CLI pending-WAL index-frequency count, result 2500 | mqlite cold CLI remains far slower than MongoDB warm p50, but avoids full hydration |
 
 Storage size after MongoDB import and secondary indexes:
 
@@ -245,6 +245,8 @@ The fresh 10k `ticket:"z300"` index-frequency smoke is checked in at
 `benchmarks/results/2026-05-13-trades-10k-ticket-count-index-frequency.json`.
 The full-fixture `ticket:"z300"` index-frequency run is checked in at
 `benchmarks/results/2026-05-13-trades-full-ticket-count-index-frequency.json`.
+The full-fixture `ticket:"z300"` pending-WAL point-read run is checked in at
+`benchmarks/results/2026-05-13-trades-full-ticket-find-pending-wal.json`.
 
 ## Next Work Items
 
@@ -256,6 +258,7 @@ The full-fixture `ticket:"z300"` index-frequency run is checked in at
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
-- Add comparable mqlite read results for `ticket`, `ticker`, and startup. Full
-  `ticket:"z300"` count now has a cold CLI measurement, but indexed point reads
-  and warm p50/p95 loops still need coverage.
+- Add comparable mqlite read results for `ticker` and startup. Full
+  `ticket:"z300"` point read and count now have cold CLI measurements, but warm
+  p50/p95 loops and clean checkpointed secondary-index reads still need
+  coverage.

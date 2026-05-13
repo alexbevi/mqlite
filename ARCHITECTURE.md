@@ -147,6 +147,11 @@ then scans supported pending WAL frames for matching inserts/updates while using
 skip later insert-only/index-only frames after a match. Mutations that could invalidate the result
 fall back to the normal read path.
 
+`find` with a simple non-`_id` equality, no sort, no skip, and at most one result can use a bounded
+pending-WAL insert lookup before mutable storage opens when the active checkpoint is empty. It scans
+insert-only WAL frames until the first matching document is found, then uses WAL metadata to verify
+later frames do not contain updates, deletes, or namespace rewrites that could invalidate the result.
+
 `count` with a single equality predicate can use value-frequency summaries from supported pending
 `createIndexes` WAL metadata frames. When a matching single-field index was created after the
 pending inserts, the count can answer from the index statistics generated during create-index

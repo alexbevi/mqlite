@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "status": "pending-wal-find-complete",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-prefix2-full.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "operation": {
+    "command": "target/debug/mqlite command --file /tmp/mqlite-trades-prefix2-full.mongodb --db market --idle-shutdown-secs 1 --eval '{\"find\":\"trades\",\"filter\":{\"ticket\":\"z300\"},\"limit\":1,\"singleBatch\":true}'",
+    "filter": {
+      "ticket": "z300"
+    },
+    "limit": 1,
+    "result": {
+      "firstBatchLength": 1,
+      "firstDocumentId": {
+        "$oid": "5597a1627df886b33f83a062"
+      },
+      "ticket": "z300"
+    },
+    "processTime": {
+      "realSeconds": 1.09,
+      "maxResidentSetBytes": 7815168,
+      "peakMemoryFootprintBytes": 3223552
+    },
+    "debug": {
+      "readPath": "pendingWalEqualityLookup",
+      "pendingWalRecords": 1002,
+      "pendingWalRelevantRecords": 1002
+    }
+  },
+  "comparison": {
+    "mongodbTicketPointP50Ms": 1.33,
+    "mongodbTicketPointP95Ms": 4.44,
+    "mqliteTicketPointColdCliMs": 1090.0
+  },
+  "notes": [
+    "This path scans pending WAL metadata after finding the first matching insert and does not open mutable storage.",
+    "This is a cold CLI measurement, not a warm p50/p95 loop.",
+    "It is not yet the final persisted secondary-index point-read path for clean checkpointed files."
+  ]
+}

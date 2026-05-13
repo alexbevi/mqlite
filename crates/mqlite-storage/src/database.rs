@@ -814,6 +814,14 @@ pub struct PendingWalIdLookup {
     pub document: Option<Document>,
 }
 
+pub struct PendingWalEqualityLookup {
+    pub last_sequence: u64,
+    pub wal_records: usize,
+    pub relevant_wal_records: usize,
+    pub wal_bytes: u64,
+    pub document: Option<Document>,
+}
+
 pub struct PendingWalEqualityCount {
     pub last_sequence: u64,
     pub wal_records: usize,
@@ -1373,6 +1381,151 @@ impl DatabaseFile {
         }))
     }
 
+    pub fn find_pending_wal_document_by_field_eq(
+        path: impl AsRef<Path>,
+        database: &str,
+        collection: &str,
+        field: &str,
+        value: &Bson,
+        max_wal_bytes: u64,
+    ) -> Result<Option<PendingWalEqualityLookup>> {
+        let _span = span(Component::Storage, "find_pending_wal_document_by_field_eq");
+        let path = path.as_ref();
+        let pager = V2Pager::open(path)?;
+        let superblock = pager.active_superblock().clone();
+        if superblock.summary.record_count != 0 {
+            return Ok(None);
+        }
+        let file_size = std::fs::metadata(path)?.len();
+        let wal_bytes = file_size.saturating_sub(superblock.wal_start_offset);
+        if wal_bytes == 0 || wal_bytes > max_wal_bytes {
+            return Ok(None);
+        }
+
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut offset = superblock.wal_start_offset;
+        let mut last_sequence = superblock.durable_lsn;
+        let mut scanned_records = 0_u64;
+        let mut relevant_records = 0_u64;
+        let mut found = None::<Document>;
+
+        while offset < file_size {
+            if file_size - offset < WAL_HEADER_LEN as u64 {
+                break;
+            }
+
+            file.seek(SeekFrom::Start(offset))?;
+            let mut header = [0_u8; WAL_HEADER_LEN];
+            file.read_exact(&mut header)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if &header[..4] != WAL_FRAME_MAGIC {
+                break;
+            }
+
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+            let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+            if payload_end > file_size {
+                break;
+            }
+
+            let mut payload = vec![0_u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if hash_bytes(&payload) != header[8..40] {
+                return Err(StorageError::InvalidWalChecksum.into());
+            }
+
+            if let Some(metadata) = decode_wal_frame_metadata(&payload)? {
+                let sequence = if metadata.sequence == 0 {
+                    decode_compact_wal_entry_sequence(&payload)?
+                } else {
+                    metadata.sequence
+                };
+                if sequence <= last_sequence {
+                    offset = payload_end;
+                    continue;
+                }
+
+                scanned_records += 1;
+                last_sequence = sequence;
+                if !wal_metadata_targets_namespace(&metadata.mutation, database, collection) {
+                    offset = payload_end;
+                    continue;
+                }
+                relevant_records += 1;
+                match metadata.mutation {
+                    WalFrameMetadataMutation::ApplyCollectionChanges { changes, .. } => {
+                        if changes.updates != 0 || changes.deletes != 0 {
+                            return Ok(None);
+                        }
+                        if found.is_none() {
+                            let compact = decode_compact_wal_entry(&payload)?;
+                            if !find_compact_equality_insert(
+                                &mut found,
+                                field,
+                                value,
+                                compact.mutation,
+                            )? {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    WalFrameMetadataMutation::CreateIndexes { .. }
+                    | WalFrameMetadataMutation::DropIndexes { .. } => {}
+                    WalFrameMetadataMutation::ReplaceCollection { .. }
+                    | WalFrameMetadataMutation::RewriteCollection { .. }
+                    | WalFrameMetadataMutation::DropCollection { .. } => return Ok(None),
+                }
+                offset = payload_end;
+                continue;
+            }
+
+            let compact = decode_compact_wal_entry(&payload)?;
+            if compact.sequence <= last_sequence {
+                offset = payload_end;
+                continue;
+            }
+
+            scanned_records += 1;
+            last_sequence = compact.sequence;
+            if !compact_mutation_targets_namespace(&compact.mutation, database, collection) {
+                offset = payload_end;
+                continue;
+            }
+            relevant_records += 1;
+            if !find_compact_equality_insert(&mut found, field, value, compact.mutation)? {
+                return Ok(None);
+            }
+            offset = payload_end;
+        }
+
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityLookupScannedRecords",
+            scanned_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityLookupRelevantRecords",
+            relevant_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalEqualityLookupScannedBytes",
+            wal_bytes,
+        );
+
+        Ok(Some(PendingWalEqualityLookup {
+            last_sequence,
+            wal_records: scanned_records as usize,
+            relevant_wal_records: relevant_records as usize,
+            wal_bytes,
+            document: found,
+        }))
+    }
+
     pub fn count_pending_wal_field_eq(
         path: impl AsRef<Path>,
         database: &str,
@@ -1635,6 +1788,54 @@ fn apply_compact_id_lookup_record(
         *found = Some((record.record_id, document));
     }
     Ok(())
+}
+
+fn find_compact_equality_insert(
+    found: &mut Option<Document>,
+    field: &str,
+    value: &Bson,
+    mutation: CompactWalMutation,
+) -> Result<bool> {
+    let CompactWalMutation::ApplyCollectionChanges {
+        changes,
+        inserts,
+        updates,
+        deletes,
+        ..
+    } = mutation
+    else {
+        return Ok(true);
+    };
+    if !updates.is_empty() || !deletes.is_empty() {
+        return Ok(false);
+    }
+    for change in changes {
+        let CompactCollectionChange::Insert(record) = change else {
+            return Ok(false);
+        };
+        if apply_compact_equality_lookup_record(found, field, value, record)? {
+            return Ok(true);
+        }
+    }
+    for record in inserts {
+        if apply_compact_equality_lookup_record(found, field, value, record)? {
+            return Ok(true);
+        }
+    }
+    Ok(true)
+}
+
+fn apply_compact_equality_lookup_record(
+    found: &mut Option<Document>,
+    field: &str,
+    value: &Bson,
+    record: CompactCollectionRecord,
+) -> Result<bool> {
+    if compact_record_field_eq(&record, field, value)? {
+        *found = Some(decode_document_bytes(&record.document)?);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn compact_record_field_eq(
@@ -6599,6 +6800,21 @@ mod tests {
         assert_eq!(count.count, 3);
         assert_eq!(count.wal_records, 3);
         assert_eq!(count.relevant_wal_records, 3);
+
+        let lookup = DatabaseFile::find_pending_wal_document_by_field_eq(
+            &path,
+            "app",
+            "widgets",
+            "ticket",
+            &Bson::String("z300".to_string()),
+            u64::MAX,
+        )
+        .expect("lookup")
+        .expect("supported lookup");
+        let document = lookup.document.expect("document");
+        assert_eq!(document.get_i64("_id").expect("_id"), 1);
+        assert_eq!(lookup.wal_records, 3);
+        assert_eq!(lookup.relevant_wal_records, 3);
     }
 
     fn exact_sku_bounds(sku: &str) -> IndexBounds {

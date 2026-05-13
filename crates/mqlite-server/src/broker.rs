@@ -1974,6 +1974,46 @@ impl Broker {
             }
         }
 
+        if let Some((field, value)) = simple_equality_filter(&filter).filter(|_| {
+            !self.storage_is_loaded()
+                && self.paths.database_path.exists()
+                && sort.is_none()
+                && skip == 0
+                && limit <= 1
+        }) {
+            if let Some(lookup) = DatabaseFile::find_pending_wal_document_by_field_eq(
+                &self.paths.database_path,
+                &database,
+                collection,
+                &field,
+                &value,
+                DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES,
+            )
+            .map_err(internal_error)?
+            {
+                set_metadata("readPath", "pendingWalEqualityLookup");
+                set_metadata("pendingWalRecords", lookup.wal_records.to_string());
+                set_metadata(
+                    "pendingWalRelevantRecords",
+                    lookup.relevant_wal_records.to_string(),
+                );
+                set_metadata("pendingWalBytes", lookup.wal_bytes.to_string());
+                let documents = lookup
+                    .document
+                    .map(|document| apply_projection(&document, projection.as_ref()))
+                    .transpose()?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let cursor = self.cursors.lock().open(
+                    format!("{database}.{collection}"),
+                    documents,
+                    batch_size,
+                    single_batch,
+                );
+                return Ok(cursor_document(cursor, "firstBatch"));
+            }
+        }
+
         let namespace = format!("{database}.{collection}");
         let execution =
             self.with_query_collection(&database, collection, |sequence, collection| {
@@ -7443,6 +7483,77 @@ mod tests {
         assert!(
             !broker.storage_is_loaded(),
             "pending WAL equality count should not force mutable storage"
+        );
+    }
+
+    #[test]
+    fn find_simple_equality_uses_pending_wal_lookup_before_storage_opens() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("lazy-startup-pending-equality-find.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            database.checkpoint().expect("checkpoint empty file");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "ticket": "z300", "sku": "first" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "ticket": "x100", "sku": "other" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending inserts");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "ticket": 1 }, "name": "ticket_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let response = broker
+            .handle_find(&doc! {
+                "find": "widgets",
+                "filter": { "ticket": "z300" },
+                "limit": 1_i64,
+                "$db": "app",
+            })
+            .expect("find");
+        let first_batch = response
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(
+            first_batch[0]
+                .as_document()
+                .expect("document")
+                .get_str("sku")
+                .expect("sku"),
+            "first"
+        );
+        assert!(
+            !broker.storage_is_loaded(),
+            "pending WAL equality lookup should not force mutable storage"
         );
     }
 
