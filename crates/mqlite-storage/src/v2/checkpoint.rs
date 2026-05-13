@@ -624,14 +624,8 @@ impl CheckpointWriter {
         if change_events.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode_refs(change_events, |chunk| {
-            ChangeEventsPage {
-                page_id: 1,
-                next_page_id: None,
-                events: chunk.to_vec(),
-            }
-            .encode()
-            .map(|_| ())
+        let chunks = chunk_by_encode_adaptive_refs(change_events, 32, |chunk| {
+            encode_change_events_page_fits(chunk)
         })?;
         let page_ids = (0..chunks.len())
             .map(|_| self.allocate_page_id())
@@ -660,7 +654,7 @@ impl CheckpointWriter {
         if plan_cache_entries.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode_refs(plan_cache_entries, |chunk| {
+        let chunks = chunk_by_encode_adaptive_refs(plan_cache_entries, 64, |chunk| {
             PlanCachePage {
                 page_id: 1,
                 next_page_id: None,
@@ -1130,6 +1124,50 @@ fn chunk_by_encode_refs<T: Clone>(
         chunks.push(current);
     }
     Ok(chunks)
+}
+
+fn chunk_by_encode_adaptive_refs<T: Clone>(
+    items: &[T],
+    initial_chunk_size: usize,
+    fits: impl Fn(&[T]) -> Result<()>,
+) -> Result<Vec<Vec<T>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    let mut chunk_size = initial_chunk_size.max(1);
+    while offset < items.len() {
+        let remaining = items.len() - offset;
+        let mut take = chunk_size.min(remaining);
+        loop {
+            let chunk = items[offset..offset + take].to_vec();
+            if fits(&chunk).is_ok() {
+                chunks.push(chunk);
+                offset += take;
+                chunk_size = take.max(1);
+                break;
+            }
+            if take == 1 {
+                fits(&items[offset..offset + 1])
+                    .map_err(|_| anyhow!("item exceeds v2 page capacity"))?;
+            }
+            take = take.div_ceil(2);
+        }
+    }
+
+    Ok(chunks)
+}
+
+fn encode_change_events_page_fits(events: &[PersistedChangeEvent]) -> Result<()> {
+    ChangeEventsPage {
+        page_id: 1,
+        next_page_id: None,
+        events: events.to_vec(),
+    }
+    .encode()
+    .map(|_| ())
 }
 
 fn checkpoint_unix_ms() -> u64 {
