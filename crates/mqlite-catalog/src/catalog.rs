@@ -826,9 +826,10 @@ impl IndexCatalog {
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
-        self.runtime_pages = build_runtime_index_pages(&entries, &self.key)?;
+        let (entries, runtime_pages) = build_runtime_index_pages_from_entries(entries, &self.key)?;
+        self.runtime_pages = runtime_pages;
         self.entries = if self.runtime_pages.is_empty() {
-            entries
+            entries.unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1595,6 +1596,29 @@ fn build_runtime_index_pages(
         pages.push(page);
     }
     Ok(pages)
+}
+
+fn build_runtime_index_pages_from_entries(
+    entries: Vec<IndexEntry>,
+    key_pattern: &Document,
+) -> Result<(Option<Vec<IndexEntry>>, Vec<RuntimeIndexPage>), CatalogError> {
+    if entries.is_empty() {
+        return Ok((Some(entries), Vec::new()));
+    }
+
+    let mut pages = Vec::new();
+    let mut page = RuntimeIndexPage::new();
+    for entry in entries {
+        if !page.entries.is_empty() && !page.can_fit_entry(&entry)? {
+            pages.push(page);
+            page = RuntimeIndexPage::new();
+        }
+        page.insert_entry(entry, key_pattern)?;
+    }
+    if !page.entries.is_empty() {
+        pages.push(page);
+    }
+    Ok((None, pages))
 }
 
 fn page_overlaps_bounds(

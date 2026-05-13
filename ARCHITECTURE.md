@@ -367,9 +367,9 @@ Each persisted index can also keep stats pages with:
 
 These stats are used by the planner after reopen instead of rebuilding histogram-like data from
 index scans.
-In-memory runtime index pages rebuild those stats by streaming page entries directly, so an index
-build or load does not need to materialize a second flat entry vector just to refresh planner
-frequencies.
+In-memory runtime index pages are packed by consuming the sorted build output directly and rebuild
+stats by streaming page entries, so an index build or load does not need to materialize second flat
+entry vectors just to refresh planner frequencies.
 
 ## Planner And Plan Cache
 
