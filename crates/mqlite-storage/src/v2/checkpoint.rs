@@ -796,7 +796,10 @@ impl CheckpointWriter {
             .records
             .iter()
             .map(|record| {
-                let slot = RecordSlot::from_document(record.record_id, &record.document)?;
+                let slot = RecordSlot {
+                    record_id: record.record_id,
+                    encoded_document: record.encoded_document_bytes()?.into_owned(),
+                };
                 document_bytes += slot.encoded_document.len() as u64;
                 Ok(slot)
             })
