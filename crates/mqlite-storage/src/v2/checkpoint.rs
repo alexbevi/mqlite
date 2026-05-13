@@ -862,7 +862,6 @@ impl CheckpointWriter {
                     return Err(anyhow!("item exceeds v2 page capacity"));
                 }
                 let overflow = current_entries.pop().expect("overflowing record slot");
-                current_payload_bytes -= overflow.encoded_document.len();
                 let next_page_id = self.allocate_page_id();
                 self.push_record_leaf_page(
                     current_page_id,

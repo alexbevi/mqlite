@@ -1868,13 +1868,13 @@ impl Broker {
                     encoded_collection_record(next_record_id, document);
                 next_record_id += 1;
                 let document_key = encoded_document_key_for_change_stream(&record.document);
-                change_events.push(change_stream_event_from_encoded(
+                change_events.push(change_stream_event_from_shared_encoded(
                     sequence,
                     change_events.len(),
                     &database,
                     Some(collection_name),
                     "insert",
-                    document_key,
+                    document_key.map(Arc::from),
                     Some(encoded_document),
                     None,
                     None,
@@ -2130,15 +2130,15 @@ impl Broker {
                             "index": operation_index as i32,
                             "_id": upserted_id.clone()
                         });
-                        change_events.push(change_stream_event_from_encoded(
+                        change_events.push(change_stream_event_from_shared_encoded(
                             sequence,
                             change_events.len(),
                             &database,
                             Some(collection_name),
                             "insert",
-                            Some(encode_bson_document_bytes(
+                            Some(Arc::from(encode_bson_document_bytes(
                                 &doc! { "_id": upserted_id.clone() },
-                            )),
+                            ))),
                             Some(encoded_document),
                             None,
                             None,
@@ -2165,15 +2165,15 @@ impl Broker {
                         let document_key = encoded_document_key_for_change_stream(&updated);
                         match &update_spec {
                             mqlite_query::UpdateSpec::Replacement(_) => {
-                                change_events.push(change_stream_event_from_encoded(
+                                change_events.push(change_stream_event_from_shared_encoded(
                                     sequence,
                                     change_events.len(),
                                     &database,
                                     Some(collection_name),
                                     "replace",
-                                    document_key,
+                                    document_key.map(Arc::from),
                                     Some(encoded_updated),
-                                    Some(encode_bson_document_bytes(&original)),
+                                    Some(Arc::from(encode_bson_document_bytes(&original))),
                                     None,
                                     false,
                                     EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
@@ -2182,16 +2182,18 @@ impl Broker {
                             _ => {
                                 let update_description =
                                     build_update_description(&original, &updated);
-                                change_events.push(change_stream_event_from_encoded(
+                                change_events.push(change_stream_event_from_shared_encoded(
                                     sequence,
                                     change_events.len(),
                                     &database,
                                     Some(collection_name),
                                     "update",
-                                    document_key,
+                                    document_key.map(Arc::from),
                                     Some(encoded_updated),
-                                    Some(encode_bson_document_bytes(&original)),
-                                    Some(encode_bson_document_bytes(&update_description)),
+                                    Some(Arc::from(encode_bson_document_bytes(&original))),
+                                    Some(Arc::from(encode_bson_document_bytes(
+                                        &update_description,
+                                    ))),
                                     false,
                                     EMPTY_BSON_DOCUMENT_BYTES.to_vec(),
                                 ));
@@ -4413,7 +4415,36 @@ fn change_stream_event_from_encoded(
     expanded: bool,
     extra_fields: Vec<u8>,
 ) -> PersistedChangeEvent {
-    PersistedChangeEvent::from_encoded_fields(
+    change_stream_event_from_shared_encoded(
+        sequence,
+        event_index,
+        database,
+        collection,
+        operation_type,
+        document_key.map(Arc::from),
+        full_document.map(Arc::from),
+        full_document_before_change.map(Arc::from),
+        update_description.map(Arc::from),
+        expanded,
+        extra_fields,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn change_stream_event_from_shared_encoded(
+    sequence: u64,
+    event_index: usize,
+    database: &str,
+    collection: Option<&str>,
+    operation_type: &str,
+    document_key: Option<Arc<[u8]>>,
+    full_document: Option<Arc<[u8]>>,
+    full_document_before_change: Option<Arc<[u8]>>,
+    update_description: Option<Arc<[u8]>>,
+    expanded: bool,
+    extra_fields: Vec<u8>,
+) -> PersistedChangeEvent {
+    PersistedChangeEvent::from_shared_encoded_fields(
         encode_bson_document_bytes(&doc! {
             "sequence": sequence as i64,
             "event": event_index as i32 + 1,
@@ -4447,10 +4478,10 @@ fn encoded_document_key_for_change_stream(document: &Document) -> Option<Vec<u8>
     })
 }
 
-fn encoded_collection_record(record_id: u64, document: Document) -> (CollectionRecord, Vec<u8>) {
-    let encoded = encode_bson_document_bytes(&document);
+fn encoded_collection_record(record_id: u64, document: Document) -> (CollectionRecord, Arc<[u8]>) {
+    let encoded = Arc::from(encode_bson_document_bytes(&document));
     (
-        CollectionRecord::from_encoded(record_id, document, encoded.clone()),
+        CollectionRecord::from_encoded_arc(record_id, document, Arc::clone(&encoded)),
         encoded,
     )
 }

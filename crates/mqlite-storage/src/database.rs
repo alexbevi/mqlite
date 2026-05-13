@@ -58,18 +58,18 @@ pub struct PersistedState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedChangeEvent {
-    token: Vec<u8>,
+    token: Arc<[u8]>,
     pub cluster_time: bson::Timestamp,
     pub wall_time: bson::DateTime,
     pub database: String,
     pub collection: Option<String>,
     pub operation_type: String,
-    document_key: Option<Vec<u8>>,
-    full_document: Option<Vec<u8>>,
-    full_document_before_change: Option<Vec<u8>>,
-    update_description: Option<Vec<u8>>,
+    document_key: Option<Arc<[u8]>>,
+    full_document: Option<Arc<[u8]>>,
+    full_document_before_change: Option<Arc<[u8]>>,
+    update_description: Option<Arc<[u8]>>,
     pub expanded: bool,
-    extra_fields: Vec<u8>,
+    extra_fields: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1772,8 +1772,39 @@ impl PersistedChangeEvent {
         expanded: bool,
         extra_fields: Vec<u8>,
     ) -> Self {
-        Self {
+        Self::from_shared_encoded_fields(
             token,
+            cluster_time,
+            wall_time,
+            database,
+            collection,
+            operation_type,
+            document_key.map(Arc::from),
+            full_document.map(Arc::from),
+            full_document_before_change.map(Arc::from),
+            update_description.map(Arc::from),
+            expanded,
+            extra_fields,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_shared_encoded_fields(
+        token: Vec<u8>,
+        cluster_time: bson::Timestamp,
+        wall_time: bson::DateTime,
+        database: String,
+        collection: Option<String>,
+        operation_type: String,
+        document_key: Option<Arc<[u8]>>,
+        full_document: Option<Arc<[u8]>>,
+        full_document_before_change: Option<Arc<[u8]>>,
+        update_description: Option<Arc<[u8]>>,
+        expanded: bool,
+        extra_fields: Vec<u8>,
+    ) -> Self {
+        Self {
+            token: Arc::from(token),
             cluster_time,
             wall_time,
             database,
@@ -1784,7 +1815,7 @@ impl PersistedChangeEvent {
             full_document_before_change,
             update_description,
             expanded,
-            extra_fields,
+            extra_fields: Arc::from(extra_fields),
         }
     }
 
@@ -1824,19 +1855,31 @@ impl PersistedChangeEvent {
     }
 
     pub fn document_key_document(&self) -> Result<Option<bson::Document>> {
-        decode_optional_document_bytes(self.document_key.clone())
+        self.document_key
+            .as_deref()
+            .map(decode_document_bytes)
+            .transpose()
     }
 
     pub fn full_document_document(&self) -> Result<Option<bson::Document>> {
-        decode_optional_document_bytes(self.full_document.clone())
+        self.full_document
+            .as_deref()
+            .map(decode_document_bytes)
+            .transpose()
     }
 
     pub fn full_document_before_change_document(&self) -> Result<Option<bson::Document>> {
-        decode_optional_document_bytes(self.full_document_before_change.clone())
+        self.full_document_before_change
+            .as_deref()
+            .map(decode_document_bytes)
+            .transpose()
     }
 
     pub fn update_description_document(&self) -> Result<Option<bson::Document>> {
-        decode_optional_document_bytes(self.update_description.clone())
+        self.update_description
+            .as_deref()
+            .map(decode_document_bytes)
+            .transpose()
     }
 
     pub fn extra_fields_document(&self) -> Result<bson::Document> {
@@ -2244,7 +2287,7 @@ impl CompactIndexEntry {
 impl CompactPersistedChangeEvent {
     fn into_persisted_change_event(self) -> Result<PersistedChangeEvent> {
         Ok(PersistedChangeEvent {
-            token: self.token,
+            token: Arc::from(self.token),
             cluster_time: bson::Timestamp {
                 time: self.cluster_time_time,
                 increment: self.cluster_time_increment,
@@ -2253,12 +2296,12 @@ impl CompactPersistedChangeEvent {
             database: self.database,
             collection: self.collection,
             operation_type: self.operation_type,
-            document_key: self.document_key,
-            full_document: self.full_document,
-            full_document_before_change: self.full_document_before_change,
-            update_description: self.update_description,
+            document_key: self.document_key.map(Arc::from),
+            full_document: self.full_document.map(Arc::from),
+            full_document_before_change: self.full_document_before_change.map(Arc::from),
+            update_description: self.update_description.map(Arc::from),
             expanded: self.expanded,
-            extra_fields: self.extra_fields,
+            extra_fields: Arc::from(self.extra_fields),
         })
     }
 }
@@ -2266,7 +2309,7 @@ impl CompactPersistedChangeEvent {
 impl<'a> EncodedPersistedChangeEvent<'a> {
     fn from_persisted_change_event(event: &'a PersistedChangeEvent) -> Self {
         Self {
-            token: &event.token,
+            token: event.token.as_ref(),
             cluster_time_time: event.cluster_time.time,
             cluster_time_increment: event.cluster_time.increment,
             wall_time_millis: event.wall_time.timestamp_millis(),
@@ -2278,7 +2321,7 @@ impl<'a> EncodedPersistedChangeEvent<'a> {
             full_document_before_change: event.full_document_before_change.as_deref(),
             update_description: event.update_description.as_deref(),
             expanded: event.expanded,
-            extra_fields: &event.extra_fields,
+            extra_fields: event.extra_fields.as_ref(),
         }
     }
 }
@@ -4489,6 +4532,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs::OpenOptions,
         io::{Read, Seek, SeekFrom, Write},
+        sync::Arc,
     };
 
     use bson::{DateTime, Document, Timestamp, doc};
@@ -4587,6 +4631,29 @@ mod tests {
             &Document::new(),
         )
         .expect("sample change event")
+    }
+
+    #[test]
+    fn persisted_change_event_clone_shares_encoded_bytes() {
+        let event = sample_change_event(7, "insert");
+        let cloned = event.clone();
+
+        assert!(Arc::ptr_eq(&event.token, &cloned.token));
+        assert!(Arc::ptr_eq(
+            event.document_key.as_ref().expect("document key"),
+            cloned.document_key.as_ref().expect("cloned document key"),
+        ));
+        assert!(Arc::ptr_eq(
+            event.full_document.as_ref().expect("full document"),
+            cloned.full_document.as_ref().expect("cloned full document"),
+        ));
+        assert!(Arc::ptr_eq(&event.extra_fields, &cloned.extra_fields));
+        assert_eq!(
+            cloned
+                .full_document_document()
+                .expect("decode full document"),
+            Some(doc! { "_id": 7_i64, "qty": 7_i64 })
+        );
     }
 
     fn counter_value(

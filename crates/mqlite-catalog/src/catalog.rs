@@ -77,6 +77,18 @@ impl CollectionRecord {
         }
     }
 
+    pub fn from_encoded_arc(
+        record_id: u64,
+        document: Document,
+        encoded_document: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            record_id,
+            document,
+            encoded_document: Some(encoded_document),
+        }
+    }
+
     pub fn encoded_document_bytes(&self) -> Result<Cow<'_, [u8]>, CatalogError> {
         match self.encoded_document.as_deref() {
             Some(bytes) => Ok(Cow::Borrowed(bytes)),

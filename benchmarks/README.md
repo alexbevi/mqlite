@@ -220,7 +220,7 @@ First-class harness results from this patch:
 | Operation | Previous Python loop | `bench trades-import` | Notes |
 | --- | ---: | ---: | --- |
 | Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 328.04s, 3,048 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. The full process wall time was 532.23s because broker cleanup happens outside the harness timer. |
-| Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s and 270.34s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, and spool-backed page packing reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the spool-backed probe still reached roughly 4.5 GiB broker RSS before manual stop. |
+| Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 
 The successful live-count result is checked in at
 `benchmarks/results/2026-05-13-trades-import-live-validated.json`. The earlier

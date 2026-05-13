@@ -229,6 +229,8 @@ rotates the active superblock.
   precomputing every chunk and page id for those metadata roots.
 - Encoded pages are spooled to a temporary file while the page graph is built, then copied into
   the database file at the existing checkpoint publish point before the superblock is rotated.
+- Persisted change-event byte payloads are shared across cloned checkpoint state so background
+  checkpoint capture does not duplicate full-document event bytes.
 - It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
 
 ### Background Published Snapshot
