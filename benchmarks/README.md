@@ -314,8 +314,9 @@ The full-fixture background-checkpoint trades-import run is checked in at
 - Add safe benchmark cleanup/checkpoint handling so interrupting long
   foreground operations cannot make benchmark files look successfully complete
   when only an older checkpoint is visible. The trades-import harness now
-  rejects stale or dirty checkpoint results before printing successful JSON, but
-  cleanup around externally interrupted broker processes still needs hardening.
+  rejects stale or dirty checkpoint results before printing successful JSON, and
+  benchmark `--reset` now refuses to remove a database that still has a live
+  broker accepting connections.
 - Reduce checkpoint publication time and file size; the full one-pass
   checkpoint completes, but foreground publication still takes 287.99s and the
   full background-checkpoint harness waits 582.53s for clean shutdown. Both

@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::Path,
+    process::Command as ProcessCommand,
     thread,
     time::{Duration, Instant},
 };
@@ -682,6 +683,63 @@ fn bench_seed_requires_large_profile_opt_in() {
         .stderr(predicates::str::contains(
             "extended benchmark profile requires --allow-large",
         ));
+}
+
+#[test]
+fn bench_trades_import_reset_refuses_running_broker() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("trades-live-broker-reset.mongodb");
+    let fixture_path = temp_dir.path().join("trades.json");
+    fs::write(
+        &fixture_path,
+        r#"{"_id":{"$oid":"5597a1617df886b33f839f9a"},"ticker":"abcd","ticket":"z300"}"#,
+    )
+    .expect("write fixture");
+
+    let manifest_path = broker_paths(&database_path)
+        .expect("broker paths")
+        .manifest_path;
+    let mut broker = ProcessCommand::new(assert_cmd::cargo::cargo_bin("mqlite"))
+        .args([
+            "serve",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--idle-shutdown-secs",
+            "60",
+        ])
+        .spawn()
+        .expect("spawn broker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !manifest_path.exists() && Instant::now() < deadline {
+        if let Some(status) = broker.try_wait().expect("broker status") {
+            panic!("broker exited before manifest: {status}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(manifest_path.exists(), "broker manifest should exist");
+
+    let mut bench = Command::cargo_bin("mqlite").expect("binary");
+    bench
+        .args([
+            "bench",
+            "trades-import",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--fixture",
+            fixture_path.to_str().expect("path"),
+            "--reset",
+            "--idle-shutdown-secs",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "refusing to reset benchmark database",
+        ))
+        .stderr(predicates::str::contains("still accepting connections"));
+
+    let _ = broker.kill();
+    let _ = broker.wait();
 }
 
 #[test]

@@ -480,7 +480,8 @@ successful benchmark JSON, it validates that final storage metadata reports the 
 count and requested secondary indexes. When foreground or background checkpoint publication is
 requested, it also requires the last checkpoint to match the imported document count and the WAL tail
 to be empty so an interrupted long-running benchmark cannot be mistaken for a complete clean-file
-result.
+result. Benchmark reset paths remove stale broker manifests and endpoints, but refuse to delete the
+database file while an existing broker for that file is still accepting connections.
 
 `mqlite command` remains the default direct validation path before any driver patching work.
 

@@ -11,7 +11,10 @@ use bson::{Bson, Document, doc, oid::ObjectId};
 use clap::{Parser, Subcommand, ValueEnum};
 use mqlite_catalog::{CollectionCatalog, CollectionRecord, apply_index_specs};
 use mqlite_debug::{Component, SessionHandle, install, session};
-use mqlite_ipc::{BoxedStream, BrokerPaths, broker_paths, connect, read_manifest, remove_manifest};
+use mqlite_ipc::{
+    BoxedStream, BrokerPaths, broker_paths, cleanup_endpoint, connect, read_manifest,
+    remove_manifest,
+};
 use mqlite_server::{Broker, BrokerConfig};
 use mqlite_storage::{DatabaseFile, WalMutation};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
@@ -360,18 +363,21 @@ async fn main() -> Result<()> {
                         dirty_wal_records,
                         allow_large,
                         allow_stress,
-                    } => seed_benchmark_fixture(
-                        &file,
-                        BenchmarkFixtureOptions {
-                            profile,
-                            db: &db,
-                            collection: &collection,
-                            reset,
-                            dirty_wal_records,
-                            allow_large,
-                            allow_stress,
-                        },
-                    )?,
+                    } => {
+                        seed_benchmark_fixture(
+                            &file,
+                            BenchmarkFixtureOptions {
+                                profile,
+                                db: &db,
+                                collection: &collection,
+                                reset,
+                                dirty_wal_records,
+                                allow_large,
+                                allow_stress,
+                            },
+                        )
+                        .await?
+                    }
                     BenchCommand::Run {
                         file,
                         profile,
@@ -883,16 +889,15 @@ fn validate_benchmark_profile(
     }
 }
 
-fn seed_benchmark_fixture(
+async fn seed_benchmark_fixture(
     file: &Path,
     options: BenchmarkFixtureOptions<'_>,
 ) -> Result<serde_json::Value> {
     let spec =
         validate_benchmark_profile(options.profile, options.allow_large, options.allow_stress)?;
     let started = Instant::now();
-    if options.reset && file.exists() {
-        std::fs::remove_file(file)
-            .with_context(|| format!("failed to reset benchmark fixture `{}`", file.display()))?;
+    if options.reset {
+        reset_benchmark_file(file, "benchmark fixture").await?;
     }
     if file.exists() && !options.reset {
         let info = DatabaseFile::info(file)?;
@@ -1190,9 +1195,8 @@ async fn run_trades_import_benchmark(
     if options.checkpoint && options.background_checkpoint {
         bail!("--checkpoint and --background-checkpoint are mutually exclusive");
     }
-    if options.reset && file.exists() {
-        std::fs::remove_file(file)
-            .with_context(|| format!("failed to reset benchmark database `{}`", file.display()))?;
+    if options.reset {
+        reset_benchmark_file(file, "benchmark database").await?;
     }
 
     let started = Instant::now();
@@ -1471,6 +1475,49 @@ fn validate_trades_import_completion(
         completion_verified: true,
         clean_checkpoint_verified: clean_checkpoint_requested,
     })
+}
+
+async fn reset_benchmark_file(file: &Path, label: &str) -> Result<()> {
+    let paths = broker_paths(file)?;
+    if paths.manifest_path.exists() {
+        match read_manifest(&paths.manifest_path) {
+            Ok(manifest) => match connect(&manifest.endpoint).await {
+                Ok(_) => bail!(
+                    "refusing to reset {label} `{}` while mqlite broker pid {} is still accepting connections at {}",
+                    file.display(),
+                    manifest.pid,
+                    manifest.endpoint
+                ),
+                Err(_) => {
+                    remove_manifest(&paths.manifest_path).with_context(|| {
+                        format!(
+                            "failed to remove stale broker manifest `{}`",
+                            paths.manifest_path.display()
+                        )
+                    })?;
+                    cleanup_endpoint(&manifest.endpoint).with_context(|| {
+                        format!(
+                            "failed to remove stale broker endpoint `{}`",
+                            manifest.endpoint
+                        )
+                    })?;
+                }
+            },
+            Err(_) => {
+                remove_manifest(&paths.manifest_path).with_context(|| {
+                    format!(
+                        "failed to remove unreadable broker manifest `{}`",
+                        paths.manifest_path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    if file.exists() {
+        std::fs::remove_file(file)
+            .with_context(|| format!("failed to reset {label} `{}`", file.display()))?;
+    }
+    Ok(())
 }
 
 fn wait_for_broker_shutdown(file: &Path, timeout: Duration) -> Result<()> {
