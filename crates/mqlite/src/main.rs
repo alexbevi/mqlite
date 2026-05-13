@@ -148,6 +148,8 @@ enum BenchCommand {
         #[arg(long)]
         reset: bool,
         #[arg(long)]
+        create_indexes: bool,
+        #[arg(long)]
         checkpoint: bool,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
@@ -401,6 +403,7 @@ async fn main() -> Result<()> {
                         collection,
                         batch_size,
                         reset,
+                        create_indexes,
                         checkpoint,
                         idle_shutdown_secs,
                     } => {
@@ -412,6 +415,7 @@ async fn main() -> Result<()> {
                                 collection: &collection,
                                 batch_size,
                                 reset,
+                                create_indexes,
                                 checkpoint,
                                 idle_shutdown_secs,
                             },
@@ -804,6 +808,7 @@ struct TradesImportOptions<'a> {
     collection: &'a str,
     batch_size: usize,
     reset: bool,
+    create_indexes: bool,
     checkpoint: bool,
     idle_shutdown_secs: u64,
 }
@@ -1253,6 +1258,29 @@ async fn run_trades_import_benchmark(
             "trades import sent {documents} documents but count returned {visible_count}; refusing to report a successful benchmark"
         );
     }
+    let (indexes_created, index_elapsed, index_response) = if options.create_indexes {
+        let index_started = Instant::now();
+        let response = send_checked_command(
+            &mut stream,
+            doc! {
+                "createIndexes": options.collection,
+                "indexes": [
+                    { "key": { "ticker": 1 }, "name": "ticker_1" },
+                    { "key": { "ticket": 1 }, "name": "ticket_1" },
+                ],
+                "$db": options.db,
+            },
+        )
+        .await?;
+        let created = response
+            .get_i32("numIndexesAfter")
+            .ok()
+            .map(|after| after >= 3)
+            .unwrap_or(false);
+        (created, Some(index_started.elapsed()), Some(response))
+    } else {
+        (false, None, None)
+    };
     let (checkpointed, checkpoint_elapsed) = if options.checkpoint {
         let checkpoint_started = Instant::now();
         let checkpoint_response = send_checked_command(
@@ -1292,6 +1320,10 @@ async fn run_trades_import_benchmark(
         "parseMs": duration_ms(parse_elapsed),
         "insertMs": duration_ms(insert_elapsed),
         "countVerificationMs": duration_ms(count_elapsed),
+        "indexesRequested": options.create_indexes,
+        "indexesCreated": indexes_created,
+        "indexBuildMs": index_elapsed.map(duration_ms),
+        "indexBuildResponse": index_response,
         "checkpointRequested": options.checkpoint,
         "checkpointMs": checkpoint_elapsed.map(duration_ms),
         "checkpointed": checkpointed,

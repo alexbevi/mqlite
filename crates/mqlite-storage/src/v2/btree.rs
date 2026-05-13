@@ -135,6 +135,16 @@ impl SecondaryTree {
         bounds: &IndexBounds,
         direction: ScanDirection,
     ) -> Result<Vec<IndexEntry>> {
+        self.scan_bounds_limited(reader, bounds, direction, None)
+    }
+
+    pub fn scan_bounds_limited<R: PageReader>(
+        &self,
+        reader: &R,
+        bounds: &IndexBounds,
+        direction: ScanDirection,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>> {
         let _span = span(Component::Storage, "secondary_tree_scan_bounds");
         let Some(root_page_id) = self.root_page_id else {
             return Ok(Vec::new());
@@ -156,9 +166,12 @@ impl SecondaryTree {
                     past_upper = entry_past_upper_bound(&entry, &encoded_bounds);
                     continue;
                 }
-                entries.extend(entry.into_index_entries(&self.key_pattern)?);
+                entry.append_index_entries(&self.key_pattern, &mut entries, limit)?;
+                if limit.is_some_and(|limit| entries.len() >= limit) {
+                    break;
+                }
             }
-            if past_upper {
+            if past_upper || limit.is_some_and(|limit| entries.len() >= limit) {
                 break;
             }
         }

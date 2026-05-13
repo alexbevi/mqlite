@@ -177,6 +177,17 @@ impl IndexHandle {
             .scan_bounds(reader, bounds, direction)
     }
 
+    pub fn scan_bounds_limited<R: PageReader>(
+        &self,
+        reader: &R,
+        bounds: &IndexBounds,
+        direction: ScanDirection,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>> {
+        SecondaryTree::new(self.meta.root_page_id, self.key_pattern.clone())
+            .scan_bounds_limited(reader, bounds, direction, limit)
+    }
+
     pub fn lookup_exact_record_id<R: PageReader>(
         &self,
         reader: &R,
@@ -302,6 +313,23 @@ impl IndexReadView for PagerIndexReadView {
         let entries = self
             .index
             .scan_bounds(&*self.pager, bounds, ScanDirection::Forward)?;
+        add_counter(
+            Component::Catalog,
+            "indexEntriesScanned",
+            entries.len() as u64,
+        );
+        Ok(entries)
+    }
+
+    fn scan_entries_limited(
+        &self,
+        bounds: &IndexBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>> {
+        let _span = span(Component::Catalog, "pager_index_scan_entries");
+        let entries =
+            self.index
+                .scan_bounds_limited(&*self.pager, bounds, ScanDirection::Forward, limit)?;
         add_counter(
             Component::Catalog,
             "indexEntriesScanned",

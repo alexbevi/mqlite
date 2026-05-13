@@ -515,6 +515,7 @@ impl Broker {
         filter: &Document,
         sort: Option<&Document>,
         projection: Option<&Document>,
+        limit: Option<usize>,
     ) -> Result<CachedFindPlan, CommandError> {
         let _span = span(Component::Server, "cached_find_plan");
         self.ensure_plan_cache_loaded()?;
@@ -531,6 +532,7 @@ impl Broker {
             filter,
             sort,
             projection,
+            limit,
             preferred_choice.as_ref(),
         )?;
         self.plan_cache.lock().entries.insert(
@@ -1341,6 +1343,7 @@ impl Broker {
                         filter,
                         sort,
                         projection,
+                        None,
                     )
                 }
                 None => Ok(CachedFindPlan {
@@ -1920,9 +1923,13 @@ impl Broker {
             .unwrap_or_default();
         let projection = body.get_document("projection").ok().cloned();
         let sort = body.get_document("sort").ok().cloned();
-        let skip = body.get_i64("skip").unwrap_or(0).max(0) as usize;
-        let limit = body.get_i64("limit").unwrap_or(0);
-        let batch_size = body.get_i64("batchSize").ok();
+        let skip = body
+            .get("skip")
+            .and_then(integral_bson_i64)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let limit = body.get("limit").and_then(integral_bson_i64).unwrap_or(0);
+        let batch_size = body.get("batchSize").and_then(integral_bson_i64);
         let single_batch = body.get_bool("singleBatch").unwrap_or(false);
         set_metadata("database", database.clone());
         set_metadata("collection", collection.to_string());
@@ -2027,6 +2034,7 @@ impl Broker {
                             &filter,
                             sort.as_ref(),
                             projection.as_ref(),
+                            limit_positive(limit),
                         )?
                         .plan
                         .into_execution()
@@ -2417,8 +2425,12 @@ impl Broker {
             CommandError::new(9, "FailedToParse", "count requires a collection name")
         })?;
         let query = body.get_document("query").ok().cloned().unwrap_or_default();
-        let skip = body.get_i64("skip").unwrap_or(0).max(0) as usize;
-        let limit = body.get_i64("limit").unwrap_or(0);
+        let skip = body
+            .get("skip")
+            .and_then(integral_bson_i64)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let limit = body.get("limit").and_then(integral_bson_i64).unwrap_or(0);
 
         if query.is_empty() && !self.storage_is_loaded() && self.paths.database_path.exists() {
             let info = DatabaseFile::info(&self.paths.database_path).map_err(internal_error)?;
@@ -2467,6 +2479,54 @@ impl Broker {
                     count.relevant_wal_records.to_string(),
                 );
                 set_metadata("pendingWalBytes", count.wal_bytes.to_string());
+                return Ok(doc! { "n": matches as i64 });
+            }
+        }
+
+        if let Some((field, value)) = simple_equality_filter(&query) {
+            let indexed_count =
+                self.with_query_collection(&database, collection_name, |_sequence, collection| {
+                    let Some(collection) = collection else {
+                        return Ok(None);
+                    };
+                    let collection = StorageFindCollection::new(collection);
+                    for index_name in collection.index_names() {
+                        let Some(index) = collection.index(&index_name) else {
+                            continue;
+                        };
+                        if let Some(count) = index.estimate_value_count(&field, &value) {
+                            return Ok(Some(count));
+                        }
+                        if index
+                            .key_pattern()
+                            .keys()
+                            .next()
+                            .is_some_and(|key| key == &field)
+                        {
+                            let lower = doc! { field.clone(): value.clone() };
+                            let bounds = IndexBounds {
+                                lower: Some(IndexBound {
+                                    key: lower.clone(),
+                                    inclusive: true,
+                                }),
+                                upper: Some(IndexBound {
+                                    key: lower,
+                                    inclusive: true,
+                                }),
+                            };
+                            return index
+                                .scan_entries_limited(&bounds, None)
+                                .map(|entries| Some(entries.len()));
+                        }
+                    }
+                    Ok(None)
+                })?;
+            if let Some(mut matches) = indexed_count {
+                matches = matches.saturating_sub(skip);
+                if limit > 0 {
+                    matches = matches.min(limit as usize);
+                }
+                set_metadata("readPath", "indexedEqualityCount");
                 return Ok(doc! { "n": matches as i64 });
             }
         }
@@ -4762,7 +4822,11 @@ trait FindIndex {
     fn name(&self) -> &str;
     fn key_pattern(&self) -> &Document;
     fn entry_count(&self) -> usize;
-    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError>;
+    fn scan_entries_limited(
+        &self,
+        bounds: &IndexBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>, CommandError>;
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize;
     fn covers_paths(&self, paths: &BTreeSet<String>) -> bool;
     fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize>;
@@ -4814,8 +4878,16 @@ impl FindIndex for IndexCatalog {
         IndexCatalog::entry_count(self)
     }
 
-    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError> {
-        Ok(IndexCatalog::scan_entries(self, bounds))
+    fn scan_entries_limited(
+        &self,
+        bounds: &IndexBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>, CommandError> {
+        let mut entries = IndexCatalog::scan_entries(self, bounds);
+        if let Some(limit) = limit {
+            entries.truncate(limit);
+        }
+        Ok(entries)
     }
 
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize {
@@ -4920,9 +4992,16 @@ impl FindIndex for StorageFindIndex<'_> {
         self.inner.entry_count()
     }
 
-    fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>, CommandError> {
+    fn scan_entries_limited(
+        &self,
+        bounds: &IndexBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>, CommandError> {
         let _span = span(Component::Catalog, "find_index_scan_entries");
-        let entries = self.inner.scan_entries(bounds).map_err(internal_error)?;
+        let entries = self
+            .inner
+            .scan_entries_limited(bounds, limit)
+            .map_err(internal_error)?;
         add_counter(Component::Catalog, "findIndexEntries", entries.len() as u64);
         Ok(entries)
     }
@@ -4964,6 +5043,7 @@ struct FindPlanContext<'a> {
     field_bounds: &'a BTreeMap<String, FieldBounds>,
     sort: Option<&'a Document>,
     projection: Option<&'a Document>,
+    limit: Option<usize>,
     projection_requirements: Option<&'a ProjectionRequirements>,
 }
 
@@ -5243,6 +5323,7 @@ fn plan_find(
     filter: &Document,
     sort: Option<&Document>,
     projection: Option<&Document>,
+    limit: Option<usize>,
     preferred_choice: Option<&PersistedPlanCacheChoice>,
 ) -> Result<PlannedFind, CommandError> {
     let _span = span(Component::Query, "plan_find");
@@ -5257,6 +5338,7 @@ fn plan_find(
         &expression,
         sort,
         projection,
+        limit,
         simple_preferred_index,
     )?;
 
@@ -5291,6 +5373,7 @@ fn plan_find_simple(
     expression: &MatchExpr,
     sort: Option<&Document>,
     projection: Option<&Document>,
+    limit: Option<usize>,
     preferred_index: Option<&str>,
 ) -> Result<PlannedFind, CommandError> {
     let _span = span(Component::Query, "plan_find_simple");
@@ -5304,6 +5387,7 @@ fn plan_find_simple(
         field_bounds: &field_bounds,
         sort,
         projection,
+        limit,
         projection_requirements: projection_requirements.as_ref(),
     };
 
@@ -5416,6 +5500,7 @@ fn plan_or_find(
             branch,
             None,
             None,
+            None,
             preferred_index,
         )?);
     }
@@ -5484,7 +5569,14 @@ fn evaluate_index_plan(
     let scan_direction = sort_plan
         .map(|plan| plan.direction)
         .unwrap_or(ScanDirection::Forward);
-    let (entries, keys_examined) = scan_index_intervals(index, &bounds, scan_direction)?;
+    let sort_required = context.sort.is_some() && sort_plan.is_none();
+    let scan_limit = if !sort_required && filter_plan.is_some() && filter_supported {
+        context.limit
+    } else {
+        None
+    };
+    let (entries, keys_examined) =
+        scan_index_intervals(index, &bounds, scan_direction, scan_limit)?;
 
     let matched_fields = filter_plan
         .as_ref()
@@ -5533,6 +5625,9 @@ fn evaluate_index_plan(
         };
         record_ids.push(entry.record_id);
         documents.push(document);
+        if !sort_required && context.limit.is_some_and(|limit| documents.len() >= limit) {
+            break;
+        }
     }
 
     Ok(Some(PlannedFind::Index {
@@ -5542,7 +5637,7 @@ fn evaluate_index_plan(
         record_ids,
         matched_fields,
         filter_covered,
-        sort_required: context.sort.is_some() && sort_plan.is_none(),
+        sort_required,
         sort_covered: sort_plan.is_some(),
         projection_covered,
         projection_applied: projection_covered,
@@ -5673,6 +5768,7 @@ fn scan_index_intervals(
     index: &dyn FindIndex,
     bounds: &[IndexBounds],
     scan_direction: ScanDirection,
+    limit: Option<usize>,
 ) -> Result<(Vec<IndexEntry>, usize), CommandError> {
     let _span = span(Component::Query, "scan_index_intervals");
     let intervals = if bounds.is_empty() {
@@ -5683,10 +5779,20 @@ fn scan_index_intervals(
     let mut keys_examined = 0_usize;
     let mut entry_by_record_id = BTreeMap::<u64, IndexEntry>::new();
     for interval in intervals {
-        let entries = index.scan_entries(&interval)?;
+        let remaining = limit.map(|limit| limit.saturating_sub(entry_by_record_id.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        let entries = index.scan_entries_limited(&interval, remaining)?;
         keys_examined += entries.len();
         for entry in entries {
             entry_by_record_id.entry(entry.record_id).or_insert(entry);
+            if limit.is_some_and(|limit| entry_by_record_id.len() >= limit) {
+                break;
+            }
+        }
+        if limit.is_some_and(|limit| entry_by_record_id.len() >= limit) {
+            break;
         }
     }
 
@@ -6611,6 +6717,19 @@ fn direction_sign(value: &Bson) -> Option<i32> {
     Some(if direction < 0 { -1 } else { 1 })
 }
 
+fn integral_bson_i64(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(value) => Some(i64::from(*value)),
+        Bson::Int64(value) => Some(*value),
+        Bson::Double(value) if value.fract() == 0.0 => Some(*value as i64),
+        _ => None,
+    }
+}
+
+fn limit_positive(limit: i64) -> Option<usize> {
+    (limit > 0).then_some(limit as usize)
+}
+
 fn tighten_lower(bounds: &mut FieldBounds, candidate: Bson, inclusive: bool) {
     match bounds.lower.as_ref() {
         Some((current, current_inclusive)) => {
@@ -7141,7 +7260,7 @@ fn planned_base_write_matches(
     collection: &CollectionCatalog,
     query: &Document,
 ) -> Result<Vec<(u64, Document)>, CommandError> {
-    let plan = plan_find(collection, query, None, None, None)?;
+    let plan = plan_find(collection, query, None, None, None, None)?;
     let base_positions = collection
         .records
         .iter()
@@ -7297,6 +7416,73 @@ mod tests {
         assert!(
             !broker.storage_is_loaded(),
             "clean checkpointed count should not force the mutable storage engine to open"
+        );
+    }
+
+    #[test]
+    fn clean_page_backed_find_and_count_honor_int32_limit() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("lazy-startup-limit.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            let mut collection = CollectionCatalog::new(doc! {});
+            collection
+                .insert_record(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1_i64, "ticket": "z300", "sku": "first" },
+                ))
+                .expect("insert");
+            collection
+                .insert_record(CollectionRecord::new(
+                    2,
+                    doc! { "_id": 2_i64, "ticket": "z300", "sku": "second" },
+                ))
+                .expect("insert");
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "ticket": 1 }, "name": "ticket_1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed collection");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let find = broker
+            .handle_find(&doc! {
+                "find": "widgets",
+                "filter": { "ticket": "z300" },
+                "limit": 1,
+                "$db": "app",
+            })
+            .expect("find");
+        let first_batch = find
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert_eq!(first_batch.len(), 1);
+
+        let count = broker
+            .handle_count(&doc! {
+                "count": "widgets",
+                "query": { "ticket": "z300" },
+                "limit": 1,
+                "$db": "app",
+            })
+            .expect("count");
+        assert_eq!(count.get_i64("n").expect("count"), 1);
+        assert!(
+            !broker.storage_is_loaded(),
+            "clean checkpointed limited read should not force the mutable storage engine to open"
         );
     }
 

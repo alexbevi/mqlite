@@ -241,6 +241,10 @@ First-class harness results from this patch:
 | `ticker:"abcd"` point read after import and index build | not previously measured | 248.34ms warm p50, 272.64ms p95 over 100 reads | `bench trades-read` reported `readPath=pendingWalEqualityLookup`; this covers ticker read latency but is still dirty-WAL-backed rather than clean checkpointed secondary-index execution. |
 | `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path; later streaming count stopped after 165.03s | 49.51ms warm p50, 51.18ms p95 over 10 counts | Fresh `createIndexes` WAL frames carry index value-frequency metadata, and the metadata prefix is stored outside compressed mutation payloads. Debug output reported `readPath=pendingWalEqualityCount`, scanned 1,002 WAL metadata records, and returned `n=2500` without full collection hydration. |
 | Forced checkpoint after import | not measured | timed out at 360.93s, 11.2 GB max RSS | The foreground checkpoint path still does not complete on the full fixture. After timeout, `mqlite info` still reported checkpoint LSN 0 and 1,002 WAL records, so the file did not appear clean after the interrupted checkpoint. |
+| One-pass import, index build, and checkpoint | standalone checkpoint timed out after replaying the WAL-backed file | 679.07s total; 1,472 docs/s including index/checkpoint phases | `bench trades-import --create-indexes --checkpoint` completed the full fixture in one broker session, verified 1,000,001 documents, built 3,000,003 index entries, and left `walRecords=0` with checkpoint LSN 1002. Import inserts took 258.98s, index build 39.59s, and checkpoint publication 314.71s. |
+| Clean checkpointed `ticket:"z300"` point read | clean read coverage was blocked before checkpoint completion | 2.00ms warm p50, 2.89ms p95 over 100 reads | `bench trades-read` on the clean one-pass file reported `readPath=pageBacked`, `storageLoadedAtStart=false`, one document fetched, and bounded index scan execution. The first cold query was 12.86ms. |
+| Clean checkpointed `ticker:"abcd"` point read | clean read coverage was blocked before checkpoint completion | 1.94ms warm p50, 3.00ms p95 over 100 reads | The low-cardinality `ticker_1` read now stops after the first matching posting instead of expanding every `abcd` record id. Debug counters reported one index entry scanned and one document opened. |
+| Clean checkpointed `ticket:"z300"` count | clean read coverage was blocked before checkpoint completion | 7.26ms warm p50, 8.23ms p95 over 10 counts | Clean equality count now uses `readPath=indexedEqualityCount`; because `z300` is outside the bounded persisted frequency sample, it scanned 2,500 matching index entries and did not hydrate collection records. |
 | WAL-backed metadata fold, full fixture | not measured | 0.07s real, 9.6 MB max RSS | New WAL frames keep the metadata prefix outside compressed mutation payloads, so `mqlite info` folded 1,002 WAL records and reported 1,000,001 records plus 3,000,003 index entries without deserializing the full mutation payloads. |
 
 The successful live-count result is checked in at
@@ -271,17 +275,19 @@ After fixing low-cardinality secondary-index posting splits, the full forced
 checkpoint still timed out but reached a lower max RSS; that follow-up is
 checked in at
 `benchmarks/results/2026-05-13-trades-checkpoint-timeout-after-posting-split.json`.
+The full one-pass import/index/checkpoint run is checked in at
+`benchmarks/results/2026-05-13-trades-full-onepass-import-index-checkpoint.json`.
+The clean page-backed read/count run is checked in at
+`benchmarks/results/2026-05-13-trades-full-clean-read-page-backed.json`.
 
 ## Next Work Items
 
-- Make full checkpoint publication bounded enough for
-  `mqlite bench trades-import --checkpoint` to complete on the full fixture.
 - Make mqlite index builds page-backed and more tightly bounded in memory; the
-  current full-fixture secondary-index build now completes, but still takes
-  331.65s and reached roughly 4.0 GiB observed broker RSS during the run.
+  one-pass full-fixture secondary-index build completes in 39.59s when it runs
+  in the already-loaded broker, but it still relies on in-memory index state.
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
-- Clean checkpointed secondary-index reads still need coverage; the current
-  `ticket`/`ticker` point-read and `ticket` count measurements are warm
-  dirty-WAL-backed runs.
+- Reduce checkpoint publication time and file size; the full one-pass
+  checkpoint completes, but publication still takes 314.71s and creates a
+  1.31 GiB file for a 243 MiB document payload.

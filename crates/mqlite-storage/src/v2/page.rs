@@ -267,6 +267,26 @@ impl SecondaryEntry {
             })
             .collect())
     }
+
+    pub fn append_index_entries(
+        &self,
+        key_pattern: &Document,
+        output: &mut Vec<IndexEntry>,
+        limit: Option<usize>,
+    ) -> Result<()> {
+        let key = bson::from_slice::<Document>(&self.key_bytes)?;
+        for posting in &self.postings {
+            if limit.is_some_and(|limit| output.len() >= limit) {
+                break;
+            }
+            output.push(IndexEntry {
+                record_id: posting.record_id,
+                key: key.clone(),
+                present_fields: present_fields_from_mask(key_pattern, posting.present_mask),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

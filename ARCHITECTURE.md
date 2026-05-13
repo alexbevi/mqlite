@@ -169,6 +169,10 @@ The page-backed read path is designed for clean checkpointed files:
 - `_id` lookups can route directly through the persisted `_id_` secondary tree
 - `find`, `count`, `distinct`, and `explain` can read collection and index state without opening
   the mutable engine
+- positive `find` limits are pushed into page-backed secondary-index scans when the chosen index
+  covers the filter and no blocking sort is required
+- equality `count` can answer from persisted index value-frequency stats, or from an exact
+  page-backed index-entry scan when the specific value is not present in the bounded stats sample
 
 The current page-backed path is read-only. If the file has a bounded pending WAL tail, read
 commands scan that tail and overlay only the requested namespace onto the published roots. For

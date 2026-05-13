@@ -714,6 +714,7 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
             "--batch-size",
             "2",
             "--reset",
+            "--create-indexes",
             "--checkpoint",
             "--idle-shutdown-secs",
             "1",
@@ -731,6 +732,10 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
     assert_eq!(response["batchSize"], 2);
     assert_eq!(response["documents"], 3);
     assert_eq!(response["verifiedCount"], 3);
+    assert_eq!(response["indexesRequested"], true);
+    assert_eq!(response["indexesCreated"], true);
+    assert!(response["indexBuildMs"].as_f64().expect("index build ms") >= 0.0);
+    assert_eq!(response["indexBuildResponse"]["numIndexesAfter"], 3);
     assert_eq!(response["checkpointed"], true);
     assert_eq!(response["batches"], 2);
     assert!(response["docsPerSec"].as_f64().expect("docs/sec") > 0.0);
@@ -739,6 +744,7 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
 
     let info = DatabaseFile::info(&database_path).expect("info");
     assert_eq!(info.summary.record_count, 3);
+    assert_eq!(info.summary.index_count, 3);
     assert_eq!(info.wal_since_checkpoint.record_count, 0);
 
     let mut count = Command::cargo_bin("mqlite").expect("binary");

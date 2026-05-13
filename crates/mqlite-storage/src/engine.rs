@@ -21,6 +21,17 @@ pub trait IndexReadView: Send + Sync {
     fn key_pattern(&self) -> &Document;
     fn entry_count(&self) -> usize;
     fn scan_entries(&self, bounds: &IndexBounds) -> Result<Vec<IndexEntry>>;
+    fn scan_entries_limited(
+        &self,
+        bounds: &IndexBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexEntry>> {
+        let mut entries = self.scan_entries(bounds)?;
+        if let Some(limit) = limit {
+            entries.truncate(limit);
+        }
+        Ok(entries)
+    }
     fn estimate_bounds_count(&self, bounds: &IndexBounds) -> usize;
     fn covers_paths(&self, paths: &std::collections::BTreeSet<String>) -> bool;
     fn estimate_value_count(&self, field: &str, value: &Bson) -> Option<usize>;
