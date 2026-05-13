@@ -370,6 +370,8 @@ index scans.
 In-memory runtime index pages are packed by consuming the sorted build output directly and rebuild
 stats by streaming page entries, so an index build or load does not need to materialize second flat
 entry vectors just to refresh planner frequencies.
+Runtime value-frequency stats are capped per indexed field; high-cardinality fields keep entry and
+presence counts but report unavailable value estimates rather than retaining unbounded histograms.
 WAL replay for `createIndexes` installs built indexes by moving them into the collection catalog
 when the caller does not need a returned full index list.
 

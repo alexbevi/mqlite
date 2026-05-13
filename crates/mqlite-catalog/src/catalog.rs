@@ -15,6 +15,7 @@ const INDEX_TREE_BRANCH_CAPACITY: usize = 64;
 const INDEX_PAGE_BYTES: usize = 4096;
 const INDEX_PAGE_HEADER_BYTES: usize = 32;
 const INDEX_PAGE_SLOT_BYTES: usize = 16;
+const MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD: usize = 4096;
 
 fn default_next_record_id() -> u64 {
     1
@@ -810,7 +811,6 @@ impl IndexCatalog {
     pub fn stats_hydrated(&self) -> bool {
         self.stats.entry_count == self.entry_count()
             && self.stats.present_fields.len() == self.key.len()
-            && self.stats.value_frequencies.len() == self.key.len()
     }
 
     fn refresh_stats(&mut self) {
@@ -1060,19 +1060,12 @@ impl IndexStats {
             }
         }
         for (field, value) in &entry.key {
-            let frequencies = self
-                .value_frequencies
-                .get_mut(field)
-                .expect("frequency field");
-            match frequencies
-                .iter_mut()
-                .find(|frequency| compare_bson(&frequency.value, value).is_eq())
-            {
-                Some(frequency) => frequency.count += 1,
-                None => frequencies.push(ValueFrequency {
-                    value: value.clone(),
-                    count: 1,
-                }),
+            let Some(frequencies) = self.value_frequencies.get_mut(field) else {
+                continue;
+            };
+            add_capped_value_frequency(frequencies, value);
+            if frequencies.len() > MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD {
+                self.value_frequencies.remove(field);
             }
         }
     }
@@ -1089,11 +1082,13 @@ impl IndexStats {
             }
         }
         for (field, value) in &entry.key {
-            let frequencies = self
-                .value_frequencies
-                .get_mut(field)
-                .expect("frequency field");
+            let Some(frequencies) = self.value_frequencies.get_mut(field) else {
+                continue;
+            };
             adjust_value_frequency(frequencies, value, 1);
+            if frequencies.len() > MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD {
+                self.value_frequencies.remove(field);
+            }
         }
     }
 }
@@ -1837,6 +1832,19 @@ fn adjust_value_frequency(frequencies: &mut Vec<ValueFrequency>, value: &Bson, d
     }
 }
 
+fn add_capped_value_frequency(frequencies: &mut Vec<ValueFrequency>, value: &Bson) {
+    match frequencies
+        .iter_mut()
+        .find(|frequency| compare_bson(&frequency.value, value).is_eq())
+    {
+        Some(frequency) => frequency.count += 1,
+        None => frequencies.push(ValueFrequency {
+            value: value.clone(),
+            count: 1,
+        }),
+    }
+}
+
 fn push_index_entry(
     merged: &mut Vec<IndexEntry>,
     entry: IndexEntry,
@@ -2136,6 +2144,40 @@ mod tests {
             .expect("sku frequencies");
         assert_eq!(frequencies.len(), 4);
         assert!(frequencies.iter().all(|frequency| frequency.count == 64));
+    }
+
+    #[test]
+    fn high_cardinality_runtime_stats_drop_unbounded_value_frequencies() {
+        let mut index = IndexCatalog::new("sku_1".to_string(), doc! { "sku": 1 }, false);
+        let entries = (0..(super::MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD as u64 + 1))
+            .map(|record_id| IndexEntry {
+                record_id,
+                key: doc! { "sku": format!("sku-{record_id}") },
+                present_fields: vec!["sku".to_string()],
+            })
+            .collect::<Vec<_>>();
+
+        index
+            .load_entries(entries)
+            .expect("load high-cardinality entries");
+
+        assert_eq!(
+            index.stats.entry_count,
+            super::MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD + 1
+        );
+        assert_eq!(
+            index.stats.present_fields.get("sku"),
+            Some(&(super::MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD + 1))
+        );
+        assert!(
+            !index.stats.value_frequencies.contains_key("sku"),
+            "high-cardinality frequency estimates should be unavailable instead of unbounded"
+        );
+        assert_eq!(
+            index.estimate_value_count("sku", &Bson::String("sku-1".to_string())),
+            None
+        );
+        assert!(index.stats_hydrated());
     }
 
     #[test]
