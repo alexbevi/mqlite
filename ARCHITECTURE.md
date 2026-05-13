@@ -247,12 +247,13 @@ The broker can checkpoint or publish on:
 
 - the periodic checkpoint interval, currently about every 60 seconds
 - the moment the last client disconnects
-- WAL backlog pressure while the broker is still loaded
+- WAL backlog pressure after active client connections drain
 - graceful shutdown
 
 WAL backlog pressure is now edge-triggered from the durable write path. Once a write becomes
 durable and the pending WAL bytes cross the configured threshold, the broker requests background
-publication immediately instead of waiting for a one-second quiet-period poll.
+publication immediately instead of waiting for a one-second quiet-period poll, but it waits for
+active client connections to drain before starting the file-destructive publish step.
 
 ## Recovery
 
@@ -407,7 +408,7 @@ The CLI surfaces split along intent:
 - `mqlite inspect`: lower-level file, superblock, WAL, and page-graph metadata
 - `mqlite verify`: slower full reopen and validation path
 - `mqlite checkpoint`: force a foreground checkpoint
-- `mqlite bench`: measure legacy one-shot write/read latency, seed reusable benchmark fixtures and run startup, metadata, point-read, write-throughput, checkpoint, checkpoint-load, and verify scenarios against them, or stream the shared trades NDJSON fixture through one broker connection with structured import timings
+- `mqlite bench`: measure legacy one-shot write/read latency, seed reusable benchmark fixtures and run startup, metadata, point-read, write-throughput, checkpoint, checkpoint-load, and verify scenarios against them, or stream the shared trades NDJSON fixture through one broker connection with count verification, optional checkpoint publication, and structured import timings
 
 `mqlite command` remains the default direct validation path before any driver patching work.
 

@@ -142,10 +142,11 @@ target/debug/mqlite bench trades-import \
   --idle-shutdown-secs 3600
 ```
 
-It verifies the final count before reporting success, then prints structured
-JSON with document count, batch count, wall time, docs/sec, startup time, parse
-time, count-verification time, insert latency percentiles, and file/WAL/storage
-counters.
+It verifies the final count, then prints structured JSON with document count,
+batch count, wall time, docs/sec, startup time, parse time,
+count-verification time, insert latency percentiles, and file/WAL/storage
+counters. Add `--checkpoint` when the run should force and time broker
+checkpoint publication before reporting storage counters.
 
 The older baseline below used a Python loop that spawned `mqlite command` for
 each batch against a long-lived broker. Keep it as the comparison point for the
@@ -214,19 +215,22 @@ Current mqlite import result from the local run:
 }
 ```
 
-First-class harness result from this patch:
+First-class harness results from this patch:
 
 | Operation | Previous Python loop | `bench trades-import` | Notes |
 | --- | ---: | ---: | --- |
-| Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 362.29s, 2,760 docs/s before validation failed | Single broker connection removed per-batch client spawn overhead, but the post-import count returned only 316,000 documents. Treat this as a failed correctness run, not a successful full-fixture import. |
+| Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 329.87s, 3,031 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. |
+| Forced checkpoint after import | not measured | manually stopped after >16 minutes | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Treat full checkpoint publication as the next bottleneck. |
 
-The failed structured result is checked in at
+The successful live-count result is checked in at
+`benchmarks/results/2026-05-13-trades-import-live-validated.json`. The earlier
+failed count-validation result is retained at
 `benchmarks/results/2026-05-13-trades-import-validation-failed.json`.
 
 ## Next Work Items
 
-- Run the first-class `mqlite bench trades-import` command against the full
-  fixture again after the checkpoint/count mismatch is fixed.
+- Make full checkpoint publication bounded enough for
+  `mqlite bench trades-import --checkpoint` to complete on the full fixture.
 - Make mqlite index builds page-backed and bounded in memory; the current
   secondary-index build exceeded 5 minutes and reached roughly 11.8 GiB RSS.
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations

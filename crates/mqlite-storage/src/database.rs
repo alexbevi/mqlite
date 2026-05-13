@@ -1320,6 +1320,7 @@ impl DatabaseFile {
         self.active_superblock = completed.active_superblock;
         self.valid_superblocks = completed.valid_superblocks.max(1);
         self.checkpoint_counts = completed.checkpoint_counts;
+        self.wal_end_offset = self.active_superblock.wal_end_offset;
         self.state.last_checkpoint_unix_ms = self.active_superblock.last_checkpoint_unix_ms;
         self.checkpoint_plan_cache_entries = completed.checkpoint_plan_cache_entries;
         Ok(true)
@@ -6313,6 +6314,91 @@ mod tests {
             .map(|record| record.document.get_i64("_id").expect("_id"))
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn concurrent_checkpoint_advances_wal_append_offset_after_finish() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("concurrent-checkpoint-append-after-finish.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            insert_record(&mut collection, 1, doc! { "_id": 1_i64, "sku": "seed" });
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed mutation");
+            database.checkpoint().expect("seed checkpoint");
+
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        2,
+                        doc! { "_id": 2_i64, "sku": "captured" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("captured insert");
+
+            let completed = database
+                .prepare_concurrent_checkpoint()
+                .expect("prepare concurrent checkpoint")
+                .expect("checkpoint job")
+                .run()
+                .expect("run concurrent checkpoint")
+                .expect("completed checkpoint");
+            assert!(
+                database
+                    .finish_concurrent_checkpoint(completed)
+                    .expect("finish checkpoint"),
+                "expected checkpoint completion to apply"
+            );
+
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        3,
+                        doc! { "_id": 3_i64, "sku": "after-finish" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("post-finish insert");
+        }
+
+        let inspect = DatabaseFile::inspect(&path).expect("inspect");
+        assert_eq!(inspect.current_record_count, 3);
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("app", "widgets")
+            .expect("collection");
+        let ids = collection
+            .records
+            .iter()
+            .map(|record| record.document.get_i64("_id").expect("_id"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]

@@ -315,6 +315,7 @@ impl Broker {
                     let watched_parent_exited = self.watched_parent_has_exited();
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
+                        && active_connections == 0
                         && active_commands == 0
                         && self.checkpoint_requested.swap(false, Ordering::SeqCst)
                     {
@@ -340,6 +341,7 @@ impl Broker {
                             .map_err(anyhow::Error::from)?
                             .wal_backlog_bytes()
                             >= self.config.checkpoint_wal_bytes_threshold
+                        && active_connections == 0
                         && active_commands == 0
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
@@ -387,6 +389,7 @@ impl Broker {
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
                         && last_checkpoint.elapsed() >= checkpoint_interval
+                        && active_connections == 0
                         && active_commands == 0
                         && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
@@ -454,6 +457,16 @@ impl Broker {
             storage.checkpoint()?;
             return Ok(true);
         }
+    }
+
+    fn handle_mqlite_checkpoint(&self) -> Result<Document, CommandError> {
+        let checkpointed = self.checkpoint_if_needed().map_err(internal_error)?;
+        let storage = self.storage_read()?;
+        Ok(doc! {
+            "checkpointed": checkpointed,
+            "lastAppliedSequence": storage.last_applied_sequence() as i64,
+            "walBytesSinceCheckpoint": storage.wal_backlog_bytes() as i64,
+        })
     }
 
     fn prepare_background_checkpoint(&self) -> Result<Option<ConcurrentCheckpointJob>> {
@@ -829,6 +842,7 @@ impl Broker {
             "configureFailPoint" => self.handle_configure_fail_point(body),
             "getParameter" => Ok(self.handle_get_parameter(body)),
             "killAllSessions" => Ok(Document::new()),
+            "mqliteCheckpoint" => self.handle_mqlite_checkpoint(),
             "listDatabases" => self.handle_list_databases(body),
             "listCollections" => self.handle_list_collections(body),
             "listIndexes" => self.handle_list_indexes(body),
@@ -7431,7 +7445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoints_when_wal_backlog_exceeds_threshold_with_open_connection() {
+    async fn defers_wal_pressure_checkpoint_until_connection_closes() {
         let temp_dir = tempdir().expect("tempdir");
         let database_path = temp_dir.path().join("wal-threshold-checkpoint.mongodb");
         let mut config = BrokerConfig::new(&database_path, 3);
@@ -7460,30 +7474,33 @@ mod tests {
         .await;
         assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
 
+        assert!(
+            !serve_task.is_finished(),
+            "broker should remain running while the client stays connected"
+        );
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect with open client");
+        assert_eq!(inspect.current_record_count, 1);
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
+
+        let ping = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
+        assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let inspect =
-                DatabaseFile::inspect(&database_path).expect("inspect after wal pressure");
+                DatabaseFile::inspect(&database_path).expect("inspect after connection close");
             if inspect.wal_records_since_checkpoint == 0 {
                 assert_eq!(inspect.current_record_count, 1);
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for the broker to checkpoint on WAL pressure"
+                "timed out waiting for the broker to checkpoint after connection close"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        assert!(
-            !serve_task.is_finished(),
-            "broker should remain running while the client stays connected"
-        );
-
-        let ping = send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }).await;
-        assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
-
-        drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
             .await
             .expect("shutdown timeout")
@@ -7492,7 +7509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_wal_pressure_checkpoint_without_waiting_for_quiet_period() {
+    async fn wal_pressure_checkpoint_waits_for_connection_drain_not_quiet_period() {
         let temp_dir = tempdir().expect("tempdir");
         let database_path = temp_dir
             .path()
@@ -7508,7 +7525,6 @@ mod tests {
         let manifest = read_manifest(&manifest_path).expect("manifest");
         let mut stream = connect(&manifest.endpoint).await.expect("connect");
 
-        let insert_started_at = Instant::now();
         let insert = send_command(
             &mut stream,
             doc! {
@@ -7520,25 +7536,30 @@ mod tests {
         .await;
         assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
 
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect with open client");
+        assert_eq!(inspect.wal_records_since_checkpoint, 1);
+
+        let drain_started_at = Instant::now();
+        drop(stream);
         let deadline = Instant::now() + Duration::from_millis(900);
         loop {
             let inspect =
                 DatabaseFile::inspect(&database_path).expect("inspect after wal pressure");
             if inspect.wal_records_since_checkpoint == 0 {
                 assert!(
-                    insert_started_at.elapsed() < Duration::from_secs(1),
-                    "checkpoint should be requested before the one-second quiet period elapses"
+                    drain_started_at.elapsed() < Duration::from_secs(1),
+                    "checkpoint should run promptly after the connection drains"
                 );
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for the broker to request checkpoint before the quiet-period gate"
+                "timed out waiting for the broker to checkpoint after connection drain"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        drop(stream);
         tokio::time::timeout(Duration::from_secs(5), serve_task)
             .await
             .expect("shutdown timeout")
@@ -7574,6 +7595,7 @@ mod tests {
         )
         .await;
         assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+        drop(stream);
 
         let capture_deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -7594,6 +7616,7 @@ mod tests {
             "expected the broker to be holding an outstanding background checkpoint handoff"
         );
 
+        let mut stream = connect(&manifest.endpoint).await.expect("reconnect");
         let ping = tokio::time::timeout(
             Duration::from_millis(250),
             send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }),
@@ -7602,20 +7625,6 @@ mod tests {
         .expect("ping should not wait for the checkpoint task");
         assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
 
-        let second_insert = tokio::time::timeout(
-            Duration::from_millis(250),
-            send_command(
-                &mut stream,
-                doc! {
-                    "insert": "widgets",
-                    "documents": [{ "_id": 3_i64, "sku": "gamma" }],
-                    "$db": "app",
-                },
-            ),
-        )
-        .await
-        .expect("insert should not wait for the checkpoint task");
-        assert_eq!(second_insert.get_f64("ok").expect("ok"), 1.0);
         assert!(
             broker
                 .storage_read()
@@ -7632,7 +7641,7 @@ mod tests {
             .expect("serve");
 
         let inspect = DatabaseFile::inspect(&database_path).expect("inspect after shutdown");
-        assert_eq!(inspect.current_record_count, 3);
+        assert_eq!(inspect.current_record_count, 2);
         assert_eq!(inspect.wal_records_since_checkpoint, 0);
     }
 

@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "status": "live-count-validated",
+  "command": "target/debug/mqlite bench trades-import --file /tmp/mqlite-trades-import-live.mongodb --fixture benchmarks/trades.json.zst --batch-size 1000 --reset --idle-shutdown-secs 3600",
+  "date": "2026-05-13",
+  "fixture": "benchmarks/trades.json.zst",
+  "databaseFile": "/tmp/mqlite-trades-import-live.mongodb",
+  "batchSize": 1000,
+  "documents": 1000001,
+  "verifiedCount": 1000001,
+  "batches": 1001,
+  "elapsedMs": 329873.13049099996,
+  "docsPerSec": 3031.471519100533,
+  "startupMs": 27.407187999999998,
+  "parseMs": 64071.254412,
+  "insertMs": 254762.984914,
+  "countVerificationMs": 8702.431032,
+  "checkpointRequested": false,
+  "checkpointed": false,
+  "insertP50Ms": 245.55081,
+  "insertP95Ms": 276.401957,
+  "insertMaxMs": 1657.570299,
+  "storage": {
+    "fileSize": 32266256,
+    "lastAppliedSequence": 1001,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 1,
+    "recordCount": 1000001,
+    "indexEntryCount": 1000001,
+    "documentBytes": 243000226,
+    "indexBytes": 48000048,
+    "checkpointGeneration": 2,
+    "checkpointPageCount": 0,
+    "walRecords": 1001,
+    "walBytes": 32245776
+  },
+  "postRunChecks": {
+    "infoRecordCount": 1000001,
+    "infoWalRecords": 1001,
+    "reopenCount": 1000001
+  },
+  "notes": [
+    "The import finished and the live broker count matched the 1000001 sent documents.",
+    "The durable file reopens through the WAL tail and reports 1000001 records, but the state is not checkpointed.",
+    "A separate --checkpoint run was manually stopped after more than 16 minutes with the broker CPU-bound and around 9 GiB RSS."
+  ]
+}

@@ -147,6 +147,8 @@ enum BenchCommand {
         batch_size: usize,
         #[arg(long)]
         reset: bool,
+        #[arg(long)]
+        checkpoint: bool,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
     },
@@ -378,6 +380,7 @@ async fn main() -> Result<()> {
                         collection,
                         batch_size,
                         reset,
+                        checkpoint,
                         idle_shutdown_secs,
                     } => {
                         run_trades_import_benchmark(
@@ -388,6 +391,7 @@ async fn main() -> Result<()> {
                                 collection: &collection,
                                 batch_size,
                                 reset,
+                                checkpoint,
                                 idle_shutdown_secs,
                             },
                         )
@@ -753,6 +757,7 @@ struct TradesImportOptions<'a> {
     collection: &'a str,
     batch_size: usize,
     reset: bool,
+    checkpoint: bool,
     idle_shutdown_secs: u64,
 }
 
@@ -1190,6 +1195,25 @@ async fn run_trades_import_benchmark(
             "trades import sent {documents} documents but count returned {visible_count}; refusing to report a successful benchmark"
         );
     }
+    let (checkpointed, checkpoint_elapsed) = if options.checkpoint {
+        let checkpoint_started = Instant::now();
+        let checkpoint_response = send_checked_command(
+            &mut stream,
+            doc! {
+                "mqliteCheckpoint": 1,
+                "$db": "admin",
+            },
+        )
+        .await?;
+        (
+            checkpoint_response
+                .get_bool("checkpointed")
+                .unwrap_or(false),
+            Some(checkpoint_started.elapsed()),
+        )
+    } else {
+        (false, None)
+    };
 
     let elapsed = started.elapsed();
     let info = DatabaseFile::info(file)?;
@@ -1210,6 +1234,9 @@ async fn run_trades_import_benchmark(
         "parseMs": duration_ms(parse_elapsed),
         "insertMs": duration_ms(insert_elapsed),
         "countVerificationMs": duration_ms(count_elapsed),
+        "checkpointRequested": options.checkpoint,
+        "checkpointMs": checkpoint_elapsed.map(duration_ms),
+        "checkpointed": checkpointed,
         "insertP50Ms": duration_ms(percentile_duration(&insert_latencies, 50.0)),
         "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
         "insertMaxMs": duration_ms(insert_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
