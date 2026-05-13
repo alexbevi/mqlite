@@ -813,6 +813,18 @@ fn bench_trades_import_can_queue_background_checkpoint() {
     assert_eq!(response["checkpointed"], false);
     assert_eq!(response["backgroundCheckpointRequested"], true);
     assert_eq!(response["backgroundCheckpointQueued"], true);
+    assert!(
+        response["backgroundCheckpointRequestMs"]
+            .as_f64()
+            .expect("background checkpoint request ms")
+            >= 0.0
+    );
+    assert!(
+        response["backgroundCheckpointWaitMs"]
+            .as_f64()
+            .expect("background checkpoint wait ms")
+            >= 0.0
+    );
     assert_eq!(response["backgroundCheckpointResponse"]["background"], true);
     assert_eq!(response["storage"]["recordCount"], 2);
     assert_eq!(response["storage"]["walRecords"], 0);

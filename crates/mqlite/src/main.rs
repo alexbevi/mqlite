@@ -1333,12 +1333,16 @@ async fn run_trades_import_benchmark(
         (false, None, None)
     };
 
-    if options.background_checkpoint {
+    let background_checkpoint_wait_elapsed = if options.background_checkpoint {
         drop(stream);
+        let wait_started = Instant::now();
         wait_for_broker_shutdown(
             file,
             Duration::from_secs(options.idle_shutdown_secs.max(1) + 30),
         )?;
+        Some(wait_started.elapsed())
+    } else {
+        None
     };
 
     let elapsed = started.elapsed();
@@ -1371,6 +1375,7 @@ async fn run_trades_import_benchmark(
         "backgroundCheckpointRequested": options.background_checkpoint,
         "backgroundCheckpointQueued": background_checkpoint_queued,
         "backgroundCheckpointRequestMs": background_checkpoint_elapsed.map(duration_ms),
+        "backgroundCheckpointWaitMs": background_checkpoint_wait_elapsed.map(duration_ms),
         "backgroundCheckpointResponse": background_checkpoint_response,
         "insertP50Ms": duration_ms(percentile_duration(&insert_latencies, 50.0)),
         "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
