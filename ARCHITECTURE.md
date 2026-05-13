@@ -227,6 +227,8 @@ rotates the active superblock.
   slots or grouped secondary leaf entries before writing those page trees.
 - Change-event and plan-cache page chains are packed as pending linked pages instead of
   precomputing every chunk and page id for those metadata roots.
+- Encoded pages are spooled to a temporary file while the page graph is built, then copied into
+  the database file at the existing checkpoint publish point before the superblock is rotated.
 - It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
 
 ### Background Published Snapshot
