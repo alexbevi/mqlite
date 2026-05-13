@@ -799,7 +799,7 @@ impl CheckpointWriter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let leaf_chunks = chunk_by_encode(slots, |chunk| {
+        let leaf_chunks = chunk_by_encode_adaptive(slots, 32, |chunk| {
             RecordLeafPage {
                 page_id: 1,
                 next_page_id: None,
@@ -839,7 +839,7 @@ impl CheckpointWriter {
     }
 
     fn write_record_level(&mut self, children: Vec<RecordChild>) -> Result<Vec<RecordChild>> {
-        let chunks = chunk_by_encode(children, |chunk| {
+        let chunks = chunk_by_encode_adaptive(children, 256, |chunk| {
             RecordInternalPage {
                 page_id: 1,
                 first_child_page_id: chunk[0].page_id,
@@ -919,7 +919,7 @@ impl CheckpointWriter {
         }
         let entry_count = entries.len() as u64;
 
-        let leaf_chunks = chunk_by_encode(secondary_entries, |chunk| {
+        let leaf_chunks = chunk_by_encode_adaptive(secondary_entries, 128, |chunk| {
             SecondaryLeafPage {
                 page_id: 1,
                 next_page_id: None,
@@ -962,7 +962,7 @@ impl CheckpointWriter {
         &mut self,
         children: Vec<SecondaryChild>,
     ) -> Result<Vec<SecondaryChild>> {
-        let chunks = chunk_by_encode(children, |chunk| {
+        let chunks = chunk_by_encode_adaptive(children, 256, |chunk| {
             SecondaryInternalPage {
                 page_id: 1,
                 first_child_page_id: chunk[0].page_id,
@@ -1099,6 +1099,14 @@ fn chunk_by_encode<T: Clone>(
     fits: impl Fn(&[T]) -> Result<()>,
 ) -> Result<Vec<Vec<T>>> {
     chunk_by_encode_refs(&items, fits)
+}
+
+fn chunk_by_encode_adaptive<T: Clone>(
+    items: Vec<T>,
+    initial_chunk_size: usize,
+    fits: impl Fn(&[T]) -> Result<()>,
+) -> Result<Vec<Vec<T>>> {
+    chunk_by_encode_adaptive_refs(&items, initial_chunk_size, fits)
 }
 
 fn chunk_by_encode_refs<T: Clone>(
