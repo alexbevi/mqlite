@@ -1344,8 +1344,17 @@ async fn run_trades_import_benchmark(
         None
     };
 
-    let elapsed = started.elapsed();
     let info = DatabaseFile::info(file)?;
+    let completion = validate_trades_import_completion(
+        &info,
+        documents,
+        options.create_indexes,
+        options.checkpoint,
+        options.background_checkpoint,
+        checkpointed,
+        background_checkpoint_queued,
+    )?;
+    let elapsed = started.elapsed();
     Ok(json!({
         "schemaVersion": 1,
         "command": "trades-import",
@@ -1376,11 +1385,87 @@ async fn run_trades_import_benchmark(
         "backgroundCheckpointRequestMs": background_checkpoint_elapsed.map(duration_ms),
         "backgroundCheckpointWaitMs": background_checkpoint_wait_elapsed.map(duration_ms),
         "backgroundCheckpointResponse": background_checkpoint_response,
+        "completionVerified": completion.completion_verified,
+        "cleanCheckpointVerified": completion.clean_checkpoint_verified,
         "insertP50Ms": duration_ms(percentile_duration(&insert_latencies, 50.0)),
         "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
         "insertMaxMs": duration_ms(insert_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
         "storage": benchmark_storage_summary(&info),
     }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradesImportCompletion {
+    completion_verified: bool,
+    clean_checkpoint_verified: bool,
+}
+
+fn validate_trades_import_completion(
+    info: &mqlite_storage::InfoReport,
+    documents: u64,
+    create_indexes: bool,
+    checkpoint_requested: bool,
+    background_checkpoint_requested: bool,
+    checkpointed: bool,
+    background_checkpoint_queued: bool,
+) -> Result<TradesImportCompletion> {
+    if info.summary.record_count as u64 != documents {
+        bail!(
+            "trades import sent {documents} documents but final storage metadata reports {}; refusing to report a successful benchmark",
+            info.summary.record_count
+        );
+    }
+    if create_indexes && info.summary.index_count < 3 {
+        bail!(
+            "trades import requested secondary indexes but final storage metadata reports only {} indexes; refusing to report a successful benchmark",
+            info.summary.index_count
+        );
+    }
+    if checkpoint_requested && !checkpointed {
+        bail!(
+            "trades import requested a foreground checkpoint but the command did not report checkpointed=true"
+        );
+    }
+    if background_checkpoint_requested && !background_checkpoint_queued {
+        bail!(
+            "trades import requested a background checkpoint but the command did not report queued=true"
+        );
+    }
+
+    let clean_checkpoint_requested = checkpoint_requested || background_checkpoint_requested;
+    if clean_checkpoint_requested {
+        if info.wal_since_checkpoint.record_count != 0 || info.wal_since_checkpoint.bytes != 0 {
+            bail!(
+                "trades import requested a clean checkpoint but final storage still has {} WAL records and {} WAL bytes",
+                info.wal_since_checkpoint.record_count,
+                info.wal_since_checkpoint.bytes
+            );
+        }
+        if info.last_checkpoint.record_count as u64 != documents {
+            bail!(
+                "trades import requested a clean checkpoint but last checkpoint reports {} records for {documents} imported documents",
+                info.last_checkpoint.record_count
+            );
+        }
+        if info.last_checkpoint.last_applied_sequence != info.last_applied_sequence {
+            bail!(
+                "trades import requested a clean checkpoint but last checkpoint sequence {} does not match current sequence {}",
+                info.last_checkpoint.last_applied_sequence,
+                info.last_applied_sequence
+            );
+        }
+        if create_indexes && info.last_checkpoint.index_count < 3 {
+            bail!(
+                "trades import requested checkpointed secondary indexes but last checkpoint reports only {} indexes",
+                info.last_checkpoint.index_count
+            );
+        }
+    }
+
+    Ok(TradesImportCompletion {
+        completion_verified: true,
+        clean_checkpoint_verified: clean_checkpoint_requested,
+    })
 }
 
 fn wait_for_broker_shutdown(file: &Path, timeout: Duration) -> Result<()> {
@@ -2232,14 +2317,16 @@ fn rate_per_second_u64(count: u64, elapsed: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use bson::doc;
+    use mqlite_storage::{InfoCheckpoint, InfoReport, InfoSummary, InfoWal};
     use serde_json::json;
 
     use super::{
         BenchmarkProfile, BenchmarkScenarios, benchmark_budget_report, benchmark_filter,
-        validate_benchmark_profile,
+        validate_benchmark_profile, validate_trades_import_completion,
     };
 
     #[test]
@@ -2298,5 +2385,94 @@ mod tests {
         assert!(dirty.first_point);
         assert!(!dirty.warm_point);
         assert!(BenchmarkScenarios::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn trades_import_completion_rejects_stale_checkpoint_metadata() {
+        let mut info = trades_import_info(236_000, 0, 3);
+        info.summary.record_count = 1_000_001;
+        info.last_applied_sequence = 1002;
+        info.last_checkpoint.last_applied_sequence = 236;
+
+        let err =
+            validate_trades_import_completion(&info, 1_000_001, true, true, false, true, false)
+                .expect_err("stale checkpoint should fail");
+
+        assert!(
+            err.to_string()
+                .contains("last checkpoint reports 236000 records")
+        );
+    }
+
+    #[test]
+    fn trades_import_completion_rejects_dirty_checkpoint_result() {
+        let mut info = trades_import_info(3, 2, 3);
+        info.summary.record_count = 3;
+
+        let err = validate_trades_import_completion(&info, 3, true, false, true, false, true)
+            .expect_err("dirty WAL should fail");
+
+        assert!(
+            err.to_string()
+                .contains("final storage still has 2 WAL records")
+        );
+    }
+
+    fn trades_import_info(
+        checkpoint_record_count: usize,
+        wal_records: usize,
+        index_count: usize,
+    ) -> InfoReport {
+        InfoReport {
+            path: PathBuf::from("/tmp/test.mongodb"),
+            file_format_version: 2,
+            file_size: 4096,
+            last_applied_sequence: 1002,
+            summary: InfoSummary {
+                database_count: 1,
+                collection_count: 1,
+                index_count,
+                record_count: checkpoint_record_count + wal_records,
+                index_entry_count: 0,
+                change_event_count: 0,
+                plan_cache_entry_count: 0,
+                document_bytes: 0,
+                index_bytes: 0,
+                total_bytes: 0,
+            },
+            last_checkpoint: InfoCheckpoint {
+                generation: 2,
+                last_applied_sequence: 1002,
+                last_checkpoint_unix_ms: 0,
+                active_superblock_slot: 0,
+                valid_superblocks: 2,
+                database_count: 1,
+                collection_count: 1,
+                index_count,
+                snapshot_offset: 0,
+                snapshot_len: 0,
+                wal_offset: 0,
+                page_size: 8192,
+                page_count: 1,
+                page_bytes: 8192,
+                record_page_count: 1,
+                record_page_bytes: 8192,
+                index_page_count: 1,
+                index_page_bytes: 8192,
+                change_event_page_count: 0,
+                change_event_page_bytes: 0,
+                record_count: checkpoint_record_count,
+                index_entry_count: 0,
+                change_event_count: 0,
+                plan_cache_entry_count: 0,
+                total_bytes: 8192,
+            },
+            wal_since_checkpoint: InfoWal {
+                record_count: wal_records,
+                bytes: if wal_records == 0 { 0 } else { 1024 },
+                truncated_tail: false,
+            },
+            databases: Vec::new(),
+        }
     }
 }

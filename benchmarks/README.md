@@ -142,11 +142,13 @@ target/debug/mqlite bench trades-import \
   --idle-shutdown-secs 3600
 ```
 
-It verifies the final count, then prints structured JSON with document count,
-batch count, wall time, docs/sec, startup time, parse time,
-count-verification time, insert latency percentiles, and file/WAL/storage
-counters. Add `--checkpoint` when the run should force and time broker
-checkpoint publication before reporting storage counters.
+It verifies the final count and final storage metadata, then prints structured
+JSON with document count, batch count, wall time, docs/sec, startup time, parse
+time, count-verification time, insert latency percentiles, completion checks,
+and file/WAL/storage counters. Checkpointed runs also require the last
+checkpoint to match the imported document count and the WAL tail to be empty
+before reporting success. Add `--checkpoint` when the run should force and time
+broker checkpoint publication before reporting storage counters.
 
 After creating `ticker_1` and `ticket_1`, use `trades-read` to measure warm
 read latency over one broker connection:
@@ -306,7 +308,9 @@ The full-fixture background-checkpoint trades-import run is checked in at
   pages in memory rather than building persisted pages directly.
 - Add safe benchmark cleanup/checkpoint handling so interrupting long
   foreground operations cannot make benchmark files look successfully complete
-  when only an older checkpoint is visible.
+  when only an older checkpoint is visible. The trades-import harness now
+  rejects stale or dirty checkpoint results before printing successful JSON, but
+  cleanup around externally interrupted broker processes still needs hardening.
 - Reduce checkpoint publication time and file size; the full one-pass
   checkpoint completes, but foreground publication still takes 287.99s and the
   full background-checkpoint harness waits 582.53s for clean shutdown. Both

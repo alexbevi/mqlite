@@ -737,6 +737,8 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
     assert!(response["indexBuildMs"].as_f64().expect("index build ms") >= 0.0);
     assert_eq!(response["indexBuildResponse"]["numIndexesAfter"], 3);
     assert_eq!(response["checkpointed"], true);
+    assert_eq!(response["completionVerified"], true);
+    assert_eq!(response["cleanCheckpointVerified"], true);
     assert_eq!(response["batches"], 2);
     assert!(response["docsPerSec"].as_f64().expect("docs/sec") > 0.0);
     assert_eq!(response["storage"]["recordCount"], 3);
@@ -813,6 +815,8 @@ fn bench_trades_import_can_queue_background_checkpoint() {
     assert_eq!(response["checkpointed"], false);
     assert_eq!(response["backgroundCheckpointRequested"], true);
     assert_eq!(response["backgroundCheckpointQueued"], true);
+    assert_eq!(response["completionVerified"], true);
+    assert_eq!(response["cleanCheckpointVerified"], true);
     assert!(
         response["backgroundCheckpointRequestMs"]
             .as_f64()
