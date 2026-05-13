@@ -249,6 +249,7 @@ First-class harness results from this patch:
 | 10k import, `ticker_1`/`ticket_1`, checkpoint after index-memory reductions | prior 10k checkpoint probe completed but used about 123 MB max RSS in the standalone checkpoint path | 6.52s total, 360ms index build, 2.81s checkpoint, 20.9 MB max RSS | The smoke run uses the first 10k documents from `benchmarks/trades.json.zst` and records the runtime-page packing, capped runtime stats, moved replay install, and streaming persisted stats changes. |
 | 10k import, chunked non-unique index build, checkpoint | 10k post-stats-cap smoke was 6.52s total, 360ms index build, 2.81s checkpoint, 20.9 MB max RSS | 6.44s total, 361ms index build, 2.75s checkpoint, 22.2 MB max RSS | Non-unique `ticker_1` and `ticket_1` now build from bounded record chunks instead of one full sorted entry vector per index. |
 | 10k import, chunked non-unique index build, background checkpoint | foreground 10k checkpoint smoke was 6.44s total and blocked until checkpoint publication finished | 7.31s total; background checkpoint request 0.44ms; publication/shutdown wait 3.14s; final `walRecords=0`; 22.7 MB max RSS | `bench trades-import --background-checkpoint` queues `mqliteCheckpoint` with `"background": true`, drops the client connection, waits for broker shutdown, and reports clean post-shutdown storage counters. |
+| Full import, chunked non-unique index build, background checkpoint | foreground full one-pass checkpoint was 653.21s total with 41.84s index build and 287.99s checkpoint publication | 1048.76s total; background checkpoint request 0.44ms; publication/shutdown wait 582.53s; final `walRecords=0`; 31.5 MB max RSS | The full fixture proves `--background-checkpoint` can return the checkpoint request immediately and still wait for clean post-shutdown counters. The measured end-to-end benchmark is slower than foreground because the background publisher runs after the import connection drains, but peak RSS is much lower than earlier standalone forced-checkpoint timeout probes. |
 | WAL-backed metadata fold, full fixture | not measured | 0.07s real, 9.6 MB max RSS | New WAL frames keep the metadata prefix outside compressed mutation payloads, so `mqlite info` folded 1,002 WAL records and reported 1,000,001 records plus 3,000,003 index entries without deserializing the full mutation payloads. |
 
 The successful live-count result is checked in at
@@ -294,6 +295,8 @@ The chunked non-unique index-build 10k smoke run is checked in at
 `benchmarks/results/2026-05-13-trades-10k-chunked-nonunique-index-build.json`.
 The 10k background-checkpoint trades-import smoke run is checked in at
 `benchmarks/results/2026-05-13-trades-10k-background-checkpoint-timed.json`.
+The full-fixture background-checkpoint trades-import run is checked in at
+`benchmarks/results/2026-05-13-trades-full-background-checkpoint.json`.
 
 ## Next Work Items
 
@@ -305,5 +308,6 @@ The 10k background-checkpoint trades-import smoke run is checked in at
   foreground operations cannot make benchmark files look successfully complete
   when only an older checkpoint is visible.
 - Reduce checkpoint publication time and file size; the full one-pass
-  checkpoint completes, but publication still takes 287.99s and creates a
-  1.31 GiB file for a 243 MiB document payload.
+  checkpoint completes, but foreground publication still takes 287.99s and the
+  full background-checkpoint harness waits 582.53s for clean shutdown. Both
+  paths create a 1.31 GiB file for a 243 MiB document payload.

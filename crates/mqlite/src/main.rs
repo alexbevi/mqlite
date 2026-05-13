@@ -17,6 +17,8 @@ use mqlite_storage::{DatabaseFile, WalMutation};
 use mqlite_wire::{OpMsg, PayloadSection, read_op_msg, write_op_msg};
 use serde_json::json;
 
+const BACKGROUND_CHECKPOINT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 #[derive(Debug, Parser)]
 #[command(name = "mqlite")]
 #[command(about = "A local MongoDB-compatible broker for file-backed databases")]
@@ -1336,10 +1338,7 @@ async fn run_trades_import_benchmark(
     let background_checkpoint_wait_elapsed = if options.background_checkpoint {
         drop(stream);
         let wait_started = Instant::now();
-        wait_for_broker_shutdown(
-            file,
-            Duration::from_secs(options.idle_shutdown_secs.max(1) + 30),
-        )?;
+        wait_for_broker_shutdown(file, BACKGROUND_CHECKPOINT_SHUTDOWN_TIMEOUT)?;
         Some(wait_started.elapsed())
     } else {
         None
