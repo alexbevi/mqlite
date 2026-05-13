@@ -7567,6 +7567,52 @@ fn command_preserves_unique_indexes_across_restart() {
 }
 
 #[test]
+fn command_create_unique_index_rejects_existing_duplicate_keys() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("command-duplicate-index.mongodb");
+
+    let mut insert = Command::cargo_bin("mqlite").expect("binary");
+    insert
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"insert":"widgets","documents":[{"_id":1,"sku":"dup"},{"_id":2,"sku":"dup"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let mut create_indexes = Command::cargo_bin("mqlite").expect("binary");
+    let output = create_indexes
+        .args([
+            "command",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--db",
+            "app",
+            "--idle-shutdown-secs",
+            "1",
+            "--eval",
+            r#"{"createIndexes":"widgets","indexes":[{"key":{"sku":1},"name":"sku_1","unique":true}]}"#,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["ok"], 0.0);
+    assert_eq!(response["code"], 11000);
+    assert_eq!(response["codeName"], "DuplicateKey");
+}
+
+#[test]
 fn command_explain_reports_ixscan_for_indexed_find() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-explain.mongodb");

@@ -15,7 +15,7 @@ use bson::{Bson, Document, doc};
 use mqlite_bson::{compare_bson, ensure_object_id, lookup_path_owned, set_path};
 use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionRecord, IndexBound, IndexBounds,
-    IndexCatalog, IndexEntry, build_index_specs, validate_drop_indexes,
+    IndexCatalog, IndexEntry, prepare_index_specs, validate_drop_indexes,
 };
 use mqlite_debug::{Component, SessionHandle, add_counter, install, set_metadata, span};
 use mqlite_exec::{CursorError, CursorManager};
@@ -1705,7 +1705,7 @@ impl Broker {
             .get_collection(&database, collection)
             .is_ok();
         let before = collection_state.indexes.len() as i32;
-        let created = build_index_specs(collection_state, &specs)?;
+        let created = prepare_index_specs(collection_state, &specs)?;
         let sequence = storage.last_applied_sequence() + 1;
         let mut change_events = Vec::new();
         if !collection_exists {

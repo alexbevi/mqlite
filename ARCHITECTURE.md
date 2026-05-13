@@ -175,6 +175,10 @@ The v2 pager is a shared read-side component:
 - It validates write plans and unique-index constraints before mutating the live state.
 - It applies committed WAL mutations to the in-memory state immediately after append succeeds.
 - Command success waits for the WAL sync barrier, not just the append.
+- `createIndexes` parses requested specs in the broker for replies/change events, then storage
+  validation builds each requested index once and carries those prepared index catalogs into the
+  post-WAL mutation apply step. This avoids rebuilding full existing-record index entries in the
+  broker, validation pass, and mutation-apply pass separately.
 
 Current WAL behavior:
 

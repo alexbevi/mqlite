@@ -1297,7 +1297,12 @@ impl DatabaseFile {
             &mut self.change_events_dirty,
             &mutation,
         );
-        apply_owned_mutation(&mut self.state, sequence, mutation)?;
+        let validation_plan = apply_owned_mutation_with_validation_plan(
+            &mut self.state,
+            sequence,
+            mutation,
+            validation_plan,
+        )?;
         self.validation_state
             .apply_plan(&self.state.catalog, validation_plan)?;
         self.wal_end_offset += appended_bytes;
@@ -3365,6 +3370,48 @@ fn apply_owned_mutation(
     Ok(())
 }
 
+fn apply_owned_mutation_with_validation_plan(
+    state: &mut PersistedState,
+    sequence: u64,
+    owned_mutation: WalMutation,
+    validation_plan: ValidationPlan,
+) -> Result<ValidationPlan> {
+    match (owned_mutation, validation_plan) {
+        (
+            WalMutation::CreateIndexes {
+                database,
+                collection,
+                change_events,
+                ..
+            },
+            ValidationPlan::InstallCreatedIndexes {
+                database: plan_database,
+                collection: plan_collection,
+                create_options,
+                created,
+            },
+        ) => {
+            apply_created_indexes(
+                state,
+                &plan_database,
+                &plan_collection,
+                create_options.as_ref(),
+                created,
+            )?;
+            state.change_events.extend(change_events);
+            state.last_applied_sequence = sequence;
+            Ok(ValidationPlan::RebuildCollection {
+                database,
+                collection,
+            })
+        }
+        (owned_mutation, validation_plan) => {
+            apply_owned_mutation(state, sequence, owned_mutation)?;
+            Ok(validation_plan)
+        }
+    }
+}
+
 fn ensure_collection_indexes_hydrated(collection_state: &mut CollectionCatalog) {
     collection_state.refresh_runtime_state();
     for index in collection_state.indexes.values_mut() {
@@ -3493,10 +3540,18 @@ fn validate_mutation(
             specs,
             ..
         } => {
-            validate_create_indexes(state, database, collection, create_options.as_ref(), specs)?;
-            ValidationPlan::RebuildCollection {
+            let created = validate_create_indexes(
+                state,
+                database,
+                collection,
+                create_options.as_ref(),
+                specs,
+            )?;
+            ValidationPlan::InstallCreatedIndexes {
                 database: database.clone(),
                 collection: collection.clone(),
+                create_options: create_options.clone(),
+                created,
             }
         }
         WalMutation::DropIndexes {
@@ -3548,6 +3603,33 @@ fn apply_create_indexes(
     }
 
     state.catalog.create_indexes(database, collection, specs)?;
+    Ok(())
+}
+
+fn apply_created_indexes(
+    state: &mut PersistedState,
+    database: &str,
+    collection: &str,
+    create_options: Option<&bson::Document>,
+    created: Vec<IndexCatalog>,
+) -> Result<()> {
+    if state.catalog.get_collection(database, collection).is_err() {
+        let Some(options) = create_options else {
+            return Err(CatalogError::NamespaceNotFound(
+                database.to_string(),
+                collection.to_string(),
+            )
+            .into());
+        };
+        state
+            .catalog
+            .create_collection(database, collection, options.clone())?;
+    }
+
+    let collection_state = state.catalog.get_collection_mut(database, collection)?;
+    for index in created {
+        collection_state.indexes.insert(index.name.clone(), index);
+    }
     Ok(())
 }
 
@@ -3752,6 +3834,12 @@ enum ValidationPlan {
     RebuildCollection {
         database: String,
         collection: String,
+    },
+    InstallCreatedIndexes {
+        database: String,
+        collection: String,
+        create_options: Option<Document>,
+        created: Vec<IndexCatalog>,
     },
     RemoveCollection {
         database: String,
@@ -4005,6 +4093,11 @@ impl ValidationState {
             ValidationPlan::RebuildCollection {
                 database,
                 collection,
+            }
+            | ValidationPlan::InstallCreatedIndexes {
+                database,
+                collection,
+                ..
             } => self.rebuild_collection(catalog, &database, &collection),
             ValidationPlan::RemoveCollection {
                 database,

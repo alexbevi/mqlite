@@ -1282,7 +1282,37 @@ pub fn build_index_specs(
     collection: &CollectionCatalog,
     specs: &[Document],
 ) -> Result<Vec<IndexCatalog>, CatalogError> {
-    let mut created = Vec::new();
+    let mut created = prepare_index_specs(collection, specs)?;
+
+    for index in &mut created {
+        let mut entries = Vec::with_capacity(collection.records.len());
+        for record in &collection.records {
+            validate_record_against_index(index, &record.document, None)?;
+            entries.push(index_entry_for_document(
+                record.record_id,
+                &record.document,
+                &index.key,
+            ));
+        }
+        index.sort_entries(&mut entries);
+        if index.unique {
+            for pair in entries.windows(2) {
+                if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
+                    return Err(CatalogError::DuplicateKey(index.name.clone()));
+                }
+            }
+        }
+        index.replace_entries(entries)?;
+    }
+
+    Ok(created)
+}
+
+pub fn prepare_index_specs(
+    collection: &CollectionCatalog,
+    specs: &[Document],
+) -> Result<Vec<IndexCatalog>, CatalogError> {
+    let mut prepared = Vec::new();
     let mut pending_names = collection.indexes.keys().cloned().collect::<BTreeSet<_>>();
 
     for spec in specs {
@@ -1303,27 +1333,10 @@ pub fn build_index_specs(
             .transpose()?;
         let mut index = IndexCatalog::new(name.clone(), key.clone(), unique);
         index.expire_after_seconds = expire_after_seconds;
-        let mut entries = Vec::with_capacity(collection.records.len());
-        for record in &collection.records {
-            validate_record_against_index(&index, &record.document, None)?;
-            insert_index_entry(
-                &mut entries,
-                index_entry_for_document(record.record_id, &record.document, &index.key),
-                &index.key,
-            );
-        }
-        if unique {
-            for pair in entries.windows(2) {
-                if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
-                    return Err(CatalogError::DuplicateKey(name.clone()));
-                }
-            }
-        }
-        index.replace_entries(entries)?;
-        created.push(index);
+        prepared.push(index);
     }
 
-    Ok(created)
+    Ok(prepared)
 }
 
 fn parse_expire_after_seconds(value: &Bson) -> Result<i64, CatalogError> {

@@ -220,6 +220,7 @@ First-class harness results from this patch:
 | Operation | Previous Python loop | `bench trades-import` | Notes |
 | --- | ---: | ---: | --- |
 | Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 333.39s, 3,000 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. The fresh WAL-metadata-prefix run took 334.77s process wall time and avoided the earlier long cleanup gap. |
+| Build `ticker_1` and `ticket_1` after import | did not complete within 318.89s; interrupted near 11.8 GiB RSS in the original probe | 331.65s, observed broker RSS roughly 4.0 GiB at 3:47 | Existing-record index builds now collect keys linearly, sort once, and apply the validation-built indexes instead of rebuilding them again during mutation apply. The command completed and reopen metadata reported 3 indexes and 3,000,003 entries. It remains far slower than MongoDB and still needs a page-backed or external-sort bulk builder. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 | WAL-backed metadata fold, full fixture | not measured | 1.41s real, 25.8 MB max RSS | New WAL frames carry a metadata prefix, so `mqlite info` folded 1001 import batches and reported 1,000,001 records without deserializing the full mutation payloads. A 10k-prefix smoke also completed in 0.02s real with 10.9 MB max RSS. |
 
@@ -229,13 +230,16 @@ failed count-validation result is retained at
 `benchmarks/results/2026-05-13-trades-import-validation-failed.json`.
 The fresh WAL metadata prefix run is checked in at
 `benchmarks/results/2026-05-13-trades-import-wal-metadata.json`.
+The completed full-fixture secondary-index run is checked in at
+`benchmarks/results/2026-05-13-trades-secondary-indexes.json`.
 
 ## Next Work Items
 
 - Make full checkpoint publication bounded enough for
   `mqlite bench trades-import --checkpoint` to complete on the full fixture.
-- Make mqlite index builds page-backed and bounded in memory; the current
-  secondary-index build exceeded 5 minutes and reached roughly 11.8 GiB RSS.
+- Make mqlite index builds page-backed and more tightly bounded in memory; the
+  current full-fixture secondary-index build now completes, but still takes
+  331.65s and reached roughly 4.0 GiB observed broker RSS during the run.
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
