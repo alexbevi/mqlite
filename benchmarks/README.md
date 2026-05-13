@@ -267,6 +267,10 @@ The warm `bench trades-read` run is checked in at
 `benchmarks/results/2026-05-13-trades-read-warm-pending-wal.json`.
 The fresh full-fixture forced-checkpoint timeout is checked in at
 `benchmarks/results/2026-05-13-trades-checkpoint-timeout-360s.json`.
+After fixing low-cardinality secondary-index posting splits, the full forced
+checkpoint still timed out but reached a lower max RSS; that follow-up is
+checked in at
+`benchmarks/results/2026-05-13-trades-checkpoint-timeout-after-posting-split.json`.
 
 ## Next Work Items
 

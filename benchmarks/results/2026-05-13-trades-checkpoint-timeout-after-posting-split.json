@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "status": "checkpoint-timeout",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-prefix2-full.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "codeChange": "9256b4a fix(storage): split low-cardinality index postings",
+  "command": "timeout 360 target/debug/mqlite checkpoint --file /tmp/mqlite-trades-prefix2-full.mongodb",
+  "processTime": {
+    "realSeconds": 360.8,
+    "userSeconds": 345.41,
+    "systemSeconds": 10.85,
+    "maxResidentSetBytes": 9227370496,
+    "peakMemoryFootprintBytes": 557056
+  },
+  "exitCode": 124,
+  "postTimeoutInfo": {
+    "lastAppliedSequence": 1002,
+    "checkpointLastAppliedSequence": 0,
+    "walRecordsSinceCheckpoint": 1002,
+    "recordCount": 1000001,
+    "indexEntryCount": 3000003,
+    "fileSizeBytes": 32492849
+  },
+  "notes": [
+    "The low-cardinality secondary-index posting split fixes the page-capacity failure reproduced on a 10k trades checkpoint with ticker_1.",
+    "The full trades fixture still does not complete foreground checkpoint publication within 360 seconds.",
+    "Max RSS improved from the previous 11236843520-byte timeout to 9227370496 bytes, but the file still remained WAL-backed with checkpoint LSN 0 after timeout.",
+    "The remaining blocker is full mutable WAL replay and snapshot publication memory/time, not duplicate-key secondary leaf encoding alone."
+  ]
+}
