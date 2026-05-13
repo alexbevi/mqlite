@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "status": "metadata-count-complete",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-10k-freq.mongodb",
+  "sourceFixture": "/tmp/mqlite-trades-10k.ndjson",
+  "sourceFixtureOrigin": "first 10000 rows from benchmarks/trades.json.zst",
+  "setup": [
+    {
+      "command": "target/debug/mqlite bench trades-import --file /tmp/mqlite-trades-10k-freq.mongodb --fixture /tmp/mqlite-trades-10k.ndjson --reset",
+      "documents": 10000,
+      "elapsedMs": 3402.907834,
+      "verifiedCount": 10000,
+      "walRecords": 10,
+      "walBytes": 323867
+    },
+    {
+      "command": "target/debug/mqlite command --file /tmp/mqlite-trades-10k-freq.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"createIndexes\":\"trades\",\"indexes\":[{\"key\":{\"ticker\":1},\"name\":\"ticker_1\"},{\"key\":{\"ticket\":1},\"name\":\"ticket_1\"}]}'",
+      "numIndexesBefore": 1,
+      "numIndexesAfter": 3
+    }
+  ],
+  "operation": {
+    "command": "target/debug/mqlite command --file /tmp/mqlite-trades-10k-freq.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"count\":\"trades\",\"query\":{\"ticket\":\"z300\"}}'",
+    "filter": {
+      "ticket": "z300"
+    },
+    "result": {
+      "n": 25,
+      "ok": 1.0
+    },
+    "processTime": {
+      "realSeconds": 2.45,
+      "maxResidentSetBytes": 7626752,
+      "peakMemoryFootprintBytes": 3186688
+    },
+    "debug": {
+      "readPath": "pendingWalEqualityCount",
+      "pendingWalRecords": 11,
+      "pendingWalRelevantRecords": 11
+    }
+  },
+  "notes": [
+    "This smoke uses a freshly written createIndexes WAL frame so the frame contains index value-frequency metadata.",
+    "Older database files with createIndexes WAL frames written before this change do not gain value-frequency metadata retroactively.",
+    "The full 1000001-document fixture still needs a fresh import and createIndexes run before this optimization can be measured at full scale."
+  ]
+}

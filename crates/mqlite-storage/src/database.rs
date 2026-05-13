@@ -558,6 +558,15 @@ struct WalFrameIndexMetadata {
     expire_after_seconds: Option<i64>,
     entry_count: usize,
     bytes: u64,
+    #[serde(default)]
+    value_frequencies: Vec<WalFrameValueFrequency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalFrameValueFrequency {
+    field: String,
+    value: Vec<u8>,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -573,6 +582,11 @@ struct WalFrameCollectionChangesMetadata {
 struct CompactWalEntry {
     sequence: u64,
     mutation: CompactWalMutation,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactWalEntrySequence {
+    sequence: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1383,7 +1397,7 @@ impl DatabaseFile {
         let mut last_sequence = superblock.durable_lsn;
         let mut scanned_records = 0_u64;
         let mut relevant_records = 0_u64;
-        let mut count = 0_usize;
+        let mut count = None::<usize>;
 
         while offset < file_size {
             if file_size - offset < WAL_HEADER_LEN as u64 {
@@ -1411,6 +1425,75 @@ impl DatabaseFile {
 
             if hash_bytes(&payload) != header[8..40] {
                 return Err(StorageError::InvalidWalChecksum.into());
+            }
+
+            if let Some(metadata) = decode_wal_frame_metadata(&payload)? {
+                let sequence = decode_compact_wal_entry_sequence(&payload)?;
+                if sequence <= last_sequence {
+                    offset = payload_end;
+                    continue;
+                }
+
+                scanned_records += 1;
+                last_sequence = sequence;
+                if !wal_metadata_targets_namespace(&metadata.mutation, database, collection) {
+                    offset = payload_end;
+                    continue;
+                }
+                relevant_records += 1;
+                match metadata.mutation {
+                    WalFrameMetadataMutation::CreateIndexes { indexes, .. } => {
+                        if let Some(metadata_count) =
+                            index_metadata_value_count(&indexes, field, value)?
+                        {
+                            count = Some(metadata_count);
+                        }
+                        offset = payload_end;
+                        continue;
+                    }
+                    WalFrameMetadataMutation::ApplyCollectionChanges { changes, .. } => {
+                        if count.is_some() && changes.updates == 0 && changes.deletes == 0 {
+                            let compact = decode_compact_wal_entry(&payload)?;
+                            let CompactWalMutation::ApplyCollectionChanges {
+                                changes,
+                                inserts,
+                                updates,
+                                deletes,
+                                ..
+                            } = compact.mutation
+                            else {
+                                return Ok(None);
+                            };
+                            if !updates.is_empty() || !deletes.is_empty() {
+                                return Ok(None);
+                            }
+                            for change in changes {
+                                let CompactCollectionChange::Insert(record) = change else {
+                                    return Ok(None);
+                                };
+                                if compact_record_field_eq(&record, field, value)? {
+                                    *count.as_mut().expect("count initialized") += 1;
+                                }
+                            }
+                            for record in inserts {
+                                if compact_record_field_eq(&record, field, value)? {
+                                    *count.as_mut().expect("count initialized") += 1;
+                                }
+                            }
+                            offset = payload_end;
+                            continue;
+                        }
+                        offset = payload_end;
+                        continue;
+                    }
+                    WalFrameMetadataMutation::DropIndexes { .. } => {
+                        offset = payload_end;
+                        continue;
+                    }
+                    WalFrameMetadataMutation::ReplaceCollection { .. }
+                    | WalFrameMetadataMutation::RewriteCollection { .. }
+                    | WalFrameMetadataMutation::DropCollection { .. } => return Ok(None),
+                }
             }
 
             let compact = decode_compact_wal_entry(&payload)?;
@@ -1444,7 +1527,7 @@ impl DatabaseFile {
                                 return Ok(None);
                             };
                             if compact_record_field_eq(&record, field, value)? {
-                                count += 1;
+                                *count.get_or_insert(0) += 1;
                             }
                         }
                         offset = payload_end;
@@ -1452,7 +1535,7 @@ impl DatabaseFile {
                     }
                     for record in inserts {
                         if compact_record_field_eq(&record, field, value)? {
-                            count += 1;
+                            *count.get_or_insert(0) += 1;
                         }
                     }
                 }
@@ -1487,7 +1570,10 @@ impl DatabaseFile {
             wal_records: scanned_records as usize,
             relevant_wal_records: relevant_records as usize,
             wal_bytes,
-            count,
+            count: match count {
+                Some(count) => count,
+                None => return Ok(None),
+            },
         }))
     }
 }
@@ -1555,6 +1641,29 @@ fn compact_record_field_eq(
     }
     let document = decode_document_bytes(&record.document)?;
     Ok(mqlite_bson::lookup_path_owned(&document, field).as_ref() == Some(value))
+}
+
+fn index_metadata_value_count(
+    indexes: &[WalFrameIndexMetadata],
+    field: &str,
+    value: &Bson,
+) -> Result<Option<usize>> {
+    for index in indexes {
+        let key = decode_document_bytes(&index.key)?;
+        if key.len() != 1 || !key.contains_key(field) {
+            continue;
+        }
+        for frequency in &index.value_frequencies {
+            if frequency.field != field {
+                continue;
+            }
+            let encoded = decode_document_bytes(&frequency.value)?;
+            if encoded.get("v") == Some(value) {
+                return Ok(Some(frequency.count));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn top_level_string_field_eq(document: &[u8], field: &str, value: &Bson) -> Option<bool> {
@@ -1853,12 +1962,14 @@ impl DatabaseFile {
         let _span = span(Component::Storage, "commit_mutation_unflushed");
         let sequence = self.state.last_applied_sequence + 1;
         let validation_plan = validate_mutation(&self.state, &self.validation_state, &mutation)?;
+        let wal_metadata = wal_metadata_from_validation_plan(&mutation, &validation_plan)?;
 
         let appended_bytes = append_wal_entry(
             &mut self.file,
             self.wal_end_offset,
             sequence,
             &mutation,
+            wal_metadata.as_ref(),
             false,
         )?;
 
@@ -2595,6 +2706,38 @@ impl WalFrameMetadata {
     }
 }
 
+fn wal_metadata_from_validation_plan(
+    mutation: &WalMutation,
+    validation_plan: &ValidationPlan,
+) -> Result<Option<WalFrameMetadata>> {
+    let (
+        WalMutation::CreateIndexes {
+            database,
+            collection,
+            create_options,
+            change_events,
+            ..
+        },
+        ValidationPlan::InstallCreatedIndexes { created, .. },
+    ) = (mutation, validation_plan)
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(WalFrameMetadata {
+        mutation: WalFrameMetadataMutation::CreateIndexes {
+            database: database.clone(),
+            collection: collection.clone(),
+            creates_collection: create_options.is_some(),
+            indexes: created
+                .iter()
+                .map(|index| WalFrameIndexMetadata::from_index_catalog(&index.name, index))
+                .collect::<Result<Vec<_>>>()?,
+            change_event_count: change_events.len(),
+        },
+    }))
+}
+
 impl WalFrameMetadataMutation {
     fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
         Ok(match mutation {
@@ -2717,6 +2860,7 @@ impl WalFrameIndexMetadata {
             expire_after_seconds: index.expire_after_seconds,
             entry_count: index.entry_count(),
             bytes: estimate_index_bytes_for_count(index.entry_count(), &index.key),
+            value_frequencies: index_value_frequencies(index)?,
         })
     }
 
@@ -2730,8 +2874,23 @@ impl WalFrameIndexMetadata {
             expire_after_seconds: spec.get_i64("expireAfterSeconds").ok(),
             entry_count: 0,
             bytes: 0,
+            value_frequencies: Vec::new(),
         })
     }
+}
+
+fn index_value_frequencies(index: &IndexCatalog) -> Result<Vec<WalFrameValueFrequency>> {
+    let mut frequencies = Vec::new();
+    for (field, values) in &index.stats.value_frequencies {
+        for frequency in values {
+            frequencies.push(WalFrameValueFrequency {
+                field: field.clone(),
+                value: encode_document_bytes(&doc! { "v": frequency.value.clone() })?,
+                count: frequency.count,
+            });
+        }
+    }
+    Ok(frequencies)
 }
 
 impl WalFrameCollectionChangesMetadata {
@@ -3234,9 +3393,20 @@ fn maybe_decode_stored_blob<'a>(bytes: &'a [u8]) -> std::result::Result<Cow<'a, 
     }
 }
 
-fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
+fn encode_wal_entry(
+    sequence: u64,
+    mutation: &WalMutation,
+    metadata: Option<&WalFrameMetadata>,
+) -> Result<Vec<u8>> {
     let compact_wal_entry = EncodedWalEntry::from_wal_entry(sequence, mutation)?;
-    let metadata = WalFrameMetadata::from_wal_mutation(mutation)?;
+    let default_metadata;
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            default_metadata = WalFrameMetadata::from_wal_mutation(mutation)?;
+            &default_metadata
+        }
+    };
     let mut metadata_bytes = Vec::new();
     cbor_ser::into_writer(&metadata, &mut metadata_bytes)?;
     let mut entry_bytes = Vec::new();
@@ -3279,6 +3449,17 @@ fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
     Ok(compact_wal_entry)
 }
 
+fn decode_compact_wal_entry_sequence(bytes: &[u8]) -> Result<u64> {
+    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let mut cursor = Cursor::new(entry_bytes);
+    let compact_wal_entry: CompactWalEntrySequence = cbor_de::from_reader(&mut cursor)?;
+    if cursor.position() != entry_bytes.len() as u64 {
+        return Err(StorageError::InvalidWalFrame.into());
+    }
+    Ok(compact_wal_entry.sequence)
+}
+
 fn decode_wal_frame_metadata(bytes: &[u8]) -> Result<Option<WalFrameMetadata>> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let (Some(metadata_bytes), _) = split_wal_payload(bytes.as_ref())? else {
@@ -3316,9 +3497,10 @@ fn append_wal_entry(
     frame_offset: u64,
     sequence: u64,
     mutation: &WalMutation,
+    metadata: Option<&WalFrameMetadata>,
     sync: bool,
 ) -> Result<u64> {
-    let payload = encode_wal_entry(sequence, mutation)?;
+    let payload = encode_wal_entry(sequence, mutation, metadata)?;
     let payload_checksum = hash_bytes(&payload);
     let frame_len = (WAL_HEADER_LEN + payload.len()) as u64;
 
@@ -5994,7 +6176,7 @@ mod tests {
                 .metadata
                 .get("walReplayLargestPayloadMutation")
                 .map(String::as_str),
-            Some("applyCollectionChanges")
+            Some("createIndexes")
         );
     }
 
@@ -6351,6 +6533,30 @@ mod tests {
                     change_events: Vec::new(),
                 })
                 .expect("commit pending inserts");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "ticket": 1 }, "name": "ticket_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    changes: vec![CollectionChange::Insert(CollectionRecord::new(
+                        4,
+                        doc! { "_id": 4_i64, "ticket": "z300" },
+                    ))],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit later pending insert");
         }
 
         let count = DatabaseFile::count_pending_wal_field_eq(
@@ -6363,9 +6569,9 @@ mod tests {
         )
         .expect("count")
         .expect("supported count");
-        assert_eq!(count.count, 2);
-        assert_eq!(count.wal_records, 1);
-        assert_eq!(count.relevant_wal_records, 1);
+        assert_eq!(count.count, 3);
+        assert_eq!(count.wal_records, 3);
+        assert_eq!(count.relevant_wal_records, 3);
     }
 
     fn exact_sku_bounds(sku: &str) -> IndexBounds {

@@ -147,10 +147,12 @@ then scans supported pending WAL frames for matching inserts/updates while using
 skip later insert-only/index-only frames after a match. Mutations that could invalidate the result
 fall back to the normal read path.
 
-`count` with a single equality predicate can stream supported insert-only pending WAL records
-without building a full collection overlay. This bounds memory, but it is still a linear document
-scan until secondary index entries or value frequencies from pending `createIndexes` frames become
-queryable.
+`count` with a single equality predicate can use value-frequency summaries from supported pending
+`createIndexes` WAL metadata frames. When a matching single-field index was created after the
+pending inserts, the count can answer from the index statistics generated during create-index
+validation and then fold in later insert-only frames. If that metadata is unavailable, the path can
+stream supported insert-only pending WAL records without building a full collection overlay. That
+fallback bounds memory, but it remains a linear document scan.
 
 ### Page-Backed Read Fast Path
 

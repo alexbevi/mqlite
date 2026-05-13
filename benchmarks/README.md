@@ -223,7 +223,7 @@ First-class harness results from this patch:
 | Build `ticker_1` and `ticket_1` after import | did not complete within 318.89s; interrupted near 11.8 GiB RSS in the original probe | 331.65s, observed broker RSS roughly 4.0 GiB at 3:47 | Existing-record index builds now collect keys linearly, sort once, and apply the validation-built indexes instead of rebuilding them again during mutation apply. The command completed and reopen metadata reported 3 indexes and 3,000,003 entries. It remains far slower than MongoDB and still needs a page-backed or external-sort bulk builder. |
 | Count all documents after import and index build | manually stopped after 107.73s after falling back to dirty-WAL record overlay | 2.20s real, 7.7 MB CLI max RSS | Empty-filter `count` now answers from metadata folded across checkpoint and WAL prefixes. Debug output reported `readPath=metadataCount` and returned `n=1,000,001`. |
 | `_id` point read after import and index build | manually stopped after 40.84s on the generic dirty-WAL overlay path | 1.61s real, 7.8 MB CLI max RSS | Simple `_id` equality can use the pending-WAL id lookup. Debug output reported `readPath=pendingWalIdLookup` while scanning 1002 WAL records. The measured id is the first fixture `_id`; the earlier MongoDB baseline id was not a useful mqlite fixture probe. |
-| `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path | streaming equality count stopped after 165.03s, 7.3 MB CLI max RSS | The streaming path bounds memory and avoids collection materialization, but still scans every inserted document. The next useful optimization needs pending secondary-index entries or value-frequency metadata from `createIndexes`. |
+| `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path | 2.45s cold CLI, 7.6 MB max RSS on a fresh 10k WAL-metadata smoke | Fresh `createIndexes` WAL frames now carry index value-frequency metadata, so simple equality counts can avoid scanning inserted documents. The debug path reported `pendingWalEqualityCount`; the full fixture must be regenerated with newly written `createIndexes` metadata before this can be measured at 1,000,001 documents. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 | WAL-backed metadata fold, full fixture | not measured | 1.41s real, 25.8 MB max RSS | New WAL frames carry a metadata prefix, so `mqlite info` folded 1001 import batches and reported 1,000,001 records without deserializing the full mutation payloads. A 10k-prefix smoke also completed in 0.02s real with 10.9 MB max RSS. |
 
@@ -241,6 +241,8 @@ The pending-WAL `_id` lookup run is checked in at
 `benchmarks/results/2026-05-13-trades-id-lookup.json`.
 The bounded but incomplete `ticket:"z300"` streaming-count probe is checked in at
 `benchmarks/results/2026-05-13-trades-ticket-count-streaming-stopped.json`.
+The fresh 10k `ticket:"z300"` index-frequency smoke is checked in at
+`benchmarks/results/2026-05-13-trades-10k-ticket-count-index-frequency.json`.
 
 ## Next Work Items
 
@@ -252,8 +254,8 @@ The bounded but incomplete `ticket:"z300"` streaming-count probe is checked in a
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
-- Once mqlite can build the `ticker` and `ticket` indexes, add comparable mqlite
-  read results for `ticket`, `ticker`, startup, and indexed counts. The
-  empty-filter count and first-fixture `_id` lookup paths are now measured, but
-  indexed `ticket` reads/counts are still blocked by the pending secondary-index
-  WAL representation.
+- Regenerate the full fixture with fresh `createIndexes` WAL metadata and
+  measure indexed `ticket` counts against the 1,000,001-document dataset. The
+  10k smoke confirms the pending-WAL index-frequency read path, but the existing
+  full fixture was indexed before those frequencies were written.
+- Add comparable mqlite read results for `ticket`, `ticker`, and startup.

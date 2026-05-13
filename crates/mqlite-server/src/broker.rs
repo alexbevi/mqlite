@@ -7345,6 +7345,15 @@ mod tests {
                     change_events: Vec::new(),
                 })
                 .expect("commit pending inserts");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "ticket": 1 }, "name": "ticket_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
         }
 
         let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
@@ -7411,6 +7420,15 @@ mod tests {
                     change_events: Vec::new(),
                 })
                 .expect("commit pending inserts");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "ticket": 1 }, "name": "ticket_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
         }
 
         let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
