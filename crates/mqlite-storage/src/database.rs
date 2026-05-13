@@ -42,6 +42,7 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 1;
 const COMPRESSION_MIN_SAVINGS_DIVISOR: usize = 8;
 const WAL_COMPRESSION_MIN_LEN: usize = PAGE_SIZE;
 const WAL_COMPRESSION_MIN_SAVINGS: usize = 512;
+const WAL_METADATA_PAYLOAD_MAGIC: &[u8; 8] = b"MQLWMD01";
 pub const EMPTY_BSON_DOCUMENT_BYTES: &[u8; 5] = &[5, 0, 0, 0, 0];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -494,6 +495,78 @@ struct WalIndexMetadata {
     expire_after_seconds: Option<i64>,
     entry_count: usize,
     bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalFrameMetadata {
+    mutation: WalFrameMetadataMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WalFrameMetadataMutation {
+    ReplaceCollection {
+        database: String,
+        collection: String,
+        collection_metadata: WalFrameCollectionMetadata,
+        change_event_count: usize,
+    },
+    RewriteCollection {
+        database: String,
+        collection: String,
+        changes: WalFrameCollectionChangesMetadata,
+        change_event_count: usize,
+    },
+    ApplyCollectionChanges {
+        database: String,
+        collection: String,
+        creates_collection: bool,
+        changes: WalFrameCollectionChangesMetadata,
+        change_event_count: usize,
+    },
+    CreateIndexes {
+        database: String,
+        collection: String,
+        creates_collection: bool,
+        indexes: Vec<WalFrameIndexMetadata>,
+        change_event_count: usize,
+    },
+    DropIndexes {
+        database: String,
+        collection: String,
+        target: String,
+        change_event_count: usize,
+    },
+    DropCollection {
+        database: String,
+        collection: String,
+        change_event_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalFrameCollectionMetadata {
+    document_count: usize,
+    document_bytes: u64,
+    indexes: Vec<WalFrameIndexMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalFrameIndexMetadata {
+    name: String,
+    key: Vec<u8>,
+    unique: bool,
+    expire_after_seconds: Option<i64>,
+    entry_count: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WalFrameCollectionChangesMetadata {
+    inserts: usize,
+    insert_bytes: u64,
+    updates: usize,
+    update_bytes: u64,
+    deletes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1939,6 +2012,181 @@ impl<'a> EncodedWalEntry<'a> {
     }
 }
 
+impl WalFrameMetadata {
+    fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
+        Ok(Self {
+            mutation: WalFrameMetadataMutation::from_wal_mutation(mutation)?,
+        })
+    }
+}
+
+impl WalFrameMetadataMutation {
+    fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
+        Ok(match mutation {
+            WalMutation::ReplaceCollection {
+                database,
+                collection,
+                collection_state,
+                change_events,
+            } => Self::ReplaceCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                collection_metadata: WalFrameCollectionMetadata::from_collection_catalog(
+                    collection_state,
+                )?,
+                change_event_count: change_events.len(),
+            },
+            WalMutation::RewriteCollection {
+                database,
+                collection,
+                changes,
+                change_events,
+                ..
+            } => Self::RewriteCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                changes: WalFrameCollectionChangesMetadata::from_collection_changes(changes),
+                change_event_count: change_events.len(),
+            },
+            WalMutation::ApplyCollectionChanges {
+                database,
+                collection,
+                create_options,
+                changes,
+                inserts,
+                updates,
+                deletes,
+                change_events,
+            } => {
+                let resolved_changes =
+                    resolved_collection_changes(changes, inserts, updates, deletes);
+                Self::ApplyCollectionChanges {
+                    database: database.clone(),
+                    collection: collection.clone(),
+                    creates_collection: create_options.is_some(),
+                    changes: WalFrameCollectionChangesMetadata::from_collection_changes(
+                        &resolved_changes,
+                    ),
+                    change_event_count: change_events.len(),
+                }
+            }
+            WalMutation::CreateIndexes {
+                database,
+                collection,
+                create_options,
+                specs,
+                change_events,
+            } => Self::CreateIndexes {
+                database: database.clone(),
+                collection: collection.clone(),
+                creates_collection: create_options.is_some(),
+                indexes: specs
+                    .iter()
+                    .map(WalFrameIndexMetadata::from_index_spec)
+                    .collect::<Result<Vec<_>>>()?,
+                change_event_count: change_events.len(),
+            },
+            WalMutation::DropIndexes {
+                database,
+                collection,
+                target,
+                change_events,
+            } => Self::DropIndexes {
+                database: database.clone(),
+                collection: collection.clone(),
+                target: target.clone(),
+                change_event_count: change_events.len(),
+            },
+            WalMutation::DropCollection {
+                database,
+                collection,
+                change_events,
+            } => Self::DropCollection {
+                database: database.clone(),
+                collection: collection.clone(),
+                change_event_count: change_events.len(),
+            },
+        })
+    }
+}
+
+impl WalFrameCollectionMetadata {
+    fn from_collection_catalog(collection: &CollectionCatalog) -> Result<Self> {
+        Ok(Self {
+            document_count: collection.records.len(),
+            document_bytes: collection
+                .records
+                .iter()
+                .map(|record| {
+                    record
+                        .encoded_document_bytes()
+                        .map(|bytes| bytes.len() as u64)
+                        .map_err(anyhow::Error::from)
+                })
+                .sum::<Result<u64>>()?,
+            indexes: collection
+                .indexes
+                .iter()
+                .map(|(name, index)| WalFrameIndexMetadata::from_index_catalog(name, index))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+impl WalFrameIndexMetadata {
+    fn from_index_catalog(name: &str, index: &IndexCatalog) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            key: encode_document_bytes(&index.key)?,
+            unique: index.unique,
+            expire_after_seconds: index.expire_after_seconds,
+            entry_count: index.entry_count(),
+            bytes: estimate_index_bytes_for_count(index.entry_count(), &index.key),
+        })
+    }
+
+    fn from_index_spec(spec: &Document) -> Result<Self> {
+        let key = spec.get_document("key")?.clone();
+        let name = spec.get_str("name").unwrap_or("").to_string();
+        Ok(Self {
+            name,
+            key: encode_document_bytes(&key)?,
+            unique: spec.get_bool("unique").unwrap_or(false),
+            expire_after_seconds: spec.get_i64("expireAfterSeconds").ok(),
+            entry_count: 0,
+            bytes: 0,
+        })
+    }
+}
+
+impl WalFrameCollectionChangesMetadata {
+    fn from_collection_changes(changes: &[CollectionChange]) -> Self {
+        let mut metadata = Self::default();
+        for change in changes {
+            match change {
+                CollectionChange::Insert(record) => {
+                    metadata.inserts += 1;
+                    metadata.insert_bytes += record
+                        .encoded_document_bytes()
+                        .ok()
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0);
+                }
+                CollectionChange::Update(record) => {
+                    metadata.updates += 1;
+                    metadata.update_bytes += record
+                        .encoded_document_bytes()
+                        .ok()
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0);
+                }
+                CollectionChange::Delete(_) => metadata.deletes += 1,
+            }
+        }
+        metadata
+    }
+}
+
 impl CompactWalMutation {
     fn into_wal_mutation(self) -> Result<WalMutation> {
         Ok(match self {
@@ -2413,8 +2661,18 @@ fn maybe_decode_stored_blob<'a>(bytes: &'a [u8]) -> std::result::Result<Cow<'a, 
 
 fn encode_wal_entry(sequence: u64, mutation: &WalMutation) -> Result<Vec<u8>> {
     let compact_wal_entry = EncodedWalEntry::from_wal_entry(sequence, mutation)?;
-    let mut bytes = Vec::new();
-    cbor_ser::into_writer(&compact_wal_entry, &mut bytes)?;
+    let metadata = WalFrameMetadata::from_wal_mutation(mutation)?;
+    let mut metadata_bytes = Vec::new();
+    cbor_ser::into_writer(&metadata, &mut metadata_bytes)?;
+    let mut entry_bytes = Vec::new();
+    cbor_ser::into_writer(&compact_wal_entry, &mut entry_bytes)?;
+    let metadata_len = u32::try_from(metadata_bytes.len())
+        .map_err(|_| anyhow::anyhow!("WAL metadata is too large"))?;
+    let mut bytes = Vec::with_capacity(12 + metadata_bytes.len() + entry_bytes.len());
+    bytes.extend_from_slice(WAL_METADATA_PAYLOAD_MAGIC);
+    bytes.extend_from_slice(&metadata_len.to_le_bytes());
+    bytes.extend_from_slice(&metadata_bytes);
+    bytes.extend_from_slice(&entry_bytes);
     maybe_encode_zstd_blob(&bytes, WAL_COMPRESSION_MIN_LEN, WAL_COMPRESSION_MIN_SAVINGS)
 }
 
@@ -2422,9 +2680,10 @@ fn decode_wal_entry(bytes: &[u8]) -> Result<DecodedWalEntry> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let decoded_len = bytes.as_ref().len();
     let compressed = matches!(&bytes, Cow::Owned(_));
-    let mut cursor = Cursor::new(bytes.as_ref());
+    let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let mut cursor = Cursor::new(entry_bytes);
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != bytes.as_ref().len() as u64 {
+    if cursor.position() != entry_bytes.len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     Ok(DecodedWalEntry {
@@ -2436,12 +2695,45 @@ fn decode_wal_entry(bytes: &[u8]) -> Result<DecodedWalEntry> {
 
 fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
-    let mut cursor = Cursor::new(bytes.as_ref());
+    let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let mut cursor = Cursor::new(entry_bytes);
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != bytes.as_ref().len() as u64 {
+    if cursor.position() != entry_bytes.len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     Ok(compact_wal_entry)
+}
+
+fn decode_wal_frame_metadata(bytes: &[u8]) -> Result<Option<WalFrameMetadata>> {
+    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let (Some(metadata_bytes), _) = split_wal_payload(bytes.as_ref())? else {
+        return Ok(None);
+    };
+    let mut cursor = Cursor::new(metadata_bytes);
+    let metadata = cbor_de::from_reader(&mut cursor)?;
+    if cursor.position() != metadata_bytes.len() as u64 {
+        return Err(StorageError::InvalidWalFrame.into());
+    }
+    Ok(Some(metadata))
+}
+
+fn split_wal_payload(bytes: &[u8]) -> Result<(Option<&[u8]>, &[u8])> {
+    if !bytes.starts_with(WAL_METADATA_PAYLOAD_MAGIC) {
+        return Ok((None, bytes));
+    }
+    let Some(metadata_len_bytes) = bytes.get(8..12) else {
+        return Err(StorageError::InvalidWalFrame.into());
+    };
+    let metadata_len = u32::from_le_bytes(metadata_len_bytes.try_into().expect("metadata len"));
+    let metadata_start = 12;
+    let metadata_end = metadata_start + metadata_len as usize;
+    if metadata_end > bytes.len() {
+        return Err(StorageError::InvalidWalFrame.into());
+    }
+    Ok((
+        Some(&bytes[metadata_start..metadata_end]),
+        &bytes[metadata_end..],
+    ))
 }
 
 fn append_wal_entry(
@@ -4000,6 +4292,146 @@ fn apply_wal_metadata_mutation(
     Ok(())
 }
 
+fn apply_wal_frame_metadata(
+    metadata: &mut WalCatalogMetadata,
+    frame: WalFrameMetadata,
+) -> Result<()> {
+    match frame.mutation {
+        WalFrameMetadataMutation::ReplaceCollection {
+            database,
+            collection,
+            collection_metadata,
+            change_event_count,
+        } => {
+            metadata
+                .databases
+                .entry(database)
+                .or_default()
+                .collections
+                .insert(
+                    collection,
+                    wal_collection_metadata_from_frame(collection_metadata)?,
+                );
+            metadata.change_event_count += change_event_count;
+        }
+        WalFrameMetadataMutation::RewriteCollection {
+            database,
+            collection,
+            changes,
+            change_event_count,
+        } => {
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            apply_wal_collection_change_metadata(collection_metadata, &changes);
+            metadata.change_event_count += change_event_count;
+        }
+        WalFrameMetadataMutation::ApplyCollectionChanges {
+            database,
+            collection,
+            creates_collection,
+            changes,
+            change_event_count,
+        } => {
+            if creates_collection {
+                let _ = ensure_wal_collection_metadata(metadata, &database, &collection);
+            }
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            apply_wal_collection_change_metadata(collection_metadata, &changes);
+            metadata.change_event_count += change_event_count;
+        }
+        WalFrameMetadataMutation::CreateIndexes {
+            database,
+            collection,
+            creates_collection,
+            indexes,
+            change_event_count,
+        } => {
+            if creates_collection {
+                let _ = ensure_wal_collection_metadata(metadata, &database, &collection);
+            }
+            let collection_metadata =
+                ensure_wal_collection_metadata(metadata, &database, &collection);
+            for index in indexes {
+                let key = decode_document_bytes(&index.key)?;
+                let bytes =
+                    estimate_index_bytes_for_count(collection_metadata.document_count, &key);
+                collection_metadata.indexes.insert(
+                    index.name,
+                    WalIndexMetadata {
+                        key,
+                        unique: index.unique,
+                        expire_after_seconds: index.expire_after_seconds,
+                        entry_count: collection_metadata.document_count,
+                        bytes,
+                    },
+                );
+            }
+            metadata.change_event_count += change_event_count;
+        }
+        WalFrameMetadataMutation::DropIndexes {
+            database,
+            collection,
+            target,
+            change_event_count,
+        } => {
+            if let Some(collection_metadata) = metadata
+                .databases
+                .get_mut(&database)
+                .and_then(|database| database.collections.get_mut(&collection))
+            {
+                if target == "*" {
+                    collection_metadata.indexes.retain(|name, _| name == "_id_");
+                } else {
+                    collection_metadata.indexes.remove(&target);
+                }
+            }
+            metadata.change_event_count += change_event_count;
+        }
+        WalFrameMetadataMutation::DropCollection {
+            database,
+            collection,
+            change_event_count,
+        } => {
+            if let Some(database_metadata) = metadata.databases.get_mut(&database) {
+                database_metadata.collections.remove(&collection);
+                if database_metadata.collections.is_empty() {
+                    metadata.databases.remove(&database);
+                }
+            }
+            metadata.change_event_count += change_event_count;
+        }
+    }
+    Ok(())
+}
+
+fn wal_collection_metadata_from_frame(
+    collection: WalFrameCollectionMetadata,
+) -> Result<WalCollectionMetadata> {
+    let indexes = collection
+        .indexes
+        .into_iter()
+        .map(|index| {
+            Ok((
+                index.name,
+                WalIndexMetadata {
+                    key: decode_document_bytes(&index.key)?,
+                    unique: index.unique,
+                    expire_after_seconds: index.expire_after_seconds,
+                    entry_count: index.entry_count,
+                    bytes: index.bytes,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(WalCollectionMetadata {
+        indexes,
+        record_sizes: HashMap::new(),
+        document_count: collection.document_count,
+        document_bytes: collection.document_bytes,
+    })
+}
+
 fn wal_collection_metadata_from_compact(
     collection: &CompactCollectionCatalog,
 ) -> Result<WalCollectionMetadata> {
@@ -4137,6 +4569,34 @@ fn apply_wal_collection_changes(
     }
 }
 
+fn apply_wal_collection_change_metadata(
+    collection: &mut WalCollectionMetadata,
+    changes: &WalFrameCollectionChangesMetadata,
+) {
+    let previous_document_count = collection.document_count;
+    let previous_average = average_document_bytes(collection);
+    collection.document_count = collection
+        .document_count
+        .saturating_add(changes.inserts)
+        .saturating_sub(changes.deletes);
+    collection.document_bytes = collection
+        .document_bytes
+        .saturating_add(changes.insert_bytes)
+        .saturating_add(changes.update_bytes)
+        .saturating_sub(previous_average.saturating_mul(changes.updates as u64))
+        .saturating_sub(previous_average.saturating_mul(changes.deletes as u64));
+
+    for index in collection.indexes.values_mut() {
+        index.bytes = scale_index_bytes(
+            index.bytes,
+            previous_document_count,
+            collection.document_count,
+            &index.key,
+        );
+        index.entry_count = collection.document_count;
+    }
+}
+
 fn apply_wal_catalog_metadata(
     file: &mut File,
     start_offset: u64,
@@ -4180,8 +4640,13 @@ fn apply_wal_catalog_metadata(
             return Err(StorageError::InvalidWalChecksum.into());
         }
 
-        let entry = decode_compact_wal_entry(&payload)?;
-        apply_wal_metadata_mutation(metadata, entry.mutation)?;
+        if let Some(frame_metadata) = decode_wal_frame_metadata(&payload)? {
+            apply_wal_frame_metadata(metadata, frame_metadata)?;
+            add_counter(Component::Storage, "walMetadataFastRecords", 1);
+        } else {
+            let entry = decode_compact_wal_entry(&payload)?;
+            apply_wal_metadata_mutation(metadata, entry.mutation)?;
+        }
         wal.records += 1;
         add_counter(Component::Storage, "walMetadataRecords", 1);
         offset = payload_end;
@@ -5100,6 +5565,56 @@ mod tests {
         assert_eq!(report.summary.record_count, 0);
         assert_eq!(report.last_checkpoint.active_superblock_slot, 0);
         assert_eq!(report.last_checkpoint.valid_superblocks, 1);
+    }
+
+    #[test]
+    fn info_folds_new_wal_frame_metadata_without_full_mutation_decode() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("info-v2-wal-metadata.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "sku": "alpha" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "sku": "beta" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: vec![sample_change_event(1, "insert")],
+                })
+                .expect("append wal");
+        }
+
+        let debug_session = session("wal-frame-metadata-info");
+        let report = {
+            let _install = install(&debug_session);
+            DatabaseFile::info(&path).expect("info")
+        };
+        assert_eq!(report.summary.record_count, 2);
+        assert_eq!(report.summary.change_event_count, 1);
+        assert_eq!(report.wal_since_checkpoint.record_count, 1);
+
+        let debug_report = debug_session.report();
+        assert_eq!(
+            counter_value(&debug_report, Component::Storage, "walMetadataRecords"),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(&debug_report, Component::Storage, "walMetadataFastRecords"),
+            Some(1)
+        );
     }
 
     #[test]

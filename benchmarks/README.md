@@ -219,13 +219,16 @@ First-class harness results from this patch:
 
 | Operation | Previous Python loop | `bench trades-import` | Notes |
 | --- | ---: | ---: | --- |
-| Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 328.04s, 3,048 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. The full process wall time was 532.23s because broker cleanup happens outside the harness timer. |
+| Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 333.39s, 3,000 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. The fresh WAL-metadata-prefix run took 334.77s process wall time and avoided the earlier long cleanup gap. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
+| WAL-backed metadata fold, full fixture | not measured | 1.41s real, 25.8 MB max RSS | New WAL frames carry a metadata prefix, so `mqlite info` folded 1001 import batches and reported 1,000,001 records without deserializing the full mutation payloads. A 10k-prefix smoke also completed in 0.02s real with 10.9 MB max RSS. |
 
 The successful live-count result is checked in at
 `benchmarks/results/2026-05-13-trades-import-live-validated.json`. The earlier
 failed count-validation result is retained at
 `benchmarks/results/2026-05-13-trades-import-validation-failed.json`.
+The fresh WAL metadata prefix run is checked in at
+`benchmarks/results/2026-05-13-trades-import-wal-metadata.json`.
 
 ## Next Work Items
 

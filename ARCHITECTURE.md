@@ -181,6 +181,9 @@ Current WAL behavior:
 - CRUD writes append typed insert, update, delete, and DDL mutations.
 - Collection change events are appended atomically with the collection mutation that caused them.
 - WAL records carry sequence numbers and checksums.
+- New WAL records include a small metadata prefix before the full mutation payload, so metadata
+  commands can fold record counts, byte estimates, index summaries, and change-event counts without
+  deserializing every document-bearing mutation.
 - Recovery replays WAL records with sequence numbers greater than the active superblock durable
   sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.
