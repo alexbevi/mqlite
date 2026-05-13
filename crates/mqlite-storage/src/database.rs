@@ -499,6 +499,8 @@ struct WalIndexMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WalFrameMetadata {
+    #[serde(default)]
+    sequence: u64,
     mutation: WalFrameMetadataMutation,
 }
 
@@ -1428,7 +1430,11 @@ impl DatabaseFile {
             }
 
             if let Some(metadata) = decode_wal_frame_metadata(&payload)? {
-                let sequence = decode_compact_wal_entry_sequence(&payload)?;
+                let sequence = if metadata.sequence == 0 {
+                    decode_compact_wal_entry_sequence(&payload)?
+                } else {
+                    metadata.sequence
+                };
                 if sequence <= last_sequence {
                     offset = payload_end;
                     continue;
@@ -1962,7 +1968,8 @@ impl DatabaseFile {
         let _span = span(Component::Storage, "commit_mutation_unflushed");
         let sequence = self.state.last_applied_sequence + 1;
         let validation_plan = validate_mutation(&self.state, &self.validation_state, &mutation)?;
-        let wal_metadata = wal_metadata_from_validation_plan(&mutation, &validation_plan)?;
+        let wal_metadata =
+            wal_metadata_from_validation_plan(sequence, &mutation, &validation_plan)?;
 
         let appended_bytes = append_wal_entry(
             &mut self.file,
@@ -2699,14 +2706,16 @@ impl<'a> EncodedWalEntry<'a> {
 }
 
 impl WalFrameMetadata {
-    fn from_wal_mutation(mutation: &WalMutation) -> Result<Self> {
+    fn from_wal_mutation(sequence: u64, mutation: &WalMutation) -> Result<Self> {
         Ok(Self {
+            sequence,
             mutation: WalFrameMetadataMutation::from_wal_mutation(mutation)?,
         })
     }
 }
 
 fn wal_metadata_from_validation_plan(
+    sequence: u64,
     mutation: &WalMutation,
     validation_plan: &ValidationPlan,
 ) -> Result<Option<WalFrameMetadata>> {
@@ -2725,6 +2734,7 @@ fn wal_metadata_from_validation_plan(
     };
 
     Ok(Some(WalFrameMetadata {
+        sequence,
         mutation: WalFrameMetadataMutation::CreateIndexes {
             database: database.clone(),
             collection: collection.clone(),
@@ -3403,7 +3413,7 @@ fn encode_wal_entry(
     let metadata = match metadata {
         Some(metadata) => metadata,
         None => {
-            default_metadata = WalFrameMetadata::from_wal_mutation(mutation)?;
+            default_metadata = WalFrameMetadata::from_wal_mutation(sequence, mutation)?;
             &default_metadata
         }
     };
@@ -3413,22 +3423,30 @@ fn encode_wal_entry(
     cbor_ser::into_writer(&compact_wal_entry, &mut entry_bytes)?;
     let metadata_len = u32::try_from(metadata_bytes.len())
         .map_err(|_| anyhow::anyhow!("WAL metadata is too large"))?;
+    let entry_bytes = maybe_encode_zstd_blob(
+        &entry_bytes,
+        WAL_COMPRESSION_MIN_LEN,
+        WAL_COMPRESSION_MIN_SAVINGS,
+    )?;
     let mut bytes = Vec::with_capacity(12 + metadata_bytes.len() + entry_bytes.len());
     bytes.extend_from_slice(WAL_METADATA_PAYLOAD_MAGIC);
     bytes.extend_from_slice(&metadata_len.to_le_bytes());
     bytes.extend_from_slice(&metadata_bytes);
     bytes.extend_from_slice(&entry_bytes);
-    maybe_encode_zstd_blob(&bytes, WAL_COMPRESSION_MIN_LEN, WAL_COMPRESSION_MIN_SAVINGS)
+    Ok(bytes)
 }
 
 fn decode_wal_entry(bytes: &[u8]) -> Result<DecodedWalEntry> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
-    let decoded_len = bytes.as_ref().len();
-    let compressed = matches!(&bytes, Cow::Owned(_));
+    let compressed_payload = matches!(&bytes, Cow::Owned(_));
     let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let entry_bytes =
+        maybe_decode_stored_blob(entry_bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let decoded_len = entry_bytes.as_ref().len();
+    let compressed = compressed_payload || matches!(&entry_bytes, Cow::Owned(_));
     let mut cursor = Cursor::new(entry_bytes);
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != entry_bytes.len() as u64 {
+    if cursor.position() != cursor.get_ref().len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     Ok(DecodedWalEntry {
@@ -3441,9 +3459,11 @@ fn decode_wal_entry(bytes: &[u8]) -> Result<DecodedWalEntry> {
 fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let entry_bytes =
+        maybe_decode_stored_blob(entry_bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let mut cursor = Cursor::new(entry_bytes);
     let compact_wal_entry: CompactWalEntry = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != entry_bytes.len() as u64 {
+    if cursor.position() != cursor.get_ref().len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     Ok(compact_wal_entry)
@@ -3452,16 +3472,22 @@ fn decode_compact_wal_entry(bytes: &[u8]) -> Result<CompactWalEntry> {
 fn decode_compact_wal_entry_sequence(bytes: &[u8]) -> Result<u64> {
     let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let entry_bytes = split_wal_payload(bytes.as_ref())?.1;
+    let entry_bytes =
+        maybe_decode_stored_blob(entry_bytes).map_err(|_| StorageError::InvalidWalFrame)?;
     let mut cursor = Cursor::new(entry_bytes);
     let compact_wal_entry: CompactWalEntrySequence = cbor_de::from_reader(&mut cursor)?;
-    if cursor.position() != entry_bytes.len() as u64 {
+    if cursor.position() != cursor.get_ref().len() as u64 {
         return Err(StorageError::InvalidWalFrame.into());
     }
     Ok(compact_wal_entry.sequence)
 }
 
 fn decode_wal_frame_metadata(bytes: &[u8]) -> Result<Option<WalFrameMetadata>> {
-    let bytes = maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?;
+    let bytes = if bytes.starts_with(WAL_METADATA_PAYLOAD_MAGIC) {
+        Cow::Borrowed(bytes)
+    } else {
+        maybe_decode_stored_blob(bytes).map_err(|_| StorageError::InvalidWalFrame)?
+    };
     let (Some(metadata_bytes), _) = split_wal_payload(bytes.as_ref())? else {
         return Ok(None);
     };
@@ -5855,7 +5881,8 @@ mod tests {
     use super::{
         CollectionChange, DATA_START_OFFSET, DatabaseFile, FILE_FORMAT_VERSION, PAGE_SIZE,
         PersistedChangeEvent, PersistedPlanCacheChoice, PersistedPlanCacheEntry, StartupMetadata,
-        VerifyReport, WAL_FRAME_MAGIC, WAL_HEADER_LEN, WalMutation, ZSTD_BLOB_MAGIC,
+        VerifyReport, WAL_FRAME_MAGIC, WAL_HEADER_LEN, WAL_METADATA_PAYLOAD_MAGIC, WalMutation,
+        ZSTD_BLOB_MAGIC, split_wal_payload,
     };
     use crate::StorageEngine;
     use crate::v2::{
@@ -7577,7 +7604,7 @@ mod tests {
     }
 
     #[test]
-    fn replays_compressed_wal_frames() {
+    fn replays_wal_frames_with_compressed_mutation_payload() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("compressed-wal.mongodb");
 
@@ -7605,9 +7632,11 @@ mod tests {
         }
 
         let payload = first_wal_payload(&path);
-        assert!(payload.starts_with(ZSTD_BLOB_MAGIC));
+        assert!(payload.starts_with(WAL_METADATA_PAYLOAD_MAGIC));
+        let (_, entry_payload) = split_wal_payload(&payload).expect("split WAL payload");
+        assert!(entry_payload.starts_with(ZSTD_BLOB_MAGIC));
 
-        let debug_session = session("compressed-wal-replay");
+        let debug_session = session("compressed-wal-entry-replay");
         let _install = install(&debug_session);
         let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
         let collection = reopened

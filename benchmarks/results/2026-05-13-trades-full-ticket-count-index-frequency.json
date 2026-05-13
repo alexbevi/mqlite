@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "status": "metadata-count-complete",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-prefix2-full.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "setup": [
+    {
+      "command": "target/debug/mqlite bench trades-import --file /tmp/mqlite-trades-prefix2-full.mongodb --fixture benchmarks/trades.json.zst --reset",
+      "documents": 1000001,
+      "elapsedMs": 323368.704868,
+      "processRealSeconds": 323.43,
+      "docsPerSec": 3092.448294921437,
+      "verifiedCount": 1000001,
+      "walRecords": 1001,
+      "walBytes": 32450257,
+      "maxResidentSetBytes": 32788480,
+      "peakMemoryFootprintBytes": 24686592
+    },
+    {
+      "command": "target/debug/mqlite command --file /tmp/mqlite-trades-prefix2-full.mongodb --db market --idle-shutdown-secs 1 --eval '{\"createIndexes\":\"trades\",\"indexes\":[{\"key\":{\"ticker\":1},\"name\":\"ticker_1\"},{\"key\":{\"ticket\":1},\"name\":\"ticket_1\"}]}'",
+      "numIndexesBefore": 1,
+      "numIndexesAfter": 3,
+      "processRealSeconds": 341.63,
+      "cliMaxResidentSetBytes": 7651328,
+      "note": "The time output measures the short-lived CLI process RSS, not the broker process that performs the index build."
+    }
+  ],
+  "info": {
+    "command": "target/debug/mqlite info --file /tmp/mqlite-trades-prefix2-full.mongodb",
+    "processRealSeconds": 0.07,
+    "maxResidentSetBytes": 9551872,
+    "recordCount": 1000001,
+    "indexCount": 3,
+    "indexEntryCount": 3000003,
+    "walRecords": 1002,
+    "walBytes": 32472369,
+    "fileSize": 32492849
+  },
+  "operation": {
+    "command": "target/debug/mqlite command --file /tmp/mqlite-trades-prefix2-full.mongodb --db market --idle-shutdown-secs 1 --eval '{\"count\":\"trades\",\"query\":{\"ticket\":\"z300\"}}'",
+    "filter": {
+      "ticket": "z300"
+    },
+    "result": {
+      "n": 2500,
+      "ok": 1.0
+    },
+    "processTime": {
+      "realSeconds": 0.10,
+      "maxResidentSetBytes": 7708672,
+      "peakMemoryFootprintBytes": 3256320
+    },
+    "debug": {
+      "readPath": "pendingWalEqualityCount",
+      "pendingWalRecords": 1002,
+      "pendingWalRelevantRecords": 1002
+    }
+  },
+  "comparison": {
+    "mongodbTicketCountP50Ms": 2.44,
+    "mqliteTicketCountColdCliMs": 100.0
+  },
+  "notes": [
+    "Fresh WAL frames keep metadata outside the compressed mutation payload, so pending-WAL equality count scans metadata without decompressing full import batches.",
+    "The prior full-fixture streaming equality count was manually stopped after 165.03s.",
+    "This result is a cold CLI command, not a warm p50/p95 loop."
+  ]
+}

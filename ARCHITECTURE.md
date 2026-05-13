@@ -205,6 +205,8 @@ Current WAL behavior:
 - New WAL records include a small metadata prefix before the full mutation payload, so metadata
   commands can fold record counts, byte estimates, index summaries, and change-event counts without
   deserializing every document-bearing mutation.
+- The metadata prefix is stored outside the compressed mutation payload. Metadata-only readers can
+  scan a dirty WAL tail without decompressing import batches or full collection/index mutations.
 - Recovery replays WAL records with sequence numbers greater than the active superblock durable
   sequence.
 - Truncated WAL tails are detected and ignored when the preceding frames are valid.
