@@ -95,6 +95,7 @@ pub struct Broker {
     active_connections: Arc<AtomicUsize>,
     active_commands: Arc<AtomicUsize>,
     checkpoint_requested: Arc<AtomicBool>,
+    forced_background_checkpoint_requested: Arc<AtomicBool>,
     last_activity: Arc<Mutex<Instant>>,
 }
 
@@ -251,6 +252,7 @@ impl Broker {
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
             checkpoint_requested: Arc::new(AtomicBool::new(false)),
+            forced_background_checkpoint_requested: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         })
     }
@@ -315,20 +317,31 @@ impl Broker {
                     let watched_parent_exited = self.watched_parent_has_exited();
                     if checkpoint_task.is_none()
                         && !watched_parent_exited
+                        && active_commands == 0
+                        && self
+                            .forced_background_checkpoint_requested
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        if let Some(job) = self.prepare_background_checkpoint()? {
+                            checkpoint_task = Some(spawn_background_checkpoint_job(
+                                job,
+                                background_checkpoint_test_delay_ms(&self.config),
+                            ));
+                            last_checkpoint = Instant::now();
+                            continue;
+                        }
+                    }
+                    if checkpoint_task.is_none()
+                        && !watched_parent_exited
                         && active_connections == 0
                         && active_commands == 0
                         && self.checkpoint_requested.swap(false, Ordering::SeqCst)
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
-                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
-                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
-                                if checkpoint_test_delay_ms > 0 {
-                                    std::thread::sleep(Duration::from_millis(
-                                        checkpoint_test_delay_ms,
-                                    ));
-                                }
-                                job.run()
-                            }));
+                            checkpoint_task = Some(spawn_background_checkpoint_job(
+                                job,
+                                background_checkpoint_test_delay_ms(&self.config),
+                            ));
                             last_checkpoint = Instant::now();
                             continue;
                         }
@@ -345,15 +358,10 @@ impl Broker {
                         && active_commands == 0
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
-                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
-                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
-                                if checkpoint_test_delay_ms > 0 {
-                                    std::thread::sleep(Duration::from_millis(
-                                        checkpoint_test_delay_ms,
-                                    ));
-                                }
-                                job.run()
-                            }));
+                            checkpoint_task = Some(spawn_background_checkpoint_job(
+                                job,
+                                background_checkpoint_test_delay_ms(&self.config),
+                            ));
                             last_checkpoint = Instant::now();
                             continue;
                         }
@@ -364,15 +372,10 @@ impl Broker {
                         && active_commands == 0
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
-                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
-                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
-                                if checkpoint_test_delay_ms > 0 {
-                                    std::thread::sleep(Duration::from_millis(
-                                        checkpoint_test_delay_ms,
-                                    ));
-                                }
-                                job.run()
-                            }));
+                            checkpoint_task = Some(spawn_background_checkpoint_job(
+                                job,
+                                background_checkpoint_test_delay_ms(&self.config),
+                            ));
                             last_checkpoint = Instant::now();
                             continue;
                         }
@@ -394,15 +397,10 @@ impl Broker {
                         && quiet_for >= CHECKPOINT_QUIET_PERIOD
                     {
                         if let Some(job) = self.prepare_background_checkpoint()? {
-                            let checkpoint_test_delay_ms = background_checkpoint_test_delay_ms(&self.config);
-                            checkpoint_task = Some(tokio::task::spawn_blocking(move || {
-                                if checkpoint_test_delay_ms > 0 {
-                                    std::thread::sleep(Duration::from_millis(
-                                        checkpoint_test_delay_ms,
-                                    ));
-                                }
-                                job.run()
-                            }));
+                            checkpoint_task = Some(spawn_background_checkpoint_job(
+                                job,
+                                background_checkpoint_test_delay_ms(&self.config),
+                            ));
                             last_checkpoint = Instant::now();
                         }
                     }
@@ -456,7 +454,33 @@ impl Broker {
         }
     }
 
-    fn handle_mqlite_checkpoint(&self) -> Result<Document, CommandError> {
+    fn handle_mqlite_checkpoint(&self, body: &Document) -> Result<Document, CommandError> {
+        if body.get_bool("background").unwrap_or(false) {
+            self.ensure_storage_open()?;
+            let storage = self.storage_read()?;
+            let last_applied_sequence = storage.last_applied_sequence();
+            let wal_bytes_since_checkpoint = storage.wal_backlog_bytes();
+            let already_running = storage.has_concurrent_checkpoint();
+            let has_pending_wal = storage.has_pending_wal();
+            let checkpoint_plan_cache_entries = storage.persisted_plan_cache_entries().to_vec();
+            drop(storage);
+            let has_pending_checkpoint = has_pending_wal
+                || checkpoint_plan_cache_entries != self.persisted_plan_cache_entries()?;
+            if !already_running && has_pending_checkpoint {
+                self.await_durable_sequence(last_applied_sequence)?;
+                self.forced_background_checkpoint_requested
+                    .store(true, Ordering::SeqCst);
+            }
+            return Ok(doc! {
+                "checkpointed": false,
+                "background": true,
+                "queued": !already_running && has_pending_checkpoint,
+                "alreadyRunning": already_running,
+                "lastAppliedSequence": last_applied_sequence as i64,
+                "walBytesSinceCheckpoint": wal_bytes_since_checkpoint as i64,
+            });
+        }
+
         let checkpointed = self.checkpoint_if_needed().map_err(internal_error)?;
         let storage = self.storage_read()?;
         Ok(doc! {
@@ -841,7 +865,7 @@ impl Broker {
             "configureFailPoint" => self.handle_configure_fail_point(body),
             "getParameter" => Ok(self.handle_get_parameter(body)),
             "killAllSessions" => Ok(Document::new()),
-            "mqliteCheckpoint" => self.handle_mqlite_checkpoint(),
+            "mqliteCheckpoint" => self.handle_mqlite_checkpoint(body),
             "listDatabases" => self.handle_list_databases(body),
             "listCollections" => self.handle_list_collections(body),
             "listIndexes" => self.handle_list_indexes(body),
@@ -3584,6 +3608,18 @@ impl Broker {
 
 fn background_checkpoint_test_delay_ms(config: &BrokerConfig) -> u64 {
     config.checkpoint_test_delay_ms
+}
+
+fn spawn_background_checkpoint_job(
+    job: ConcurrentCheckpointJob,
+    checkpoint_test_delay_ms: u64,
+) -> tokio::task::JoinHandle<Result<Option<CompletedConcurrentCheckpoint>>> {
+    tokio::task::spawn_blocking(move || {
+        if checkpoint_test_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(checkpoint_test_delay_ms));
+        }
+        job.run()
+    })
 }
 
 #[cfg(test)]
@@ -8325,6 +8361,96 @@ mod tests {
 
         let inspect = DatabaseFile::inspect(&database_path).expect("inspect after shutdown");
         assert_eq!(inspect.current_record_count, 2);
+        assert_eq!(inspect.wal_records_since_checkpoint, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_background_checkpoint_serves_commands_while_connection_stays_open() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("explicit-background-checkpoint.mongodb");
+        seed_reusable_checkpoint_space(&database_path);
+
+        let mut config = BrokerConfig::new(&database_path, 2);
+        config.checkpoint_interval_secs = 60;
+        config.checkpoint_test_delay_ms = 1_500;
+        let broker = Broker::new(config).expect("broker");
+        let manifest_path = broker.paths().manifest_path.clone();
+        let serve_task = tokio::spawn(broker.clone().serve());
+        wait_for_manifest(&manifest_path, &serve_task).await;
+        let manifest = read_manifest(&manifest_path).expect("manifest");
+        let mut stream = connect(&manifest.endpoint).await.expect("connect");
+
+        let insert = send_command(
+            &mut stream,
+            doc! {
+                "insert": "widgets",
+                "documents": [{ "_id": 2_i64, "sku": "beta" }],
+                "$db": "app",
+            },
+        )
+        .await;
+        assert_eq!(insert.get_f64("ok").expect("ok"), 1.0);
+
+        let checkpoint = send_command(
+            &mut stream,
+            doc! { "mqliteCheckpoint": 1, "background": true, "$db": "admin" },
+        )
+        .await;
+        assert_eq!(checkpoint.get_f64("ok").expect("ok"), 1.0);
+        assert!(checkpoint.get_bool("background").expect("background"));
+        assert!(checkpoint.get_bool("queued").expect("queued"));
+        assert!(!checkpoint.get_bool("checkpointed").expect("checkpointed"));
+
+        let capture_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if broker
+                .storage_read()
+                .expect("storage")
+                .has_concurrent_checkpoint()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < capture_deadline,
+                "timed out waiting for explicit background checkpoint handoff"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let ping = tokio::time::timeout(
+            Duration::from_millis(250),
+            send_command(&mut stream, doc! { "ping": 1, "$db": "admin" }),
+        )
+        .await
+        .expect("ping should not wait for explicit background checkpoint");
+        assert_eq!(ping.get_f64("ok").expect("ok"), 1.0);
+
+        let during_insert = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_command(
+                &mut stream,
+                doc! {
+                    "insert": "widgets",
+                    "documents": [{ "_id": 3_i64, "sku": "gamma" }],
+                    "$db": "app",
+                },
+            ),
+        )
+        .await
+        .expect("write should not wait for explicit background checkpoint");
+        assert_eq!(during_insert.get_f64("ok").expect("ok"), 1.0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("join")
+            .expect("serve");
+
+        let inspect = DatabaseFile::inspect(&database_path).expect("inspect after shutdown");
+        assert_eq!(inspect.current_record_count, 3);
         assert_eq!(inspect.wal_records_since_checkpoint, 0);
     }
 

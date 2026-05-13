@@ -1711,6 +1711,14 @@ async fn run_benchmark_checkpoint_load_scenario(
     .await?;
     let trigger_elapsed = trigger_started.elapsed();
 
+    let checkpoint_request_started = Instant::now();
+    let checkpoint_request = send_checked_command(
+        &mut stream,
+        doc! { "mqliteCheckpoint": 1, "background": true, "$db": "admin" },
+    )
+    .await?;
+    let checkpoint_request_elapsed = checkpoint_request_started.elapsed();
+
     let capture_started = Instant::now();
     let capture_deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1765,6 +1773,8 @@ async fn run_benchmark_checkpoint_load_scenario(
 
     Ok(json!({
         "triggerInsertMs": duration_ms(trigger_elapsed),
+        "checkpointRequestMs": duration_ms(checkpoint_request_elapsed),
+        "checkpointRequest": checkpoint_request,
         "checkpointObservedAfterMs": duration_ms(checkpoint_observed_after),
         "checkpointTestDelayMs": checkpoint_test_delay_ms,
         "probeCommands": probe_commands,

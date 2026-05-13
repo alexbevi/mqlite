@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "command": "run",
+  "profile": "smoke",
+  "scenario": "checkpoint-load",
+  "file": "/tmp/mqlite-bg-checkpoint-result.mongodb",
+  "db": "bench",
+  "collection": "widgets",
+  "elapsedMs": 10016.749098,
+  "startup": null,
+  "metadata": null,
+  "pointReads": null,
+  "writes": null,
+  "checkpoint": null,
+  "checkpointLoad": {
+    "triggerInsertMs": 2536.84153,
+    "checkpointRequestMs": 0.256909,
+    "checkpointRequest": {
+      "checkpointed": false,
+      "background": true,
+      "queued": true,
+      "alreadyRunning": false,
+      "lastAppliedSequence": 2,
+      "walBytesSinceCheckpoint": 1792,
+      "ok": 1.0
+    },
+    "checkpointObservedAfterMs": 306.327837,
+    "checkpointTestDelayMs": 1500,
+    "probeCommands": 5,
+    "p50CommandMs": 0.163194,
+    "p95CommandMs": 0.223866,
+    "maxCommandMs": 0.223866,
+    "insertDuringCheckpointMs": 22.129019,
+    "stillRunningAfterProbes": true
+  },
+  "verify": null,
+  "storageBefore": {
+    "fileSize": 3477504,
+    "lastAppliedSequence": 1,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 2,
+    "recordCount": 10000,
+    "indexEntryCount": 20000,
+    "documentBytes": 1926871,
+    "indexBytes": 450000,
+    "checkpointGeneration": 3,
+    "checkpointPageCount": 422,
+    "walRecords": 0,
+    "walBytes": 0
+  },
+  "storageAfter": {
+    "fileSize": 10407936,
+    "lastAppliedSequence": 3,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 2,
+    "recordCount": 10002,
+    "indexEntryCount": 20004,
+    "documentBytes": 1927403,
+    "indexBytes": 450218,
+    "checkpointGeneration": 5,
+    "checkpointPageCount": 423,
+    "walRecords": 0,
+    "walBytes": 0
+  },
+  "targets": {
+    "startupMs": 300.0,
+    "firstPointQueryMs": 500.0
+  }
+}

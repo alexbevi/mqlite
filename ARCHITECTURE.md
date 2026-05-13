@@ -254,7 +254,7 @@ There are two checkpoint-style write paths today.
 The foreground checkpoint path writes the current in-memory state into published page roots and
 rotates the active superblock.
 
-- It is used for explicit checkpoint requests and final broker shutdown cleanup.
+- It is used for synchronous explicit checkpoint requests and final broker shutdown cleanup.
 - After the first snapshot exists, it uses the same dirty-subtree publisher as background
   publication, so clean collection pages can be reused.
 - Record and secondary-index leaf pages are packed incrementally from the live collection and index
@@ -269,6 +269,8 @@ rotates the active superblock.
 - Persisted change-event byte payloads are shared across cloned checkpoint state so background
   checkpoint capture does not duplicate full-document event bytes.
 - It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
+- Explicit `mqliteCheckpoint` requests with `"background": true` skip this foreground path and
+  queue a background published snapshot instead.
 
 ### Background Published Snapshot
 
@@ -282,6 +284,10 @@ normal command handling for the full checkpoint duration.
 - Change-event pages and plan-cache pages are reused unless those areas were dirty.
 - The superblock is rotated to the newer roots after the page graph is safely written.
 - WAL appended after the capture is preserved after the new published roots.
+- Automatic background publication still waits for client connections to drain. Explicit
+  `mqliteCheckpoint` requests with `"background": true` can queue the same publisher while a
+  connection remains open; command handling continues while the publisher writes the captured
+  snapshot.
 
 This is the main current startup optimization for dirty workloads: reopen only has to replay the
 WAL written after the latest published roots, not the full tail since the last foreground
