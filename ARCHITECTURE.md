@@ -137,6 +137,10 @@ around the page types listed above.
 `mqlite verify` is intentionally slower. It opens the mutable engine, loads the persisted state,
 replays the WAL tail, and validates the result.
 
+`count` with an empty filter uses the same metadata-first path when mutable storage is not already
+loaded. It answers from checkpoint metadata plus WAL metadata prefixes, applies `skip`/`limit`, and
+does not construct a record overlay for dirty files.
+
 ### Page-Backed Read Fast Path
 
 The page-backed read path is designed for clean checkpointed files:

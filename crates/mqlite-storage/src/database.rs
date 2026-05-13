@@ -796,6 +796,8 @@ struct DeltaOverlayCollectionReadView {
     indexes: BTreeMap<String, DeltaOverlayIndexReadView>,
 }
 
+struct ArcCollectionReadView(Arc<dyn CollectionReadView>);
+
 struct DeltaOverlayIndexReadView {
     name: String,
     key_pattern: Document,
@@ -857,6 +859,24 @@ impl CollectionReadView for DeltaOverlayCollectionReadView {
             .get(name)
             .map(|index| index as &dyn IndexReadView)
             .or_else(|| self.base.index(name))
+    }
+}
+
+impl CollectionReadView for ArcCollectionReadView {
+    fn scan_records(&self) -> Result<Vec<CollectionRecord>> {
+        self.0.scan_records()
+    }
+
+    fn record_document(&self, record_id: u64) -> Result<Option<Document>> {
+        self.0.record_document(record_id)
+    }
+
+    fn index_names(&self) -> Vec<String> {
+        self.0.index_names()
+    }
+
+    fn index(&self, name: &str) -> Option<&dyn IndexReadView> {
+        self.0.index(name)
     }
 }
 
@@ -1069,6 +1089,16 @@ impl DatabaseFile {
                 relevant_wal_records += 1;
                 let sequence = compact.sequence;
                 let mutation = compact.into_wal_entry()?.mutation;
+                if matches!(mutation, WalMutation::CreateIndexes { .. }) {
+                    if base_view.is_none() {
+                        base_view = Self::open_page_backed_collection_read_view(
+                            path, database, collection,
+                        )?
+                        .map(Arc::from);
+                    }
+                    offset = payload_end;
+                    continue;
+                }
                 if overlay_state.is_none() {
                     if base_view.is_none() {
                         base_view = Self::open_page_backed_collection_read_view(
@@ -1150,6 +1180,15 @@ impl DatabaseFile {
                 .ok()
                 .cloned()
                 .map(|collection| Box::new(collection) as Box<dyn CollectionReadView>)
+        } else if overlay_delta.is_none() {
+            base_view
+                .or_else(|| {
+                    Self::open_page_backed_collection_read_view(path, database, collection)
+                        .ok()
+                        .flatten()
+                        .map(Arc::from)
+                })
+                .map(|base| Box::new(ArcCollectionReadView(base)) as Box<dyn CollectionReadView>)
         } else {
             let base = base_view.expect("base view initialized for insert-only overlay");
             let delta = overlay_delta.expect("delta initialized for insert-only overlay");
@@ -5628,6 +5667,70 @@ mod tests {
         assert_eq!(
             counter_value(&report, Component::Storage, "recordTreeScanRecords"),
             None
+        );
+    }
+
+    #[test]
+    fn create_indexes_pending_wal_overlay_keeps_base_records_page_backed() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir
+            .path()
+            .join("pending-wal-create-indexes-overlay.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(Document::new());
+            for record_id in 1..=3 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! {
+                        "_id": record_id as i32,
+                        "sku": format!("sku-{record_id}"),
+                    },
+                );
+            }
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("commit checkpointed collection");
+            database.checkpoint().expect("checkpoint");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "sku": 1 }, "name": "sku_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
+        }
+
+        let overlay =
+            DatabaseFile::open_pending_wal_collection_read_view(&path, "app", "widgets", u64::MAX)
+                .expect("open overlay")
+                .expect("overlay result");
+
+        assert!(overlay.used_overlay);
+        assert_eq!(overlay.wal_records, 1);
+        assert_eq!(overlay.relevant_wal_records, 1);
+        let view = overlay.view.expect("overlay view");
+        assert_eq!(view.index("_id_").expect("_id index").entry_count(), 3);
+        assert_eq!(
+            view.record_document(2)
+                .expect("record lookup")
+                .expect("record")
+                .get_str("sku")
+                .expect("sku"),
+            "sku-2"
+        );
+        assert!(
+            view.index("sku_1").is_none(),
+            "metadata-only createIndexes overlay must not expose an index whose entries are not page-backed"
         );
     }
 

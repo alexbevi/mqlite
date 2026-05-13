@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "status": "metadata-count-validated",
+  "command": "target/debug/mqlite command --file /tmp/mqlite-trades-walmeta.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"count\":\"trades\",\"query\":{}}'",
+  "debugCommand": "target/debug/mqlite --debug command --file /tmp/mqlite-trades-walmeta.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"count\":\"trades\",\"query\":{}}'",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-walmeta.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "result": {
+    "n": 1000001,
+    "ok": 1.0
+  },
+  "processTime": {
+    "realSeconds": 2.20,
+    "userSeconds": 0.0,
+    "sysSeconds": 0.0,
+    "maxResidentSetBytes": 7671808,
+    "peakMemoryFootprintBytes": 3256320
+  },
+  "debug": {
+    "readPath": "metadataCount"
+  },
+  "before": {
+    "realSecondsStopped": 107.73,
+    "termination": "manual stop after dirty-WAL count fell back to record overlay construction"
+  },
+  "notes": [
+    "The file had the full import and ticker_1/ticket_1 createIndexes in the WAL tail.",
+    "Empty-filter count now uses metadata folded from checkpoint and WAL metadata prefixes instead of opening mutable storage or materializing record overlays.",
+    "This does not make indexed ticket reads/counts fast yet because secondary index entries created by pending createIndexes are not page-backed."
+  ]
+}

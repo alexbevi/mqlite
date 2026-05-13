@@ -2341,9 +2341,35 @@ impl Broker {
         let skip = body.get_i64("skip").unwrap_or(0).max(0) as usize;
         let limit = body.get_i64("limit").unwrap_or(0);
 
+        if query.is_empty() && !self.storage_is_loaded() && self.paths.database_path.exists() {
+            let info = DatabaseFile::info(&self.paths.database_path).map_err(internal_error)?;
+            let mut matches = info
+                .databases
+                .iter()
+                .find(|database_info| database_info.name == database)
+                .and_then(|database_info| {
+                    database_info
+                        .collections
+                        .iter()
+                        .find(|collection| collection.name == collection_name)
+                })
+                .map(|collection| collection.document_count)
+                .unwrap_or(0);
+            matches = matches.saturating_sub(skip);
+            if limit > 0 {
+                matches = matches.min(limit as usize);
+            }
+            set_metadata("readPath", "metadataCount");
+            return Ok(doc! { "n": matches as i64 });
+        }
+
         let mut matches =
             self.with_query_collection(&database, collection_name, |_sequence, collection| {
                 Ok(match collection {
+                    Some(collection) if query.is_empty() => match collection.index("_id_") {
+                        Some(index) => index.entry_count(),
+                        None => collection.scan_records().map_err(internal_error)?.len(),
+                    },
                     Some(collection) => collection
                         .scan_records()
                         .map_err(internal_error)?
@@ -7137,6 +7163,62 @@ mod tests {
         assert!(
             !broker.storage_is_loaded(),
             "clean checkpointed count should not force the mutable storage engine to open"
+        );
+    }
+
+    #[test]
+    fn count_uses_page_backed_fast_path_across_pending_create_indexes() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir
+            .path()
+            .join("lazy-startup-count-pending-create-indexes.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            let mut collection = CollectionCatalog::new(doc! {});
+            collection
+                .insert_record(CollectionRecord::new(
+                    1,
+                    doc! { "_id": 1_i64, "sku": "alpha" },
+                ))
+                .expect("insert");
+            collection
+                .insert_record(CollectionRecord::new(
+                    2,
+                    doc! { "_id": 2_i64, "sku": "beta" },
+                ))
+                .expect("insert");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("seed collection");
+            database.checkpoint().expect("checkpoint");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "sku": 1 }, "name": "sku_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("create pending index");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let response = broker
+            .handle_count(&doc! {
+                "count": "widgets",
+                "$db": "app",
+            })
+            .expect("count");
+        assert_eq!(response.get_i64("n").expect("count"), 2);
+        assert!(
+            !broker.storage_is_loaded(),
+            "pending createIndexes should not force mutable storage for count-all"
         );
     }
 

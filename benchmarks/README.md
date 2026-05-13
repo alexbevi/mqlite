@@ -46,7 +46,7 @@ Results:
 | --- | ---: | ---: | ---: |
 | Import 1,000,001 docs, batch 1000 | 27.87s, 35,874 docs/s | 412.17s, 2,426 docs/s | mqlite 14.8x slower |
 | Build `ticker_1` and `ticket_1` | 3.00s server-side, 8.92s including `mongosh` startup | Did not complete within 318.89s; interrupted | mqlite >106x slower to current cutoff |
-| Count all docs | p50 216.42ms | not yet comparable on a clean full mqlite file | pending |
+| Count all docs | p50 216.42ms | 2.20s cold CLI on WAL-backed indexed file via metadata path | mqlite 10.2x slower than MongoDB p50, but no full record hydration |
 | `_id` point read, 1000 iterations | p50 0.72ms, p95 1.08ms | not yet comparable on a clean full mqlite file | pending |
 | `ticket: "z300"` indexed point read, 1000 iterations | p50 1.33ms, p95 4.44ms | blocked by mqlite index build | pending |
 | `ticket: "z300"` indexed count, 10 iterations | p50 2.44ms, result 2500 | blocked by mqlite index build | pending |
@@ -221,6 +221,7 @@ First-class harness results from this patch:
 | --- | ---: | ---: | --- |
 | Import fixture, batch 1000 | 412.17s, 2,426 docs/s | 333.39s, 3,000 docs/s with live count validation | Single broker connection removed per-batch client spawn overhead and the live count matched 1,000,001 documents. The file remains WAL-backed until checkpointed. The fresh WAL-metadata-prefix run took 334.77s process wall time and avoided the earlier long cleanup gap. |
 | Build `ticker_1` and `ticket_1` after import | did not complete within 318.89s; interrupted near 11.8 GiB RSS in the original probe | 331.65s, observed broker RSS roughly 4.0 GiB at 3:47 | Existing-record index builds now collect keys linearly, sort once, and apply the validation-built indexes instead of rebuilding them again during mutation apply. The command completed and reopen metadata reported 3 indexes and 3,000,003 entries. It remains far slower than MongoDB and still needs a page-backed or external-sort bulk builder. |
+| Count all documents after import and index build | manually stopped after 107.73s after falling back to dirty-WAL record overlay | 2.20s real, 7.7 MB CLI max RSS | Empty-filter `count` now answers from metadata folded across checkpoint and WAL prefixes. Debug output reported `readPath=metadataCount` and returned `n=1,000,001`. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 | WAL-backed metadata fold, full fixture | not measured | 1.41s real, 25.8 MB max RSS | New WAL frames carry a metadata prefix, so `mqlite info` folded 1001 import batches and reported 1,000,001 records without deserializing the full mutation payloads. A 10k-prefix smoke also completed in 0.02s real with 10.9 MB max RSS. |
 
@@ -232,6 +233,8 @@ The fresh WAL metadata prefix run is checked in at
 `benchmarks/results/2026-05-13-trades-import-wal-metadata.json`.
 The completed full-fixture secondary-index run is checked in at
 `benchmarks/results/2026-05-13-trades-secondary-indexes.json`.
+The metadata-backed count-all run is checked in at
+`benchmarks/results/2026-05-13-trades-count-metadata.json`.
 
 ## Next Work Items
 
@@ -244,4 +247,6 @@ The completed full-fixture secondary-index run is checked in at
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
 - Once mqlite can build the `ticker` and `ticket` indexes, add comparable mqlite
-  read results for `_id`, `ticket`, `ticker`, count, startup, and metadata.
+  read results for `_id`, `ticket`, `ticker`, startup, and indexed counts. The
+  empty-filter count path is now measured, but indexed `ticket` reads/counts are
+  still blocked by the pending secondary-index WAL representation.
