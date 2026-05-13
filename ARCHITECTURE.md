@@ -370,6 +370,8 @@ index scans.
 In-memory runtime index pages are packed by consuming the sorted build output directly and rebuild
 stats by streaming page entries, so an index build or load does not need to materialize second flat
 entry vectors just to refresh planner frequencies.
+WAL replay for `createIndexes` installs built indexes by moving them into the collection catalog
+when the caller does not need a returned full index list.
 
 ## Planner And Plan Cache
 

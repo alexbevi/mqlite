@@ -1297,6 +1297,18 @@ pub fn apply_index_specs(
     Ok(created)
 }
 
+pub fn install_index_specs(
+    collection: &mut CollectionCatalog,
+    specs: &[Document],
+) -> Result<usize, CatalogError> {
+    let created = build_index_specs(collection, specs)?;
+    let created_count = created.len();
+    for index in created {
+        collection.indexes.insert(index.name.clone(), index);
+    }
+    Ok(created_count)
+}
+
 pub fn build_index_specs(
     collection: &CollectionCatalog,
     specs: &[Document],
@@ -2046,6 +2058,29 @@ mod tests {
                 .expect("drop"),
             1
         );
+    }
+
+    #[test]
+    fn installs_index_specs_without_returning_full_index_catalogs() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        collection
+            .insert_record(CollectionRecord::new(2, doc! { "_id": 2, "sku": "b" }))
+            .expect("insert");
+        collection
+            .insert_record(CollectionRecord::new(1, doc! { "_id": 1, "sku": "a" }))
+            .expect("insert");
+
+        let created = super::install_index_specs(
+            &mut collection,
+            &[doc! { "key": { "sku": 1 }, "name": "sku_1" }],
+        )
+        .expect("install index");
+
+        assert_eq!(created, 1);
+        let index = collection.indexes.get("sku_1").expect("installed index");
+        assert_eq!(index.entry_count(), 2);
+        assert!(index.entries.is_empty());
+        assert!(!index.entries_materialized);
     }
 
     #[test]

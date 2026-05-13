@@ -16,7 +16,7 @@ use fs4::FileExt;
 use mqlite_catalog::{
     Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBound,
     IndexBounds, IndexCatalog, IndexEntry, apply_index_specs, build_index_specs,
-    validate_collection_indexes, validate_drop_indexes,
+    install_index_specs, validate_collection_indexes, validate_drop_indexes,
 };
 use mqlite_debug::{Component, add_counter, record_duration, set_metadata, span};
 use serde::{Deserialize, Serialize};
@@ -4581,7 +4581,8 @@ fn apply_create_indexes(
             .create_collection(database, collection, options.clone())?;
     }
 
-    state.catalog.create_indexes(database, collection, specs)?;
+    let collection_state = state.catalog.get_collection_mut(database, collection)?;
+    install_index_specs(collection_state, specs)?;
     Ok(())
 }
 
