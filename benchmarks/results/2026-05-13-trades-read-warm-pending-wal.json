@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "command": "trades-read",
+  "file": "/tmp/mqlite-trades-prefix2-full.mongodb",
+  "db": "market",
+  "collection": "trades",
+  "ticket": "z300",
+  "elapsedMs": 26089.882806999998,
+  "startupMs": 28.905052,
+  "ticketFind": {
+    "reads": 100,
+    "elapsedMs": 25517.689498,
+    "queriesPerSec": 3.918849397021329,
+    "firstQueryElapsedMs": 255.77342,
+    "p50Ms": 253.922845,
+    "p95Ms": 263.92044500000003,
+    "maxMs": 282.146068,
+    "firstDocumentId": {
+      "$oid": "5597a1627df886b33f83a062"
+    },
+    "readPath": "pendingWalEqualityLookup",
+    "pendingWalRecords": 1002,
+    "pendingWalRelevantRecords": 1002,
+    "zstdBlobsDecompressed": 1,
+    "zstdBytesDecompressed": 1137203
+  },
+  "ticketCount": {
+    "reads": 10,
+    "expectedCount": 2500,
+    "elapsedMs": 491.850959,
+    "queriesPerSec": 20.331307148470717,
+    "firstQueryElapsedMs": 50.126253000000005,
+    "p50Ms": 49.507439,
+    "p95Ms": 51.176553999999996,
+    "maxMs": 51.176553999999996,
+    "readPath": "pendingWalEqualityCount",
+    "pendingWalRecords": 1002,
+    "pendingWalRelevantRecords": 1002
+  },
+  "storage": {
+    "fileSize": 32492849,
+    "lastAppliedSequence": 1002,
+    "databaseCount": 1,
+    "collectionCount": 1,
+    "indexCount": 3,
+    "recordCount": 1000001,
+    "indexEntryCount": 3000003,
+    "documentBytes": 243000226,
+    "indexBytes": 154000154,
+    "checkpointGeneration": 2,
+    "checkpointPageCount": 0,
+    "walRecords": 1002,
+    "walBytes": 32472369
+  },
+  "comparison": {
+    "mongodbTicketPointP50Ms": 1.33,
+    "mongodbTicketPointP95Ms": 4.44,
+    "mongodbTicketCountP50Ms": 2.44
+  },
+  "notes": [
+    "The harness reuses one broker connection and reports warm command latency percentiles.",
+    "The full file is still dirty-WAL-backed, so these are pending-WAL read paths rather than clean checkpointed secondary-index reads."
+  ]
+}

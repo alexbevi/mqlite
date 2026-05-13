@@ -152,6 +152,24 @@ enum BenchCommand {
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
     },
+    TradesRead {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "market")]
+        db: String,
+        #[arg(long, default_value = "trades")]
+        collection: String,
+        #[arg(long, default_value = "z300")]
+        ticket: String,
+        #[arg(long, default_value_t = 100)]
+        reads: u32,
+        #[arg(long, default_value_t = 10)]
+        count_reads: u32,
+        #[arg(long, default_value_t = 2500)]
+        expected_ticket_count: i64,
+        #[arg(long, default_value_t = 60)]
+        idle_shutdown_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -315,7 +333,8 @@ async fn main() -> Result<()> {
                     match &command {
                         BenchCommand::Seed { file, .. }
                         | BenchCommand::Run { file, .. }
-                        | BenchCommand::TradesImport { file, .. } => {
+                        | BenchCommand::TradesImport { file, .. }
+                        | BenchCommand::TradesRead { file, .. } => {
                             session.insert_metadata("file", file.display().to_string());
                         }
                     }
@@ -392,6 +411,30 @@ async fn main() -> Result<()> {
                                 batch_size,
                                 reset,
                                 checkpoint,
+                                idle_shutdown_secs,
+                            },
+                        )
+                        .await?
+                    }
+                    BenchCommand::TradesRead {
+                        file,
+                        db,
+                        collection,
+                        ticket,
+                        reads,
+                        count_reads,
+                        expected_ticket_count,
+                        idle_shutdown_secs,
+                    } => {
+                        run_trades_read_benchmark(
+                            &file,
+                            TradesReadOptions {
+                                db: &db,
+                                collection: &collection,
+                                ticket: &ticket,
+                                reads,
+                                count_reads,
+                                expected_ticket_count,
                                 idle_shutdown_secs,
                             },
                         )
@@ -758,6 +801,16 @@ struct TradesImportOptions<'a> {
     batch_size: usize,
     reset: bool,
     checkpoint: bool,
+    idle_shutdown_secs: u64,
+}
+
+struct TradesReadOptions<'a> {
+    db: &'a str,
+    collection: &'a str,
+    ticket: &'a str,
+    reads: u32,
+    count_reads: u32,
+    expected_ticket_count: i64,
     idle_shutdown_secs: u64,
 }
 
@@ -1241,6 +1294,146 @@ async fn run_trades_import_benchmark(
         "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
         "insertMaxMs": duration_ms(insert_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
         "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+async fn run_trades_read_benchmark(
+    file: &Path,
+    options: TradesReadOptions<'_>,
+) -> Result<serde_json::Value> {
+    if options.reads == 0 {
+        bail!("--reads must be greater than 0");
+    }
+    if options.count_reads == 0 {
+        bail!("--count-reads must be greater than 0");
+    }
+
+    let started = Instant::now();
+    let startup_started = Instant::now();
+    let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
+    let startup_elapsed = startup_started.elapsed();
+    let find = run_trades_ticket_find_reads(&mut stream, &options).await?;
+    let count = run_trades_ticket_count_reads(&mut stream, &options).await?;
+    let info = DatabaseFile::info(file)?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "command": "trades-read",
+        "file": file.display().to_string(),
+        "db": options.db,
+        "collection": options.collection,
+        "ticket": options.ticket,
+        "elapsedMs": duration_ms(started.elapsed()),
+        "startupMs": duration_ms(startup_elapsed),
+        "ticketFind": find,
+        "ticketCount": count,
+        "storage": benchmark_storage_summary(&info),
+    }))
+}
+
+async fn run_trades_ticket_find_reads(
+    stream: &mut BoxedStream,
+    options: &TradesReadOptions<'_>,
+) -> Result<serde_json::Value> {
+    let mut latencies = Vec::with_capacity(options.reads as usize);
+    let mut first_query_debug = None;
+    let mut first_document_id = None;
+    let started = Instant::now();
+    for index in 0..options.reads {
+        let command = doc! {
+            "find": options.collection,
+            "filter": { "ticket": options.ticket },
+            "limit": 1,
+            "singleBatch": true,
+            "$db": options.db,
+        };
+        let query_started = Instant::now();
+        let response = if index == 0 {
+            let (response, debug) = send_checked_command_with_broker_debug(stream, command).await?;
+            first_query_debug = debug;
+            response
+        } else {
+            send_checked_command(stream, command).await?
+        };
+        latencies.push(query_started.elapsed());
+        let first_batch = response
+            .get_document("cursor")
+            .context("find reply missing cursor")?
+            .get_array("firstBatch")
+            .context("find reply missing firstBatch")?;
+        if first_batch.len() != 1 {
+            bail!(
+                "trades ticket find expected one document for ticket `{}`, got {}",
+                options.ticket,
+                first_batch.len()
+            );
+        }
+        if first_document_id.is_none() {
+            first_document_id = first_batch[0]
+                .as_document()
+                .and_then(|document| document.get("_id").cloned());
+        }
+    }
+
+    Ok(json!({
+        "reads": options.reads,
+        "elapsedMs": duration_ms(started.elapsed()),
+        "queriesPerSec": rate_per_second(options.reads, started.elapsed()),
+        "firstQueryElapsedMs": duration_ms(*latencies.first().unwrap_or(&Duration::ZERO)),
+        "p50Ms": duration_ms(percentile_duration(&latencies, 50.0)),
+        "p95Ms": duration_ms(percentile_duration(&latencies, 95.0)),
+        "maxMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "firstDocumentId": first_document_id,
+        "firstQueryDebug": first_query_debug,
+    }))
+}
+
+async fn run_trades_ticket_count_reads(
+    stream: &mut BoxedStream,
+    options: &TradesReadOptions<'_>,
+) -> Result<serde_json::Value> {
+    let mut latencies = Vec::with_capacity(options.count_reads as usize);
+    let mut first_query_debug = None;
+    let started = Instant::now();
+    for index in 0..options.count_reads {
+        let command = doc! {
+            "count": options.collection,
+            "query": { "ticket": options.ticket },
+            "$db": options.db,
+        };
+        let query_started = Instant::now();
+        let response = if index == 0 {
+            let (response, debug) = send_checked_command_with_broker_debug(stream, command).await?;
+            first_query_debug = debug;
+            response
+        } else {
+            send_checked_command(stream, command).await?
+        };
+        latencies.push(query_started.elapsed());
+        let count = bson_numeric_i64(
+            response
+                .get("n")
+                .ok_or_else(|| anyhow!("count response missing `n`"))?,
+        )
+        .context("count response `n` must be numeric")?;
+        if count != options.expected_ticket_count {
+            bail!(
+                "trades ticket count expected {}, got {count}",
+                options.expected_ticket_count
+            );
+        }
+    }
+
+    Ok(json!({
+        "reads": options.count_reads,
+        "expectedCount": options.expected_ticket_count,
+        "elapsedMs": duration_ms(started.elapsed()),
+        "queriesPerSec": rate_per_second(options.count_reads, started.elapsed()),
+        "firstQueryElapsedMs": duration_ms(*latencies.first().unwrap_or(&Duration::ZERO)),
+        "p50Ms": duration_ms(percentile_duration(&latencies, 50.0)),
+        "p95Ms": duration_ms(percentile_duration(&latencies, 95.0)),
+        "maxMs": duration_ms(latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
+        "firstQueryDebug": first_query_debug,
     }))
 }
 
