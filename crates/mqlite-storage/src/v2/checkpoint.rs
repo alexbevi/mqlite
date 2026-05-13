@@ -624,7 +624,7 @@ impl CheckpointWriter {
         if change_events.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode(change_events.to_vec(), |chunk| {
+        let chunks = chunk_by_encode_refs(change_events, |chunk| {
             ChangeEventsPage {
                 page_id: 1,
                 next_page_id: None,
@@ -660,7 +660,7 @@ impl CheckpointWriter {
         if plan_cache_entries.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode(plan_cache_entries.to_vec(), |chunk| {
+        let chunks = chunk_by_encode_refs(plan_cache_entries, |chunk| {
             PlanCachePage {
                 page_id: 1,
                 next_page_id: None,
@@ -1104,6 +1104,13 @@ fn chunk_by_encode<T: Clone>(
     items: Vec<T>,
     fits: impl Fn(&[T]) -> Result<()>,
 ) -> Result<Vec<Vec<T>>> {
+    chunk_by_encode_refs(&items, fits)
+}
+
+fn chunk_by_encode_refs<T: Clone>(
+    items: &[T],
+    fits: impl Fn(&[T]) -> Result<()>,
+) -> Result<Vec<Vec<T>>> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -1111,7 +1118,7 @@ fn chunk_by_encode<T: Clone>(
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     for item in items {
-        current.push(item);
+        current.push(item.clone());
         if current.len() > 1 && fits(&current).is_err() {
             let last = current.pop().expect("overflowing item");
             chunks.push(current);
