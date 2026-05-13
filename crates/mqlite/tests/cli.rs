@@ -770,6 +770,60 @@ fn bench_trades_import_streams_fixture_over_one_broker_connection() {
 }
 
 #[test]
+fn bench_trades_import_can_queue_background_checkpoint() {
+    let temp_dir = tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("trades-background-checkpoint.mongodb");
+    let fixture_path = temp_dir.path().join("trades.json");
+    fs::write(
+        &fixture_path,
+        concat!(
+            r#"{"_id":{"$oid":"5597a1617df886b33f839f9a"},"ticker":"abcd","ticket":"z300","price":110}"#,
+            "\n",
+            r#"{"_id":{"$oid":"5597a1627df886b33f839f9b"},"ticker":"wxyz","shares":200}"#,
+            "\n",
+        ),
+    )
+    .expect("write fixture");
+
+    let mut bench = Command::cargo_bin("mqlite").expect("binary");
+    let output = bench
+        .args([
+            "bench",
+            "trades-import",
+            "--file",
+            database_path.to_str().expect("path"),
+            "--fixture",
+            fixture_path.to_str().expect("path"),
+            "--batch-size",
+            "2",
+            "--reset",
+            "--create-indexes",
+            "--background-checkpoint",
+            "--idle-shutdown-secs",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let response: Value = serde_json::from_slice(&output).expect("json response");
+    assert_eq!(response["checkpointRequested"], false);
+    assert_eq!(response["checkpointed"], false);
+    assert_eq!(response["backgroundCheckpointRequested"], true);
+    assert_eq!(response["backgroundCheckpointQueued"], true);
+    assert_eq!(response["backgroundCheckpointResponse"]["background"], true);
+    assert_eq!(response["storage"]["recordCount"], 2);
+    assert_eq!(response["storage"]["walRecords"], 0);
+
+    let info = DatabaseFile::info(&database_path).expect("info");
+    assert_eq!(info.summary.record_count, 2);
+    assert_eq!(info.summary.index_count, 3);
+    assert_eq!(info.wal_since_checkpoint.record_count, 0);
+}
+
+#[test]
 fn command_collectionless_aggregate_supports_documents_stage() {
     let temp_dir = tempdir().expect("tempdir");
     let database_path = temp_dir.path().join("command-documents.mongodb");

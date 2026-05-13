@@ -151,6 +151,8 @@ enum BenchCommand {
         create_indexes: bool,
         #[arg(long)]
         checkpoint: bool,
+        #[arg(long)]
+        background_checkpoint: bool,
         #[arg(long, default_value_t = 60)]
         idle_shutdown_secs: u64,
     },
@@ -405,6 +407,7 @@ async fn main() -> Result<()> {
                         reset,
                         create_indexes,
                         checkpoint,
+                        background_checkpoint,
                         idle_shutdown_secs,
                     } => {
                         run_trades_import_benchmark(
@@ -417,6 +420,7 @@ async fn main() -> Result<()> {
                                 reset,
                                 create_indexes,
                                 checkpoint,
+                                background_checkpoint,
                                 idle_shutdown_secs,
                             },
                         )
@@ -810,6 +814,7 @@ struct TradesImportOptions<'a> {
     reset: bool,
     create_indexes: bool,
     checkpoint: bool,
+    background_checkpoint: bool,
     idle_shutdown_secs: u64,
 }
 
@@ -1175,6 +1180,9 @@ async fn run_trades_import_benchmark(
     if options.batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
+    if options.checkpoint && options.background_checkpoint {
+        bail!("--checkpoint and --background-checkpoint are mutually exclusive");
+    }
     if options.reset && file.exists() {
         std::fs::remove_file(file)
             .with_context(|| format!("failed to reset benchmark database `{}`", file.display()))?;
@@ -1281,7 +1289,7 @@ async fn run_trades_import_benchmark(
     } else {
         (false, None, None)
     };
-    let (checkpointed, checkpoint_elapsed) = if options.checkpoint {
+    let (checkpointed, checkpoint_elapsed, checkpoint_response) = if options.checkpoint {
         let checkpoint_started = Instant::now();
         let checkpoint_response = send_checked_command(
             &mut stream,
@@ -1296,9 +1304,41 @@ async fn run_trades_import_benchmark(
                 .get_bool("checkpointed")
                 .unwrap_or(false),
             Some(checkpoint_started.elapsed()),
+            Some(checkpoint_response),
         )
     } else {
-        (false, None)
+        (false, None, None)
+    };
+    let (
+        background_checkpoint_queued,
+        background_checkpoint_elapsed,
+        background_checkpoint_response,
+    ) = if options.background_checkpoint {
+        let checkpoint_started = Instant::now();
+        let checkpoint_response = send_checked_command(
+            &mut stream,
+            doc! {
+                "mqliteCheckpoint": 1,
+                "background": true,
+                "$db": "admin",
+            },
+        )
+        .await?;
+        (
+            checkpoint_response.get_bool("queued").unwrap_or(false),
+            Some(checkpoint_started.elapsed()),
+            Some(checkpoint_response),
+        )
+    } else {
+        (false, None, None)
+    };
+
+    if options.background_checkpoint {
+        drop(stream);
+        wait_for_broker_shutdown(
+            file,
+            Duration::from_secs(options.idle_shutdown_secs.max(1) + 30),
+        )?;
     };
 
     let elapsed = started.elapsed();
@@ -1327,11 +1367,31 @@ async fn run_trades_import_benchmark(
         "checkpointRequested": options.checkpoint,
         "checkpointMs": checkpoint_elapsed.map(duration_ms),
         "checkpointed": checkpointed,
+        "checkpointResponse": checkpoint_response,
+        "backgroundCheckpointRequested": options.background_checkpoint,
+        "backgroundCheckpointQueued": background_checkpoint_queued,
+        "backgroundCheckpointRequestMs": background_checkpoint_elapsed.map(duration_ms),
+        "backgroundCheckpointResponse": background_checkpoint_response,
         "insertP50Ms": duration_ms(percentile_duration(&insert_latencies, 50.0)),
         "insertP95Ms": duration_ms(percentile_duration(&insert_latencies, 95.0)),
         "insertMaxMs": duration_ms(insert_latencies.iter().copied().max().unwrap_or(Duration::ZERO)),
         "storage": benchmark_storage_summary(&info),
     }))
+}
+
+fn wait_for_broker_shutdown(file: &Path, timeout: Duration) -> Result<()> {
+    let paths = broker_paths(file)?;
+    let deadline = Instant::now() + timeout;
+    while paths.manifest_path.exists() {
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for mqlite broker manifest to be removed at {}",
+                paths.manifest_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
 }
 
 async fn run_trades_read_benchmark(
