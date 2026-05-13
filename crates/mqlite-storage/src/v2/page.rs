@@ -53,6 +53,11 @@ pub(crate) struct RecordLeafPage {
 }
 
 impl RecordLeafPage {
+    pub(crate) fn entries_fit(entry_count: usize, total_payload_bytes: usize) -> Result<bool> {
+        let slot_area_end = page_slot_area_end(entry_count, RECORD_LEAF_SLOT_LEN)?;
+        Ok(PAGE_LEN.saturating_sub(total_payload_bytes) >= slot_area_end)
+    }
+
     pub fn encode(&self) -> Result<[u8; PAGE_LEN]> {
         let mut bytes = [0_u8; PAGE_LEN];
         encode_header(
@@ -1045,6 +1050,19 @@ mod tests {
                 RecordSlot::from_document(12, &doc! { "_id": 2, "sku": "b" }).expect("record"),
             ],
         };
+        assert!(
+            RecordLeafPage::entries_fit(
+                leaf.entries.len(),
+                leaf.entries
+                    .iter()
+                    .map(|entry| entry.encoded_document.len())
+                    .sum()
+            )
+            .expect("record leaf fit check")
+        );
+        assert!(
+            !RecordLeafPage::entries_fit(1, 32 * 1024).expect("oversized record leaf fit check")
+        );
         let decoded_leaf =
             RecordLeafPage::decode(&leaf.encode().expect("encode leaf")).expect("decode leaf");
         assert_eq!(decoded_leaf, leaf);

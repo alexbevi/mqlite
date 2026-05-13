@@ -786,56 +786,84 @@ impl CheckpointWriter {
             return Ok((None, 0));
         }
         let mut document_bytes = 0_u64;
-        let slots = collection
-            .records
-            .iter()
-            .map(|record| {
-                let slot = RecordSlot {
-                    record_id: record.record_id,
-                    encoded_document: record.encoded_document_bytes()?.into_owned(),
-                };
-                document_bytes += slot.encoded_document.len() as u64;
-                Ok(slot)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let leaf_chunks = chunk_by_encode_adaptive(slots, 32, |chunk| {
-            RecordLeafPage {
-                page_id: 1,
-                next_page_id: None,
-                entries: chunk.to_vec(),
-            }
-            .encode()
-            .map(|_| ())
-        })?;
-        let leaf_ids = (0..leaf_chunks.len())
-            .map(|_| self.allocate_page_id())
-            .collect::<Vec<_>>();
         let mut children = Vec::new();
-        for (index, chunk) in leaf_chunks.into_iter().enumerate() {
-            let page_id = leaf_ids[index];
-            let next_page_id = leaf_ids.get(index + 1).copied();
-            let first_record_id = chunk[0].record_id;
-            self.pages.push((
-                page_id,
-                RecordLeafPage {
-                    page_id,
-                    next_page_id,
-                    entries: chunk,
+        let mut current_page_id = self.allocate_page_id();
+        let mut current_entries = Vec::new();
+        let mut current_payload_bytes = 0_usize;
+        let mut current_first_record_id = None;
+
+        for record in &collection.records {
+            let slot = RecordSlot {
+                record_id: record.record_id,
+                encoded_document: record.encoded_document_bytes()?.into_owned(),
+            };
+            document_bytes += slot.encoded_document.len() as u64;
+            current_payload_bytes += slot.encoded_document.len();
+            if current_first_record_id.is_none() {
+                current_first_record_id = Some(slot.record_id);
+            }
+            current_entries.push(slot);
+            if !RecordLeafPage::entries_fit(current_entries.len(), current_payload_bytes)? {
+                if current_entries.len() == 1 {
+                    return Err(anyhow!("item exceeds v2 page capacity"));
                 }
-                .encode()?
-                .to_vec(),
-            ));
-            children.push(RecordChild {
-                page_id,
-                first_record_id,
-            });
+                let overflow = current_entries.pop().expect("overflowing record slot");
+                current_payload_bytes -= overflow.encoded_document.len();
+                let next_page_id = self.allocate_page_id();
+                self.push_record_leaf_page(
+                    current_page_id,
+                    Some(next_page_id),
+                    current_entries,
+                    current_first_record_id.expect("record leaf first id"),
+                    &mut children,
+                )?;
+                current_page_id = next_page_id;
+                current_first_record_id = Some(overflow.record_id);
+                current_payload_bytes = overflow.encoded_document.len();
+                current_entries = vec![overflow];
+                if !RecordLeafPage::entries_fit(current_entries.len(), current_payload_bytes)? {
+                    return Err(anyhow!("item exceeds v2 page capacity"));
+                }
+            }
         }
+
+        self.push_record_leaf_page(
+            current_page_id,
+            None,
+            current_entries,
+            current_first_record_id.expect("record leaf first id"),
+            &mut children,
+        )?;
 
         while children.len() > 1 {
             children = self.write_record_level(children)?;
         }
         Ok((Some(children[0].page_id), document_bytes))
+    }
+
+    fn push_record_leaf_page(
+        &mut self,
+        page_id: PageId,
+        next_page_id: Option<PageId>,
+        entries: Vec<RecordSlot>,
+        first_record_id: u64,
+        children: &mut Vec<RecordChild>,
+    ) -> Result<()> {
+        self.pages.push((
+            page_id,
+            RecordLeafPage {
+                page_id,
+                next_page_id,
+                entries,
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        children.push(RecordChild {
+            page_id,
+            first_record_id,
+        });
+        Ok(())
     }
 
     fn write_record_level(&mut self, children: Vec<RecordChild>) -> Result<Vec<RecordChild>> {

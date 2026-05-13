@@ -222,6 +222,9 @@ rotates the active superblock.
 - It is used for explicit checkpoint requests and final broker shutdown cleanup.
 - After the first snapshot exists, it uses the same dirty-subtree publisher as background
   publication, so clean collection pages can be reused.
+- Record leaf pages are packed incrementally from the live collection records, so checkpoint
+  publication no longer has to materialize a second full vector of record slots before writing
+  record pages.
 - It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
 
 ### Background Published Snapshot
