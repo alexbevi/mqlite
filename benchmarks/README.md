@@ -247,6 +247,7 @@ First-class harness results from this patch:
 | Clean checkpointed `ticket:"z300"` count | clean read coverage was blocked before checkpoint completion | 7.26ms warm p50, 8.23ms p95 over 10 counts | Clean equality count now uses `readPath=indexedEqualityCount`; because `z300` is outside the bounded persisted frequency sample, it scanned 2,500 matching index entries and did not hydrate collection records. |
 | Explicit background checkpoint under load, smoke fixture | automatic background checkpoint waited for connection drain | checkpoint request 0.26ms; ping p50 0.16ms, p95 0.22ms; write during checkpoint 22.13ms | `bench run --scenario checkpoint-load` now sends `mqliteCheckpoint` with `"background": true`, observes the handoff while the connection stays open, and proves commands continue during the delayed publisher. |
 | 10k import, `ticker_1`/`ticket_1`, checkpoint after index-memory reductions | prior 10k checkpoint probe completed but used about 123 MB max RSS in the standalone checkpoint path | 6.52s total, 360ms index build, 2.81s checkpoint, 20.9 MB max RSS | The smoke run uses the first 10k documents from `benchmarks/trades.json.zst` and records the runtime-page packing, capped runtime stats, moved replay install, and streaming persisted stats changes. |
+| 10k import, chunked non-unique index build, checkpoint | 10k post-stats-cap smoke was 6.52s total, 360ms index build, 2.81s checkpoint, 20.9 MB max RSS | 6.44s total, 361ms index build, 2.75s checkpoint, 22.2 MB max RSS | Non-unique `ticker_1` and `ticket_1` now build from bounded record chunks instead of one full sorted entry vector per index. |
 | WAL-backed metadata fold, full fixture | not measured | 0.07s real, 9.6 MB max RSS | New WAL frames keep the metadata prefix outside compressed mutation payloads, so `mqlite info` folded 1,002 WAL records and reported 1,000,001 records plus 3,000,003 index entries without deserializing the full mutation payloads. |
 
 The successful live-count result is checked in at
@@ -286,6 +287,8 @@ The explicit background checkpoint-load smoke run is checked in at
 The post-index-memory-reduction 10k import/index/checkpoint smoke run is checked
 in at
 `benchmarks/results/2026-05-13-trades-10k-index-memory-after-stats-cap.json`.
+The chunked non-unique index-build 10k smoke run is checked in at
+`benchmarks/results/2026-05-13-trades-10k-chunked-nonunique-index-build.json`.
 
 ## Next Work Items
 

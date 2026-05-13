@@ -16,6 +16,7 @@ const INDEX_PAGE_BYTES: usize = 4096;
 const INDEX_PAGE_HEADER_BYTES: usize = 32;
 const INDEX_PAGE_SLOT_BYTES: usize = 16;
 const MAX_RUNTIME_VALUE_FREQUENCIES_PER_FIELD: usize = 4096;
+const NON_UNIQUE_INDEX_BUILD_CHUNK_RECORDS: usize = 8192;
 
 fn default_next_record_id() -> u64 {
     1
@@ -1311,24 +1312,40 @@ pub fn build_index_specs(
     let mut created = prepare_index_specs(collection, specs)?;
 
     for index in &mut created {
-        let mut entries = Vec::with_capacity(collection.records.len());
-        for record in &collection.records {
-            validate_record_against_index(index, &record.document, None)?;
-            entries.push(index_entry_for_document(
-                record.record_id,
-                &record.document,
-                &index.key,
-            ));
-        }
-        index.sort_entries(&mut entries);
         if index.unique {
+            let mut entries = Vec::with_capacity(collection.records.len());
+            for record in &collection.records {
+                validate_record_against_index(index, &record.document, None)?;
+                entries.push(index_entry_for_document(
+                    record.record_id,
+                    &record.document,
+                    &index.key,
+                ));
+            }
+            index.sort_entries(&mut entries);
             for pair in entries.windows(2) {
                 if compare_index_keys(&pair[0].key, &pair[1].key, &index.key) == Ordering::Equal {
                     return Err(CatalogError::DuplicateKey(index.name.clone()));
                 }
             }
+            index.replace_entries(entries)?;
+        } else {
+            for chunk in collection
+                .records
+                .chunks(NON_UNIQUE_INDEX_BUILD_CHUNK_RECORDS)
+            {
+                let mut entries = Vec::with_capacity(chunk.len());
+                for record in chunk {
+                    entries.push(index_entry_for_document(
+                        record.record_id,
+                        &record.document,
+                        &index.key,
+                    ));
+                }
+                index.sort_entries(&mut entries);
+                index.append_entries(entries)?;
+            }
         }
-        index.replace_entries(entries)?;
     }
 
     Ok(created)
@@ -2112,6 +2129,52 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].record_id, 1);
         assert_eq!(entries[1].record_id, 2);
+    }
+
+    #[test]
+    fn non_unique_index_builds_in_chunks_without_flat_materialized_entries() {
+        let mut collection = CollectionCatalog::new(doc! {});
+        for record_id in 0..(super::NON_UNIQUE_INDEX_BUILD_CHUNK_RECORDS as u64 + 17) {
+            collection
+                .insert_record(CollectionRecord::new(
+                    record_id + 1,
+                    doc! {
+                        "_id": record_id as i64,
+                        "sku": format!("sku-{:05}", 90000_u64 - record_id),
+                        "bucket": format!("b{}", record_id % 8),
+                    },
+                ))
+                .expect("insert");
+        }
+
+        let created = super::apply_index_specs(
+            &mut collection,
+            &[doc! { "key": { "bucket": 1 }, "name": "bucket_1" }],
+        )
+        .expect("create index");
+
+        let index = &created[0];
+        assert_eq!(
+            index.entry_count(),
+            super::NON_UNIQUE_INDEX_BUILD_CHUNK_RECORDS + 17
+        );
+        assert!(index.entries.is_empty());
+        assert!(!index.entries_materialized);
+        assert_eq!(
+            index.estimate_value_count("bucket", &Bson::String("b3".to_string())),
+            Some(1026)
+        );
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "bucket": "b3" },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "bucket": "b3" },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids.len(), 1026);
     }
 
     #[test]

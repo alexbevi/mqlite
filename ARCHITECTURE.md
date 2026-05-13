@@ -370,6 +370,9 @@ index scans.
 In-memory runtime index pages are packed by consuming the sorted build output directly and rebuild
 stats by streaming page entries, so an index build or load does not need to materialize second flat
 entry vectors just to refresh planner frequencies.
+Non-unique secondary index builds use bounded record chunks and append sorted chunk entries into
+runtime pages, so common bulk builds such as `ticker_1` and `ticket_1` avoid one full sorted entry
+vector. Unique index builds still use a full sorted vector for duplicate-key validation.
 Runtime value-frequency stats are capped per indexed field; high-cardinality fields keep entry and
 presence counts but report unavailable value estimates rather than retaining unbounded histograms.
 Persisted checkpoint stats follow the same shape and stream over index entries without cloning a
