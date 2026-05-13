@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "status": "checkpoint-timeout",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-prefix2-full.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "command": "timeout 360 target/debug/mqlite checkpoint --file /tmp/mqlite-trades-prefix2-full.mongodb",
+  "processTime": {
+    "realSeconds": 360.93,
+    "userSeconds": 344.55,
+    "systemSeconds": 11.83,
+    "maxResidentSetBytes": 11236843520,
+    "peakMemoryFootprintBytes": 561152
+  },
+  "exitCode": 124,
+  "postTimeoutInfo": {
+    "lastAppliedSequence": 1002,
+    "checkpointLastAppliedSequence": 0,
+    "walRecordsSinceCheckpoint": 1002,
+    "recordCount": 1000001,
+    "indexEntryCount": 3000003
+  },
+  "notes": [
+    "The foreground checkpoint path still does not complete on the full trades fixture within 360 seconds.",
+    "The timeout did not leave the file appearing clean; checkpoint LSN remained 0 and the WAL still reported 1002 records.",
+    "The checkpoint process reached about 11.2 GB max RSS, so the next checkpoint milestone needs to address full-state memory pressure or move explicit checkpointing to a bounded/concurrent path."
+  ]
+}

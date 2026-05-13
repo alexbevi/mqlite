@@ -240,7 +240,7 @@ First-class harness results from this patch:
 | `ticket:"z300"` point read after import and index build | did not return within 30s on the generic hydrated path | 253.92ms warm p50, 263.92ms p95 over 100 reads | `bench trades-read` reported `readPath=pendingWalEqualityLookup` and returned the first matching document without opening mutable storage. This is still far slower than MongoDB's 1.33ms p50 and still dirty-WAL-backed rather than clean checkpointed secondary-index execution. |
 | `ticker:"abcd"` point read after import and index build | not previously measured | 248.34ms warm p50, 272.64ms p95 over 100 reads | `bench trades-read` reported `readPath=pendingWalEqualityLookup`; this covers ticker read latency but is still dirty-WAL-backed rather than clean checkpointed secondary-index execution. |
 | `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path; later streaming count stopped after 165.03s | 49.51ms warm p50, 51.18ms p95 over 10 counts | Fresh `createIndexes` WAL frames carry index value-frequency metadata, and the metadata prefix is stored outside compressed mutation payloads. Debug output reported `readPath=pendingWalEqualityCount`, scanned 1,002 WAL metadata records, and returned `n=2500` without full collection hydration. |
-| Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
+| Forced checkpoint after import | not measured | timed out at 360.93s, 11.2 GB max RSS | The foreground checkpoint path still does not complete on the full fixture. After timeout, `mqlite info` still reported checkpoint LSN 0 and 1,002 WAL records, so the file did not appear clean after the interrupted checkpoint. |
 | WAL-backed metadata fold, full fixture | not measured | 0.07s real, 9.6 MB max RSS | New WAL frames keep the metadata prefix outside compressed mutation payloads, so `mqlite info` folded 1,002 WAL records and reported 1,000,001 records plus 3,000,003 index entries without deserializing the full mutation payloads. |
 
 The successful live-count result is checked in at
@@ -265,6 +265,8 @@ The full-fixture `ticket:"z300"` pending-WAL point-read run is checked in at
 `benchmarks/results/2026-05-13-trades-full-ticket-find-pending-wal.json`.
 The warm `bench trades-read` run is checked in at
 `benchmarks/results/2026-05-13-trades-read-warm-pending-wal.json`.
+The fresh full-fixture forced-checkpoint timeout is checked in at
+`benchmarks/results/2026-05-13-trades-checkpoint-timeout-360s.json`.
 
 ## Next Work Items
 
