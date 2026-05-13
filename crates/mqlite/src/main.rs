@@ -161,6 +161,8 @@ enum BenchCommand {
         collection: String,
         #[arg(long, default_value = "z300")]
         ticket: String,
+        #[arg(long, default_value = "abcd")]
+        ticker: String,
         #[arg(long, default_value_t = 100)]
         reads: u32,
         #[arg(long, default_value_t = 10)]
@@ -421,6 +423,7 @@ async fn main() -> Result<()> {
                         db,
                         collection,
                         ticket,
+                        ticker,
                         reads,
                         count_reads,
                         expected_ticket_count,
@@ -432,6 +435,7 @@ async fn main() -> Result<()> {
                                 db: &db,
                                 collection: &collection,
                                 ticket: &ticket,
+                                ticker: &ticker,
                                 reads,
                                 count_reads,
                                 expected_ticket_count,
@@ -808,6 +812,7 @@ struct TradesReadOptions<'a> {
     db: &'a str,
     collection: &'a str,
     ticket: &'a str,
+    ticker: &'a str,
     reads: u32,
     count_reads: u32,
     expected_ticket_count: i64,
@@ -1312,7 +1317,10 @@ async fn run_trades_read_benchmark(
     let startup_started = Instant::now();
     let mut stream = connect_or_spawn_broker(file, options.idle_shutdown_secs, None).await?;
     let startup_elapsed = startup_started.elapsed();
-    let find = run_trades_ticket_find_reads(&mut stream, &options).await?;
+    let ticket_find =
+        run_trades_field_find_reads(&mut stream, &options, "ticket", options.ticket).await?;
+    let ticker_find =
+        run_trades_field_find_reads(&mut stream, &options, "ticker", options.ticker).await?;
     let count = run_trades_ticket_count_reads(&mut stream, &options).await?;
     let info = DatabaseFile::info(file)?;
 
@@ -1323,17 +1331,21 @@ async fn run_trades_read_benchmark(
         "db": options.db,
         "collection": options.collection,
         "ticket": options.ticket,
+        "ticker": options.ticker,
         "elapsedMs": duration_ms(started.elapsed()),
         "startupMs": duration_ms(startup_elapsed),
-        "ticketFind": find,
+        "ticketFind": ticket_find,
+        "tickerFind": ticker_find,
         "ticketCount": count,
         "storage": benchmark_storage_summary(&info),
     }))
 }
 
-async fn run_trades_ticket_find_reads(
+async fn run_trades_field_find_reads(
     stream: &mut BoxedStream,
     options: &TradesReadOptions<'_>,
+    field: &str,
+    value: &str,
 ) -> Result<serde_json::Value> {
     let mut latencies = Vec::with_capacity(options.reads as usize);
     let mut first_query_debug = None;
@@ -1342,7 +1354,7 @@ async fn run_trades_ticket_find_reads(
     for index in 0..options.reads {
         let command = doc! {
             "find": options.collection,
-            "filter": { "ticket": options.ticket },
+            "filter": { field: value },
             "limit": 1,
             "singleBatch": true,
             "$db": options.db,
@@ -1363,8 +1375,7 @@ async fn run_trades_ticket_find_reads(
             .context("find reply missing firstBatch")?;
         if first_batch.len() != 1 {
             bail!(
-                "trades ticket find expected one document for ticket `{}`, got {}",
-                options.ticket,
+                "trades {field} find expected one document for value `{value}`, got {}",
                 first_batch.len()
             );
         }
@@ -1377,6 +1388,8 @@ async fn run_trades_ticket_find_reads(
 
     Ok(json!({
         "reads": options.reads,
+        "field": field,
+        "value": value,
         "elapsedMs": duration_ms(started.elapsed()),
         "queriesPerSec": rate_per_second(options.reads, started.elapsed()),
         "firstQueryElapsedMs": duration_ms(*latencies.first().unwrap_or(&Duration::ZERO)),

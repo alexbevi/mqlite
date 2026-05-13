@@ -158,9 +158,9 @@ target/debug/mqlite bench trades-read \
   --count-reads 10
 ```
 
-It reports startup time, warm `ticket:"z300"` point-read p50/p95/max,
-`ticket:"z300"` count p50/p95/max, first-query broker debug metadata, and
-storage counters.
+It reports startup time, warm `ticket:"z300"` and `ticker:"abcd"` point-read
+p50/p95/max, `ticket:"z300"` count p50/p95/max, first-query broker debug
+metadata, and storage counters.
 
 The older baseline below used a Python loop that spawned `mqlite command` for
 each batch against a long-lived broker. Keep it as the comparison point for the
@@ -238,6 +238,7 @@ First-class harness results from this patch:
 | Count all documents after import and index build | manually stopped after 107.73s after falling back to dirty-WAL record overlay | 2.20s real, 7.7 MB CLI max RSS | Empty-filter `count` now answers from metadata folded across checkpoint and WAL prefixes. Debug output reported `readPath=metadataCount` and returned `n=1,000,001`. |
 | `_id` point read after import and index build | manually stopped after 40.84s on the generic dirty-WAL overlay path | 1.61s real, 7.8 MB CLI max RSS | Simple `_id` equality can use the pending-WAL id lookup. Debug output reported `readPath=pendingWalIdLookup` while scanning 1002 WAL records. The measured id is the first fixture `_id`; the earlier MongoDB baseline id was not a useful mqlite fixture probe. |
 | `ticket:"z300"` point read after import and index build | did not return within 30s on the generic hydrated path | 253.92ms warm p50, 263.92ms p95 over 100 reads | `bench trades-read` reported `readPath=pendingWalEqualityLookup` and returned the first matching document without opening mutable storage. This is still far slower than MongoDB's 1.33ms p50 and still dirty-WAL-backed rather than clean checkpointed secondary-index execution. |
+| `ticker:"abcd"` point read after import and index build | not previously measured | 248.34ms warm p50, 272.64ms p95 over 100 reads | `bench trades-read` reported `readPath=pendingWalEqualityLookup`; this covers ticker read latency but is still dirty-WAL-backed rather than clean checkpointed secondary-index execution. |
 | `ticket:"z300"` count after import and index build | manually stopped after 40.82s on the generic dirty-WAL overlay path; later streaming count stopped after 165.03s | 49.51ms warm p50, 51.18ms p95 over 10 counts | Fresh `createIndexes` WAL frames carry index value-frequency metadata, and the metadata prefix is stored outside compressed mutation payloads. Debug output reported `readPath=pendingWalEqualityCount`, scanned 1,002 WAL metadata records, and returned `n=2500` without full collection hydration. |
 | Forced checkpoint after import | not measured | manually stopped after >16 minutes; later probes stopped at 180.48s, 270.34s, and 300.02s | The broker was CPU-bound at roughly 9 GiB RSS while publishing the full imported state. Record, secondary-index, metadata-chain, spool-backed page packing, and shared change-event buffers reduce duplicate checkpoint inputs, but full checkpoint publication still does not complete on the full fixture; the shared-buffer probe still reached roughly 3.57 GiB broker RSS by 3:20 before the 300s timeout. |
 | WAL-backed metadata fold, full fixture | not measured | 0.07s real, 9.6 MB max RSS | New WAL frames keep the metadata prefix outside compressed mutation payloads, so `mqlite info` folded 1,002 WAL records and reported 1,000,001 records plus 3,000,003 index entries without deserializing the full mutation payloads. |
@@ -275,7 +276,6 @@ The warm `bench trades-read` run is checked in at
 - Add safe benchmark cleanup/checkpoint handling so interrupting long operations
   cannot make benchmark files look successfully complete when only an older
   checkpoint is visible.
-- Add comparable mqlite read results for `ticker` and startup. Full
-  `ticket:"z300"` point read and count now have cold CLI measurements, but warm
-  p50/p95 loops and clean checkpointed secondary-index reads still need
-  coverage.
+- Clean checkpointed secondary-index reads still need coverage; the current
+  `ticket`/`ticker` point-read and `ticket` count measurements are warm
+  dirty-WAL-backed runs.
