@@ -1009,8 +1009,19 @@ pub struct ValueFrequency {
 
 impl IndexStats {
     fn build(entries: &[IndexEntry], key_pattern: &Document) -> Self {
-        let mut stats = Self {
-            entry_count: entries.len(),
+        let mut stats = Self::empty_for_key_pattern(key_pattern);
+        for entry in entries {
+            stats.add_entry(entry);
+        }
+        for frequencies in stats.value_frequencies.values_mut() {
+            frequencies.sort_by(|left, right| compare_bson(&left.value, &right.value));
+        }
+        stats
+    }
+
+    fn empty_for_key_pattern(key_pattern: &Document) -> Self {
+        Self {
+            entry_count: 0,
             present_fields: key_pattern
                 .keys()
                 .cloned()
@@ -1021,28 +1032,17 @@ impl IndexStats {
                 .cloned()
                 .map(|field| (field, Vec::new()))
                 .collect(),
-        };
-        for entry in entries {
-            for field in &entry.present_fields {
-                if let Some(count) = stats.present_fields.get_mut(field) {
-                    *count += 1;
-                }
-            }
-            for (field, value) in &entry.key {
-                let frequencies = stats
-                    .value_frequencies
-                    .get_mut(field)
-                    .expect("frequency field");
-                match frequencies
-                    .iter_mut()
-                    .find(|frequency| compare_bson(&frequency.value, value).is_eq())
-                {
-                    Some(frequency) => frequency.count += 1,
-                    None => frequencies.push(ValueFrequency {
-                        value: value.clone(),
-                        count: 1,
-                    }),
-                }
+        }
+    }
+
+    fn build_pages<'a, I>(pages: I, key_pattern: &Document) -> Self
+    where
+        I: IntoIterator<Item = &'a RuntimeIndexPage>,
+    {
+        let mut stats = Self::empty_for_key_pattern(key_pattern);
+        for page in pages {
+            for entry in &page.entries {
+                stats.add_entry(entry);
             }
         }
         for frequencies in stats.value_frequencies.values_mut() {
@@ -1051,15 +1051,29 @@ impl IndexStats {
         stats
     }
 
-    fn build_pages<'a, I>(pages: I, key_pattern: &Document) -> Self
-    where
-        I: IntoIterator<Item = &'a RuntimeIndexPage>,
-    {
-        let entries = pages
-            .into_iter()
-            .flat_map(|page| page.entries.iter().cloned())
-            .collect::<Vec<_>>();
-        Self::build(&entries, key_pattern)
+    fn add_entry(&mut self, entry: &IndexEntry) {
+        self.entry_count += 1;
+        for field in &entry.present_fields {
+            if let Some(count) = self.present_fields.get_mut(field) {
+                *count += 1;
+            }
+        }
+        for (field, value) in &entry.key {
+            let frequencies = self
+                .value_frequencies
+                .get_mut(field)
+                .expect("frequency field");
+            match frequencies
+                .iter_mut()
+                .find(|frequency| compare_bson(&frequency.value, value).is_eq())
+            {
+                Some(frequency) => frequency.count += 1,
+                None => frequencies.push(ValueFrequency {
+                    value: value.clone(),
+                    count: 1,
+                }),
+            }
+        }
     }
 
     fn insert_entry(&mut self, entry: &IndexEntry, key_pattern: &Document) {
@@ -1968,7 +1982,7 @@ mod tests {
 
     use super::{
         Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBound,
-        IndexBounds, default_index_name,
+        IndexBounds, IndexCatalog, IndexEntry, default_index_name,
     };
 
     #[test]
@@ -2031,6 +2045,38 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].record_id, 1);
         assert_eq!(entries[1].record_id, 2);
+    }
+
+    #[test]
+    fn rebuilds_stats_from_runtime_pages_without_materializing_entries() {
+        let mut index = IndexCatalog::new("sku_1".to_string(), doc! { "sku": 1 }, false);
+        let entries = (0..256_u64)
+            .map(|record_id| {
+                let sku = format!("sku-{}", record_id % 4);
+                IndexEntry {
+                    record_id,
+                    key: doc! { "sku": sku },
+                    present_fields: vec!["sku".to_string()],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        index.load_entries(entries).expect("load entries");
+
+        assert!(
+            !index.entries_materialized,
+            "runtime-page stats rebuild should not force a flat entries snapshot"
+        );
+        assert!(index.entries.is_empty());
+        assert_eq!(index.stats.entry_count, 256);
+        assert_eq!(index.stats.present_fields.get("sku"), Some(&256));
+        let frequencies = index
+            .stats
+            .value_frequencies
+            .get("sku")
+            .expect("sku frequencies");
+        assert_eq!(frequencies.len(), 4);
+        assert!(frequencies.iter().all(|frequency| frequency.count == 64));
     }
 
     #[test]
