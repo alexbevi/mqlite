@@ -44,8 +44,8 @@ Results:
 
 | Operation | MongoDB standalone | mqlite current | Gap |
 | --- | ---: | ---: | ---: |
-| Import 1,000,001 docs, batch 1000 | 27.87s, 35,874 docs/s | 412.17s, 2,426 docs/s | mqlite 14.8x slower |
-| Build `ticker_1` and `ticket_1` | 3.00s server-side, 8.92s including `mongosh` startup | Did not complete within 318.89s; interrupted | mqlite >106x slower to current cutoff |
+| Import 1,000,001 docs, batch 1000 | 27.87s, 35,874 docs/s | 323.43s, 3,092 docs/s | mqlite 11.6x slower |
+| Build `ticker_1` and `ticket_1` | 3.00s server-side, 8.92s including `mongosh` startup | 341.63s command wall time | mqlite 114x slower than MongoDB server-side index build |
 | Count all docs | p50 216.42ms | 2.20s cold CLI on WAL-backed indexed file via metadata path | mqlite 10.2x slower than MongoDB p50, but no full record hydration |
 | `_id` point read, 1000 iterations | p50 0.72ms, p95 1.08ms | 1.61s cold CLI for first fixture `_id` on WAL-backed indexed file | mqlite remains far slower than MongoDB warm p50, but avoids full record hydration |
 | `ticket: "z300"` indexed point read, 1000 iterations | p50 1.33ms, p95 4.44ms | 1.09s cold CLI pending-WAL equality lookup | mqlite cold CLI remains far slower than MongoDB warm p50, but avoids full hydration |
