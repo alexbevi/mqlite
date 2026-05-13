@@ -624,27 +624,28 @@ impl CheckpointWriter {
         if change_events.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode_adaptive_refs(change_events, 32, |chunk| {
-            encode_change_events_page_fits(chunk)
-        })?;
-        let page_ids = (0..chunks.len())
-            .map(|_| self.allocate_page_id())
-            .collect::<Vec<_>>();
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let page_id = page_ids[index];
-            let next_page_id = page_ids.get(index + 1).copied();
-            self.pages.push((
-                page_id,
-                ChangeEventsPage {
-                    page_id,
-                    next_page_id,
-                    events: chunk,
-                }
-                .encode()?
-                .to_vec(),
-            ));
+        let mut first_page_id = None;
+        let mut pending_page: Option<(PageId, Vec<PersistedChangeEvent>)> = None;
+        let mut offset = 0;
+        let mut chunk_size = 32;
+        while offset < change_events.len() {
+            let (chunk, next_chunk_size) =
+                next_adaptive_chunk_from_refs(change_events, offset, chunk_size, |chunk| {
+                    encode_change_events_page_fits(chunk)
+                })?;
+            offset += chunk.len();
+            chunk_size = next_chunk_size;
+            let page_id = self.allocate_page_id();
+            first_page_id.get_or_insert(page_id);
+            if let Some((pending_page_id, pending_events)) = pending_page.take() {
+                self.push_change_events_page(pending_page_id, Some(page_id), pending_events)?;
+            }
+            pending_page = Some((page_id, chunk));
         }
-        Ok(page_ids.first().copied())
+        if let Some((page_id, events)) = pending_page {
+            self.push_change_events_page(page_id, None, events)?;
+        }
+        Ok(first_page_id)
     }
 
     fn write_plan_cache(
@@ -654,33 +655,72 @@ impl CheckpointWriter {
         if plan_cache_entries.is_empty() {
             return Ok(None);
         }
-        let chunks = chunk_by_encode_adaptive_refs(plan_cache_entries, 64, |chunk| {
-            PlanCachePage {
-                page_id: 1,
-                next_page_id: None,
-                entries: chunk.to_vec(),
+        let mut first_page_id = None;
+        let mut pending_page: Option<(PageId, Vec<PersistedPlanCacheEntry>)> = None;
+        let mut offset = 0;
+        let mut chunk_size = 64;
+        while offset < plan_cache_entries.len() {
+            let (chunk, next_chunk_size) =
+                next_adaptive_chunk_from_refs(plan_cache_entries, offset, chunk_size, |chunk| {
+                    PlanCachePage {
+                        page_id: 1,
+                        next_page_id: None,
+                        entries: chunk.to_vec(),
+                    }
+                    .encode()
+                    .map(|_| ())
+                })?;
+            offset += chunk.len();
+            chunk_size = next_chunk_size;
+            let page_id = self.allocate_page_id();
+            first_page_id.get_or_insert(page_id);
+            if let Some((pending_page_id, pending_entries)) = pending_page.take() {
+                self.push_plan_cache_page(pending_page_id, Some(page_id), pending_entries)?;
             }
-            .encode()
-            .map(|_| ())
-        })?;
-        let page_ids = (0..chunks.len())
-            .map(|_| self.allocate_page_id())
-            .collect::<Vec<_>>();
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let page_id = page_ids[index];
-            let next_page_id = page_ids.get(index + 1).copied();
-            self.pages.push((
-                page_id,
-                PlanCachePage {
-                    page_id,
-                    next_page_id,
-                    entries: chunk,
-                }
-                .encode()?
-                .to_vec(),
-            ));
+            pending_page = Some((page_id, chunk));
         }
-        Ok(page_ids.first().copied())
+        if let Some((page_id, entries)) = pending_page {
+            self.push_plan_cache_page(page_id, None, entries)?;
+        }
+        Ok(first_page_id)
+    }
+
+    fn push_change_events_page(
+        &mut self,
+        page_id: PageId,
+        next_page_id: Option<PageId>,
+        events: Vec<PersistedChangeEvent>,
+    ) -> Result<()> {
+        self.pages.push((
+            page_id,
+            ChangeEventsPage {
+                page_id,
+                next_page_id,
+                events,
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        Ok(())
+    }
+
+    fn push_plan_cache_page(
+        &mut self,
+        page_id: PageId,
+        next_page_id: Option<PageId>,
+        entries: Vec<PersistedPlanCacheEntry>,
+    ) -> Result<()> {
+        self.pages.push((
+            page_id,
+            PlanCachePage {
+                page_id,
+                next_page_id,
+                entries,
+            }
+            .encode()?
+            .to_vec(),
+        ));
+        Ok(())
     }
 
     fn write_namespace_tree(&mut self, mut entries: Vec<NamespaceEntry>) -> Result<Option<PageId>> {
@@ -1225,6 +1265,30 @@ fn chunk_by_encode_adaptive_refs<T: Clone>(
     }
 
     Ok(chunks)
+}
+
+fn next_adaptive_chunk_from_refs<T: Clone>(
+    items: &[T],
+    offset: usize,
+    chunk_size: usize,
+    fits: impl Fn(&[T]) -> Result<()>,
+) -> Result<(Vec<T>, usize)> {
+    let remaining = items.len().saturating_sub(offset);
+    if remaining == 0 {
+        return Ok((Vec::new(), chunk_size.max(1)));
+    }
+    let mut take = chunk_size.max(1).min(remaining);
+    loop {
+        let chunk = items[offset..offset + take].to_vec();
+        if fits(&chunk).is_ok() {
+            return Ok((chunk, take.max(1)));
+        }
+        if take == 1 {
+            fits(&items[offset..offset + 1])
+                .map_err(|_| anyhow!("item exceeds v2 page capacity"))?;
+        }
+        take = take.div_ceil(2);
+    }
 }
 
 fn encode_change_events_page_fits(events: &[PersistedChangeEvent]) -> Result<()> {

@@ -225,6 +225,8 @@ rotates the active superblock.
 - Record and secondary-index leaf pages are packed incrementally from the live collection and index
   entries, so checkpoint publication no longer has to materialize second full vectors of record
   slots or grouped secondary leaf entries before writing those page trees.
+- Change-event and plan-cache page chains are packed as pending linked pages instead of
+  precomputing every chunk and page id for those metadata roots.
 - It still runs synchronously for explicit checkpoint requests and shutdown cleanup.
 
 ### Background Published Snapshot
