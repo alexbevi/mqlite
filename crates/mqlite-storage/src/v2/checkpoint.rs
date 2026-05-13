@@ -1202,7 +1202,6 @@ struct SecondaryChild {
 }
 
 fn build_persisted_index_stats(index: &IndexCatalog) -> Result<PersistedIndexStats> {
-    let entries = index.entries_snapshot();
     let mut present_fields = index
         .key
         .keys()
@@ -1215,20 +1214,30 @@ fn build_persisted_index_stats(index: &IndexCatalog) -> Result<PersistedIndexSta
         .cloned()
         .map(|field| (field, BTreeMap::<Vec<u8>, u64>::new()))
         .collect::<BTreeMap<_, _>>();
+    let mut entry_count = 0_u64;
 
-    for entry in &entries {
+    index.try_for_each_entry(|entry| -> Result<()> {
+        entry_count += 1;
         for field in &entry.present_fields {
             if let Some(count) = present_fields.get_mut(field) {
                 *count += 1;
             }
         }
         for (field, value) in &entry.key {
-            if let Some(frequencies) = value_frequencies.get_mut(field) {
+            let exceeded = {
+                let Some(frequencies) = value_frequencies.get_mut(field) else {
+                    continue;
+                };
                 let encoded = encode_persisted_stat_value(value)?;
                 *frequencies.entry(encoded).or_insert(0) += 1;
+                frequencies.len() > MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD
+            };
+            if exceeded {
+                value_frequencies.remove(field);
             }
         }
-    }
+        Ok(())
+    })?;
 
     let value_frequencies = value_frequencies
         .into_iter()
@@ -1247,15 +1256,12 @@ fn build_persisted_index_stats(index: &IndexCatalog) -> Result<PersistedIndexSta
                     .expect("persisted stats values are valid bson scalars");
                 compare_bson(&left, &right)
             });
-            if frequencies.len() > MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD {
-                frequencies.truncate(MAX_PERSISTED_VALUE_FREQUENCIES_PER_FIELD);
-            }
             (field, frequencies)
         })
         .collect();
 
     Ok(PersistedIndexStats {
-        entry_count: entries.len() as u64,
+        entry_count,
         present_fields,
         value_frequencies,
     })
@@ -1551,5 +1557,15 @@ mod tests {
         assert_eq!(info.summary.record_count, 10_000);
         assert_eq!(info.summary.index_entry_count, 20_000);
         assert_eq!(info.wal_since_checkpoint.record_count, 0);
+
+        let view = open_collection_read_view(&path, "app", "widgets")
+            .expect("open view")
+            .expect("collection view");
+        let index = view.index("sku_1").expect("sku index");
+        assert_eq!(index.present_count("sku"), Some(10_000));
+        assert_eq!(
+            index.estimate_value_count("sku", &Bson::String("sku-00000001".to_string())),
+            None
+        );
     }
 }

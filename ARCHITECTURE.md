@@ -372,6 +372,8 @@ stats by streaming page entries, so an index build or load does not need to mate
 entry vectors just to refresh planner frequencies.
 Runtime value-frequency stats are capped per indexed field; high-cardinality fields keep entry and
 presence counts but report unavailable value estimates rather than retaining unbounded histograms.
+Persisted checkpoint stats follow the same shape and stream over index entries without cloning a
+flat entry snapshot.
 WAL replay for `createIndexes` installs built indexes by moving them into the collection catalog
 when the caller does not need a returned full index list.
 
