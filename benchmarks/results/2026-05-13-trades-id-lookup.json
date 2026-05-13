@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "status": "pending-wal-id-lookup-validated",
+  "command": "target/debug/mqlite command --file /tmp/mqlite-trades-walmeta.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"find\":\"trades\",\"filter\":{\"_id\":{\"$oid\":\"5597a1617df886b33f839f9a\"}},\"limit\":1}'",
+  "debugCommand": "target/debug/mqlite --debug command --file /tmp/mqlite-trades-walmeta.mongodb --db market --idle-shutdown-secs 3600 --eval '{\"find\":\"trades\",\"filter\":{\"_id\":{\"$oid\":\"5597a1617df886b33f839f9a\"}},\"limit\":1}'",
+  "date": "2026-05-13",
+  "databaseFile": "/tmp/mqlite-trades-walmeta.mongodb",
+  "sourceFixture": "benchmarks/trades.json.zst",
+  "filter": {
+    "_id": {
+      "$oid": "5597a1617df886b33f839f9a"
+    }
+  },
+  "result": {
+    "firstBatchLength": 1,
+    "ok": 1.0
+  },
+  "processTime": {
+    "realSeconds": 1.61,
+    "userSeconds": 0.0,
+    "sysSeconds": 0.0,
+    "maxResidentSetBytes": 7835648,
+    "peakMemoryFootprintBytes": 3198976
+  },
+  "debug": {
+    "readPath": "pendingWalIdLookup",
+    "pendingWalRecords": 1002,
+    "pendingWalRelevantRecords": 1002
+  },
+  "before": {
+    "realSecondsStopped": 40.84,
+    "termination": "manual stop after the generic dirty-WAL record overlay path did not complete promptly"
+  },
+  "notes": [
+    "The fixture importer stores JSON extended ObjectId values as BSON documents, so the measured filter uses the exact first fixture _id document.",
+    "The earlier MongoDB baseline probe id was not used for the mqlite measurement because it did not produce a fast-path hit in this fixture representation.",
+    "This does not make ticket/ticker indexed reads fast yet because the pending createIndexes frame does not expose page-backed secondary index entries."
+  ]
+}

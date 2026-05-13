@@ -1935,6 +1935,45 @@ impl Broker {
             let _ = apply_projection(&Document::new(), Some(projection))?;
         }
 
+        if let Some(id) = simple_id_filter(&filter).filter(|_| {
+            !self.storage_is_loaded()
+                && self.paths.database_path.exists()
+                && sort.is_none()
+                && skip == 0
+                && limit <= 1
+        }) {
+            if let Some(lookup) = DatabaseFile::find_pending_wal_document_by_id(
+                &self.paths.database_path,
+                &database,
+                collection,
+                &id,
+                DEFAULT_PENDING_WAL_READ_OVERLAY_MAX_BYTES,
+            )
+            .map_err(internal_error)?
+            {
+                set_metadata("readPath", "pendingWalIdLookup");
+                set_metadata("pendingWalRecords", lookup.wal_records.to_string());
+                set_metadata(
+                    "pendingWalRelevantRecords",
+                    lookup.relevant_wal_records.to_string(),
+                );
+                set_metadata("pendingWalBytes", lookup.wal_bytes.to_string());
+                let documents = lookup
+                    .document
+                    .map(|document| apply_projection(&document, projection.as_ref()))
+                    .transpose()?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let cursor = self.cursors.lock().open(
+                    format!("{database}.{collection}"),
+                    documents,
+                    batch_size,
+                    single_batch,
+                );
+                return Ok(cursor_document(cursor, "firstBatch"));
+            }
+        }
+
         let namespace = format!("{database}.{collection}");
         let execution =
             self.with_query_collection(&database, collection, |sequence, collection| {
@@ -5961,6 +6000,21 @@ fn fetch_record_document(
         .ok_or_else(|| CommandError::new(8, "UnknownError", "missing record for index entry"))
 }
 
+fn simple_id_filter(filter: &Document) -> Option<Bson> {
+    if filter.len() != 1 {
+        return None;
+    }
+    match filter.get("_id") {
+        Some(Bson::Document(document))
+            if document.len() == 1 && document.get_str("$oid").is_ok() =>
+        {
+            Some(Bson::Document(document.clone()))
+        }
+        Some(Bson::Document(_)) | None => None,
+        Some(value) => Some(value.clone()),
+    }
+}
+
 fn build_plan_cache_key(
     namespace: &str,
     filter: &Document,
@@ -7219,6 +7273,66 @@ mod tests {
         assert!(
             !broker.storage_is_loaded(),
             "pending createIndexes should not force mutable storage for count-all"
+        );
+    }
+
+    #[test]
+    fn find_by_id_uses_pending_wal_lookup_before_storage_opens() {
+        let temp_dir = tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("lazy-startup-id-lookup.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&database_path).expect("create db");
+            database.checkpoint().expect("checkpoint empty file");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "sku": "alpha" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "sku": "beta" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending inserts");
+        }
+
+        let broker = Broker::new(BrokerConfig::new(&database_path, 60)).expect("broker");
+        let response = broker
+            .handle_find(&doc! {
+                "find": "widgets",
+                "filter": { "_id": 2_i64 },
+                "limit": 1_i64,
+                "$db": "app",
+            })
+            .expect("find");
+        let first_batch = response
+            .get_document("cursor")
+            .expect("cursor")
+            .get_array("firstBatch")
+            .expect("firstBatch");
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(
+            first_batch[0]
+                .as_document()
+                .expect("document")
+                .get_str("sku")
+                .expect("sku"),
+            "beta"
+        );
+        assert!(
+            !broker.storage_is_loaded(),
+            "pending WAL _id lookup should not force mutable storage"
         );
     }
 

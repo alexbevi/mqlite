@@ -141,6 +141,12 @@ replays the WAL tail, and validates the result.
 loaded. It answers from checkpoint metadata plus WAL metadata prefixes, applies `skip`/`limit`, and
 does not construct a record overlay for dirty files.
 
+`find` with a simple `_id` equality, no sort, no skip, and at most one result can use a bounded
+pending-WAL lookup before mutable storage opens. The lookup checks the checkpointed `_id_` index,
+then scans supported pending WAL frames for matching inserts/updates while using WAL metadata to
+skip later insert-only/index-only frames after a match. Mutations that could invalidate the result
+fall back to the normal read path.
+
 ### Page-Backed Read Fast Path
 
 The page-backed read path is designed for clean checkpointed files:

@@ -14,9 +14,9 @@ use bson::{Bson, Document, doc};
 use ciborium::{de as cbor_de, ser as cbor_ser};
 use fs4::FileExt;
 use mqlite_catalog::{
-    Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBounds,
-    IndexCatalog, IndexEntry, apply_index_specs, build_index_specs, validate_collection_indexes,
-    validate_drop_indexes,
+    Catalog, CatalogError, CollectionCatalog, CollectionMutation, CollectionRecord, IndexBound,
+    IndexBounds, IndexCatalog, IndexEntry, apply_index_specs, build_index_specs,
+    validate_collection_indexes, validate_drop_indexes,
 };
 use mqlite_debug::{Component, add_counter, record_duration, set_metadata, span};
 use serde::{Deserialize, Serialize};
@@ -790,6 +790,14 @@ pub struct PendingWalCollectionReadView {
     pub view: Option<Box<dyn CollectionReadView>>,
 }
 
+pub struct PendingWalIdLookup {
+    pub last_sequence: u64,
+    pub wal_records: usize,
+    pub relevant_wal_records: usize,
+    pub wal_bytes: u64,
+    pub document: Option<Document>,
+}
+
 struct DeltaOverlayCollectionReadView {
     base: Arc<dyn CollectionReadView>,
     delta: CollectionCatalog,
@@ -1206,6 +1214,290 @@ impl DatabaseFile {
         }))
     }
 
+    pub fn find_pending_wal_document_by_id(
+        path: impl AsRef<Path>,
+        database: &str,
+        collection: &str,
+        id: &Bson,
+        max_wal_bytes: u64,
+    ) -> Result<Option<PendingWalIdLookup>> {
+        let _span = span(Component::Storage, "find_pending_wal_document_by_id");
+        let path = path.as_ref();
+        let pager = V2Pager::open(path)?;
+        let superblock = pager.active_superblock().clone();
+        let file_size = std::fs::metadata(path)?.len();
+        let wal_bytes = file_size.saturating_sub(superblock.wal_start_offset);
+        if wal_bytes == 0 || wal_bytes > max_wal_bytes {
+            return Ok(None);
+        }
+
+        let mut found = Self::open_page_backed_collection_read_view(path, database, collection)?
+            .and_then(|view| find_page_backed_document_by_id(view.as_ref(), id).transpose())
+            .transpose()?
+            .map(|(record_id, document)| (record_id, document));
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut offset = superblock.wal_start_offset;
+        let mut last_sequence = superblock.durable_lsn;
+        let mut scanned_records = 0_u64;
+        let mut relevant_records = 0_u64;
+
+        while offset < file_size {
+            if file_size - offset < WAL_HEADER_LEN as u64 {
+                break;
+            }
+
+            file.seek(SeekFrom::Start(offset))?;
+            let mut header = [0_u8; WAL_HEADER_LEN];
+            file.read_exact(&mut header)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if &header[..4] != WAL_FRAME_MAGIC {
+                break;
+            }
+
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().expect("payload len"));
+            let payload_end = offset + WAL_HEADER_LEN as u64 + payload_len as u64;
+            if payload_end > file_size {
+                break;
+            }
+
+            let mut payload = vec![0_u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|_| StorageError::Truncated)?;
+
+            if hash_bytes(&payload) != header[8..40] {
+                return Err(StorageError::InvalidWalChecksum.into());
+            }
+
+            if found.is_some() {
+                if let Some(metadata) = decode_wal_frame_metadata(&payload)? {
+                    scanned_records += 1;
+                    if wal_metadata_preserves_id_lookup_after_found(
+                        &metadata.mutation,
+                        database,
+                        collection,
+                    ) {
+                        if wal_metadata_targets_namespace(&metadata.mutation, database, collection)
+                        {
+                            relevant_records += 1;
+                        }
+                        offset = payload_end;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+            }
+
+            let compact = decode_compact_wal_entry(&payload)?;
+            if compact.sequence <= last_sequence {
+                offset = payload_end;
+                continue;
+            }
+
+            scanned_records += 1;
+            last_sequence = compact.sequence;
+            if !compact_mutation_targets_namespace(&compact.mutation, database, collection) {
+                offset = payload_end;
+                continue;
+            }
+            relevant_records += 1;
+
+            match compact.mutation {
+                CompactWalMutation::ApplyCollectionChanges {
+                    changes,
+                    inserts,
+                    updates,
+                    deletes,
+                    ..
+                } => {
+                    apply_compact_id_lookup_changes(
+                        &mut found, id, changes, inserts, updates, deletes,
+                    )?;
+                }
+                CompactWalMutation::CreateIndexes { .. } => {}
+                CompactWalMutation::ReplaceCollection { .. }
+                | CompactWalMutation::RewriteCollection { .. }
+                | CompactWalMutation::DropIndexes { .. }
+                | CompactWalMutation::DropCollection { .. } => return Ok(None),
+            }
+
+            offset = payload_end;
+        }
+
+        add_counter(
+            Component::Storage,
+            "pendingWalIdLookupScannedRecords",
+            scanned_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalIdLookupRelevantRecords",
+            relevant_records,
+        );
+        add_counter(
+            Component::Storage,
+            "pendingWalIdLookupScannedBytes",
+            wal_bytes,
+        );
+
+        Ok(Some(PendingWalIdLookup {
+            last_sequence,
+            wal_records: scanned_records as usize,
+            relevant_wal_records: relevant_records as usize,
+            wal_bytes,
+            document: found.map(|(_, document)| document),
+        }))
+    }
+}
+
+fn apply_compact_id_lookup_changes(
+    found: &mut Option<(u64, Document)>,
+    id: &Bson,
+    changes: Vec<CompactCollectionChange>,
+    inserts: Vec<CompactCollectionRecord>,
+    updates: Vec<CompactCollectionRecord>,
+    deletes: Vec<u64>,
+) -> Result<()> {
+    if !changes.is_empty() {
+        for change in changes {
+            match change {
+                CompactCollectionChange::Insert(record)
+                | CompactCollectionChange::Update(record) => {
+                    apply_compact_id_lookup_record(found, id, record)?;
+                }
+                CompactCollectionChange::Delete(record_id) => {
+                    apply_compact_id_lookup_delete(found, record_id);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if found.is_none() {
+        for record in inserts {
+            apply_compact_id_lookup_record(found, id, record)?;
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+
+    for record in updates {
+        apply_compact_id_lookup_record(found, id, record)?;
+    }
+    for record_id in deletes {
+        apply_compact_id_lookup_delete(found, record_id);
+    }
+    Ok(())
+}
+
+fn apply_compact_id_lookup_record(
+    found: &mut Option<(u64, Document)>,
+    id: &Bson,
+    record: CompactCollectionRecord,
+) -> Result<()> {
+    let document = decode_document_bytes(&record.document)?;
+    if document.get("_id") == Some(id) {
+        *found = Some((record.record_id, document));
+    }
+    Ok(())
+}
+
+fn apply_compact_id_lookup_delete(found: &mut Option<(u64, Document)>, record_id: u64) {
+    if found
+        .as_ref()
+        .is_some_and(|(found_record_id, _)| *found_record_id == record_id)
+    {
+        *found = None;
+    }
+}
+
+fn find_page_backed_document_by_id(
+    view: &dyn CollectionReadView,
+    id: &Bson,
+) -> Result<Option<(u64, Document)>> {
+    let Some(index) = view.index("_id_") else {
+        return Ok(None);
+    };
+    let key = doc! { "_id": id.clone() };
+    let bounds = IndexBounds {
+        lower: Some(IndexBound {
+            key: key.clone(),
+            inclusive: true,
+        }),
+        upper: Some(IndexBound {
+            key,
+            inclusive: true,
+        }),
+    };
+    let Some(entry) = index.scan_entries(&bounds)?.into_iter().next() else {
+        return Ok(None);
+    };
+    view.record_document(entry.record_id)
+        .map(|document| document.map(|document| (entry.record_id, document)))
+}
+
+fn wal_metadata_targets_namespace(
+    mutation: &WalFrameMetadataMutation,
+    database: &str,
+    collection: &str,
+) -> bool {
+    match mutation {
+        WalFrameMetadataMutation::ReplaceCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | WalFrameMetadataMutation::RewriteCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | WalFrameMetadataMutation::ApplyCollectionChanges {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | WalFrameMetadataMutation::CreateIndexes {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | WalFrameMetadataMutation::DropIndexes {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        }
+        | WalFrameMetadataMutation::DropCollection {
+            database: mutation_database,
+            collection: mutation_collection,
+            ..
+        } => mutation_database == database && mutation_collection == collection,
+    }
+}
+
+fn wal_metadata_preserves_id_lookup_after_found(
+    mutation: &WalFrameMetadataMutation,
+    database: &str,
+    collection: &str,
+) -> bool {
+    if !wal_metadata_targets_namespace(mutation, database, collection) {
+        return true;
+    }
+
+    match mutation {
+        WalFrameMetadataMutation::ApplyCollectionChanges { changes, .. } => {
+            changes.updates == 0 && changes.deletes == 0
+        }
+        WalFrameMetadataMutation::CreateIndexes { .. }
+        | WalFrameMetadataMutation::DropIndexes { .. } => true,
+        WalFrameMetadataMutation::ReplaceCollection { .. }
+        | WalFrameMetadataMutation::RewriteCollection { .. }
+        | WalFrameMetadataMutation::DropCollection { .. } => false,
+    }
+}
+
+impl DatabaseFile {
     pub fn read_plan_cache_entries(path: impl AsRef<Path>) -> Result<Vec<PersistedPlanCacheEntry>> {
         let _span = span(Component::Storage, "read_plan_cache_entries");
         v2_engine::load_plan_cache_entries_only(path)
@@ -5132,7 +5424,7 @@ mod tests {
         sync::Arc,
     };
 
-    use bson::{DateTime, Document, Timestamp, doc};
+    use bson::{Bson, DateTime, Document, Timestamp, doc};
     use mqlite_catalog::{
         CollectionCatalog, CollectionRecord, IndexBound, IndexBounds, apply_index_specs,
     };
@@ -5732,6 +6024,59 @@ mod tests {
             view.index("sku_1").is_none(),
             "metadata-only createIndexes overlay must not expose an index whose entries are not page-backed"
         );
+    }
+
+    #[test]
+    fn pending_wal_id_lookup_finds_insert_without_collection_overlay() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("pending-wal-id-lookup.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            database.checkpoint().expect("checkpoint empty file");
+            database
+                .commit_mutation(WalMutation::ApplyCollectionChanges {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: Some(Document::new()),
+                    changes: vec![
+                        CollectionChange::Insert(CollectionRecord::new(
+                            1,
+                            doc! { "_id": 1_i64, "sku": "alpha" },
+                        )),
+                        CollectionChange::Insert(CollectionRecord::new(
+                            2,
+                            doc! { "_id": 2_i64, "sku": "beta" },
+                        )),
+                    ],
+                    inserts: Vec::new(),
+                    updates: Vec::new(),
+                    deletes: Vec::new(),
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending inserts");
+            database
+                .commit_mutation(WalMutation::CreateIndexes {
+                    database: "app".to_string(),
+                    collection: "widgets".to_string(),
+                    create_options: None,
+                    specs: vec![doc! { "key": { "sku": 1 }, "name": "sku_1" }],
+                    change_events: Vec::new(),
+                })
+                .expect("commit pending index");
+        }
+
+        let lookup = DatabaseFile::find_pending_wal_document_by_id(
+            &path,
+            "app",
+            "widgets",
+            &Bson::Int64(2),
+            u64::MAX,
+        )
+        .expect("lookup")
+        .expect("supported lookup");
+        let document = lookup.document.expect("document");
+        assert_eq!(document.get_str("sku").expect("sku"), "beta");
     }
 
     fn exact_sku_bounds(sku: &str) -> IndexBounds {
