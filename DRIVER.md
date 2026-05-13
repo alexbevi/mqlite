@@ -15,6 +15,7 @@ For direct local validation outside a driver, the CLI also exposes `mqlite info 
 `mqlite command --debug` is the direct diagnostics path when a local file is slow: it keeps the command reply on stdout and emits a structured JSON report on stderr with client-side IPC and wire timings plus broker-side server, query, storage, catalog, exec, and BSON spans and counters, including WAL replay bytes and document work broken down by mutation type.
 
 On the storage side, the page-backed v2 read path now persists per-index value-frequency and field-presence stats through checkpoint and reopen, so broker planning can reuse those estimates without rebuilding them first.
+Checkpointed secondary indexes split large duplicate-key posting lists across fixed-size leaf entries, so low-cardinality indexes remain durable and readable after reopen.
 V2 checkpoints also now persist change-stream history and plan-cache entries alongside the page graph, so broker-visible durable state can round-trip through the new superblock roots without the old snapshot wrapper.
 
 ## Required Driver Behavior

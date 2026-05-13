@@ -111,6 +111,7 @@ At a high level, the current engine already covers:
 - single-file durable storage with WAL, checkpoints, recovery, and persisted secondary indexes
 - selective zstd compression for checkpoint pages, snapshot metadata, and large WAL frames when the stored bytes shrink materially
 - page-local in-memory secondary-index maintenance so bulk inserts only rewrite touched index leaves
+- checkpointed secondary indexes split large duplicate-key posting lists across fixed-size leaf entries, so low-cardinality keys remain persistable
 - persisted v2 index stats so page-backed reads keep value-frequency and field-presence estimates after checkpoint and reopen
 - v2 page graphs can now be materialized back into a full in-memory catalog when a broker path still needs collection-owned state
 - v2 checkpoints can now carry change-stream history and persisted plan-cache entries alongside the page graph

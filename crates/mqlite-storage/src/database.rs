@@ -7746,6 +7746,59 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_low_cardinality_secondary_index_postings() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("low-cardinality-index.mongodb");
+
+        {
+            let mut database = DatabaseFile::open_or_create(&path).expect("create database");
+            let mut collection = CollectionCatalog::new(doc! {});
+            for record_id in 1..=1000_u64 {
+                insert_record(
+                    &mut collection,
+                    record_id,
+                    doc! { "_id": record_id as i64, "ticker": "abcd" },
+                );
+            }
+            apply_index_specs(
+                &mut collection,
+                &[doc! { "key": { "ticker": 1 }, "name": "ticker_1" }],
+            )
+            .expect("create index");
+            database
+                .commit_mutation(WalMutation::ReplaceCollection {
+                    database: "market".to_string(),
+                    collection: "trades".to_string(),
+                    collection_state: collection,
+                    change_events: Vec::new(),
+                })
+                .expect("mutation");
+            database.checkpoint().expect("checkpoint");
+        }
+
+        let reopened = DatabaseFile::open_or_create(&path).expect("reopen");
+        let collection = reopened
+            .catalog()
+            .get_collection("market", "trades")
+            .expect("collection");
+        let index = collection.indexes.get("ticker_1").expect("ticker index");
+        assert_eq!(index.entry_count(), 1000);
+        let record_ids = index.scan_bounds(&IndexBounds {
+            lower: Some(IndexBound {
+                key: doc! { "ticker": "abcd" },
+                inclusive: true,
+            }),
+            upper: Some(IndexBound {
+                key: doc! { "ticker": "abcd" },
+                inclusive: true,
+            }),
+        });
+        assert_eq!(record_ids.len(), 1000);
+        assert_eq!(record_ids[0], 1);
+        assert_eq!(record_ids[999], 1000);
+    }
+
+    #[test]
     fn reopens_compound_descending_indexes_in_persisted_order() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("compound-descending.mongodb");

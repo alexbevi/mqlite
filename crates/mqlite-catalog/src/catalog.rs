@@ -826,9 +826,13 @@ impl IndexCatalog {
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), CatalogError> {
-        self.entries = entries;
-        self.runtime_pages = build_runtime_index_pages(&self.entries, &self.key)?;
-        self.entries_materialized = true;
+        self.runtime_pages = build_runtime_index_pages(&entries, &self.key)?;
+        self.entries = if self.runtime_pages.is_empty() {
+            entries
+        } else {
+            Vec::new()
+        };
+        self.entries_materialized = self.runtime_pages.is_empty();
         self.refresh_stats();
         self.invalidate_tree();
         Ok(())
@@ -2023,9 +2027,10 @@ mod tests {
         .expect("create index");
 
         let index = &created[0];
-        assert_eq!(index.entries.len(), 2);
-        assert_eq!(index.entries[0].record_id, 1);
-        assert_eq!(index.entries[1].record_id, 2);
+        let entries = index.entries_snapshot();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_id, 1);
+        assert_eq!(entries[1].record_id, 2);
     }
 
     #[test]
@@ -2114,14 +2119,22 @@ mod tests {
             .update_record_at(1, doc! { "_id": 2, "sku": "c" })
             .expect("update");
         assert!(modified);
-        let entries = &collection.indexes.get("sku_1").expect("index").entries;
+        let entries = collection
+            .indexes
+            .get("sku_1")
+            .expect("index")
+            .entries_snapshot();
         assert_eq!(entries[0].key, doc! { "sku": "a" });
         assert_eq!(entries[1].key, doc! { "sku": "c" });
 
         let removed = collection.delete_records(&BTreeSet::from([1_u64]));
         assert_eq!(removed, 1);
         collection.validate_indexes().expect("validate");
-        let entries = &collection.indexes.get("sku_1").expect("index").entries;
+        let entries = collection
+            .indexes
+            .get("sku_1")
+            .expect("index")
+            .entries_snapshot();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].record_id, 2);
     }
@@ -2179,14 +2192,22 @@ mod tests {
             "gamma"
         );
 
-        let sku_entries = &collection.indexes.get("sku_1").expect("sku index").entries;
+        let sku_entries = collection
+            .indexes
+            .get("sku_1")
+            .expect("sku index")
+            .entries_snapshot();
         assert_eq!(sku_entries.len(), 2);
         assert_eq!(sku_entries[0].key, doc! { "sku": "alpha-2" });
         assert_eq!(sku_entries[0].record_id, 1);
         assert_eq!(sku_entries[1].key, doc! { "sku": "gamma" });
         assert_eq!(sku_entries[1].record_id, 3);
 
-        let qty_entries = &collection.indexes.get("qty_1").expect("qty index").entries;
+        let qty_entries = collection
+            .indexes
+            .get("qty_1")
+            .expect("qty index")
+            .entries_snapshot();
         assert_eq!(qty_entries.len(), 2);
         assert_eq!(qty_entries[0].record_id, 1);
         assert_eq!(qty_entries[1].record_id, 3);
@@ -2436,11 +2457,11 @@ mod tests {
         )
         .expect("create index");
 
-        let entries = &collection
+        let entries = collection
             .indexes
             .get("category_1_qty_-1")
             .expect("index")
-            .entries;
+            .entries_snapshot();
         assert_eq!(
             entries
                 .iter()

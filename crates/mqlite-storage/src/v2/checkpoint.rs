@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use bson::Bson;
 use fs4::FileExt;
 use mqlite_bson::compare_bson;
-use mqlite_catalog::{Catalog, CollectionCatalog, IndexCatalog};
+use mqlite_catalog::{Catalog, CollectionCatalog, IndexCatalog, IndexEntry};
 
 use crate::v2::{
     catalog::{
@@ -978,35 +978,52 @@ impl CheckpointWriter {
             entry_count += 1;
             let encoded_key = encode_index_key(&entry.key, &index.key)?;
             match current_key.as_ref() {
-                Some(existing) if *existing == encoded_key => current_group.push(entry.clone()),
-                _ => {
-                    if !current_group.is_empty() {
-                        let secondary_entry =
-                            SecondaryEntry::from_index_entries(&current_group, &index.key)?;
-                        self.push_secondary_entry_to_leaf(
-                            secondary_entry,
+                Some(existing) if *existing == encoded_key => {
+                    current_group.push(entry.clone());
+                    let secondary_entry =
+                        SecondaryEntry::from_index_entries(&current_group, &index.key)?;
+                    if !SecondaryLeafPage::entries_fit(&[secondary_entry])? {
+                        if current_group.len() == 1 {
+                            return Err(anyhow!("item exceeds v2 page capacity"));
+                        }
+                        let overflow = current_group.pop().expect("overflowing secondary group");
+                        self.push_secondary_group_to_leaf(
+                            &mut current_group,
+                            index,
                             &mut current_page_id,
                             &mut current_leaf_entries,
                             &mut children,
                         )?;
-                        current_group.clear();
+                        current_group.push(overflow);
                     }
+                }
+                _ => {
+                    self.push_secondary_group_to_leaf(
+                        &mut current_group,
+                        index,
+                        &mut current_page_id,
+                        &mut current_leaf_entries,
+                        &mut children,
+                    )?;
                     index_bytes += bson::to_vec(&entry.key)?.len() as u64;
                     current_key = Some(encoded_key);
                     current_group.push(entry.clone());
+                    let secondary_entry =
+                        SecondaryEntry::from_index_entries(&current_group, &index.key)?;
+                    if !SecondaryLeafPage::entries_fit(&[secondary_entry])? {
+                        return Err(anyhow!("item exceeds v2 page capacity"));
+                    }
                 }
             }
             Ok(())
         })?;
-        if !current_group.is_empty() {
-            let secondary_entry = SecondaryEntry::from_index_entries(&current_group, &index.key)?;
-            self.push_secondary_entry_to_leaf(
-                secondary_entry,
-                &mut current_page_id,
-                &mut current_leaf_entries,
-                &mut children,
-            )?;
-        }
+        self.push_secondary_group_to_leaf(
+            &mut current_group,
+            index,
+            &mut current_page_id,
+            &mut current_leaf_entries,
+            &mut children,
+        )?;
 
         self.push_secondary_leaf_page(current_page_id, None, current_leaf_entries, &mut children)?;
 
@@ -1014,6 +1031,28 @@ impl CheckpointWriter {
             children = self.write_secondary_level(children)?;
         }
         Ok((Some(children[0].page_id), entry_count, index_bytes))
+    }
+
+    fn push_secondary_group_to_leaf(
+        &mut self,
+        current_group: &mut Vec<IndexEntry>,
+        index: &IndexCatalog,
+        current_page_id: &mut PageId,
+        current_leaf_entries: &mut Vec<SecondaryEntry>,
+        children: &mut Vec<SecondaryChild>,
+    ) -> Result<()> {
+        if current_group.is_empty() {
+            return Ok(());
+        }
+        let secondary_entry = SecondaryEntry::from_index_entries(current_group, &index.key)?;
+        self.push_secondary_entry_to_leaf(
+            secondary_entry,
+            current_page_id,
+            current_leaf_entries,
+            children,
+        )?;
+        current_group.clear();
+        Ok(())
     }
 
     fn push_secondary_entry_to_leaf(

@@ -256,6 +256,8 @@ rotates the active superblock.
 - Record and secondary-index leaf pages are packed incrementally from the live collection and index
   entries, so checkpoint publication no longer has to materialize second full vectors of record
   slots or grouped secondary leaf entries before writing those page trees.
+- Low-cardinality secondary indexes split duplicate-key posting lists across as many leaf entries
+  as needed, so one heavily repeated key cannot exceed the fixed v2 page size during checkpoint.
 - Change-event and plan-cache page chains are packed as pending linked pages instead of
   precomputing every chunk and page id for those metadata roots.
 - Encoded pages are spooled to a temporary file while the page graph is built, then copied into
@@ -334,7 +336,8 @@ The current v2 secondary format uses:
 - normalized comparable key bytes for navigation and bound checks
 - prefix-compressed separator keys in internal pages
 - prefix-compressed keys in leaf pages
-- duplicate-key posting lists in leaf pages for repeated non-unique keys
+- duplicate-key posting lists in leaf pages for repeated non-unique keys, split across multiple
+  leaf entries when a single key has more postings than one page can store
 - `RecordId` tie-breaking
 - persisted field-presence masks so covered reads can distinguish explicit `null` from missing
 
